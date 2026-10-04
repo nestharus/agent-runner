@@ -316,6 +316,11 @@ impl Run {
         writeln!(self.stdin, "{}", json!({ "cmd": "cancel" })).unwrap();
     }
 
+    /// Writes one raw control line.
+    fn control(&mut self, line: &str) {
+        writeln!(self.stdin, "{line}").unwrap();
+    }
+
     fn terminal(mut self) -> (Value, ExitStatus, Vec<Value>) {
         let terminal = self.until("terminal", |value| value["event"] == "terminal");
         let status = self.child.wait().unwrap();
@@ -2385,4 +2390,226 @@ fn recover_purpose_with_an_intent_is_refused() {
     assert_eq!(status.code(), Some(64), "{terminal}");
     assert_eq!(terminal["status"], "spec-refused");
     assert!(!dir.store().exists(), "nothing written");
+}
+
+/// Owner-level controls whose `control` number and `event` match.
+fn by_control<'a>(seen: &'a [Value], event: &str, control: u64) -> Vec<&'a Value> {
+    seen.iter()
+        .filter(|value| value["event"] == event && value["control"] == control)
+        .collect()
+}
+
+/// Live follow-up: a further caller input reaches the same live harness
+/// and session, durably admitted before it is reported, with its own
+/// correlated ack and turn end. Malformed controls admit nothing. `close`
+/// stops the harness through its work PID 1 after the turn ended: status
+/// `closed` (7), the harness's actual end a signal, never `cancelled`.
+#[test]
+fn follow_up_reaches_the_same_session_and_close_is_not_cancel() {
+    let dir = Scratch::new("follow");
+    let state = dir.state("a");
+    let mut run = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            1,
+            json!([{ "id": "a", "argv": peer(&state, &[]), "messages": ["one"] }]),
+        ),
+    );
+    let first = run.event("a", "turn-end");
+    assert_eq!(first["input"], 0, "{first}");
+    // Controls 1-6: none is admitted.
+    for line in [
+        "not json",
+        r#"{"cmd":"send"}"#,
+        r#"{"cmd":"send","text":""}"#,
+        r#"{"cmd":"send","text":"x","harness":"nope"}"#,
+        r#"{"cmd":"send","text":"x","extra":1}"#,
+        r#"{"cmd":"bogus"}"#,
+    ] {
+        run.control(line);
+    }
+    run.control(&json!({ "cmd": "send", "text": "two", "ref": "r2" }).to_string());
+    let admitted = run.event("a", "follow-up-admitted");
+    assert_eq!(admitted["control"], 7, "{admitted}");
+    assert_eq!(admitted["ref"], "r2");
+    assert_eq!(admitted["input"], 1);
+    assert_eq!(admitted["durable"], true);
+    let ack = run.until("ack of input 1", |value| {
+        value["event"] == "ack" && value["index"] == 1
+    });
+    let turn = run.until("turn-end of input 1", |value| {
+        value["event"] == "turn-end" && value["input"] == 1
+    });
+    assert_eq!(turn["message_id"], ack["message_id"], "{turn}");
+    assert_eq!(turn["session"], first["session"], "same session");
+    // One write, so the later lines reach the owner before the run can end.
+    run.control(&format!(
+        "{}\n{}\n{}",
+        r#"{"cmd":"close"}"#,
+        json!({ "cmd": "send", "text": "three", "ref": "r3" }),
+        r#"{"cmd":"close"}"#,
+    ));
+    let close = run.until("close-requested", |value| {
+        value["event"] == "close-requested"
+    });
+    assert_eq!(close["control"], 8);
+    let (terminal, status, seen) = run.terminal();
+
+    for control in 1..=6 {
+        assert!(by_control(&seen, "follow-up-admitted", control).is_empty());
+        assert!(by_control(&seen, "follow-up-received", control).is_empty());
+    }
+    assert_eq!(
+        by_control(&seen, "control-refused", 1)[0]["reason"],
+        "malformed"
+    );
+    for control in 2..=5 {
+        let refused = by_control(&seen, "follow-up-refused", control);
+        assert_eq!(refused.len(), 1, "control {control}: {seen:#?}");
+        assert_eq!(refused[0]["admitted"], false);
+    }
+    assert_eq!(
+        by_control(&seen, "follow-up-refused", 4)[0]["reason"],
+        "unknown-harness"
+    );
+    assert_eq!(
+        by_control(&seen, "control-refused", 6)[0]["reason"],
+        "unknown-command"
+    );
+    let after = by_control(&seen, "follow-up-refused", 9);
+    assert_eq!(after[0]["reason"], "input-closed", "{after:?}");
+    assert_eq!(after[0]["ref"], "r3");
+    assert_eq!(
+        by_control(&seen, "control-refused", 10)[0]["reason"],
+        "close-already-requested"
+    );
+    assert_eq!(events(&seen, "a", "follow-up-admitted").len(), 1);
+    assert_eq!(events(&seen, "a", "close-stopping").len(), 1);
+
+    assert_eq!(terminal["status"], "closed", "{terminal}");
+    assert_eq!(status.code(), Some(7));
+    assert_eq!(terminal["cancel_requested"], false);
+    assert_eq!(terminal["close_requested"], true);
+    assert_eq!(terminal["owed"], 0);
+    assert_eq!(terminal["records_complete"], true);
+    assert_eq!(terminal["all_harnesses_reaped"], true);
+    let a = harness(&terminal, "a");
+    assert_eq!(a["exits"], json!(["signal:9"]), "{a}");
+    assert_eq!(a["close"], "stopped-by-owner-after-turns-ended");
+    assert_eq!(a["launches"], 1);
+    assert_eq!(a["messages"][0]["origin"], "intent");
+    assert_eq!(a["messages"][1]["origin"], "follow-up");
+    assert_eq!(a["messages"][1]["label"], "accepted");
+    assert_eq!(a["messages"][1]["completion"], "not-observed");
+
+    let peer = read_state(&state);
+    assert_eq!(peer["sessions"], json!(["sess-1"]));
+    let prompts = peer["prompts"].as_array().unwrap();
+    assert_eq!(prompts.len(), 2, "{peer}");
+    assert!(prompts.iter().all(|prompt| prompt["session"] == "sess-1"));
+    let conn = db(&dir);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM message WHERE origin = 'follow-up' AND idx = 1 AND control = 7 AND caller_ref = 'r2' AND ack_label = 'accepted'"
+        ),
+        1
+    );
+}
+
+/// Unsupported overlap is refused, not queued: while an input's turn is
+/// open a follow-up is not admitted and nothing is sent. A close waits
+/// for that turn; with a turn that never ends, only cancel ends the run,
+/// as `cancelled`, with the close not followed through.
+#[test]
+fn overlapping_follow_up_is_refused_and_close_waits_for_the_open_turn() {
+    let dir = Scratch::new("overlap");
+    let state = dir.state("a");
+    let mut run = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            1,
+            json!([{ "id": "a", "argv": peer(&state, &["--no-idle"]), "messages": ["one"] }]),
+        ),
+    );
+    let pid = run.event("a", "launched")["pid"].as_u64().unwrap();
+    run.event("a", "ack");
+    run.control(&json!({ "cmd": "send", "text": "two" }).to_string());
+    let refused = run.event("a", "follow-up-refused");
+    assert_eq!(refused["reason"], "input-open", "{refused}");
+    assert_eq!(refused["control"], 1);
+    run.control(r#"{"cmd":"close"}"#);
+    run.until("close-requested", |value| {
+        value["event"] == "close-requested"
+    });
+    std::thread::sleep(QUIET_WINDOW);
+    let seen = run.drain_now();
+    assert!(events(seen, "a", "close-stopping").is_empty(), "{seen:#?}");
+    assert!(events(seen, "a", "exited").is_empty());
+    assert!(alive(pid), "a close does not stop an open turn");
+    run.cancel();
+    let (terminal, status, seen) = run.terminal();
+    assert_eq!(terminal["status"], "cancelled", "{terminal}");
+    assert_eq!(status.code(), Some(2));
+    assert_eq!(terminal["close_requested"], true);
+    let a = harness(&terminal, "a");
+    assert_eq!(a["close"], "not-stopped-by-close");
+    assert_eq!(a["exits"], json!(["signal:9"]));
+    assert_eq!(a["messages"].as_array().unwrap().len(), 1);
+    assert!(events(&seen, "a", "follow-up-admitted").is_empty());
+    assert_eq!(read_state(&state)["prompts"].as_array().unwrap().len(), 1);
+}
+
+/// An admitted follow-up is owed debt like an intent message: sent but
+/// never acknowledged, it stays owed in the terminal and the store,
+/// labelled by why this instance stopped, with no acknowledgement claimed.
+#[test]
+fn admitted_follow_up_without_ack_stays_owed_debt() {
+    let dir = Scratch::new("debt");
+    let state = dir.state("a");
+    let mut run = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            1,
+            json!([{ "id": "a", "argv": peer(&state, &["--silent-after-acks", "1"]), "messages": ["one"] }]),
+        ),
+    );
+    run.event("a", "turn-end");
+    run.control(&json!({ "cmd": "send", "text": "two", "ref": "d" }).to_string());
+    let admitted = run.event("a", "follow-up-admitted");
+    assert_eq!(admitted["input"], 1);
+    wait_state(&state, |peer| {
+        peer["prompts"].as_array().unwrap().len() == 2
+    });
+    run.cancel();
+    let (terminal, status, seen) = run.terminal();
+    assert_eq!(terminal["status"], "cancelled", "{terminal}");
+    assert_eq!(status.code(), Some(2));
+    assert_eq!(terminal["owed"], 1);
+    assert_eq!(terminal["owed_history"], "retained-in-store");
+    let message = &harness(&terminal, "a")["messages"][1];
+    assert_eq!(message["origin"], "follow-up");
+    assert_eq!(message["state"], "owed");
+    assert_eq!(message["label"], "cancelled");
+    assert_eq!(message["attempts"], 1);
+    assert!(
+        !seen
+            .iter()
+            .any(|value| value["event"] == "ack" && value["index"] == 1)
+    );
+    let conn = db(&dir);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM message WHERE idx = 1 AND origin = 'follow-up' AND ack_label IS NULL"
+        ),
+        1
+    );
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM attempt WHERE idx = 1"),
+        1
+    );
 }

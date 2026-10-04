@@ -20,6 +20,7 @@ use oulipoly_acp::{
 use serde_json::{Value, json};
 
 use crate::bash::{self, OpenInput, Views};
+use crate::conversation::{Closing, FollowUp, Inbox};
 use crate::custody::{self, Adopted, PidNs, ReceiptWait, Root, RootSlot, WorkStdio};
 use crate::live::Custody;
 use crate::store::{DurableAck, DurableHarness, Store, StoreError};
@@ -69,6 +70,8 @@ pub struct MessageRecord {
     /// Observed no-acknowledgement closures charged to this message, by
     /// every generation.
     pub closures: u32,
+    /// A caller's follow-up to the live conversation, not part of the intent.
+    pub follow_up: bool,
 }
 
 /// What one harness worker owned and how it ended.
@@ -93,6 +96,9 @@ pub struct HarnessRecord {
     pub wait_failures: Vec<String>,
     /// Live harnesses left to a newer owner when this one detached.
     pub detached: u32,
+    /// This owner had the harness killed by its work PID 1 because the
+    /// caller closed the conversation (its exit is still in `exits`).
+    pub close_stopped: bool,
     pub messages: Vec<MessageRecord>,
 }
 
@@ -107,8 +113,10 @@ impl HarnessRecord {
             "prior_unknown_ends": self.prior_unknown_ends,
             "wait_failures": self.wait_failures,
             "detached": self.detached,
+            "close": if self.close_stopped { "stopped-by-owner-after-turns-ended" } else { "not-stopped-by-close" },
             "messages": self.messages.iter().map(|message| json!({
                 "index": message.index,
+                "origin": if message.follow_up { "follow-up" } else { "intent" },
                 "state": if message.owed { "owed" } else { "acknowledged" },
                 "label": message.label,
                 "at_most_once": message.at_most_once,
@@ -133,6 +141,7 @@ struct Tracked {
     closures: u32,
     attempts: u32,
     prior_unknown: u32,
+    follow_up: bool,
 }
 
 /// How one connection to a launched harness stopped being driven.
@@ -194,6 +203,10 @@ struct Worker {
     /// Native user message ids this instance's agent messages named as
     /// their parent.
     answered: std::collections::HashSet<String>,
+    /// The caller's further input to this harness's live conversation.
+    inbox: Arc<Inbox>,
+    closing: Arc<Closing>,
+    close_stopped: bool,
 }
 
 /// What one worker is given: its durable harness record and shared state.
@@ -210,6 +223,8 @@ pub(crate) struct Assignment {
     pub(crate) prior: Option<Prior>,
     pub(crate) tx: Sender<Event>,
     pub(crate) views: Views,
+    pub(crate) inbox: Arc<Inbox>,
+    pub(crate) closing: Arc<Closing>,
 }
 
 pub(crate) fn run(assignment: Assignment) {
@@ -226,6 +241,8 @@ pub(crate) fn run(assignment: Assignment) {
         prior,
         tx,
         views,
+        inbox,
+        closing,
     } = assignment;
     let tracked = harness
         .messages
@@ -239,6 +256,7 @@ pub(crate) fn run(assignment: Assignment) {
             closures: durable.closures,
             attempts: durable.attempts,
             prior_unknown: durable.prior_unknown,
+            follow_up: durable.follow_up,
         })
         .collect();
     let mut worker = Worker {
@@ -266,6 +284,9 @@ pub(crate) fn run(assignment: Assignment) {
         detached: 0,
         views,
         answered: std::collections::HashSet::new(),
+        inbox,
+        closing,
+        close_stopped: false,
     };
     worker.view(|view| {
         view.id.clone_from(&worker.id);
@@ -720,6 +741,7 @@ impl Worker {
             writer,
             Rc::clone(&observed),
             Arc::clone(&self.slot.stop),
+            Some(Arc::clone(&self.inbox)),
         );
         let mut client = AcpClient::new(
             transport,
@@ -728,7 +750,12 @@ impl Worker {
                 version: env!("CARGO_PKG_VERSION").to_owned(),
             },
         );
-        let end = self.converse(&mut client);
+        let end = self.converse(&mut client, &observed, &live);
+        // Out of conversation: nothing more is taken, and what the caller
+        // queued but this worker never took is not admitted.
+        for follow_up in self.inbox.shut() {
+            self.refuse(&follow_up, "conversation-ended");
+        }
         drop(client);
         if observed.detached.get() {
             return self.finish_live(live, ConnEnd::Stop, "");
@@ -852,7 +879,12 @@ impl Worker {
         true
     }
 
-    fn converse(&mut self, client: &mut AcpClient<HarnessTransport>) -> ConnEnd {
+    fn converse(
+        &mut self,
+        client: &mut AcpClient<HarnessTransport>,
+        observed: &Observed,
+        live: &Live,
+    ) -> ConnEnd {
         match client.initialize() {
             Ok(peer) => self.report(json!({
                 "event": "negotiated",
@@ -922,119 +954,230 @@ impl Worker {
         let session = self.session.clone().expect("session id");
         let position = self.position;
         let mut seen = client.events().len();
-        while let Some(index) = self.head() {
-            // The attempt is durable before it is sent, so no successor can
-            // miss an attempt that may have been inserted.
-            let Some(attempt) = self.durable(|store| store.begin_attempt(position, index)) else {
-                return ConnEnd::Stop;
-            };
-            self.tracked[index].attempts += 1;
-            // Open for Bash attribution from before the send: the harness may
-            // act on it as soon as it is inserted, before this owner reads
-            // the acknowledgement. Its id is known only from the ACK.
-            self.view(|view| {
-                if !view.open.iter().any(|input| input.index == index) {
-                    view.open.push(OpenInput {
-                        index,
-                        message_id: None,
-                    });
-                }
-            });
-            let outcome = client.submit(&session, &mut self.tracked[index].message);
-            self.report_turn(client, &mut seen);
-            let (resolution, end) = match &outcome {
-                DeliveryOutcome::Accepted(acceptance)
-                | DeliveryOutcome::DuplicateUnknown(acceptance) => {
-                    let ack = DurableAck {
-                        label: if acceptance.at_most_once {
-                            "accepted"
-                        } else {
-                            "duplicate-unknown"
-                        }
-                        .to_owned(),
-                        basis: acceptance.basis.map(|basis| basis_label(basis).to_owned()),
-                        recovered: acceptance.recovered,
-                        generation: self.store.lock().expect("store lock").generation(),
-                        message_id: Some(acceptance.message_id.clone()),
-                    };
-                    // Reported only once durable: an unrecorded ACK leaves
-                    // the attempt unresolved for a successor to classify.
-                    if self
-                        .durable(|store| store.record_ack(position, index, attempt, &ack))
-                        .is_none()
-                    {
-                        return ConnEnd::Stop;
+        self.inbox.open();
+        'conversation: loop {
+            while let Some(index) = self.head() {
+                // The attempt is durable before it is sent, so no successor can
+                // miss an attempt that may have been inserted.
+                let Some(attempt) = self.durable(|store| store.begin_attempt(position, index))
+                else {
+                    return ConnEnd::Stop;
+                };
+                self.tracked[index].attempts += 1;
+                // Open for Bash attribution from before the send: the harness may
+                // act on it as soon as it is inserted, before this owner reads
+                // the acknowledgement. Its id is known only from the ACK.
+                self.view(|view| {
+                    if !view.open.iter().any(|input| input.index == index) {
+                        view.open.push(OpenInput {
+                            index,
+                            message_id: None,
+                        });
                     }
-                    self.report(json!({
-                        "event": "ack",
-                        "index": index,
-                        "label": ack.label,
-                        "basis": ack.basis,
-                        "recovered": ack.recovered,
-                        "message_id": ack.message_id,
-                        "durable": true,
-                    }));
-                    let message_id = ack.message_id.clone();
-                    self.view(|view| {
-                        if let Some(input) = view.open.iter_mut().find(|input| input.index == index)
+                });
+                let outcome = client.submit(&session, &mut self.tracked[index].message);
+                self.report_turn(client, &mut seen);
+                let (resolution, end) = match &outcome {
+                    DeliveryOutcome::Accepted(acceptance)
+                    | DeliveryOutcome::DuplicateUnknown(acceptance) => {
+                        let ack = DurableAck {
+                            label: if acceptance.at_most_once {
+                                "accepted"
+                            } else {
+                                "duplicate-unknown"
+                            }
+                            .to_owned(),
+                            basis: acceptance.basis.map(|basis| basis_label(basis).to_owned()),
+                            recovered: acceptance.recovered,
+                            generation: self.store.lock().expect("store lock").generation(),
+                            message_id: Some(acceptance.message_id.clone()),
+                        };
+                        // Reported only once durable: an unrecorded ACK leaves
+                        // the attempt unresolved for a successor to classify.
+                        if self
+                            .durable(|store| store.record_ack(position, index, attempt, &ack))
+                            .is_none()
                         {
-                            input.message_id = message_id;
+                            return ConnEnd::Stop;
                         }
-                    });
-                    self.tracked[index].ack = Some(ack);
-                    continue;
-                }
-                DeliveryOutcome::Rejected { code, .. } => {
-                    self.tracked[index].label = Some("rejected".to_owned());
-                    self.report(json!({ "event": "rejected", "index": index, "code": code }));
-                    ("rejected", None)
-                }
-                DeliveryOutcome::NotAcknowledged(NoAckCause::PeerGone) => {
-                    ("no-ack:transport-closed", Some(ConnEnd::Gone))
-                }
-                DeliveryOutcome::NotAcknowledged(NoAckCause::InvalidResponse(_)) => {
-                    self.tracked[index].label = Some("invalid-response".to_owned());
-                    self.report(json!({ "event": "invalid-response", "index": index }));
-                    ("no-ack:invalid-response", Some(ConnEnd::Stop))
-                }
-                DeliveryOutcome::NotNegotiated => {
-                    self.tracked[index].label = Some("not-negotiated".to_owned());
-                    self.view(|view| view.open.retain(|input| input.index != index));
-                    ("not-sent", Some(ConnEnd::Stop))
-                }
-                DeliveryOutcome::SessionMismatch => {
-                    self.tracked[index].label = Some("session-mismatch".to_owned());
-                    self.view(|view| view.open.retain(|input| input.index != index));
-                    ("not-sent", Some(ConnEnd::Stop))
-                }
-            };
-            if self
-                .durable(|store| store.resolve_attempt(attempt, resolution))
-                .is_none()
-            {
-                return ConnEnd::Stop;
-            }
-            if let Some(end) = end {
-                return end;
-            }
-        }
-        // Nothing owed on this connection. Keep reading through the client
-        // until the harness ends its stream; acknowledgement is not an end.
-        loop {
-            let idle = client.await_session_idle(&session);
-            self.report_turn(client, &mut seen);
-            match idle {
-                Ok(idle) => self.report(json!({
-                    "event": "idle",
-                    "meaning": "readiness-since-first-attempt",
-                    "stop_reason": idle.stop_reason,
-                })),
-                Err(IdleWaitFailure::PeerGone) => return ConnEnd::Drained,
-                Err(IdleWaitFailure::NoAttempt | IdleWaitFailure::ProtocolViolation(_)) => {
+                        self.report(json!({
+                            "event": "ack",
+                            "index": index,
+                            "label": ack.label,
+                            "basis": ack.basis,
+                            "recovered": ack.recovered,
+                            "message_id": ack.message_id,
+                            "durable": true,
+                        }));
+                        let message_id = ack.message_id.clone();
+                        self.view(|view| {
+                            if let Some(input) =
+                                view.open.iter_mut().find(|input| input.index == index)
+                            {
+                                input.message_id = message_id;
+                            }
+                        });
+                        self.tracked[index].ack = Some(ack);
+                        continue;
+                    }
+                    DeliveryOutcome::Rejected { code, .. } => {
+                        self.tracked[index].label = Some("rejected".to_owned());
+                        self.report(json!({ "event": "rejected", "index": index, "code": code }));
+                        ("rejected", None)
+                    }
+                    DeliveryOutcome::NotAcknowledged(NoAckCause::PeerGone) => {
+                        ("no-ack:transport-closed", Some(ConnEnd::Gone))
+                    }
+                    DeliveryOutcome::NotAcknowledged(NoAckCause::InvalidResponse(_)) => {
+                        self.tracked[index].label = Some("invalid-response".to_owned());
+                        self.report(json!({ "event": "invalid-response", "index": index }));
+                        ("no-ack:invalid-response", Some(ConnEnd::Stop))
+                    }
+                    DeliveryOutcome::NotNegotiated => {
+                        self.tracked[index].label = Some("not-negotiated".to_owned());
+                        self.view(|view| view.open.retain(|input| input.index != index));
+                        ("not-sent", Some(ConnEnd::Stop))
+                    }
+                    DeliveryOutcome::SessionMismatch => {
+                        self.tracked[index].label = Some("session-mismatch".to_owned());
+                        self.view(|view| view.open.retain(|input| input.index != index));
+                        ("not-sent", Some(ConnEnd::Stop))
+                    }
+                };
+                if self
+                    .durable(|store| store.resolve_attempt(attempt, resolution))
+                    .is_none()
+                {
                     return ConnEnd::Stop;
                 }
+                if let Some(end) = end {
+                    return end;
+                }
+            }
+            // Nothing owed on this connection. Keep reading through the client
+            // until the harness ends its stream; acknowledgement is not an end.
+            // Between turns the caller's bell may interrupt the wait: a further
+            // input is taken only here, and a close acts only here.
+            loop {
+                if self.closing.requested() && !self.close_stopped && self.no_open_input() {
+                    self.stop_for_close(live);
+                }
+                observed.wake_armed.set(true);
+                let idle = client.await_session_idle(&session);
+                observed.wake_armed.set(false);
+                self.report_turn(client, &mut seen);
+                match idle {
+                    Ok(idle) => self.report(json!({
+                        "event": "idle",
+                        "meaning": "readiness-since-first-attempt",
+                        "stop_reason": idle.stop_reason,
+                    })),
+                    Err(IdleWaitFailure::PeerGone) if observed.woken.replace(false) => {
+                        if !self.take_follow_ups() {
+                            return ConnEnd::Stop;
+                        }
+                        if self.head().is_some() {
+                            continue 'conversation;
+                        }
+                    }
+                    Err(IdleWaitFailure::PeerGone) => return ConnEnd::Drained,
+                    Err(IdleWaitFailure::NoAttempt | IdleWaitFailure::ProtocolViolation(_)) => {
+                        return ConnEnd::Stop;
+                    }
+                }
             }
         }
+    }
+
+    /// Whether every input sent on this harness's session has had its turn
+    /// end reported (idle-tag coverage, not processing).
+    fn no_open_input(&self) -> bool {
+        self.views
+            .lock()
+            .expect("views")
+            .get(self.position)
+            .is_none_or(|view| view.open.is_empty())
+    }
+
+    /// The caller closed the conversation and every admitted input's turn
+    /// has ended: this owner has the harness killed by its own work PID 1.
+    /// Its end is still known only from that waiter's report.
+    fn stop_for_close(&mut self, live: &Live) {
+        self.close_stopped = true;
+        let signalled = live.root.kill(live.work);
+        self.report(json!({
+            "event": "close-stopping",
+            "work": live.work,
+            "signalled": signalled,
+            "by": "work-pid1-kill",
+            "meaning": "input closed and every admitted input's turn ended; not processing success",
+        }));
+    }
+
+    fn refuse(&self, follow_up: &FollowUp, reason: &str) {
+        self.report(json!({
+            "event": "follow-up-refused",
+            "control": follow_up.control,
+            "ref": follow_up.caller_ref,
+            "reason": reason,
+            "admitted": false,
+        }));
+    }
+
+    /// Takes what the caller queued. One input at a time: a follow-up is
+    /// admitted only when nothing is owed or open on this harness (every
+    /// earlier input acknowledged and its turn ended); otherwise it is
+    /// refused, not deferred. Admission is a durable commit of an owed
+    /// message, reported only after it. Returns false if the store was lost.
+    fn take_follow_ups(&mut self) -> bool {
+        for follow_up in self.inbox.take() {
+            let refused = if self.cancelled() {
+                Some(self.stop_reason())
+            } else if self.closing.requested() {
+                Some("input-closed")
+            } else if self.head().is_some() || !self.no_open_input() {
+                Some("input-open")
+            } else {
+                None
+            };
+            if let Some(reason) = refused {
+                self.refuse(&follow_up, reason);
+                continue;
+            }
+            let position = self.position;
+            let admitted = self.durable(|store| {
+                store.admit_follow_up(
+                    position,
+                    follow_up.control,
+                    follow_up.caller_ref.as_deref(),
+                    &follow_up.text,
+                )
+            });
+            let Some((index, message)) = admitted else {
+                self.refuse(&follow_up, "store-lost");
+                return false;
+            };
+            debug_assert_eq!(index, self.tracked.len());
+            self.tracked.push(Tracked {
+                message,
+                label: None,
+                ack: None,
+                closures: 0,
+                attempts: 0,
+                prior_unknown: 0,
+                follow_up: true,
+            });
+            let _ = self.tx.send(Event::Admitted(self.position));
+            self.report(json!({
+                "event": "follow-up-admitted",
+                "control": follow_up.control,
+                "ref": follow_up.caller_ref,
+                "input": index,
+                "stage": "durably-committed",
+                "durable": true,
+            }));
+        }
+        true
     }
 
     /// The owner input whose acknowledged `messageId` is `message_id`.
@@ -1169,6 +1312,7 @@ impl Worker {
                     attempts: tracked.attempts,
                     prior_unknown: tracked.prior_unknown,
                     closures: tracked.closures,
+                    follow_up: tracked.follow_up,
                 }
             })
             .collect();
@@ -1181,6 +1325,7 @@ impl Worker {
             prior_unknown_ends: self.prior_unknown_ends,
             wait_failures: self.wait_failures.clone(),
             detached: self.detached,
+            close_stopped: self.close_stopped,
             messages,
         }
     }
@@ -1258,6 +1403,7 @@ mod tests {
                         closures: 0,
                         attempts: 0,
                         prior_unknown: 0,
+                        follow_up: false,
                     })
                     .collect(),
                 session: None,
@@ -1271,6 +1417,9 @@ mod tests {
                 detached: 0,
                 views: Arc::default(),
                 answered: std::collections::HashSet::new(),
+                inbox: Arc::new(Inbox::new().unwrap()),
+                closing: Arc::default(),
+                close_stopped: false,
             },
             rx,
             dir,
@@ -1359,8 +1508,13 @@ mod tests {
             .then_some(stop)
             .flatten();
         let record = worker.record();
-        let (report, code) =
-            crate::terminal_report(&[(worker.id.clone(), 1)], &[record], true, store_lost);
+        let (report, code) = crate::terminal_report(
+            &[(worker.id.clone(), 1)],
+            &[record],
+            true,
+            false,
+            store_lost,
+        );
         assert_eq!(
             report["status"], loss,
             "real write loss must survive stop ordering"

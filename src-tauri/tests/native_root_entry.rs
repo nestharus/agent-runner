@@ -43,7 +43,8 @@ fn var(name: &str) -> String {
 }
 
 /// A loopback stand-in for a model: to `RUN <command>` it calls `bash`
-/// once; after a tool result it answers `DONE`; otherwise `NO-SCRIPT`.
+/// once; after a tool result it answers `DONE`; to `SAY <text>` it answers
+/// `<text>`; otherwise `NO-SCRIPT`.
 fn scripted_model() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -112,7 +113,7 @@ fn serve(mut stream: TcpStream) {
             let answer = if last["role"] == "tool" {
                 "DONE"
             } else {
-                "NO-SCRIPT"
+                text.strip_prefix("SAY ").unwrap_or("NO-SCRIPT")
             };
             vec![
                 chunk(
@@ -314,6 +315,14 @@ impl Run {
         let entry = self.entry("terminal");
         let status = self.child.wait().unwrap();
         (owner, entry, status.code(), std::mem::take(&mut self.seen))
+    }
+
+    /// Writes control lines to the entry's stdin in one write.
+    fn control(&mut self, lines: &[Value]) {
+        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        let stdin = self.stdin.as_mut().unwrap();
+        stdin.write_all(text.as_bytes()).unwrap();
+        stdin.flush().unwrap();
     }
 
     fn saw(&self, event: &str) -> bool {
@@ -795,4 +804,88 @@ fn native_root_survives_entry_death_and_is_continued_or_cancelled_by_attachment(
         left.is_empty(),
         "processes left under the scratch: {left:?}"
     );
+}
+
+/// A further communication to the same live native session, then an
+/// explicit close. Each input has its own correlated insertion ACK, scripted
+/// reply (by native parent) and idle-tag turn end in one native session of
+/// one host launch. The close stops the host through its work PID 1 once
+/// both turns ended: owner `closed` (7), entry 87, the host's end a signal,
+/// never `cancelled`/82. The scripted stand-in is not a model: this shows
+/// routing and observation levels, not processing.
+#[test]
+#[ignore = "needs the root supervisor built beside the Runner, OULIPOLY_NATIVE_DEPS, OULIPOLY_AGENT_BASH_TOOL, AGENT_BASH_BIN, OULIPOLY_NATIVE_SCRATCH and loopback"]
+fn native_root_follow_up_reaches_the_live_session_and_close_is_not_cancel() {
+    let scratch = PathBuf::from(var("OULIPOLY_NATIVE_SCRATCH"));
+    let base_url = scripted_model();
+    let root = Root::new(&scratch, "c", &base_url, "SAY first");
+    let mut run = root.start();
+    run.entry("setup-completed");
+    let host_pid = run.event("launched")["pid"].as_u64().unwrap();
+    let session = run.event("session-opened")["session"].clone();
+    let at = |event: &'static str, field: &'static str, index: u64| {
+        move |value: &Value| value["event"] == event && value[field] == index
+    };
+
+    let ack0 = run.until("ack 0", at("ack", "index", 0));
+    let reply0 = run.until("reply to input 0", at("agent-message", "input", 0));
+    let turn0 = run.until("turn-end 0", at("turn-end", "input", 0));
+    assert_eq!(reply0["text"], "first", "{reply0}");
+    assert_eq!(reply0["parent_message_id"], ack0["message_id"]);
+    assert_eq!(turn0["message_id"], ack0["message_id"]);
+    assert_eq!(turn0["own_output"], true);
+
+    run.control(&[json!({ "cmd": "send", "text": "SAY second", "ref": "f1" })]);
+    let received = run.event("follow-up-received");
+    assert_eq!(received["stage"], "queued-not-admitted", "{received}");
+    let admitted = run.event("follow-up-admitted");
+    assert_eq!(admitted["input"], 1, "{admitted}");
+    assert_eq!(admitted["ref"], "f1");
+    assert_eq!(admitted["durable"], true);
+    let ack1 = run.until("ack 1", at("ack", "index", 1));
+    assert_ne!(ack1["message_id"], ack0["message_id"]);
+    let reply1 = run.until("reply to input 1", at("agent-message", "input", 1));
+    assert_eq!(reply1["text"], "second", "{reply1}");
+    assert_eq!(reply1["input_attribution"], "native-parent");
+    assert_eq!(reply1["session"], session);
+    let turn1 = run.until("turn-end 1", at("turn-end", "input", 1));
+    assert_eq!(turn1["message_id"], ack1["message_id"]);
+    assert_eq!(turn1["session"], session);
+    assert_eq!(turn1["stop_reason"], "end_turn");
+    assert_eq!(turn1["own_output"], true);
+    assert!(!ended(host_pid), "the host is still live after two turns");
+
+    run.control(&[
+        json!({ "cmd": "close" }),
+        json!({ "cmd": "send", "text": "SAY third", "ref": "f2" }),
+    ]);
+    let close = run.event("close-requested");
+    let refused = run.event("follow-up-refused");
+    assert_eq!(refused["reason"], "input-closed", "{refused}");
+    assert_eq!(refused["ref"], "f2");
+    run.event("close-stopping");
+    let (owner, entry, code, seen) = run.finish();
+    println!("close: {close}");
+
+    let count = |event: &str| seen.iter().filter(|value| value["event"] == event).count();
+    assert_eq!(count("launched"), 1, "one host launch");
+    assert_eq!(count("session-opened"), 1, "one native session");
+    assert_eq!(count("follow-up-admitted"), 1);
+    assert_eq!(count("ack"), 2);
+    assert_eq!(count("cancel-requested"), 0);
+    assert_eq!(owner["status"], "closed", "{owner}");
+    assert_eq!(owner["cancel_requested"], false);
+    assert_eq!(owner["close_requested"], true);
+    assert_eq!(owner["owed"], 0);
+    assert_eq!(owner["all_harnesses_reaped"], true);
+    assert_eq!(owner["root_pid1"]["end_observed"], true, "{owner}");
+    let host = &owner["harnesses"][0];
+    assert_eq!(host["exits"], json!(["signal:9"]), "{host}");
+    assert_eq!(host["close"], "stopped-by-owner-after-turns-ended");
+    assert_eq!(host["messages"][1]["origin"], "follow-up");
+    assert_eq!(host["messages"][1]["completion"], "not-observed");
+    assert_eq!(entry["stage"], "owner-ended", "{entry}");
+    assert_eq!(entry["owner_exit"], 7, "{entry}");
+    assert_eq!(code, Some(87), "{entry}");
+    wait_ended(host_pid, "native host");
 }
