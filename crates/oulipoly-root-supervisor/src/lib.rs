@@ -60,8 +60,11 @@
 //!    then reports `no-durable-intent`. Durability target: survives this
 //!    process's crash and an OS/host crash. Means: WAL journal with
 //!    `synchronous=FULL` (each commit syncs the WAL before returning), plus
-//!    an fsync of the store directory after the claim. Host-crash survival
-//!    also assumes the storage honours fsync; that is not tested here.
+//!    an fsync of the store directory and its parent after the claim, before
+//!    the event. The parent sync persists a newly created root directory's
+//!    entry and also runs on recovery/retry. Host-crash survival assumes
+//!    durably provisioned ancestors and storage that honours fsync; actual
+//!    host/power crash is not tested here.
 //!    There is no batching: each transition is its own commit.
 //! 3. **Attempted delivery**: an attempt row is committed **before** each
 //!    `session/prompt` is sent.
@@ -135,7 +138,8 @@
 //!   Cancel ends this instance; it does not withdraw durable intent.
 //! * `authority-lost` / `store-failed`: a store write was refused or failed
 //!   (exit 5). Own harnesses are signalled; what the store holds is
-//!   authoritative, this instance's view is not.
+//!   authoritative, this instance's view is not. Authority loss outranks
+//!   store failure, which outranks cancellation, regardless of arrival order.
 //! * `incomplete`: records or successful exit/reaping observations are
 //!   missing (exit 4). A failed wait reports `wait-failed` / `unproven`,
 //!   never an exit, closure count or relaunch authorization. Even a cancelled

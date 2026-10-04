@@ -292,6 +292,12 @@ impl Store {
         tx.commit()?;
         // Make the directory entries of the store files durable too.
         File::open(dir)?.sync_all()?;
+        // Persist the root directory's own entry before acknowledging the
+        // claim. Also sync on recovery/retry: a prior claim may have died or
+        // failed after creating the directory but before syncing its parent.
+        if let Some(parent) = dir.parent() {
+            File::open(parent)?.sync_all()?;
+        }
         Ok(Claimed {
             store: Store {
                 conn,

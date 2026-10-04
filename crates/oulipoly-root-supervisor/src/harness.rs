@@ -810,4 +810,124 @@ mod tests {
         assert_eq!(worker.record().messages[0].label, "rejected");
         assert!(worker.record().exits.is_empty());
     }
+
+    fn pending_attempt(worker: &mut Worker) -> i64 {
+        // A real in-flight durable reservation, without spawning a harness.
+        worker.launches = 0;
+        let attempt = worker.durable(|store| store.begin_attempt(0, 0)).unwrap();
+        worker.tracked[0].attempts += 1;
+        attempt
+    }
+
+    fn fail_attempt_writes(dir: &Dir) {
+        // Abort a real SQLite write in this test's newly created store.
+        let conn = rusqlite::Connection::open(dir.0.join(crate::store::DB_FILE)).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_resolution BEFORE UPDATE ON attempt
+             BEGIN SELECT RAISE(ABORT, 'test resolution refused'); END;",
+        )
+        .unwrap();
+    }
+
+    fn assert_loss_terminal(worker: &Worker, loss: &str) {
+        let stop = worker.custody.lock().unwrap().reason();
+        // Same state-derived loss selection used by the root's terminal path.
+        let store_lost = matches!(stop, Some("authority-lost" | "store-failed"))
+            .then_some(stop)
+            .flatten();
+        let record = worker.record();
+        let (report, code) =
+            crate::terminal_report(&[(worker.id.clone(), 1)], &[record], true, store_lost);
+        assert_eq!(
+            report["status"], loss,
+            "real write loss must survive stop ordering"
+        );
+        assert_eq!(code, crate::EXIT_STORE_LOST);
+        assert_eq!(report["cancel_requested"], true);
+        assert_eq!(report["owed_history"], "store-holds-authoritative-state");
+        assert_eq!(report["owed"], 1);
+        assert_eq!(report["harnesses"][0]["messages"][0]["attempts"], 1);
+        assert_eq!(report["harnesses"][0]["messages"][0]["closures"], 0);
+        assert_eq!(
+            report["harnesses"][0]["messages"][0]["completion"],
+            "not-observed"
+        );
+    }
+
+    #[test]
+    fn cancel_then_refused_worker_write_reports_authority_loss() {
+        let (mut worker, rx, dir) = worker();
+        let attempt = pending_attempt(&mut worker);
+        worker.custody.lock().unwrap().cancel();
+        std::fs::remove_file(dir.0.join(crate::store::LOCK_FILE)).unwrap();
+        let successor = Store::claim(&dir.0, None).unwrap();
+        assert_eq!(successor.store.generation(), 2);
+        assert_eq!(successor.classified_unknown, 1);
+        assert!(
+            worker
+                .durable(|store| store.resolve_attempt(attempt, "no-ack:transport-closed"))
+                .is_none()
+        );
+        assert!(
+            rx.try_iter()
+                .any(|event| matches!(event, Event::Report(v) if v["event"] == "authority-lost"))
+        );
+        assert_eq!(worker.record().messages[0].label, "authority-lost");
+        assert_loss_terminal(&worker, "authority-lost");
+    }
+
+    #[test]
+    fn cancel_then_failed_worker_write_reports_store_failure() {
+        let (mut worker, rx, dir) = worker();
+        let attempt = pending_attempt(&mut worker);
+        fail_attempt_writes(&dir);
+        worker.custody.lock().unwrap().cancel();
+        assert!(
+            worker
+                .durable(|store| store.resolve_attempt(attempt, "no-ack:transport-closed"))
+                .is_none()
+        );
+        assert!(
+            rx.try_iter()
+                .any(|event| matches!(event, Event::Report(v) if v["event"] == "store-failed"))
+        );
+        assert_eq!(worker.record().messages[0].label, "store-failed");
+        assert_loss_terminal(&worker, "store-failed");
+    }
+
+    #[test]
+    fn failed_then_refused_worker_write_escalates_and_keeps_message_cause() {
+        let (mut worker, rx, dir) = worker();
+        let attempt = pending_attempt(&mut worker);
+        // A per-message cause is independent of the run-level store loss.
+        worker.tracked[0].label = Some("rejected".into());
+        fail_attempt_writes(&dir);
+        assert!(
+            worker
+                .durable(|store| store.resolve_attempt(attempt, "rejected"))
+                .is_none()
+        );
+        std::fs::remove_file(dir.0.join(crate::store::LOCK_FILE)).unwrap();
+        let conn = rusqlite::Connection::open(dir.0.join(crate::store::DB_FILE)).unwrap();
+        conn.execute_batch("DROP TRIGGER refuse_resolution")
+            .unwrap();
+        let successor = Store::claim(&dir.0, None).unwrap();
+        assert_eq!(successor.classified_unknown, 1);
+        assert!(
+            worker
+                .durable(|store| store.resolve_attempt(attempt, "rejected"))
+                .is_none()
+        );
+        let events: Vec<_> = rx
+            .try_iter()
+            .filter_map(|event| match event {
+                Event::Report(v) => Some(v["event"].as_str().unwrap().to_owned()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events, ["store-failed", "authority-lost"]);
+        worker.custody.lock().unwrap().cancel();
+        assert_eq!(worker.record().messages[0].label, "rejected");
+        assert_loss_terminal(&worker, "authority-lost");
+    }
 }

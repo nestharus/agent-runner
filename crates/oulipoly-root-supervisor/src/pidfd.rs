@@ -47,7 +47,7 @@ impl Custody {
         self.stopped.is_some()
     }
 
-    /// `cancelled`, `authority-lost` or `store-failed`; the first wins.
+    /// Store authority loss outranks store failure, which outranks cancel.
     pub(crate) fn reason(&self) -> Option<&'static str> {
         self.stopped
     }
@@ -69,10 +69,15 @@ impl Custody {
         self.stop("cancelled")
     }
 
-    /// Stops the run for `reason` (keeping an earlier reason) and sends
-    /// `SIGKILL` to every live owned harness.
+    /// Stops the run, retaining the strongest observed store loss even if
+    /// cancel arrived first, and sends `SIGKILL` to every live owned harness.
     pub(crate) fn stop(&mut self, reason: &'static str) -> usize {
-        self.stopped.get_or_insert(reason);
+        self.stopped = Some(match (self.stopped, reason) {
+            (Some("authority-lost"), _) | (_, "authority-lost") => "authority-lost",
+            (Some("store-failed"), _) | (_, "store-failed") => "store-failed",
+            (Some(earlier), _) => earlier,
+            (None, reason) => reason,
+        });
         self.live.values().filter(|fd| kill(fd)).count()
     }
 }
