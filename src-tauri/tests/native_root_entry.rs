@@ -22,6 +22,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
@@ -37,6 +38,9 @@ const UNNAMED: &str =
     r#"printf %s:%s:%s "$OULIPOLY_WITNESS_DECLARED" "${OULIPOLY_WITNESS_AMBIENT-unset}" "$HOME" x"#;
 const ALLOW_ALL: &str = r#"{"permission":{"*":"allow","bash":"allow"}}"#;
 const RECOVER: &str = "oulipoly-recover-marker";
+
+/// Every `authorization` header value the scripted stand-in received.
+static AUTHORIZATIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 fn var(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set"))
@@ -67,10 +71,12 @@ fn serve(mut stream: TcpStream) {
         if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
             break;
         }
-        if let Some((name, value)) = line.split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
-        {
-            length = value.trim().parse().unwrap();
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                length = value.trim().parse().unwrap();
+            } else if name.eq_ignore_ascii_case("authorization") {
+                AUTHORIZATIONS.lock().unwrap().push(value.trim().to_owned());
+            }
         }
     }
     let mut body = vec![0; length];
@@ -1257,4 +1263,301 @@ fn native_root_host_root_owner_runs_its_native_host_and_bash_as_the_work_user() 
         output.ends_with("|0"),
         "setuid probe effective uid: {output}"
     );
+}
+
+/// The in-root command of the authenticated roots: whether the Bash run
+/// inherited the host's server password or an inline auth, and its uid.
+const SECRETS_ABSENT: &str = r#"printf 'pw=%s auth=%s uid=%s' "${OPENCODE_SERVER_PASSWORD+set}" "${OPENCODE_AUTH_CONTENT+set}" "$(id -u)""#;
+/// The fixture provider's key, given only in the private auth file.
+const AUTH_KEY: &str = "fixture-auth-file-key-not-a-credential";
+/// Stand-ins for the shape of a subscription entry; the provider is not
+/// enabled, so nothing uses them.
+const OAUTH_ACCESS: &str = "fixture-oauth-access-not-a-token";
+
+/// Makes `root` an authenticated request: its fixture provider's key only
+/// in a private auth file the request names (beside an unused OAuth entry
+/// of the subscription's shape), and the command `SECRETS_ABSENT`.
+fn authenticated(root: &mut Root, owner: Option<(u32, u32)>) -> PathBuf {
+    use std::os::unix::fs::OpenOptionsExt;
+    let auth = root.dir.join("auth.json");
+    let text = json!({
+        "fixture": { "type": "api", "key": AUTH_KEY },
+        "openai": { "type": "oauth", "refresh": "", "access": OAUTH_ACCESS,
+            "expires": 4_102_444_800_000_u64, "accountId": "fixture-account" },
+    })
+    .to_string();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&auth)
+        .and_then(|mut file| file.write_all(text.as_bytes()))
+        .unwrap();
+    if let Some((uid, gid)) = owner {
+        std::os::unix::fs::chown(&auth, Some(uid), Some(gid)).unwrap();
+    }
+    root.request["opencode"]["auth"] = json!(auth);
+    let options = &mut root.request["opencode"]["provider"]["fixture"]["options"];
+    options.as_object_mut().unwrap().remove("apiKey");
+    root.request["opencode"]["bash_allow"] = json!([SECRETS_ABSENT]);
+    root.request["messages"] = json!([format!("RUN {SECRETS_ABSENT}")]);
+    auth
+}
+
+/// The TCP port the process `pid` listens on at 127.0.0.1, from its own
+/// network namespace's table and its socket descriptors.
+fn listening_port(pid: u64) -> u16 {
+    let inodes: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .filter_map(|fd| {
+            let link = std::fs::read_link(fd.ok()?.path()).ok()?;
+            let link = link.to_str()?;
+            Some(link.strip_prefix("socket:[")?.strip_suffix(']')?.to_owned())
+        })
+        .collect();
+    let table = std::fs::read_to_string(format!("/proc/{pid}/net/tcp")).unwrap();
+    let ports: Vec<u16> = table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let (address, port) = fields.get(1)?.split_once(':')?;
+            (address == "0100007F"
+                && fields.get(3) == Some(&"0A")
+                && inodes
+                    .iter()
+                    .any(|inode| Some(&inode.as_str()) == fields.get(9)))
+            .then(|| u16::from_str_radix(port, 16).ok())?
+        })
+        .collect();
+    assert_eq!(
+        ports.len(),
+        1,
+        "listening ports of {pid}: {ports:?}\n{table}"
+    );
+    ports[0]
+}
+
+/// The status of one `GET /session` to the host's loopback server, with
+/// the given Basic credential, if any.
+fn http_status(port: u16, credential: Option<&str>) -> u16 {
+    use base64::Engine;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let mut request =
+        format!("GET /session HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nconnection: close\r\n");
+    if let Some(credential) = credential {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(credential);
+        request.push_str(&format!("authorization: Basic {encoded}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut status = String::new();
+    BufReader::new(stream).read_line(&mut status).unwrap();
+    status
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no HTTP status: {status:?}"))
+}
+
+/// Tool outputs of the native conversation, read by OpenCode itself from
+/// the launch's data directory, as `work` when given.
+fn tool_outputs(
+    root: &Root,
+    launch: &Value,
+    session: &str,
+    work: Option<(u32, u32)>,
+) -> Vec<String> {
+    use std::os::unix::process::CommandExt;
+    let opencode = Path::new(&var("OULIPOLY_NATIVE_DEPS"))
+        .join("node_modules/opencode-linux-x64/bin/opencode");
+    let mut command = Command::new(opencode);
+    command
+        .args(["export", "--pure", session])
+        .current_dir(root.request["cwd"].as_str().unwrap())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", root.dir.join("tmp"))
+        .envs(
+            launch["env"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| (key, value.as_str().unwrap())),
+        )
+        .stdin(Stdio::null());
+    if let Some((uid, gid)) = work {
+        command.gid(gid).uid(uid);
+    }
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "export: {output:?}");
+    let text = String::from_utf8(output.stdout).unwrap();
+    let exported: Value = serde_json::from_str(&text[text.find('{').unwrap()..]).unwrap();
+    exported["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["parts"].as_array().unwrap().iter())
+        .filter(|part| part["type"] == "tool")
+        .map(|part| {
+            part["state"]["output"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Runs one authenticated root (see [`authenticated`]) through one
+/// scripted turn and its cancel. `work` is the host-root work identity;
+/// `None` is an unprivileged root, everything this process's.
+fn authenticated_run(root: &Root, auth: &Path, work: Option<(u32, u32)>) {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: getuid has no preconditions.
+    let uid = work.map_or_else(|| unsafe { libc::getuid() }, |(uid, _)| uid);
+    let auth_text = std::fs::read_to_string(auth).unwrap();
+    let launch_dir = PathBuf::from(root.request["launch_dir"].as_str().unwrap());
+    let mut run = root.start();
+    let setup = run.entry("setup-completed");
+    let placed = &setup["launch"]["auth"];
+    assert_eq!(placed["default_plugins"], "enabled", "{setup}");
+    let password_file = launch_dir.join("secret/server-password");
+    assert_eq!(placed["server_password_file"], json!(password_file));
+    let auth_file = launch_dir.join("xdg/data/opencode/auth.json");
+    assert_eq!(placed["auth_file"], json!(auth_file));
+    let password = std::fs::read_to_string(&password_file).unwrap();
+    let password = password.trim_end().to_owned();
+    assert_eq!(password.len(), 64, "password length");
+    assert_eq!(std::fs::read_to_string(&auth_file).unwrap(), auth_text);
+    for (path, mode) in [
+        (launch_dir.join("secret"), 0o700),
+        (password_file.clone(), 0o600),
+        (launch_dir.join("xdg/data/opencode"), 0o700),
+        (auth_file.clone(), 0o600),
+    ] {
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert_eq!((meta.uid(), meta.mode() & 0o7777), (uid, mode), "{path:?}");
+    }
+
+    let host_pid = run.event("launched")["pid"].as_u64().unwrap();
+    run.event("endpoint-connected");
+    // The endpoint plugin's own client reached the protected server.
+    let session = run.event("session-opened")["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let port = listening_port(host_pid);
+    let unauthenticated = http_status(port, None);
+    let wrong = http_status(port, Some("opencode:not-the-password"));
+    let authorized = http_status(port, Some(&format!("opencode:{password}")));
+    println!("loopback {port}: none={unauthenticated} wrong={wrong} password={authorized}");
+    assert_eq!((unauthenticated, wrong, authorized), (401, 401, 200));
+    let host = environ(host_pid);
+    assert_eq!(
+        host.get("OPENCODE_SERVER_PASSWORD"),
+        Some(&password),
+        "host password"
+    );
+    for absent in ["OPENCODE_DISABLE_DEFAULT_PLUGINS", "OPENCODE_AUTH_CONTENT"] {
+        assert!(!host.contains_key(absent), "host has {absent}");
+    }
+
+    assert_eq!(run.event("ack")["label"], "accepted");
+    let accepted = run.event("bash-accepted");
+    assert_eq!(
+        accepted["argv"],
+        json!(["bash", "-lc", SECRETS_ABSENT]),
+        "{accepted}"
+    );
+    run.event("bash-ended");
+    let idle = run.event("idle");
+    assert_eq!(idle["stop_reason"], "end_turn", "{idle}");
+    assert_eq!(run.event("agent-message")["text"], "DONE");
+    let seen_by_model = AUTHORIZATIONS.lock().unwrap().clone();
+    assert!(
+        seen_by_model
+            .iter()
+            .any(|value| value == &format!("Bearer {AUTH_KEY}")),
+        "the provider key from the auth file reached the stand-in: {seen_by_model:?}"
+    );
+
+    run.control(&[json!({ "cmd": "cancel" })]);
+    let (owner, entry, code, seen) = run.finish();
+    assert_eq!(owner["status"], "cancelled", "{owner}");
+    assert_eq!(owner["all_harnesses_reaped"], true, "{owner}");
+    assert_eq!(owner["root_pid1"]["end_observed"], true, "{owner}");
+    assert_eq!(owner["bash"]["accepted"], 1, "{owner}");
+    assert_eq!(code, Some(82), "{entry}");
+    for value in &seen {
+        let text = value.to_string();
+        for secret in [password.as_str(), AUTH_KEY, OAUTH_ACCESS] {
+            assert!(!text.contains(secret), "secret on stdout: {text}");
+        }
+    }
+    // No refresh or other write-back reached the placed copy.
+    assert_eq!(std::fs::read_to_string(&auth_file).unwrap(), auth_text);
+    let outputs = tool_outputs(root, &setup["launch"], &session, work);
+    println!("bash run output: {outputs:?}");
+    assert_eq!(outputs.len(), 1, "{outputs:?}");
+    // An unprivileged root's work runs as uid 0 of its own user namespace;
+    // a host-root root's work is the work user's host uid.
+    let expected = match work {
+        Some((uid, _)) => format!("pw= auth= uid={uid}"),
+        None => "pw= auth= uid=0".to_owned(),
+    };
+    assert!(
+        outputs[0].trim_end().ends_with(&expected),
+        "the Bash run inherited neither secret: {outputs:?}"
+    );
+}
+
+/// An authenticated unprivileged root (in the loopback-only fixture): the
+/// auth file is placed privately and read by the host, built-in plugins
+/// load, and the host's loopback server refuses requests without its
+/// password while the endpoint plugin's own client gets through. The
+/// scripted stand-in is not a model and the OAuth entry is never used.
+#[test]
+#[ignore = "needs the root supervisor built beside the Runner, OULIPOLY_NATIVE_DEPS, OULIPOLY_AGENT_BASH_TOOL, AGENT_BASH_BIN, OULIPOLY_NATIVE_SCRATCH and loopback only"]
+fn native_root_authenticated_host_requires_its_password_and_reads_a_private_auth_file() {
+    let scratch = PathBuf::from(var("OULIPOLY_NATIVE_SCRATCH"));
+    let base_url = scripted_model();
+    let mut root = Root::new(&scratch, "u", &base_url, "unused");
+    let auth = authenticated(&mut root, None);
+    authenticated_run(&root, &auth, None);
+}
+
+/// THE PREPARED AUTHENTICATED HOST-ROOT SAMPLE. Run once, as host uid 0,
+/// by ROOT only, inside its script's own network, PID and mount namespaces
+/// with loopback up; never by a model. The same checks as the unprivileged
+/// authenticated root, with a host-root owner and the auth file, password,
+/// native host and Bash run all the work user's.
+#[test]
+#[ignore = "PRIVILEGED SAMPLE: host uid 0 only, via the prepared script; needs the root supervisor binaries beside the Runner, OULIPOLY_NATIVE_DEPS, OULIPOLY_AGENT_BASH_TOOL, AGENT_BASH_BIN, OULIPOLY_NATIVE_SCRATCH, OULIPOLY_WORKLOAD_USER and loopback only"]
+fn native_root_host_root_authenticated_host_runs_as_the_work_user_behind_its_password() {
+    // SAFETY: geteuid has no preconditions.
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "the privileged sample runs as host root only"
+    );
+    let user = var("OULIPOLY_WORKLOAD_USER");
+    let (uid, gid) = host_ids(&user);
+    assert_ne!(uid, 0, "the work user must not be root");
+    let scratch = PathBuf::from(var("OULIPOLY_NATIVE_SCRATCH"));
+    let base_url = scripted_model();
+    let mut root = Root::new(&scratch, "a", &base_url, "unused");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root.dir, std::fs::Permissions::from_mode(0o711)).unwrap();
+    }
+    for sub in ["owner-home", "project", "tmp"] {
+        std::os::unix::fs::chown(root.dir.join(sub), Some(uid), Some(gid)).unwrap();
+    }
+    root.request["workload"] = json!({ "isolation": "host-root", "user": user });
+    // The caller's private auth file stays host root's: the entry reads it.
+    let auth = authenticated(&mut root, None);
+    authenticated_run(&root, &auth, Some((uid, gid)));
 }

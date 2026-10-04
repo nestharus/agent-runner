@@ -29,14 +29,44 @@
 //!   (`npm ci --ignore-scripts`) beside exactly this crate's lockfile; the
 //!   launch directory links its `node_modules`, so OpenCode's own
 //!   dependency install there has nothing to do and fetches nothing.
-//! * Nothing here launches, models or authenticates: a model and provider
-//!   are the caller's (`model`, `provider`), and the native data directory
-//!   starts empty.
+//! * Nothing here launches or models: a model and provider are the
+//!   caller's (`model`, `provider`). Without `auth`, nothing authenticates:
+//!   the native data directory starts empty, OpenCode's built-in plugins
+//!   stay disabled and its loopback HTTP server has no password.
+//! * **Authentication** (`auth`, opt-in per request, with a model). The
+//!   caller names one private OpenCode `auth.json` (provider id to one
+//!   `oauth`, `api` or `wellknown` entry; the model's provider must have
+//!   one). Its required fields are checked before any setup writes;
+//!   optional field types and the full native schema are not validated.
+//!   It is read once and refused for invalid required fields,
+//!   with no part of its contents in a reason, and written as the native
+//!   data directory's `opencode/auth.json` (`0600`). Never into
+//!   `opencode.json`, argv, an event or the root's environment. Both
+//!   secrets below are reachable by the work identity, the principal the
+//!   host and every in-root Bash run as: this keeps them out of group-
+//!   readable config, argv and setup events, not hidden from that user.
+//!   Setup adds neither value to the root's declared environment; caller-
+//!   supplied credential variables can still reach mediated Bash.
+//!   OpenCode may rewrite its own `auth.json` (a refresh, if the entry
+//!   allows one).
+//!   Such a launch also:
+//!   - enables OpenCode's built-in plugins, all of them: the release has
+//!     one switch, and its OpenAI (Codex subscription) auth is one of them;
+//!   - gets a fresh random loopback server password, written only to
+//!     `secret/server-password` (`0600`) and read from there into the host's
+//!     environment as it starts (`OPENCODE_SERVER_PASSWORD`). Its native
+//!     agent-bash requester inherits that password in the host lineage;
+//!     owner-spawned mediated Bash has the separate root environment.
+//!     With the launch password, the
+//!     host's HTTP API refuses requests without it and its internal clients
+//!     (the endpoint plugin's included) send it. No argv carries the value.
 //! * **Work identity.** Without one, everything is the caller's (`0700` /
 //!   `0600`), as for an unprivileged root. With a `host-root` work identity
 //!   (the caller is host root), the fresh tree is handed over before it is
 //!   opened up: HOME and the XDG data, cache and state directories become
-//!   the identity's (`0700`); the launch, XDG and XDG config directories,
+//!   the identity's (`0700`), as do `secret` and the native data
+//!   `opencode` directory (`0700`) and their files (`0600`) when `auth` is
+//!   given; the launch, XDG and XDG config directories,
 //!   every written file and the `node_modules` link stay the caller's with
 //!   the identity's primary group (`0750` / `0640`), so the host reads its
 //!   code, config and policy but cannot change them; the native config
@@ -65,13 +95,28 @@ const LOCK: &str = include_str!("../native/opencode/package-lock.json");
 /// The OpenCode binary inside the installed dependencies.
 const OPENCODE: &str = "node_modules/opencode-linux-x64/bin/opencode";
 
-/// Inherited variables that would add config beside the launch's own.
-pub const REMOVED_ENV: [&str; 4] = [
+/// Inherited variables that would add config or credentials beside the
+/// launch's own: auth comes only from the launch's data directory, and a
+/// server password only from its own `secret` file.
+/// Removal applies to the native host, not to the caller's declared root
+/// environment or mediated Bash. A declared default-plugin override is
+/// also not unset by auth opt-in.
+pub const REMOVED_ENV: [&str; 7] = [
     "OPENCODE_CONFIG",
     "OPENCODE_CONFIG_DIR",
     "OPENCODE_CONFIG_CONTENT",
     "OPENCODE_PERMISSION",
+    "OPENCODE_AUTH_CONTENT",
+    "OPENCODE_SERVER_PASSWORD",
+    "OPENCODE_SERVER_USERNAME",
 ];
+
+/// Largest accepted `auth` file.
+const AUTH_LIMIT: u64 = 64 * 1024;
+
+/// Reads the server password from the file named by `$0` into the host's
+/// environment, then execs the host (`"$@"`): the value is in no argv.
+const WITH_PASSWORD: &str = r#"IFS= read -r OPENCODE_SERVER_PASSWORD < "$0" && export OPENCODE_SERVER_PASSWORD && exec "$@""#;
 
 /// What the caller chooses for one native OpenCode host.
 #[derive(Debug, Clone, Deserialize)]
@@ -93,6 +138,10 @@ pub struct OpenCodeSetup {
     /// Native provider config (`provider` in OpenCode's config).
     #[serde(default)]
     pub provider: Option<Map<String, Value>>,
+    /// Absolute path of a private OpenCode `auth.json` for this launch
+    /// (see the module docs); needs `model`.
+    #[serde(default)]
+    pub auth: Option<String>,
 }
 
 /// A provisioned launch: the harness `argv` and what it sets.
@@ -103,6 +152,17 @@ pub struct OpenCodeLaunch {
     pub env: Vec<(String, String)>,
     /// The native config directory (`$XDG_CONFIG_HOME/opencode`).
     pub config_dir: PathBuf,
+    /// Where an authenticated launch's secrets are (paths, never values).
+    pub auth: Option<AuthPlacement>,
+}
+
+/// An authenticated launch's secret files.
+#[derive(Debug, Clone)]
+pub struct AuthPlacement {
+    /// The native data directory's `opencode/auth.json`.
+    pub auth_file: PathBuf,
+    /// The loopback server password the host reads as it starts.
+    pub password_file: PathBuf,
 }
 
 impl OpenCodeLaunch {
@@ -118,6 +178,11 @@ impl OpenCodeLaunch {
             "env": env,
             "removed_env": REMOVED_ENV,
             "config_dir": self.config_dir,
+            "auth": self.auth.as_ref().map(|auth| json!({
+                "auth_file": auth.auth_file,
+                "server_password_file": auth.password_file,
+                "default_plugins": "enabled",
+            })),
         })
     }
 }
@@ -213,7 +278,7 @@ pub fn provision_opencode(
     let inputs = setup_inputs(setup).map_err(OpenCodeSetupError::InputInvalid)?;
     let launch = write_launch(setup, inputs).map_err(OpenCodeSetupError::ConstructionFailed)?;
     if let Some(identity) = identity {
-        hand_over(Path::new(&setup.dir), identity)
+        hand_over(Path::new(&setup.dir), identity, launch.auth.is_some())
             .map_err(OpenCodeSetupError::ConstructionFailed)?;
     }
     Ok(launch)
@@ -222,7 +287,7 @@ pub fn provision_opencode(
 /// Gives the fresh launch tree its `host-root` ownership (see the module
 /// docs). The launch directory stays `0700` and the caller's until last,
 /// so nothing here can be raced by another user.
-fn hand_over(dir: &Path, identity: &Identity) -> Result<(), String> {
+fn hand_over(dir: &Path, identity: &Identity, secrets: bool) -> Result<(), String> {
     use std::os::unix::fs::{PermissionsExt, lchown};
     let set = |path: &Path, uid: Option<u32>, mode: Option<u32>| {
         lchown(path, uid, Some(identity.gid))
@@ -248,6 +313,16 @@ fn hand_over(dir: &Path, identity: &Identity) -> Result<(), String> {
         set(&config.join(sub), None, Some(0o750))?;
     }
     set(&config, None, Some(0o1770))?;
+    if secrets {
+        for (sub, mode) in [
+            ("secret/server-password", 0o600),
+            ("secret", 0o700),
+            ("xdg/data/opencode/auth.json", 0o600),
+            ("xdg/data/opencode", 0o700),
+        ] {
+            set(&dir.join(sub), Some(identity.uid), Some(mode))?;
+        }
+    }
     for sub in ["home", "xdg/data", "xdg/cache", "xdg/state"] {
         set(&dir.join(sub), Some(identity.uid), Some(0o700))?;
     }
@@ -264,6 +339,8 @@ struct SetupInputs<'a> {
     permission: String,
     tool_source: String,
     model_provider: Option<&'a str>,
+    /// The checked `auth` file's text.
+    auth: Option<String>,
 }
 
 // All setup input checks finish before entering the writing phase.
@@ -285,6 +362,11 @@ fn setup_inputs(setup: &OpenCodeSetup) -> Result<SetupInputs<'_>, String> {
         }
         (None, None) => None,
         _ => return Err("model and provider go together".to_owned()),
+    };
+    let auth = match (&setup.auth, model_provider) {
+        (Some(path), Some(name)) => Some(read_auth(&absolute("auth", path)?, name)?),
+        (Some(_), None) => return Err("auth needs a model and provider".to_owned()),
+        (None, _) => None,
     };
     let opencode = deps.join(OPENCODE);
     if !opencode.is_file() {
@@ -310,7 +392,94 @@ fn setup_inputs(setup: &OpenCodeSetup) -> Result<SetupInputs<'_>, String> {
         permission,
         tool_source,
         model_provider,
+        auth,
     })
+}
+
+/// Reads and checks the caller's `auth` file. No reason carries any part
+/// of its contents: only the path, an I/O error kind, a JSON position or
+/// the model's provider name.
+fn read_auth(path: &Path, provider: &str) -> Result<String, String> {
+    use std::io::Read;
+    // No final symlink, and no blocking open of a FIFO.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| format!("auth {}: {}", path.display(), error.kind()))?;
+    let meta = file
+        .metadata()
+        .map_err(|error| format!("auth: {}", error.kind()))?;
+    if !meta.is_file() {
+        return Err("auth is not a regular file".to_owned());
+    }
+    if meta.len() > AUTH_LIMIT {
+        return Err(format!("auth is larger than {AUTH_LIMIT} bytes"));
+    }
+    let mut bytes = Vec::new();
+    file.take(AUTH_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("auth: {}", error.kind()))?;
+    if bytes.len() as u64 > AUTH_LIMIT {
+        return Err(format!("auth is larger than {AUTH_LIMIT} bytes"));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| "auth is not UTF-8".to_owned())?;
+    let value: Value = serde_json::from_str(&text).map_err(|error| {
+        format!(
+            "auth is not JSON (line {}, column {})",
+            error.line(),
+            error.column()
+        )
+    })?;
+    let entries = value
+        .as_object()
+        .ok_or("auth is not a JSON object of provider entries")?;
+    // Check required fields; optional types and the full native schema
+    // are not validated here, so native decoding may still drop an entry.
+    let string = |entry: &Value, field: &str| entry.get(field).is_some_and(Value::is_string);
+    for entry in entries.values() {
+        let known = match entry.get("type").and_then(Value::as_str) {
+            Some("oauth") => {
+                string(entry, "refresh")
+                    && string(entry, "access")
+                    && entry.get("expires").is_some_and(Value::is_u64)
+            }
+            Some("api") => string(entry, "key"),
+            Some("wellknown") => string(entry, "key") && string(entry, "token"),
+            _ => false,
+        };
+        if !known {
+            return Err(
+                "auth has an entry that is not a complete oauth, api or wellknown entry".to_owned(),
+            );
+        }
+    }
+    if !entries.contains_key(provider) {
+        return Err(format!("auth has no {provider} entry"));
+    }
+    Ok(text)
+}
+
+/// A fresh loopback server password: 32 random bytes, hex.
+fn server_password() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        // SAFETY: the kernel writes at most the remaining length into
+        // `bytes` from `filled`.
+        let read = unsafe {
+            libc::getrandom(bytes[filled..].as_mut_ptr().cast(), bytes.len() - filled, 0)
+        };
+        if read < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!("server password: {error}"));
+        }
+        filled += read as usize;
+    }
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn write_launch(setup: &OpenCodeSetup, inputs: SetupInputs<'_>) -> Result<OpenCodeLaunch, String> {
@@ -321,6 +490,7 @@ fn write_launch(setup: &OpenCodeSetup, inputs: SetupInputs<'_>) -> Result<OpenCo
         permission,
         tool_source,
         model_provider,
+        auth,
     } = inputs;
     let mkdir = |path: &Path| {
         fs::DirBuilder::new()
@@ -367,6 +537,22 @@ fn write_launch(setup: &OpenCodeSetup, inputs: SetupInputs<'_>) -> Result<OpenCo
         config["provider"] = Value::Object(provider.clone());
     }
     let config = serde_json::to_string(&config).expect("config json");
+    let auth = match auth {
+        Some(text) => {
+            let secret = dir.join("secret");
+            mkdir(&secret)?;
+            let password_file = secret.join("server-password");
+            write_new(&password_file, &format!("{}\n", server_password()?))?;
+            mkdir(&dir.join("xdg/data/opencode"))?;
+            let auth_file = dir.join("xdg/data/opencode/auth.json");
+            write_new(&auth_file, &text)?;
+            Some(AuthPlacement {
+                auth_file,
+                password_file,
+            })
+        }
+        None => None,
+    };
     let config = format!(
         r#"{},"permission":{permission}}}"#,
         config.strip_suffix('}').expect("json object")
@@ -374,7 +560,7 @@ fn write_launch(setup: &OpenCodeSetup, inputs: SetupInputs<'_>) -> Result<OpenCo
     write_new(&config_dir.join("opencode.json"), &config)?;
 
     let path = |sub: &str| utf8(&dir.join(sub));
-    let env = vec![
+    let mut env = vec![
         ("HOME".to_owned(), path("home")?),
         ("XDG_CONFIG_HOME".to_owned(), path("xdg/config")?),
         ("XDG_DATA_HOME".to_owned(), path("xdg/data")?),
@@ -392,16 +578,29 @@ fn write_launch(setup: &OpenCodeSetup, inputs: SetupInputs<'_>) -> Result<OpenCo
         ("OPENCODE_DISABLE_LSP_DOWNLOAD".to_owned(), "1".to_owned()),
         ("OPENCODE_DISABLE_SHARE".to_owned(), "1".to_owned()),
     ];
+    if auth.is_some() {
+        env.retain(|(name, _)| name != "OPENCODE_DISABLE_DEFAULT_PLUGINS");
+    }
     // `env` keeps what the owner and root PID 1 add (the Bash ingress and
     // the endpoint socket), removes inherited config, sets the rest and
-    // execs OpenCode: no further process. `acp` loads the config
-    // directory's plugins at startup; its own stdio ACP is unused.
+    // execs OpenCode (through `sh`, which reads the server password into
+    // its own environment and execs, for an authenticated launch): no
+    // further process. `acp` loads the config directory's plugins at
+    // startup; its own stdio ACP is unused.
     let mut argv = vec!["/usr/bin/env".to_owned()];
     for name in REMOVED_ENV {
         argv.push("-u".to_owned());
         argv.push(name.to_owned());
     }
     argv.extend(env.iter().map(|(key, value)| format!("{key}={value}")));
+    if let Some(auth) = &auth {
+        argv.extend([
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            WITH_PASSWORD.to_owned(),
+            utf8(&auth.password_file)?,
+        ]);
+    }
     argv.extend([
         utf8(&deps.join(OPENCODE))?,
         "acp".to_owned(),
@@ -414,13 +613,68 @@ fn write_launch(setup: &OpenCodeSetup, inputs: SetupInputs<'_>) -> Result<OpenCo
         argv,
         env,
         config_dir,
+        auth,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Identity, SetupInputs, hand_over, permission, write_launch};
+    use super::{Identity, SetupInputs, hand_over, permission, read_auth, write_launch};
     use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+
+    const SECRET: &str = "fixture-secret-marker";
+
+    fn setup(dir: &Path, auth: Option<&str>) -> super::OpenCodeSetup {
+        super::OpenCodeSetup {
+            dir: dir.to_str().unwrap().to_owned(),
+            deps: "/nonexistent-deps".to_owned(),
+            agent_bash_tool: "/t".to_owned(),
+            agent_bash_bin: "/b".to_owned(),
+            bash_allow: vec!["true".to_owned()],
+            model: auth.map(|_| "openai/m".to_owned()),
+            provider: auth.map(|_| {
+                serde_json::from_str(r#"{"openai":{"models":{"m":{"name":"m"}}}}"#).unwrap()
+            }),
+            auth: auth.map(str::to_owned),
+        }
+    }
+
+    fn inputs(dir: &Path, auth: Option<String>) -> SetupInputs<'static> {
+        SetupInputs {
+            dir: dir.to_path_buf(),
+            deps: "/nonexistent-deps".into(),
+            bin: "/b".into(),
+            permission: permission(&["true".to_owned()]).unwrap(),
+            tool_source: "// tool".to_owned(),
+            model_provider: auth.as_ref().map(|_| "openai"),
+            auth,
+        }
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!("native-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir(&base).unwrap();
+        base
+    }
+
+    fn own_identity() -> Identity {
+        // SAFETY: getuid/getgid have no preconditions.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        Identity {
+            user: "self".into(),
+            uid,
+            gid,
+            groups: vec![gid],
+        }
+    }
+
+    fn oauth() -> String {
+        format!(
+            r#"{{"openai":{{"type":"oauth","refresh":"","access":"{SECRET}","expires":1,"accountId":"a"}}}}"#
+        )
+    }
 
     /// The host-root layout, handed to this (unprivileged) process's own
     /// identity: chowning to oneself needs no privilege, so the modes and
@@ -432,33 +686,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir(&base).unwrap();
         let dir = base.join("launch");
-        let setup = super::OpenCodeSetup {
-            dir: dir.to_str().unwrap().to_owned(),
-            deps: "/nonexistent-deps".to_owned(),
-            agent_bash_tool: "/t".to_owned(),
-            agent_bash_bin: "/b".to_owned(),
-            bash_allow: vec!["true".to_owned()],
-            model: None,
-            provider: None,
-        };
-        let inputs = SetupInputs {
-            dir: dir.clone(),
-            deps: "/nonexistent-deps".into(),
-            bin: "/b".into(),
-            permission: permission(&setup.bash_allow).unwrap(),
-            tool_source: "// tool".to_owned(),
-            model_provider: None,
-        };
-        write_launch(&setup, inputs).unwrap();
-        // SAFETY: getuid/getgid have no preconditions.
-        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-        let identity = Identity {
-            user: "self".into(),
-            uid,
-            gid,
-            groups: vec![gid],
-        };
-        hand_over(&dir, &identity).unwrap();
+        write_launch(&setup(&dir, None), inputs(&dir, None)).unwrap();
+        let identity = own_identity();
+        let gid = identity.gid;
+        hand_over(&dir, &identity, false).unwrap();
         let mode = |sub: &str| {
             let meta = std::fs::symlink_metadata(dir.join(sub)).unwrap();
             assert_eq!(meta.gid(), gid, "{sub}");
@@ -484,6 +715,221 @@ mod tests {
         ] {
             assert_eq!(mode(sub), expected, "{sub}");
         }
+        assert!(!dir.join("secret").exists() && !dir.join("xdg/data/opencode").exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Without `auth`, the launch is the offline one: built-in plugins
+    /// disabled, no server password, OpenCode exec'd by `env` directly.
+    #[test]
+    fn launch_without_auth_keeps_plugins_disabled_and_no_password() {
+        let base = std::env::temp_dir().join(format!("native-offline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir(&base).unwrap();
+        let dir = base.join("launch");
+        let launch = write_launch(&setup(&dir, None), inputs(&dir, None)).unwrap();
+        assert!(launch.auth.is_none());
+        assert!(
+            launch
+                .argv
+                .contains(&"OPENCODE_DISABLE_DEFAULT_PLUGINS=1".to_owned())
+        );
+        assert!(
+            !launch.argv.contains(&"/bin/sh".to_owned()),
+            "{:?}",
+            launch.argv
+        );
+        let opencode = launch
+            .argv
+            .iter()
+            .position(|arg| arg.ends_with("/opencode"));
+        assert_eq!(
+            launch.argv[opencode.unwrap() - 1],
+            "OPENCODE_DISABLE_SHARE=1"
+        );
+        assert_eq!(launch.to_json()["auth"], serde_json::Value::Null);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// With `auth`: the auth file and a fresh password are private files,
+    /// handed to the identity; plugins are enabled; no argv, config or
+    /// receipt carries either value.
+    #[test]
+    fn launch_with_auth_places_private_secrets_and_keeps_values_out_of_argv_and_config() {
+        let base = std::env::temp_dir().join(format!("native-auth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir(&base).unwrap();
+        let dir = base.join("launch");
+        let launch = write_launch(
+            &setup(&dir, Some("/caller/auth.json")),
+            inputs(&dir, Some(oauth())),
+        )
+        .unwrap();
+        let identity = own_identity();
+        hand_over(&dir, &identity, true).unwrap();
+        let placed = launch.auth.as_ref().unwrap();
+        assert_eq!(placed.auth_file, dir.join("xdg/data/opencode/auth.json"));
+        assert_eq!(placed.password_file, dir.join("secret/server-password"));
+        assert_eq!(std::fs::read_to_string(&placed.auth_file).unwrap(), oauth());
+        let password = std::fs::read_to_string(&placed.password_file).unwrap();
+        let password = password.strip_suffix('\n').unwrap();
+        assert_eq!(password.len(), 64);
+        assert!(password.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        for (sub, expected) in [
+            ("secret", 0o700),
+            ("secret/server-password", 0o600),
+            ("xdg/data/opencode", 0o700),
+            ("xdg/data/opencode/auth.json", 0o600),
+        ] {
+            let meta = std::fs::symlink_metadata(dir.join(sub)).unwrap();
+            assert_eq!(
+                (meta.uid(), meta.mode() & 0o7777),
+                (identity.uid, expected),
+                "{sub}"
+            );
+        }
+        // A second launch gets another password.
+        let other = base.join("other");
+        let again = write_launch(
+            &setup(&other, Some("/caller/auth.json")),
+            inputs(&other, Some(oauth())),
+        )
+        .unwrap();
+        assert_ne!(
+            std::fs::read_to_string(again.auth.unwrap().password_file).unwrap(),
+            format!("{password}\n")
+        );
+
+        assert!(
+            !launch
+                .argv
+                .iter()
+                .any(|arg| arg.starts_with("OPENCODE_DISABLE_DEFAULT_PLUGINS")),
+            "{:?}",
+            launch.argv
+        );
+        let sh = launch.argv.iter().position(|arg| arg == "/bin/sh").unwrap();
+        assert_eq!(launch.argv[sh + 1], "-c");
+        assert_eq!(launch.argv[sh + 3], placed.password_file.to_str().unwrap());
+        assert!(launch.argv[sh + 4].ends_with("/opencode"));
+        for name in ["OPENCODE_SERVER_PASSWORD", "OPENCODE_AUTH_CONTENT"] {
+            let at = launch.argv.iter().position(|arg| arg == name).unwrap();
+            assert_eq!(launch.argv[at - 1], "-u");
+        }
+        let receipt = launch.to_json();
+        assert_eq!(receipt["auth"]["default_plugins"], "enabled");
+        let config =
+            std::fs::read_to_string(dir.join("xdg/config/opencode/opencode.json")).unwrap();
+        for text in [format!("{:?}", launch.argv), receipt.to_string(), config] {
+            assert!(!text.contains(password), "password in {text}");
+            assert!(!text.contains(SECRET), "auth value in {text}");
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The launcher itself: the host gets the password in its environment
+    /// from the file, and an unreadable file stops it before the host.
+    #[test]
+    fn password_launcher_reads_the_file_into_the_environment_only() {
+        let base = scratch("launcher");
+        let file = base.as_path().join("pw");
+        std::fs::write(&file, "abc123\n").unwrap();
+        let run = |file: &Path| {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", super::WITH_PASSWORD])
+                .arg(file)
+                .args([
+                    "/bin/sh",
+                    "-c",
+                    r#"printf %s "$OPENCODE_SERVER_PASSWORD"; printf '|%s' "$0""#,
+                    "argv0",
+                ])
+                .env_remove("OPENCODE_SERVER_PASSWORD")
+                .output()
+                .unwrap()
+        };
+        let output = run(&file);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "abc123|argv0");
+        let missing = run(&base.as_path().join("absent"));
+        assert!(!missing.status.success(), "{missing:?}");
+        assert!(missing.stdout.is_empty(), "{missing:?}");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Refusals of the caller's auth file name no part of its contents.
+    #[test]
+    fn auth_is_checked_before_writes_and_refusals_never_carry_its_contents() {
+        let base = scratch("authfile");
+        let write = |name: &str, text: &str| {
+            let path = base.as_path().join(name);
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let good = write("good", &oauth());
+        assert_eq!(read_auth(&good, "openai").unwrap(), oauth());
+        let link = base.as_path().join("link");
+        std::os::unix::fs::symlink(&good, &link).unwrap();
+        let fifo = base.as_path().join("fifo");
+        let fifo_c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let cases = [
+            (base.as_path().join("absent"), "openai", "not found"),
+            (link, "openai", "loop"),
+            (fifo, "openai", "not a regular file"),
+            (
+                write("syntax", &format!("{{\"openai\":\"{SECRET}")),
+                "openai",
+                "not JSON",
+            ),
+            (
+                write("array", &format!("[\"{SECRET}\"]")),
+                "openai",
+                "not a JSON object",
+            ),
+            (
+                write(
+                    "partial",
+                    &format!(r#"{{"openai":{{"type":"oauth","access":"{SECRET}","expires":1}}}}"#),
+                ),
+                "openai",
+                "not a complete",
+            ),
+            (
+                write("kind", &format!(r#"{{"openai":{{"type":"{SECRET}"}}}}"#)),
+                "openai",
+                "not a complete",
+            ),
+            (good.clone(), "anthropic", "no anthropic entry"),
+            (
+                write("large", &format!("{{\"x\":\"{}\"}}", "a".repeat(70_000))),
+                "openai",
+                "larger than",
+            ),
+        ];
+        for (path, provider, reason) in cases {
+            let refused = read_auth(&path, provider).unwrap_err();
+            assert!(refused.contains(reason), "{path:?}: {refused}");
+            assert!(!refused.contains(SECRET), "{path:?}: {refused}");
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// `auth` without a model is refused by input checks, before writes.
+    #[test]
+    fn auth_needs_a_model() {
+        let base = scratch("nomodel");
+        let dir = base.as_path().join("launch");
+        let mut setup = setup(&dir, Some("/caller/auth.json"));
+        setup.model = None;
+        setup.provider = None;
+        let refused = super::provision_opencode(&setup, None).unwrap_err();
+        assert_eq!(
+            refused,
+            super::OpenCodeSetupError::InputInvalid("auth needs a model and provider".to_owned())
+        );
+        assert!(!dir.exists());
         std::fs::remove_dir_all(&base).unwrap();
     }
 

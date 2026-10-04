@@ -24,6 +24,16 @@
 //! directory, and the work's IPC (the harness socket directory and the
 //! Bash ingress) is `<launch_dir>/ipc`, made fresh by the owner.
 //!
+//! `opencode.auth` (opt-in, with a model) names a private OpenCode
+//! `auth.json` that setup checks before any effect and places in the
+//! launch's own data directory. Such a launch enables OpenCode's built-in
+//! plugins and a loopback password inherited by the native host's requester.
+//! Required auth fields are checked, not the full native schema. Setup adds
+//! neither value to the root environment; caller-declared credentials can
+//! reach mediated Bash. Both files are reachable by the work identity. This
+//! entry does not refresh, copy back or remove them: the caller owns the
+//! source file and the launch directory's copy after the root ends.
+//!
 //! `--recover <file>` acts on an existing store: `{"store", "purpose",
 //! "env"}`, `purpose` being `cancel` or `continue-attached`. A new owner
 //! claims the store (the next owner generation; earlier unresolved
@@ -126,7 +136,8 @@ pub(crate) struct NativeRootRequest {
     outage_closure_cap: u32,
     delivery_attempt_cap: u32,
     /// The native setup inputs (`deps`, `agent_bash_tool`, `agent_bash_bin`,
-    /// `bash_allow`, optional `model` and `provider`).
+    /// `bash_allow`, optional `model` and `provider`, and optional `auth`:
+    /// see the module docs).
     opencode: NativeSetup,
     /// Who the root's work runs as (see the module docs).
     workload: RequestWorkload,
@@ -155,6 +166,8 @@ struct NativeSetup {
     model: Option<String>,
     #[serde(default)]
     provider: Option<Map<String, Value>>,
+    #[serde(default)]
+    auth: Option<String>,
 }
 
 /// The recovery request file.
@@ -247,6 +260,7 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
         bash_allow: request.opencode.bash_allow.clone(),
         model: request.opencode.model.clone(),
         provider: request.opencode.provider.clone(),
+        auth: request.opencode.auth.clone(),
     };
     // The owner's own checks first, so its refusal cannot follow setup's
     // effects. They read only that the argv is non-empty; every
@@ -867,6 +881,12 @@ mod tests {
         let mut extra = base(&fresh, json!({}));
         extra["inherit_env"] = json!(true);
         assert!(read(extra).unwrap_err().contains("unknown field"));
+        let mut authed = base(&fresh, json!({}));
+        authed["opencode"]["auth"] = json!("/private/auth.json");
+        assert_eq!(
+            read(authed).unwrap().opencode.auth.as_deref(),
+            Some("/private/auth.json")
+        );
     }
 
     /// The work identity is declared, never taken from the caller's euid:
