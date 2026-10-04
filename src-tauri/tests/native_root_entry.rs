@@ -147,7 +147,7 @@ impl Root {
             .mode(0o700)
             .create(&dir)
             .unwrap_or_else(|error| panic!("{dir:?}: {error} (use a fresh scratch)"));
-        for sub in ["owner-home", "project"] {
+        for sub in ["owner-home", "project", "tmp"] {
             std::fs::DirBuilder::new()
                 .mode(0o700)
                 .create(dir.join(sub))
@@ -160,6 +160,9 @@ impl Root {
             "env": {
                 "PATH": "/usr/bin:/bin",
                 "HOME": dir.join("owner-home"),
+                // Temporary files of the root's processes (OpenCode's
+                // runtime extracts libraries) stay in the root's directory.
+                "TMPDIR": dir.join("tmp"),
                 "OULIPOLY_WITNESS_DECLARED": DECLARED,
                 // Declared, but the native launch removes it from its host.
                 "OPENCODE_CONFIG_CONTENT": ALLOW_ALL,
@@ -366,6 +369,7 @@ fn tool_parts(launch: &Value, cwd: &str, session: &str) -> Vec<(String, String, 
         .current_dir(cwd)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", Path::new(cwd).parent().unwrap().join("tmp"))
         .envs(
             launch["env"]
                 .as_object()
@@ -948,7 +952,7 @@ fn host_root(scratch: &Path, name: &str, base_url: &str, user: &str, ids: (u32, 
     use std::os::unix::fs::PermissionsExt;
     let mut root = Root::new(scratch, name, base_url, &format!("RUN {IDENTITY}"));
     std::fs::set_permissions(&root.dir, std::fs::Permissions::from_mode(0o711)).unwrap();
-    for sub in ["owner-home", "project"] {
+    for sub in ["owner-home", "project", "tmp"] {
         std::os::unix::fs::chown(root.dir.join(sub), Some(ids.0), Some(ids.1)).unwrap();
     }
     root.request["workload"] = json!({ "isolation": "host-root", "user": user });
@@ -1206,6 +1210,7 @@ fn native_root_host_root_owner_runs_its_native_host_and_bash_as_the_work_user() 
             .current_dir(&project)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", root.dir.join("tmp"))
             .envs(
                 setup["launch"]["env"]
                     .as_object()
