@@ -14,9 +14,9 @@
 //   - deny: native denial, nothing runs, no request;
 //   - ask: a native permission request, which the ACP v2 endpoint forwards
 //     to the owner; only a selected allow_once runs it, once.
-// - Then it runs the unmodified agent-bash tool, copied beside this
-//   directory as `../agent-bash/bash.ts`; its description and arguments are
-//   that tool's own. Inside a root, that tool runs through the root's own
+// - Then it runs the unmodified agent-bash tool, placed beside this
+//   directory as `../agent-bash/bash.ts` by the owner setup (the crate's
+//   `native` module); its description and arguments are that tool's own. Inside a root, that tool runs through the root's own
 //   Bash ingress (`OULIPOLY_ROOT_BASH_V1`) only.
 // - `always` names only the exact pattern asked for.
 

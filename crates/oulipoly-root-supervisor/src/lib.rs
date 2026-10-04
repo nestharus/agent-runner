@@ -350,9 +350,11 @@
 //! * Bash ingress: the agent-bash tool speaks it (root v1). A native
 //!   OpenCode host loads that tool only behind
 //!   `native/opencode/bash-policy-tool.ts`, whose native permission
-//!   decides each exact command; that is shown with a scripted stand-in
-//!   for a model, not a model. The owner grants no permission request
-//!   (it answers method-not-found, a native rejection). No completion
+//!   decides each whole command string; the [`native`] setup provisions
+//!   both with the root's deny-default policy (only named commands run).
+//!   That is shown with a scripted stand-in for a model, not a model. The
+//!   owner grants no permission request (it answers method-not-found, a
+//!   native rejection). No completion
 //!   is delivered to a harness as a new input; one thread per connection
 //!   and no deadline on reading a request; the peer is identified by its
 //!   `SO_PEERCRED` pid, so a requester that exits and whose pid is reused
@@ -376,6 +378,7 @@ pub mod bash;
 mod custody;
 mod harness;
 mod live;
+pub mod native;
 mod store;
 #[doc(hidden)]
 pub mod sys;
