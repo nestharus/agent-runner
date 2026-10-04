@@ -13,6 +13,7 @@ members = [
     "crates/oulipoly-agent-messenger",
     "crates/oulipoly-kernel-broker",
     "crates/oulipoly-acp",
+    "crates/oulipoly-root-supervisor",
 ]
 default-members = [
     "src-tauri",
@@ -27,6 +28,7 @@ default-members = [
     "crates/oulipoly-agent-messenger",
     "crates/oulipoly-kernel-broker",
     "crates/oulipoly-acp",
+    "crates/oulipoly-root-supervisor",
 ]
 
 [workspace.package]

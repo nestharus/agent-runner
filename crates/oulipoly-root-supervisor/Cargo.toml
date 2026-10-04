@@ -1,0 +1,26 @@
+[package]
+name = "oulipoly-root-supervisor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Unwired per-root supervisor process owning ACP v2 harness subprocesses (Linux, in-memory only)"
+
+[lib]
+name = "oulipoly_root_supervisor"
+
+[[bin]]
+name = "oulipoly-root-supervisor"
+path = "src/main.rs"
+
+# Deterministic ACP v2 peer used only as an owned harness in this crate's
+# process-level tests. It is not a real harness.
+[[bin]]
+name = "oulipoly-acp-deterministic-peer"
+path = "src/bin/deterministic_peer.rs"
+test = false
+
+[dependencies]
+libc.workspace = true
+oulipoly-acp = { path = "../oulipoly-acp" }
+serde.workspace = true
+serde_json.workspace = true
