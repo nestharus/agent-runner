@@ -17,14 +17,25 @@
 //! `unshare --user --map-current-user --net --pid --fork`, which also
 //! bounds cleanup: everything in that PID namespace ends with it.
 //!
+//! The third loads the actual agent-bash `bash` tool behind the native
+//! permission gate `native/opencode/bash-policy-tool.ts` and drives it with
+//! a scripted loopback stand-in for a model (no model, provider or
+//! credential): it also needs `OULIPOLY_AGENT_BASH_TOOL`, the matching
+//! agent-bash `integrations/opencode/tools/bash.ts`, and `AGENT_BASH_BIN`,
+//! that source's `agent-bash` binary. Its loopback must be up (in a new
+//! network namespace, `ip link set lo up` before dropping capabilities).
+//!
 //! The only timer is a test watchdog; on expiry the test cancels its
 //! supervisor and fails.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, channel};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -48,6 +59,20 @@ impl Model {
     }
 }
 
+/// What a fixture's native host runs.
+enum Host<'a> {
+    /// Insertion only: no model turn starts.
+    InsertionOnly,
+    /// Real configured model turns.
+    Model(&'a Model),
+    /// Turns answered by a [`ScriptedModel`], with the agent-bash tool
+    /// behind the native permission gate and this permission config.
+    ScriptedBash {
+        base_url: &'a str,
+        permission: Value,
+    },
+}
+
 struct Fixture {
     dir: PathBuf,
     opencode: PathBuf,
@@ -56,7 +81,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new(model: Option<&Model>) -> Self {
+    fn new(host: Host) -> Self {
         let deps = PathBuf::from(
             std::env::var("OULIPOLY_NATIVE_DEPS").expect("OULIPOLY_NATIVE_DEPS must be set"),
         );
@@ -71,7 +96,13 @@ impl Fixture {
         .unwrap();
         let base = std::env::var("OULIPOLY_NATIVE_SCRATCH")
             .map_or_else(|_| std::env::temp_dir(), PathBuf::from);
-        let dir = base.join(format!("native-{}", std::process::id()));
+        // One directory per fixture: tests in one process run concurrently.
+        static FIXTURES: AtomicUsize = AtomicUsize::new(0);
+        let dir = base.join(format!(
+            "native-{}-{}",
+            std::process::id(),
+            FIXTURES.fetch_add(1, Ordering::Relaxed)
+        ));
         let mkdir = |path: &Path| {
             std::fs::DirBuilder::new()
                 .recursive(true)
@@ -114,12 +145,12 @@ impl Fixture {
         if let Ok(trace) = std::env::var("OULIPOLY_ACP_V2_TRACE") {
             env.push(("OULIPOLY_ACP_V2_TRACE", trace));
         }
-        match model {
-            None => {
+        match host {
+            Host::InsertionOnly => {
                 env.push(("OPENCODE_DISABLE_DEFAULT_PLUGINS", "1".to_owned()));
                 env.push(("OULIPOLY_ACP_V2_NO_REPLY", "1".to_owned()));
             }
-            Some(model) => {
+            Host::Model(model) => {
                 // The built-in (default) plugins carry OpenCode's own OpenAI
                 // ChatGPT-OAuth support, which reads `<data>/opencode/auth.json`.
                 let data = dir.join("xdg/data/opencode");
@@ -141,6 +172,52 @@ impl Fixture {
                         "store": false,
                     },
                 }}}});
+            }
+            Host::ScriptedBash {
+                base_url,
+                permission,
+            } => {
+                // The global config directory holds the tools: the gate as
+                // `tool/bash.ts`, the unmodified agent-bash tool beside it,
+                // and the locked dependencies, so OpenCode's own dependency
+                // install there finds nothing to do and fetches nothing.
+                let tool = PathBuf::from(
+                    std::env::var("OULIPOLY_AGENT_BASH_TOOL")
+                        .expect("OULIPOLY_AGENT_BASH_TOOL must be set"),
+                );
+                let bin = std::env::var("AGENT_BASH_BIN").expect("AGENT_BASH_BIN must be set");
+                let config_dir = dir.join("xdg/config/opencode");
+                mkdir(&config_dir.join("tool"));
+                mkdir(&config_dir.join("agent-bash"));
+                std::fs::copy(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("native/opencode/bash-policy-tool.ts"),
+                    config_dir.join("tool/bash.ts"),
+                )
+                .unwrap();
+                std::fs::copy(&tool, config_dir.join("agent-bash/bash.ts")).unwrap();
+                for file in ["package.json", "package-lock.json"] {
+                    std::fs::copy(deps.join(file), config_dir.join(file)).unwrap();
+                }
+                std::os::unix::fs::symlink(
+                    deps.join("node_modules"),
+                    config_dir.join("node_modules"),
+                )
+                .unwrap();
+                env.push(("AGENT_BASH_BIN", bin));
+                env.push(("OPENCODE_DISABLE_DEFAULT_PLUGINS", "1".to_owned()));
+                env.push(("OPENCODE_DISABLE_MODELS_FETCH", "1".to_owned()));
+                config["model"] = json!("fixture/scripted");
+                config["enabled_providers"] = json!(["fixture"]);
+                config["agent"] = json!({ "title": { "disable": true } });
+                config["permission"] = permission;
+                config["provider"] = json!({ "fixture": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "name": "fixture",
+                    // Not a credential: the stand-in reads no header.
+                    "options": { "baseURL": base_url, "apiKey": "fixture-not-a-credential" },
+                    "models": { "scripted": { "name": "scripted", "tool_call": true } },
+                }});
             }
         }
         env.push(("OPENCODE_CONFIG_CONTENT", config.to_string()));
@@ -213,6 +290,171 @@ impl Fixture {
                 )
             })
             .collect()
+    }
+}
+
+impl Fixture {
+    /// Every tool part of the native conversation as OpenCode itself
+    /// exports it: `(tool, status, input, output or error)`.
+    fn tool_parts(&self, session: &str) -> Vec<(String, String, Value, String)> {
+        let output = Command::new(&self.opencode)
+            .args(["export", "--pure", session])
+            .current_dir(&self.project)
+            .env_clear()
+            .envs(self.env.iter().map(|(key, value)| (key, value)))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "export: {output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        let start = text.find('{').expect("json in export output");
+        let exported: Value = serde_json::from_str(&text[start..]).unwrap();
+        exported["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["parts"].as_array().unwrap().iter())
+            .filter(|part| part["type"] == "tool")
+            .map(|part| {
+                let state = &part["state"];
+                let result = state["output"]
+                    .as_str()
+                    .or_else(|| state["error"].as_str())
+                    .unwrap_or_default();
+                (
+                    part["tool"].as_str().unwrap().to_owned(),
+                    state["status"].as_str().unwrap().to_owned(),
+                    state["input"].clone(),
+                    result.to_owned(),
+                )
+            })
+            .collect()
+    }
+}
+
+/// A loopback stand-in for a model, never a model or provider: an
+/// OpenAI-compatible streaming chat-completions endpoint answering from a
+/// script. After a tool result it answers the text `DONE`; to a user
+/// message `RUN <command>` it calls `bash` once with that command; to
+/// anything else it answers `NO-SCRIPT`. It keeps every request body.
+struct ScriptedModel {
+    base_url: String,
+    requests: Arc<Mutex<Vec<Value>>>,
+}
+
+impl ScriptedModel {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let kept = Arc::clone(&kept);
+                std::thread::spawn(move || Self::serve(stream, &kept));
+            }
+        });
+        Self { base_url, requests }
+    }
+
+    fn requests(&self) -> Vec<Value> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    fn serve(mut stream: TcpStream, kept: &Mutex<Vec<Value>>) {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut start = String::new();
+        reader.read_line(&mut start).unwrap();
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().unwrap();
+            }
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        let path = start
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default()
+            .to_owned();
+        let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        kept.lock()
+            .unwrap()
+            .push(json!({ "path": path, "body": body }));
+        if !path.ends_with("/chat/completions") {
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            );
+            return;
+        }
+        let chunk = |delta: Value, finish: Value| {
+            json!({
+                "id": "scripted",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "scripted",
+                "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }],
+            })
+        };
+        let messages = body["messages"].as_array().cloned().unwrap_or_default();
+        let last = messages.last().cloned().unwrap_or(Value::Null);
+        let user_text = |message: &Value| match &message["content"] {
+            Value::String(text) => text.clone(),
+            Value::Array(parts) => parts
+                .iter()
+                .filter_map(|part| part["text"].as_str())
+                .collect::<Vec<_>>()
+                .join(""),
+            _ => String::new(),
+        };
+        let command = (last["role"] == "user")
+            .then(|| user_text(&last))
+            .and_then(|text| text.strip_prefix("RUN ").map(str::to_owned));
+        let chunks = match command {
+            Some(command) if last["role"] != "tool" => vec![
+                chunk(
+                    json!({ "role": "assistant", "tool_calls": [{
+                        "index": 0,
+                        "id": "call_scripted_1",
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "arguments": json!({ "command": command }).to_string(),
+                        },
+                    }]}),
+                    Value::Null,
+                ),
+                chunk(json!({}), json!("tool_calls")),
+            ],
+            _ => {
+                let text = if last["role"] == "tool" {
+                    "DONE"
+                } else {
+                    "NO-SCRIPT"
+                };
+                vec![
+                    chunk(json!({ "role": "assistant", "content": text }), Value::Null),
+                    chunk(json!({}), json!("stop")),
+                ]
+            }
+        };
+        let mut out = String::from(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n",
+        );
+        for chunk in chunks {
+            out.push_str(&format!("data: {chunk}\n\n"));
+        }
+        out.push_str("data: [DONE]\n\n");
+        let _ = stream.write_all(out.as_bytes());
+        let _ = stream.shutdown(std::net::Shutdown::Both);
     }
 }
 
@@ -308,7 +550,7 @@ fn assert_cancelled_and_reaped(terminal: &Value, code: Option<i32>) {
 #[test]
 #[ignore = "needs OULIPOLY_NATIVE_DEPS (public OpenCode + ACP SDK) and loopback-only networking"]
 fn native_host_opens_then_resumes_its_conversation_over_the_owner_socket() {
-    let fixture = Fixture::new(None);
+    let fixture = Fixture::new(Host::InsertionOnly);
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -395,7 +637,7 @@ fn native_host_opens_then_resumes_its_conversation_over_the_owner_socket() {
 #[ignore = "needs OULIPOLY_NATIVE_DEPS, OULIPOLY_NATIVE_MODEL, OULIPOLY_NATIVE_AUTH and network to the provider; spends real model turns"]
 fn native_host_runs_a_configured_model_turn_over_the_owner_socket() {
     let model = Model::from_env();
-    let fixture = Fixture::new(Some(&model));
+    let fixture = Fixture::new(Host::Model(&model));
 
     let mut run = Run::start(
         &fixture,
@@ -450,4 +692,176 @@ fn native_host_runs_a_configured_model_turn_over_the_owner_socket() {
     let roles: Vec<&str> = exported.iter().map(|(_, role, _)| role.as_str()).collect();
     assert_eq!(roles.first(), Some(&"user"));
     assert!(roles.contains(&"assistant"), "{exported:?}");
+}
+
+/// The native host loads the actual agent-bash `bash` tool behind the
+/// native permission gate, and each of the three dispositions of the
+/// configured `bash` permission takes its own route. The turns are driven
+/// by a [`ScriptedModel`], not a model; the tool, the permission
+/// evaluation, the owner's Bash ingress and the command are real.
+///
+/// * allow: the command runs once through this root's own Bash ingress and
+///   its root v1 result returns to the native conversation.
+/// * deny: native denial; no permission request, nothing reaches the
+///   ingress.
+/// * ask (the default): the request reaches the owner, which refuses it
+///   (it grants nothing); native rejection, nothing reaches the ingress.
+#[test]
+#[ignore = "needs OULIPOLY_NATIVE_DEPS, OULIPOLY_AGENT_BASH_TOOL, AGENT_BASH_BIN and loopback"]
+fn native_host_runs_the_agent_bash_tool_under_its_configured_permission() {
+    const ALLOWED: &str = "printf oulipoly-native-allowed";
+    const DENIED: &str = "printf oulipoly-native-denied";
+    const ASKED: &str = "printf oulipoly-native-asked";
+    let model = ScriptedModel::start();
+    let fixture = Fixture::new(Host::ScriptedBash {
+        base_url: &model.base_url,
+        // Every other tool is denied, so hidden; `bash` decides per exact
+        // command, asking the owner for anything not named.
+        permission: json!({
+            "*": "deny",
+            "bash": { "*": "ask", ALLOWED: "allow", DENIED: "deny" },
+        }),
+    });
+
+    // allow
+    let mut run = Run::start(
+        &fixture,
+        &fixture.spec("root-allow", None, &format!("RUN {ALLOWED}")),
+    );
+    run.event("endpoint-connected");
+    let allowed_session = run.event("session-opened")["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(run.event("ack")["label"], "accepted");
+    let accepted = run.event("bash-accepted");
+    assert_eq!(
+        accepted["argv"],
+        json!(["bash", "-lc", ALLOWED]),
+        "{accepted}"
+    );
+    let ended = run.event("bash-ended");
+    println!("allow: {accepted}\n{ended}");
+    let idle = run.event("idle");
+    assert_eq!(idle["stop_reason"], "end_turn", "{idle}");
+    assert_eq!(run.event("agent-message")["text"], "DONE");
+    assert!(
+        !run.seen
+            .iter()
+            .any(|value| value["event"] == "request-refused"),
+        "{:#?}",
+        run.seen
+    );
+    let (terminal, code) = run.cancel();
+    assert_cancelled_and_reaped(&terminal, code);
+    assert_eq!(terminal["bash"]["accepted"], 1, "{terminal}");
+
+    // deny
+    let mut run = Run::start(
+        &fixture,
+        &fixture.spec("root-deny", None, &format!("RUN {DENIED}")),
+    );
+    run.event("endpoint-connected");
+    let denied_session = run.event("session-opened")["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(run.event("ack")["label"], "accepted");
+    let idle = run.event("idle");
+    println!("deny: {idle}");
+    assert_eq!(idle["stop_reason"], "end_turn", "{idle}");
+    assert_eq!(run.event("agent-message")["text"], "DONE");
+    assert!(
+        !run.seen.iter().any(|value| {
+            value["event"] == "request-refused" || value["event"] == "bash-accepted"
+        }),
+        "{:#?}",
+        run.seen
+    );
+    let (terminal, code) = run.cancel();
+    assert_cancelled_and_reaped(&terminal, code);
+    assert_eq!(terminal["bash"]["accepted"], 0, "{terminal}");
+
+    // ask -> the owner refuses
+    let mut run = Run::start(
+        &fixture,
+        &fixture.spec("root-ask", None, &format!("RUN {ASKED}")),
+    );
+    run.event("endpoint-connected");
+    let asked_session = run.event("session-opened")["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(run.event("ack")["label"], "accepted");
+    let refused = run.event("request-refused");
+    assert_eq!(refused["method"], "session/request_permission", "{refused}");
+    let notice = run.event("notice");
+    assert_eq!(
+        notice["title"],
+        format!("permission rejected: bash {ASKED}"),
+        "{notice}"
+    );
+    let idle = run.event("idle");
+    println!("ask: {refused}\n{notice}\n{idle}");
+    let (terminal, code) = run.cancel();
+    assert_cancelled_and_reaped(&terminal, code);
+    assert_eq!(terminal["bash"]["accepted"], 0, "{terminal}");
+
+    // What the native host offered the stand-in: only the agent-bash tool,
+    // once, in place of the built-in, with its own arguments.
+    let requests = model.requests();
+    println!("stand-in requests: {}", requests.len());
+    for request in &requests {
+        let tools: Vec<&str> = request["body"]["tools"]
+            .as_array()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|tool| tool["function"]["name"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        println!("request {} tools {tools:?}", request["path"]);
+    }
+    assert_eq!(requests.len(), 5, "{requests:#?}");
+    for request in &requests {
+        let tools = request["body"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1, "{request}");
+        assert_eq!(tools[0]["function"]["name"], "bash", "{request}");
+    }
+    let bash = &requests[0]["body"]["tools"][0]["function"];
+    assert!(
+        bash["description"]
+            .as_str()
+            .unwrap()
+            .starts_with("Run a shell command under a detached supervisor."),
+        "{bash}"
+    );
+    for arg in ["command", "handle", "delivery", "workdir"] {
+        assert!(
+            bash["parameters"]["properties"].get(arg).is_some(),
+            "{bash}"
+        );
+    }
+
+    // The native store's own record of each tool call.
+    let allowed = fixture.tool_parts(&allowed_session);
+    let denied = fixture.tool_parts(&denied_session);
+    let asked = fixture.tool_parts(&asked_session);
+    println!("allowed: {allowed:?}\ndenied: {denied:?}\nasked: {asked:?}");
+    assert_eq!(allowed.len(), 1, "{allowed:?}");
+    assert_eq!(allowed[0].0, "bash");
+    assert_eq!(allowed[0].1, "completed", "{allowed:?}");
+    assert_eq!(allowed[0].2["command"], ALLOWED);
+    assert!(
+        allowed[0]
+            .3
+            .starts_with("Root v1 work ended: exited with code 0")
+            && allowed[0].3.ends_with("oulipoly-native-allowed"),
+        "{allowed:?}"
+    );
+    assert_eq!(denied.len(), 1, "{denied:?}");
+    assert_eq!(denied[0].1, "error", "{denied:?}");
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(asked[0].1, "error", "{asked:?}");
 }
