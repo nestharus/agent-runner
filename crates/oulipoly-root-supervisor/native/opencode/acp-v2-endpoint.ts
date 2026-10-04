@@ -25,13 +25,19 @@
 //     a prompt still waits for its insertion fails that prompt (no ACK);
 //   - at its end, read back from the native store rather than taken from the
 //     event stream (native busy repeats, and the assistant message completes
-//     after idle): each assistant text part since the last user message as
-//     `agent_message` (native assistant message id, the part's text), then
-//     one `state_update` idle whose stopReason maps the last assistant
-//     message: error -> `_native_error`, finish "stop" -> end_turn,
-//     "length" -> max_tokens, other -> `_native_<finish>`. The end is the
-//     first native idle after busy once that message is completed (or none
-//     exists); repeated native idles are not repeated;
+//     after idle): each not yet reported assistant message whose native
+//     parentID is a user message this host inserted, as ONE
+//     `agent_message` carrying all its text parts (alpha7 `agent_message`
+//     replaces content per messageId, so parts are never sent separately)
+//     and `_meta` "oulipoly.ai/parentMessageId" = that parentID; then one
+//     `state_update` idle whose stopReason maps the latest such message:
+//     error -> `_native_error`, finish "stop" -> end_turn, "length" ->
+//     max_tokens, other -> `_native_<finish>`, and whose `_meta`
+//     "oulipoly.ai/lastUserMessageId" names the latest native user message
+//     the turn had processed (native ids ascend). Attribution is the native
+//     parent, never position. The end is the first native idle after busy
+//     once those messages are completed; repeated native idles are not
+//     repeated. A failed readback ends with `_native_unread` and no tag;
 //   - a native permission request as `session/request_permission` to the
 //     attached connection. Only a selected allow_once option allows it once;
 //     any other answer, a JSON-RPC error (e.g. method not found) or no
@@ -62,7 +68,18 @@ const shared: {
   asks: Map<string, Set<Ask>>
   // Native session id -> what the current native turn has shown so far.
   turns: Map<string, Turn>
-} = (g.__oulipolyAcpV2 ??= { waiters: new Map(), sessions: new Map(), asks: new Map(), turns: new Map() })
+  // Native user message ids this host minted for prompts it inserts.
+  inserted: Set<string>
+  // Assistant message ids already reported as `agent_message`.
+  reported: Set<string>
+} = (g.__oulipolyAcpV2 ??= {
+  waiters: new Map(),
+  sessions: new Map(),
+  asks: new Map(),
+  turns: new Map(),
+  inserted: new Set(),
+  reported: new Set(),
+})
 
 function log(line: string) {
   const file = process.env.OULIPOLY_ACP_V2_LOG
@@ -115,24 +132,36 @@ async function endTurn(client: any, session: string, current: Turn) {
   })
   if (current.ended) return
   const messages: any[] = read?.data ?? []
-  const lastUser = messages.map((m) => m.info.role).lastIndexOf("user")
-  const replies = messages.slice(lastUser + 1).filter((m) => m.info.role === "assistant")
-  const last = replies.at(-1)?.info
+  const replies = messages.filter(
+    (m) => m.info.role === "assistant" && shared.inserted.has(m.info.parentID) && !shared.reported.has(m.info.id),
+  )
   // Its completion event calls again.
-  if (read && last && !last.time?.completed && !last.error) return
+  if (read && replies.some((m) => !m.info.time?.completed && !m.info.error)) return
   current.ended = true
   shared.turns.delete(session)
-  for (const reply of replies)
-    for (const part of reply.parts)
-      if (part.type === "text" && part.text)
-        notify(session, {
-          sessionUpdate: "agent_message",
-          messageId: reply.info.id,
-          content: [{ type: "text", text: part.text }],
-        })
+  for (const reply of replies) {
+    shared.reported.add(reply.info.id)
+    const content = reply.parts
+      .filter((part: any) => part.type === "text" && part.text)
+      .map((part: any) => ({ type: "text", text: part.text }))
+    if (content.length)
+      notify(session, {
+        sessionUpdate: "agent_message",
+        messageId: reply.info.id,
+        content,
+        _meta: { "oulipoly.ai/parentMessageId": reply.info.parentID },
+      })
+  }
+  const last = replies.at(-1)?.info
+  const lastUser = messages.filter((m) => m.info.role === "user").at(-1)?.info.id
   const stop = read ? stopReason(last, current.error) : current.error ? "_native_error" : "_native_unread"
-  log(`turn end ${session} replies=${replies.length} stop=${stop}`)
-  notify(session, { sessionUpdate: "state_update", state: "idle", ...(stop ? { stopReason: stop } : {}) })
+  log(`turn end ${session} replies=${replies.length} stop=${stop} lastUser=${read ? lastUser : "unread"}`)
+  notify(session, {
+    sessionUpdate: "state_update",
+    state: "idle",
+    ...(stop ? { stopReason: stop } : {}),
+    ...(read && lastUser ? { _meta: { "oulipoly.ai/lastUserMessageId": lastUser } } : {}),
+  })
 }
 
 // The first attached connection answers; none attached is a refusal.
@@ -216,6 +245,9 @@ function listen(socketPath: string, client: any, directory: string) {
         })
         const noReply = process.env.OULIPOLY_ACP_V2_NO_REPLY === "1"
         const messageID = mintMessageID()
+        // Known before insertion, so a turn ending before the ACK still
+        // attributes its reply. A minted id that never inserts names nothing.
+        shared.inserted.add(messageID)
         const inserted = new Promise<void>((done, fail) =>
           shared.waiters.set(messageID, { session: params.sessionId, message: false, text: false, done, fail }),
         )

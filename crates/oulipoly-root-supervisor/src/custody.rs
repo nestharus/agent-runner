@@ -53,6 +53,7 @@ impl WorkStdio {
 pub(crate) struct Spawned {
     pub(crate) stdio: WorkStdio,
     pub(crate) harness_host_pid: Option<i32>,
+    pub(crate) pidns: Option<PidNs>,
     pub(crate) exec_error: Option<String>,
 }
 
@@ -61,6 +62,24 @@ pub(crate) struct Adopted {
     pub(crate) work: i64,
     pub(crate) stdio: WorkStdio,
     pub(crate) harness_host_pid: Option<i32>,
+    pub(crate) pidns: Option<PidNs>,
+}
+
+/// One work's own PID namespace (`st_dev`, `st_ino` of its nsfs inode), as
+/// that work's PID 1 read it before starting the harness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PidNs {
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+}
+
+impl PidNs {
+    fn parse(value: &Value) -> Option<Self> {
+        Some(Self {
+            dev: value.get(0)?.as_u64()?,
+            ino: value.get(1)?.as_u64()?,
+        })
+    }
 }
 
 pub(crate) enum ReceiptWait {
@@ -316,16 +335,19 @@ impl Root {
                         .as_str()
                         .and_then(|name| name.strip_prefix('w'))
                         .and_then(|id| id.parse().ok());
-                    let host = reply["works"]
+                    let listed = reply["works"]
                         .as_array()
-                        .and_then(|works| works.iter().find(|w| w["work"] == value["work"]))
+                        .and_then(|works| works.iter().find(|w| w["work"] == value["work"]));
+                    let host = listed
                         .and_then(|w| w["harness_host_pid"].as_i64())
                         .and_then(|pid| i32::try_from(pid).ok());
+                    let pidns = listed.and_then(|w| PidNs::parse(&w["pidns"]));
                     if let (Some(work), Some(stdio)) = (work, WorkStdio::from_fds(fds)) {
                         live.push(Adopted {
                             work,
                             stdio,
                             harness_host_pid: host,
+                            pidns,
                         });
                     }
                 }
@@ -400,13 +422,16 @@ impl Root {
     }
 
     /// Asks root PID 1 to start `argv` as the harness of `work`, in `cwd`,
-    /// with `env` added to root PID 1's environment.
+    /// with `env` added to root PID 1's environment. A `command` (a Bash
+    /// run, not a harness) reads `/dev/null` and its stderr joins its
+    /// stdout; a harness keeps its stdin pipe and root PID 1's stderr.
     pub(crate) fn spawn(
         &self,
         work: i64,
         argv: &[String],
         env: &serde_json::Map<String, Value>,
         cwd: &str,
+        command: bool,
     ) -> Result<Spawned, String> {
         let Some((reply, fds)) = self.request(json!({
             "op": "spawn",
@@ -414,6 +439,8 @@ impl Root {
             "argv": argv,
             "env": env,
             "cwd": cwd,
+            "stdin": if command { "null" } else { "pipe" },
+            "stderr": if command { "stdout" } else { "inherit" },
         })) else {
             return Err("root-pid1-unreachable".to_owned());
         };
@@ -426,6 +453,7 @@ impl Root {
             harness_host_pid: reply["harness_host_pid"]
                 .as_i64()
                 .and_then(|pid| i32::try_from(pid).ok()),
+            pidns: PidNs::parse(&reply["pidns"]),
             exec_error: reply["exec_error"].as_str().map(str::to_owned),
         })
     }

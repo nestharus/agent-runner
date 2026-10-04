@@ -24,6 +24,8 @@
 //!   idle may precede the latest message. The draft provides no completion
 //!   correlation with that message.
 //!   Another foreground task may have caused idle; this is not physical drain.
+//!   An agent may tag an idle with [`TURN_INPUT_META`] and its messages with
+//!   [`PARENT_MESSAGE_META`]; the client only reports those tags.
 //! * **Message identity.** [`OutboundMessage::fresh`] mints a Linux random
 //!   identity for one communication and carries it in the prompt's `_meta` under
 //!   [`MESSAGE_KEY_META`]. Retries reuse it; [`OutboundMessage`] has no way
@@ -130,6 +132,17 @@ pub const DEDUP_CONTRACT_META: &str = "oulipoly.ai/messageKeyDedup";
 /// `_meta` key on a prompt response: `true` when the agent returned an
 /// earlier insertion of the same message key instead of inserting again.
 pub const DUPLICATE_META: &str = "oulipoly.ai/duplicate";
+
+/// `_meta` key on an `agent_message` update: the inserted user message
+/// (an earlier prompt response's `messageId`) this agent message answers,
+/// as the agent itself recorded it. Absent: no attribution is claimed.
+pub const PARENT_MESSAGE_META: &str = "oulipoly.ai/parentMessageId";
+
+/// `_meta` key on an idle `state_update`: the latest inserted user message
+/// the agent had processed when it went idle. With ascending message ids it
+/// covers that message and every earlier one in the session. Absent: the
+/// idle is readiness only, never any message's turn end.
+pub const TURN_INPUT_META: &str = "oulipoly.ai/lastUserMessageId";
 
 /// Version of the dedup contract described in the crate documentation.
 pub const DEDUP_CONTRACT_VERSION: u64 = 1;

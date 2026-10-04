@@ -494,6 +494,7 @@ fn turn_output_notices_and_refused_requests_are_observed() {
         session_id: "s".to_owned(),
         message_id: "m-agent".to_owned(),
         text: "REFUSED".to_owned(),
+        parent_message_id: None,
     }));
     let (_, written) = client.into_transport().into_parts();
     let refusal = String::from_utf8(written)
@@ -503,4 +504,64 @@ fn turn_output_notices_and_refused_requests_are_observed() {
         .find(|line| line["id"] == "p1")
         .expect("a reply to the agent request");
     assert_eq!(refusal["error"]["code"], -32601);
+}
+
+// (d) Correlation tags are reported as the agent sent them, and only then:
+// an untagged idle or message claims no input.
+
+#[test]
+fn correlation_tags_are_reported_only_when_the_agent_sent_them() {
+    let update = |update: Value| json!({ "jsonrpc": "2.0", "method": "session/update", "params": { "sessionId": "s", "update": update } });
+    let lines = [
+        json!({ "jsonrpc": "2.0", "id": 1, "result": {
+            "protocolVersion": 2, "info": { "name": "a", "version": "1" }, "capabilities": { "session": {} } } }),
+        json!({ "jsonrpc": "2.0", "id": 2, "result": { "sessionId": "s" } }),
+        json!({ "jsonrpc": "2.0", "id": 3, "result": { "messageId": "m-user" } }),
+        update(
+            json!({ "sessionUpdate": "agent_message", "messageId": "m-a",
+            "content": [{ "type": "text", "text": "x" }],
+            "_meta": { oulipoly_acp::PARENT_MESSAGE_META: "m-user" } }),
+        ),
+        update(
+            json!({ "sessionUpdate": "agent_message", "messageId": "m-b",
+            "content": [{ "type": "text", "text": "y" }] }),
+        ),
+        update(
+            json!({ "sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn" }),
+        ),
+        update(
+            json!({ "sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn",
+            "_meta": { oulipoly_acp::TURN_INPUT_META: "m-user" } }),
+        ),
+    ];
+    let input: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    let mut client = AcpClient::new(
+        LineTransport::new(Cursor::new(input.into_bytes()), Vec::new()),
+        info(),
+    );
+    client.initialize().expect("v2 negotiation");
+    let session = client.open_session(CWD).expect("session/new");
+    let mut msg = message("turn");
+    assert!(matches!(
+        client.submit(&session, &mut msg),
+        DeliveryOutcome::Accepted(_)
+    ));
+    let first = client.await_session_idle(&session).unwrap();
+    assert_eq!(
+        first.last_user_message_id, None,
+        "untagged idle names nothing"
+    );
+    let second = client.await_session_idle(&session).unwrap();
+    assert_eq!(second.last_user_message_id.as_deref(), Some("m-user"));
+    let parents: Vec<Option<&str>> = client
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::AgentMessage {
+                parent_message_id, ..
+            } => Some(parent_message_id.as_deref()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(parents, [Some("m-user"), None]);
 }

@@ -19,7 +19,8 @@ use oulipoly_acp::{
 };
 use serde_json::{Value, json};
 
-use crate::custody::{self, Adopted, ReceiptWait, Root, RootSlot, WorkStdio};
+use crate::bash::{self, OpenInput, Views};
+use crate::custody::{self, Adopted, PidNs, ReceiptWait, Root, RootSlot, WorkStdio};
 use crate::live::Custody;
 use crate::store::{DurableAck, DurableHarness, Store, StoreError};
 use crate::transport::{self, HarnessTransport, Observed};
@@ -189,6 +190,10 @@ struct Worker {
     prior_unknown_ends: u32,
     wait_failures: Vec<String>,
     detached: u32,
+    views: Views,
+    /// Native user message ids this instance's agent messages named as
+    /// their parent.
+    answered: std::collections::HashSet<String>,
 }
 
 /// What one worker is given: its durable harness record and shared state.
@@ -204,6 +209,7 @@ pub(crate) struct Assignment {
     pub(crate) slot: Arc<RootSlot>,
     pub(crate) prior: Option<Prior>,
     pub(crate) tx: Sender<Event>,
+    pub(crate) views: Views,
 }
 
 pub(crate) fn run(assignment: Assignment) {
@@ -219,6 +225,7 @@ pub(crate) fn run(assignment: Assignment) {
         slot,
         prior,
         tx,
+        views,
     } = assignment;
     let tracked = harness
         .messages
@@ -257,13 +264,39 @@ pub(crate) fn run(assignment: Assignment) {
         prior_unknown_ends: 0,
         wait_failures: Vec::new(),
         detached: 0,
+        views,
+        answered: std::collections::HashSet::new(),
     };
+    worker.view(|view| {
+        view.id.clone_from(&worker.id);
+        view.session.clone_from(&worker.session);
+    });
     worker.supervise();
     let record = worker.record();
     let _ = worker.tx.send(Event::Done(record));
 }
 
 impl Worker {
+    fn view(&self, change: impl FnOnce(&mut bash::View)) {
+        let mut views = self.views.lock().expect("views");
+        if let Some(view) = views.get_mut(self.position) {
+            change(view);
+        }
+    }
+
+    /// Lets the Bash ingress attribute processes in this work's namespace
+    /// to this harness while the work is live.
+    fn show_work(&self, work: i64, pidns: Option<PidNs>) {
+        match pidns {
+            Some(pidns) => self.view(|view| view.works.push((work, pidns))),
+            None => self.report(json!({
+                "event": "bash-unattributable",
+                "work": work,
+                "reason": "work-pidns-unreported",
+            })),
+        }
+    }
+
     fn report(&self, mut value: Value) {
         value["harness"] = Value::String(self.id.clone());
         let _ = self.tx.send(Event::Report(value));
@@ -396,6 +429,7 @@ impl Worker {
                 root.kill(adopted.work);
             }
         }
+        self.show_work(adopted.work, adopted.pidns);
         let live = Live {
             work: adopted.work,
             stdio: adopted.stdio,
@@ -417,9 +451,13 @@ impl Worker {
     }
 
     /// What the harness of `work` is started with beyond root PID 1's own
-    /// environment: for a socket endpoint, the socket the owner chose.
+    /// environment: this root's Bash ingress and, for a socket endpoint,
+    /// the socket the owner chose.
     fn launch_env(&self, work: i64) -> Result<serde_json::Map<String, Value>, String> {
         let mut env = serde_json::Map::new();
+        let ingress = bash::Ingress::socket_path(&self.store_dir);
+        let ingress = ingress.to_str().ok_or("store path is not UTF-8")?;
+        env.insert(bash::BASH_ENV.to_owned(), Value::String(ingress.to_owned()));
         if self.endpoint == Endpoint::UnixSocket {
             let path = socket_path(&self.store_dir, work);
             let dir = path.parent().expect("socket directory");
@@ -590,7 +628,7 @@ impl Worker {
         };
         let spawned = match self
             .launch_env(work)
-            .and_then(|env| root.spawn(work, &self.argv, &env, &self.cwd))
+            .and_then(|env| root.spawn(work, &self.argv, &env, &self.cwd, false))
         {
             Ok(spawned) => spawned,
             Err(reason) => {
@@ -611,6 +649,7 @@ impl Worker {
             "work": work,
             "incarnation": root.incarnation,
         }));
+        self.show_work(work, spawned.pidns);
         let live = Live {
             work,
             stdio: spawned.stdio,
@@ -722,6 +761,12 @@ impl Worker {
     ) -> (ConnEnd, &'static str) {
         let waited = live.root.wait_receipt(live.work);
         drop(live.stdio);
+        // This harness process is gone: none of its inputs is in progress
+        // in it any more, and nothing in its namespace can ask for Bash.
+        self.view(|view| {
+            view.works.retain(|(work, _)| *work != live.work);
+            view.open.clear();
+        });
         let exit = match waited {
             ReceiptWait::Receipt(receipt) => {
                 self.custody
@@ -847,6 +892,7 @@ impl Worker {
                     return ConnEnd::Stop;
                 }
                 self.report(json!({ "event": "session-opened", "session": id }));
+                self.view(|view| view.session = Some(id.clone()));
                 self.session = Some(id);
             }
             Ok(None) => self.report(json!({
@@ -875,6 +921,17 @@ impl Worker {
                 return ConnEnd::Stop;
             };
             self.tracked[index].attempts += 1;
+            // Open for Bash attribution from before the send: the harness may
+            // act on it as soon as it is inserted, before this owner reads
+            // the acknowledgement. Its id is known only from the ACK.
+            self.view(|view| {
+                if !view.open.iter().any(|input| input.index == index) {
+                    view.open.push(OpenInput {
+                        index,
+                        message_id: None,
+                    });
+                }
+            });
             let outcome = client.submit(&session, &mut self.tracked[index].message);
             self.report_turn(client, &mut seen);
             let (resolution, end) = match &outcome {
@@ -909,6 +966,13 @@ impl Worker {
                         "message_id": ack.message_id,
                         "durable": true,
                     }));
+                    let message_id = ack.message_id.clone();
+                    self.view(|view| {
+                        if let Some(input) = view.open.iter_mut().find(|input| input.index == index)
+                        {
+                            input.message_id = message_id;
+                        }
+                    });
                     self.tracked[index].ack = Some(ack);
                     continue;
                 }
@@ -927,10 +991,12 @@ impl Worker {
                 }
                 DeliveryOutcome::NotNegotiated => {
                     self.tracked[index].label = Some("not-negotiated".to_owned());
+                    self.view(|view| view.open.retain(|input| input.index != index));
                     ("not-sent", Some(ConnEnd::Stop))
                 }
                 DeliveryOutcome::SessionMismatch => {
                     self.tracked[index].label = Some("session-mismatch".to_owned());
+                    self.view(|view| view.open.retain(|input| input.index != index));
                     ("not-sent", Some(ConnEnd::Stop))
                 }
             };
@@ -963,21 +1029,82 @@ impl Worker {
         }
     }
 
+    /// The owner input whose acknowledged `messageId` is `message_id`.
+    fn input_of(&self, message_id: &str) -> Option<usize> {
+        self.tracked.iter().position(|tracked| {
+            tracked
+                .ack
+                .as_ref()
+                .and_then(|ack| ack.message_id.as_deref())
+                == Some(message_id)
+        })
+    }
+
     /// Reports what the turn showed since `seen`: agent output, notices and
     /// the agent requests this owner refused. None of it is an ACK.
-    fn report_turn(&self, client: &AcpClient<HarnessTransport>, seen: &mut usize) {
+    ///
+    /// Output names the owner input it answers only by the agent's own
+    /// parent tag. A turn end is reported for an input only from an idle
+    /// the agent tagged with that input's or a later user message (native
+    /// ids ascend); then `own_output` says whether any output named it.
+    /// An untagged idle stays readiness: no input's end.
+    fn report_turn(&mut self, client: &AcpClient<HarnessTransport>, seen: &mut usize) {
         for event in &client.events()[*seen..] {
             match event {
                 SessionEvent::AgentMessage {
                     session_id,
                     message_id,
                     text,
-                } => self.report(json!({
-                    "event": "agent-message",
-                    "session": session_id,
-                    "message_id": message_id,
-                    "text": text,
-                })),
+                    parent_message_id,
+                } => {
+                    let input = parent_message_id
+                        .as_deref()
+                        .and_then(|parent| self.input_of(parent));
+                    if let Some(parent) = parent_message_id {
+                        self.answered.insert(parent.clone());
+                    }
+                    self.report(json!({
+                        "event": "agent-message",
+                        "session": session_id,
+                        "message_id": message_id,
+                        "text": text,
+                        "parent_message_id": parent_message_id,
+                        "input": input,
+                        "input_attribution": match (parent_message_id, input) {
+                            (None, _) => "untagged",
+                            (Some(_), Some(_)) => "native-parent",
+                            (Some(_), None) => "parent-not-an-owner-input",
+                        },
+                    }));
+                }
+                SessionEvent::Idle {
+                    session_id,
+                    stop_reason,
+                    last_user_message_id: Some(last),
+                } => {
+                    let mut covered = Vec::new();
+                    self.view(|view| {
+                        view.open.retain(|input| match &input.message_id {
+                            Some(id) if id.as_str() <= last.as_str() => {
+                                covered.push((input.index, id.clone()));
+                                false
+                            }
+                            _ => true,
+                        });
+                    });
+                    for (index, message_id) in covered {
+                        self.report(json!({
+                            "event": "turn-end",
+                            "session": session_id,
+                            "input": index,
+                            "message_id": message_id,
+                            "stop_reason": stop_reason,
+                            "last_user_message_id": last,
+                            "own_output": self.answered.contains(&message_id),
+                            "meaning": "agent-idle-tagged-at-or-after-this-input",
+                        }));
+                    }
+                }
                 SessionEvent::Notice {
                     session_id,
                     severity,
@@ -1134,6 +1261,8 @@ mod tests {
                 prior_unknown_ends: 0,
                 wait_failures: vec![],
                 detached: 0,
+                views: Arc::default(),
+                answered: std::collections::HashSet::new(),
             },
             rx,
             dir,

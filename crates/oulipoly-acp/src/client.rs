@@ -229,12 +229,16 @@ pub enum SessionEvent {
     Idle {
         session_id: String,
         stop_reason: Option<String>,
+        /// The agent's [`crate::TURN_INPUT_META`] tag, if any.
+        last_user_message_id: Option<String>,
     },
     /// `agent_message`: the agent's output, its text blocks joined.
     AgentMessage {
         session_id: String,
         message_id: String,
         text: String,
+        /// The agent's [`crate::PARENT_MESSAGE_META`] tag, if any.
+        parent_message_id: Option<String>,
     },
     /// `notice`, e.g. a turn's error or a refused permission.
     Notice {
@@ -260,6 +264,8 @@ pub enum SessionEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionIdle {
     pub stop_reason: Option<String>,
+    /// The agent's [`crate::TURN_INPUT_META`] tag, if any.
+    pub last_user_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -542,7 +548,7 @@ impl<T: Transport> AcpClient<T> {
         };
         let mut scanned = start;
         loop {
-            if let Some((next, stop_reason)) =
+            if let Some((next, idle)) =
                 self.events[scanned..]
                     .iter()
                     .enumerate()
@@ -550,12 +556,19 @@ impl<T: Transport> AcpClient<T> {
                         SessionEvent::Idle {
                             session_id: id,
                             stop_reason,
-                        } if id == session_id => Some((scanned + offset + 1, stop_reason.clone())),
+                            last_user_message_id,
+                        } if id == session_id => Some((
+                            scanned + offset + 1,
+                            SessionIdle {
+                                stop_reason: stop_reason.clone(),
+                                last_user_message_id: last_user_message_id.clone(),
+                            },
+                        )),
                         _ => None,
                     })
             {
                 self.idle_cursor.insert(session_id.to_owned(), next);
-                return Ok(SessionIdle { stop_reason });
+                return Ok(idle);
             }
             scanned = self.events.len();
             match self.transport.recv() {
@@ -707,6 +720,7 @@ fn session_event(notification: wire::UpdateSessionNotification) -> Option<Sessio
                     .get("stopReason")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
+                last_user_message_id: meta_str(&update, crate::TURN_INPUT_META),
             },
             other => SessionEvent::Other {
                 session_id,
@@ -724,6 +738,7 @@ fn session_event(notification: wire::UpdateSessionNotification) -> Option<Sessio
                 .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
                 .filter_map(|block| block.get("text").and_then(Value::as_str))
                 .collect(),
+            parent_message_id: meta_str(&update, crate::PARENT_MESSAGE_META),
         },
         "notice" => SessionEvent::Notice {
             session_id,
@@ -736,6 +751,16 @@ fn session_event(notification: wire::UpdateSessionNotification) -> Option<Sessio
         },
         _ => SessionEvent::Other { session_id, kind },
     })
+}
+
+/// A non-empty string under `key` in the update's own `_meta`.
+fn meta_str(update: &Value, key: &str) -> Option<String> {
+    update
+        .get("_meta")?
+        .get(key)?
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn parse<D: DeserializeOwned>(value: &Value) -> Result<D, String> {
