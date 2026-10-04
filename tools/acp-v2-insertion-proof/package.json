@@ -1,0 +1,10 @@
+{
+  "name": "oulipoly-acp-v2-insertion-proof",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.7.0",
+    "zod": "4.6.5",
+    "opencode-linux-x64": "1.18.30"
+  }
+}
