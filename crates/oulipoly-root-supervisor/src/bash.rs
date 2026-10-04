@@ -2,14 +2,19 @@
 //! inside one of this owner's harness namespaces reaches **this** owner,
 //! and nothing else. See the crate docs (Bash) for the wire.
 //!
-//! * The listener is `<store>/bash.sock`, inside the root's private store
-//!   directory, and every harness is started with its path in
-//!   [`BASH_ENV`], which its descendants inherit.
+//! * The listener is `bash.sock` in the root's IPC directory: the private
+//!   store for `unprivileged-userns`, the owner-made `ipc_dir` for
+//!   `host-root`, where the socket is handed to the work identity (`0600`).
+//!   Every harness is started with its path in [`BASH_ENV`], which its
+//!   descendants inherit.
 //! * Attribution is positive: the connecting process (`SO_PEERCRED`) must
-//!   have this owner's uid and be, at that moment, a member of the exact PID
+//!   have the work's uid (the declared host user under `host-root`, this
+//!   owner's otherwise) and be, at that moment, a member of the exact PID
 //!   namespace of one live harness work of this owner, as that work's own
 //!   PID 1 recorded it. Everything else is refused (`peer-unattributed`),
 //!   reported, and nothing is recorded or run: no fallback, no other owner.
+//!   A process of that uid elsewhere, or of any other uid (host root
+//!   included) inside a harness namespace, is refused.
 //! * An accepted run is recorded durably (a `bash` work) before the
 //!   requester is told `accepted`, then launched by root PID 1 as its own
 //!   work: a per-work PID 1 in a new PID namespace and the command as its
@@ -98,7 +103,6 @@ enum Outcome {
 
 /// One owner run's Bash ingress.
 pub(crate) struct Ingress {
-    store_dir: PathBuf,
     root_id: String,
     slot: Arc<RootSlot>,
     custody: Arc<Mutex<Custody>>,
@@ -127,7 +131,6 @@ pub(crate) enum Prior {
 
 impl Ingress {
     pub(crate) fn new(
-        store_dir: PathBuf,
         root_id: String,
         slot: Arc<RootSlot>,
         custody: Arc<Mutex<Custody>>,
@@ -136,7 +139,6 @@ impl Ingress {
         tx: Sender<Event>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            store_dir,
             root_id,
             slot,
             custody,
@@ -159,7 +161,7 @@ impl Ingress {
     /// or why there is no ingress (then every Bash request fails to
     /// connect, which a requester must read as no owner, never as success).
     pub(crate) fn listen(self: &Arc<Self>) -> Result<PathBuf, String> {
-        let path = Self::socket_path(&self.store_dir);
+        let path = Self::socket_path(&self.slot.workload.ipc_dir);
         // A socket file left by an earlier owner of this store names no
         // listener: this owner holds the store lock.
         match std::fs::remove_file(&path) {
@@ -168,6 +170,7 @@ impl Ingress {
             Err(error) => return Err(format!("stale socket: {error}")),
         }
         let listener = UnixListener::bind(&path).map_err(|error| error.to_string())?;
+        crate::workload::hand_socket(&self.slot.workload, &path)?;
         let ingress = Arc::clone(self);
         thread::spawn(move || {
             for stream in listener.incoming() {
@@ -203,7 +206,7 @@ impl Ingress {
             gate.closed = true;
             drop(gate);
             // Wakes the accept loop so it sees the close and returns.
-            let path = Self::socket_path(&self.store_dir);
+            let path = Self::socket_path(&self.slot.workload.ipc_dir);
             let _ = UnixStream::connect(&path);
             let _ = std::fs::remove_file(&path);
         }
@@ -279,23 +282,8 @@ impl Ingress {
 
     /// The harness whose live work's own PID namespace the peer is in.
     fn attribute(&self, cred: &libc::ucred) -> Result<Attributed, String> {
-        // SAFETY: geteuid has no preconditions.
-        if cred.uid != unsafe { libc::geteuid() } {
-            return Err("peer-unattributed: other-uid".to_owned());
-        }
-        let pidfd = sys::pidfd_open(cred.pid)
-            .map_err(|error| format!("peer-unattributed: pidfd: {error}"))?;
-        let ns = std::fs::metadata(format!("/proc/{}/ns/pid", cred.pid))
-            .map_err(|error| format!("peer-unattributed: pidns: {error}"))?;
-        // Still running after the read, so the pid named the peer, not a
-        // reuse; a pid can only be reused after its process is reaped.
-        if sys::pidfd_exited(&pidfd, 0).unwrap_or(true) {
-            return Err("peer-unattributed: gone".to_owned());
-        }
-        let ns = PidNs {
-            dev: ns.dev(),
-            ino: ns.ino(),
-        };
+        let ns = cred_pidns(cred, self.slot.workload.peer_uid())
+            .map_err(|reason| format!("peer-unattributed: {reason}"))?;
         let views = self.views.lock().expect("views");
         views
             .iter()
@@ -437,6 +425,8 @@ impl Ingress {
             "work": work,
             "pid": spawned.harness_host_pid,
             "exec_error": spawned.exec_error,
+            // At this moment only; a short run may already be gone (null).
+            "identity": spawned.harness_host_pid.map(crate::workload::observe),
         }));
         self.finish(&root, work, token, spawned.stdio.stdout, Some(sink));
     }
@@ -670,6 +660,32 @@ fn merge(into: &mut Value, from: &Value) {
     }
 }
 
+/// The PID namespace of a peer with uid `uid`, read while it provably
+/// still runs; `Err` names why it is not attributable.
+fn cred_pidns(cred: &libc::ucred, uid: u32) -> Result<PidNs, String> {
+    if cred.uid != uid {
+        return Err("other-uid".to_owned());
+    }
+    let pidfd = sys::pidfd_open(cred.pid).map_err(|error| format!("pidfd: {error}"))?;
+    let ns = std::fs::metadata(format!("/proc/{}/ns/pid", cred.pid))
+        .map_err(|error| format!("pidns: {error}"))?;
+    // Still running after the read, so the pid named the peer, not a
+    // reuse; a pid can only be reused after its process is reaped.
+    if sys::pidfd_exited(&pidfd, 0).unwrap_or(true) {
+        return Err("gone".to_owned());
+    }
+    Ok(PidNs {
+        dev: ns.dev(),
+        ino: ns.ino(),
+    })
+}
+
+/// The connected peer's pid and PID namespace, if it has uid `uid`.
+pub(crate) fn peer_pidns(stream: &UnixStream, uid: u32) -> Result<(i32, PidNs), String> {
+    let cred = peer_cred(stream).map_err(|error| format!("peer-unknown: {error}"))?;
+    cred_pidns(&cred, uid).map(|ns| (cred.pid, ns))
+}
+
 fn peer_cred(stream: &UnixStream) -> std::io::Result<libc::ucred> {
     let fd: OwnedFd = stream.as_fd().try_clone_to_owned()?;
     sys::peer_cred(&fd)
@@ -799,6 +815,7 @@ mod tests {
                 session: None,
                 messages: vec!["one".into()],
             }],
+            workload: crate::Workload::UnprivilegedUserns {},
         };
         let mut claimed = Store::claim(&dir.join("store"), Some(&intent)).unwrap();
         claimed
@@ -810,13 +827,12 @@ mod tests {
         let slot = Arc::new(RootSlot::new(
             dir.join("store"),
             1,
-            sys::Isolation::UnprivilegedUserns,
+            crate::workload::unprivileged_for_tests(&dir.join("store")),
             Arc::clone(&stop),
             Some(Arc::clone(&root)),
         ));
         let (tx, _rx) = channel();
         let ingress = Ingress::new(
-            dir.join("store"),
             claimed.root_id,
             slot,
             Arc::new(Mutex::new(Custody::new(stop))),

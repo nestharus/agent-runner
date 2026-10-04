@@ -32,6 +32,20 @@
 //! * Nothing here launches, models or authenticates: a model and provider
 //!   are the caller's (`model`, `provider`), and the native data directory
 //!   starts empty.
+//! * **Work identity.** Without one, everything is the caller's (`0700` /
+//!   `0600`), as for an unprivileged root. With a `host-root` work identity
+//!   (the caller is host root), the fresh tree is handed over before it is
+//!   opened up: HOME and the XDG data, cache and state directories become
+//!   the identity's (`0700`); the launch, XDG and XDG config directories,
+//!   every written file and the `node_modules` link stay the caller's with
+//!   the identity's primary group (`0750` / `0640`), so the host reads its
+//!   code, config and policy but cannot change them; the native config
+//!   directory itself is `1770` (sticky), so the host may add its own
+//!   files there (OpenCode writes `.gitignore`) but not replace or remove
+//!   the caller's. Only paths created here are changed. Other members of
+//!   that primary group get the same read access (a known limit). The
+//!   caller's `deps`, agent-bash tool and binary are only read and must be
+//!   readable by the identity; nothing here changes them.
 
 use std::fs;
 use std::io::Write;
@@ -40,6 +54,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+
+use crate::workload::Identity;
 
 const ENDPOINT: &str = include_str!("../native/opencode/acp-v2-endpoint.ts");
 const GATE: &str = include_str!("../native/opencode/bash-policy-tool.ts");
@@ -190,9 +206,55 @@ impl std::error::Error for OpenCodeSetupError {}
 /// [`OpenCodeSetupError::ConstructionFailed`] may leave partial effects;
 /// inspect them before any further attempt. Success means provisioning,
 /// not native launch or delivery of a caller's receipt.
-pub fn provision_opencode(setup: &OpenCodeSetup) -> Result<OpenCodeLaunch, OpenCodeSetupError> {
+pub fn provision_opencode(
+    setup: &OpenCodeSetup,
+    identity: Option<&Identity>,
+) -> Result<OpenCodeLaunch, OpenCodeSetupError> {
     let inputs = setup_inputs(setup).map_err(OpenCodeSetupError::InputInvalid)?;
-    write_launch(setup, inputs).map_err(OpenCodeSetupError::ConstructionFailed)
+    let launch = write_launch(setup, inputs).map_err(OpenCodeSetupError::ConstructionFailed)?;
+    if let Some(identity) = identity {
+        hand_over(Path::new(&setup.dir), identity)
+            .map_err(OpenCodeSetupError::ConstructionFailed)?;
+    }
+    Ok(launch)
+}
+
+/// Gives the fresh launch tree its `host-root` ownership (see the module
+/// docs). The launch directory stays `0700` and the caller's until last,
+/// so nothing here can be raced by another user.
+fn hand_over(dir: &Path, identity: &Identity) -> Result<(), String> {
+    use std::os::unix::fs::{PermissionsExt, lchown};
+    let set = |path: &Path, uid: Option<u32>, mode: Option<u32>| {
+        lchown(path, uid, Some(identity.gid))
+            .and_then(|()| match mode {
+                Some(mode) => fs::set_permissions(path, fs::Permissions::from_mode(mode)),
+                None => Ok(()),
+            })
+            .map_err(|error| format!("{}: {error}", path.display()))
+    };
+    let config = dir.join("xdg/config/opencode");
+    for file in [
+        "acp-v2-endpoint.ts",
+        "tool/bash.ts",
+        "agent-bash/bash.ts",
+        "package.json",
+        "package-lock.json",
+        "opencode.json",
+    ] {
+        set(&config.join(file), None, Some(0o640))?;
+    }
+    set(&config.join("node_modules"), None, None)?;
+    for sub in ["tool", "agent-bash"] {
+        set(&config.join(sub), None, Some(0o750))?;
+    }
+    set(&config, None, Some(0o1770))?;
+    for sub in ["home", "xdg/data", "xdg/cache", "xdg/state"] {
+        set(&dir.join(sub), Some(identity.uid), Some(0o700))?;
+    }
+    for sub in ["xdg/config", "xdg", ""] {
+        set(&dir.join(sub), None, Some(0o750))?;
+    }
+    Ok(())
 }
 
 struct SetupInputs<'a> {
@@ -357,7 +419,73 @@ fn write_launch(setup: &OpenCodeSetup, inputs: SetupInputs<'_>) -> Result<OpenCo
 
 #[cfg(test)]
 mod tests {
-    use super::permission;
+    use super::{Identity, SetupInputs, hand_over, permission, write_launch};
+    use std::os::unix::fs::MetadataExt;
+
+    /// The host-root layout, handed to this (unprivileged) process's own
+    /// identity: chowning to oneself needs no privilege, so the modes and
+    /// which paths are handed over are checked here; only the uid differs
+    /// from a real host-root setup.
+    #[test]
+    fn hand_over_gives_the_identity_its_state_and_keeps_code_and_policy_read_only() {
+        let base = std::env::temp_dir().join(format!("native-hand-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir(&base).unwrap();
+        let dir = base.join("launch");
+        let setup = super::OpenCodeSetup {
+            dir: dir.to_str().unwrap().to_owned(),
+            deps: "/nonexistent-deps".to_owned(),
+            agent_bash_tool: "/t".to_owned(),
+            agent_bash_bin: "/b".to_owned(),
+            bash_allow: vec!["true".to_owned()],
+            model: None,
+            provider: None,
+        };
+        let inputs = SetupInputs {
+            dir: dir.clone(),
+            deps: "/nonexistent-deps".into(),
+            bin: "/b".into(),
+            permission: permission(&setup.bash_allow).unwrap(),
+            tool_source: "// tool".to_owned(),
+            model_provider: None,
+        };
+        write_launch(&setup, inputs).unwrap();
+        // SAFETY: getuid/getgid have no preconditions.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let identity = Identity {
+            user: "self".into(),
+            uid,
+            gid,
+            groups: vec![gid],
+        };
+        hand_over(&dir, &identity).unwrap();
+        let mode = |sub: &str| {
+            let meta = std::fs::symlink_metadata(dir.join(sub)).unwrap();
+            assert_eq!(meta.gid(), gid, "{sub}");
+            meta.mode() & 0o7777
+        };
+        for (sub, expected) in [
+            ("", 0o750),
+            ("home", 0o700),
+            ("xdg", 0o750),
+            ("xdg/config", 0o750),
+            ("xdg/data", 0o700),
+            ("xdg/cache", 0o700),
+            ("xdg/state", 0o700),
+            ("xdg/config/opencode", 0o1770),
+            ("xdg/config/opencode/tool", 0o750),
+            ("xdg/config/opencode/agent-bash", 0o750),
+            ("xdg/config/opencode/opencode.json", 0o640),
+            ("xdg/config/opencode/tool/bash.ts", 0o640),
+            ("xdg/config/opencode/agent-bash/bash.ts", 0o640),
+            ("xdg/config/opencode/acp-v2-endpoint.ts", 0o640),
+            ("xdg/config/opencode/package.json", 0o640),
+            ("xdg/config/opencode/package-lock.json", 0o640),
+        ] {
+            assert_eq!(mode(sub), expected, "{sub}");
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn permission_denies_by_default_and_allows_only_named_commands() {

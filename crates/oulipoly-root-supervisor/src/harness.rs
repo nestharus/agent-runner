@@ -181,7 +181,6 @@ struct Worker {
     id: String,
     argv: Vec<String>,
     endpoint: Endpoint,
-    store_dir: PathBuf,
     position: usize,
     cap: u32,
     attempt_cap: u32,
@@ -214,7 +213,6 @@ struct Worker {
 pub(crate) struct Assignment {
     pub(crate) position: usize,
     pub(crate) harness: DurableHarness,
-    pub(crate) store_dir: PathBuf,
     pub(crate) cap: u32,
     pub(crate) attempt_cap: u32,
     pub(crate) cwd: String,
@@ -232,7 +230,6 @@ pub(crate) fn run(assignment: Assignment) {
     let Assignment {
         position,
         harness,
-        store_dir,
         cap,
         attempt_cap,
         cwd,
@@ -264,7 +261,6 @@ pub(crate) fn run(assignment: Assignment) {
         id: harness.id,
         argv: harness.argv,
         endpoint: harness.endpoint,
-        store_dir,
         position,
         cap,
         attempt_cap,
@@ -485,11 +481,12 @@ impl Worker {
     /// the socket the owner chose.
     fn launch_env(&self, work: i64) -> Result<serde_json::Map<String, Value>, String> {
         let mut env = serde_json::Map::new();
-        let ingress = bash::Ingress::socket_path(&self.store_dir);
+        let ipc = &self.slot.workload.ipc_dir;
+        let ingress = bash::Ingress::socket_path(ipc);
         let ingress = ingress.to_str().ok_or("store path is not UTF-8")?;
         env.insert(bash::BASH_ENV.to_owned(), Value::String(ingress.to_owned()));
         if self.endpoint == Endpoint::UnixSocket {
-            let path = socket_path(&self.store_dir, work);
+            let path = socket_path(ipc, work);
             let dir = path.parent().expect("socket directory");
             match fs::DirBuilder::new().mode(0o700).create(dir) {
                 Ok(()) => {}
@@ -507,13 +504,13 @@ impl Worker {
     /// listens is waited for until it ends, the run detaches or the caller
     /// cancels: no timer gives up on it or kills it.
     fn connect(&self, live: &Live) -> Result<UnixStream, Unconnected> {
-        let path = socket_path(&self.store_dir, live.work);
+        let path = socket_path(&self.slot.workload.ipc_dir, live.work);
         loop {
             if transport::detached(&self.slot.stop) {
                 return Err(Unconnected::Detached);
             }
             match UnixStream::connect(&path) {
-                Ok(stream) => return Ok(stream),
+                Ok(stream) => return self.attribute_listener(live.work, stream),
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -525,6 +522,38 @@ impl Worker {
                 return Err(Unconnected::Ended);
             }
             thread::sleep(CONNECT_RETRY);
+        }
+    }
+
+    /// Admits the listener only if it is the work's own: a process of the
+    /// work identity inside that work's exact PID namespace. A socket in a
+    /// directory the work identity owns names no one by itself.
+    fn attribute_listener(&self, work: i64, stream: UnixStream) -> Result<UnixStream, Unconnected> {
+        let expected = {
+            let views = self.views.lock().expect("views");
+            views.get(self.position).and_then(|view| {
+                view.works
+                    .iter()
+                    .find(|(id, _)| *id == work)
+                    .map(|(_, pidns)| *pidns)
+            })
+        };
+        let attributed =
+            bash::peer_pidns(&stream, self.slot.workload.peer_uid()).and_then(|(_, pidns)| {
+                match expected {
+                    Some(expected) if expected == pidns => Ok(()),
+                    Some(_) => Err("outside-the-work-namespace".to_owned()),
+                    None => Err("work-pidns-unreported".to_owned()),
+                }
+            });
+        match attributed {
+            Ok(()) => Ok(stream),
+            Err(reason) => {
+                self.report(json!({ "event": "endpoint-refused", "work": work, "reason": format!("listener-unattributed: {reason}") }));
+                Err(Unconnected::Failed(format!(
+                    "listener-unattributed: {reason}"
+                )))
+            }
         }
     }
 
@@ -678,6 +707,7 @@ impl Worker {
             "pid": spawned.harness_host_pid,
             "work": work,
             "incarnation": root.incarnation,
+            "identity": spawned.harness_host_pid.map(crate::workload::observe),
         }));
         self.show_work(work, spawned.pidns);
         let live = Live {
@@ -836,7 +866,7 @@ impl Worker {
         }
         if self.endpoint == Endpoint::UnixSocket && exit.is_ok() {
             // Its listener ended with it; the path is never reused.
-            let _ = fs::remove_file(socket_path(&self.store_dir, work));
+            let _ = fs::remove_file(socket_path(&self.slot.workload.ipc_dir, work));
         }
         self.finish_drive(end, cause, exit)
     }
@@ -1378,6 +1408,7 @@ mod tests {
                 session: None,
                 messages: vec!["x".into()],
             }],
+            workload: crate::Workload::UnprivilegedUserns {},
         };
         let mut claimed = Store::claim(&dir.0, Some(&intent)).unwrap();
         let harness = claimed.harnesses.remove(0);
@@ -1387,7 +1418,6 @@ mod tests {
                 id: "test".into(),
                 argv: vec![],
                 endpoint: Endpoint::Stdio,
-                store_dir: dir.0.clone(),
                 position: 0,
                 cap: 3,
                 attempt_cap: 10,
@@ -1397,7 +1427,7 @@ mod tests {
                 slot: Arc::new(RootSlot::new(
                     dir.0.clone(),
                     1,
-                    crate::sys::Isolation::current(),
+                    crate::workload::unprivileged_for_tests(&dir.0),
                     Arc::new(crate::transport::StopSignal::new().unwrap()),
                     None,
                 )),

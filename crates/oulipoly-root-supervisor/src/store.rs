@@ -50,7 +50,7 @@ pub(crate) const LOCK_FILE: &str = "owner.lock";
 pub(crate) const DB_FILE: &str = "intent.sqlite3";
 /// Version of this new per-root lineage. There is no migration chain: a
 /// store of any other version is refused.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 /// How long a write waits for a foreign SQLite lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -75,6 +75,7 @@ CREATE TABLE intent (
     outage_closure_cap INTEGER NOT NULL,
     delivery_attempt_cap INTEGER NOT NULL,
     cwd TEXT NOT NULL,
+    workload TEXT NOT NULL,
     generation INTEGER NOT NULL
 );
 CREATE TABLE harness (
@@ -267,6 +268,8 @@ pub(crate) struct Claimed {
     pub(crate) outage_closure_cap: u32,
     pub(crate) delivery_attempt_cap: u32,
     pub(crate) cwd: String,
+    /// The intent's declared work identity, as committed.
+    pub(crate) workload: crate::Workload,
     pub(crate) harnesses: Vec<DurableHarness>,
     /// Earlier-generation attempts this claim classified as unknown.
     pub(crate) classified_unknown: u32,
@@ -347,14 +350,14 @@ impl Store {
              WHERE outcome IS NULL AND generation < ?2",
             params![UNKNOWN_PRIOR_OWNER, generation],
         )?;
-        let existing: Option<(u32, u32, String)> = tx
+        let existing: Option<(u32, u32, String, String)> = tx
             .query_row(
-                "SELECT outage_closure_cap, delivery_attempt_cap, cwd FROM intent",
+                "SELECT outage_closure_cap, delivery_attempt_cap, cwd, workload FROM intent",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        let (created, cap, attempt_cap, cwd, harnesses) = match (intent, existing) {
+        let (created, cap, attempt_cap, cwd, workload, harnesses) = match (intent, existing) {
             (Some(_), Some(_)) => return Err(ClaimError::IntentExists),
             (None, None) => return Err(ClaimError::NoIntent),
             (Some(intent), None) => {
@@ -368,10 +371,13 @@ impl Store {
                     intent.outage_closure_cap,
                     intent.delivery_attempt_cap,
                     intent.cwd.clone(),
+                    intent.workload.clone(),
                     harnesses,
                 )
             }
-            (None, Some((cap, attempt_cap, cwd))) => {
+            (None, Some((cap, attempt_cap, cwd, workload))) => {
+                let workload: crate::Workload = serde_json::from_str(&workload)
+                    .map_err(|error| ClaimError::Store(format!("stored workload: {error}")))?;
                 // Persisted attempts from every generation count: a restart
                 // loop cannot buy more attempts than the intent allows.
                 tx.execute(
@@ -381,7 +387,14 @@ impl Store {
                             WHERE a.harness = message.harness AND a.idx = message.idx) >= ?2",
                     params![ATTEMPTS_EXHAUSTED, attempt_cap],
                 )?;
-                (false, cap, attempt_cap, cwd, load_intent(&tx, generation)?)
+                (
+                    false,
+                    cap,
+                    attempt_cap,
+                    cwd,
+                    workload,
+                    load_intent(&tx, generation)?,
+                )
             }
         };
         let root_id: String = tx.query_row("SELECT root_id FROM root", [], |row| row.get(0))?;
@@ -433,6 +446,7 @@ impl Store {
             outage_closure_cap: cap,
             delivery_attempt_cap: attempt_cap,
             cwd,
+            workload,
             harnesses,
             classified_unknown: u32::try_from(classified_unknown).unwrap_or(u32::MAX),
             root_id,
@@ -783,12 +797,14 @@ fn create_intent(
     generation: i64,
 ) -> Result<Vec<DurableHarness>, ClaimError> {
     tx.execute(
-        "INSERT INTO intent (singleton, outage_closure_cap, delivery_attempt_cap, cwd, generation)
-         VALUES (1, ?1, ?2, ?3, ?4)",
+        "INSERT INTO intent (singleton, outage_closure_cap, delivery_attempt_cap, cwd, workload, generation)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5)",
         params![
             intent.outage_closure_cap,
             intent.delivery_attempt_cap,
             intent.cwd,
+            serde_json::to_string(&intent.workload)
+                .map_err(|error| ClaimError::Store(error.to_string()))?,
             generation
         ],
     )?;
@@ -954,6 +970,7 @@ mod tests {
                 session: None,
                 messages: vec!["one".into()],
             }],
+            workload: crate::Workload::UnprivilegedUserns {},
         }
     }
 

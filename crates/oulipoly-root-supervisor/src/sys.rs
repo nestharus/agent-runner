@@ -333,16 +333,9 @@ pub enum Isolation {
     UnprivilegedUserns,
 }
 
+/// Chosen from the root's declared work identity (`workload` module),
+/// never from the caller's euid.
 impl Isolation {
-    pub fn current() -> Self {
-        // SAFETY: geteuid has no preconditions.
-        if unsafe { libc::geteuid() } == 0 {
-            Self::HostRootPidns
-        } else {
-            Self::UnprivilegedUserns
-        }
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             Self::HostRootPidns => "host-root-pidns",

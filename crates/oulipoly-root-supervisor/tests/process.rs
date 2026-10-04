@@ -94,14 +94,10 @@ fn stamp(pid: i32, start_time: i64) {
     }
 }
 
-/// The isolation an owner run by this test's uid must report.
+/// The isolation every owner here declares: these tests run unprivileged
+/// (a root owner refuses the declaration before launching anything).
 fn expected_isolation() -> &'static str {
-    // SAFETY: geteuid has no preconditions.
-    if unsafe { libc::geteuid() } == 0 {
-        "host-root-pidns"
-    } else {
-        "unprivileged-userns-pidns"
-    }
+    "unprivileged-userns-pidns"
 }
 
 /// Reaps `pid` if (and only if) it is this test process's child.
@@ -414,6 +410,7 @@ fn spec(dir: &Scratch, cap: u32, harnesses: Value) -> Value {
             "outage_closure_cap": cap,
             "delivery_attempt_cap": 10,
             "cwd": "/",
+            "workload": { "isolation": "unprivileged-userns" },
             "harnesses": harnesses,
         },
     })
@@ -1265,6 +1262,7 @@ fn owner_restart_loop_exhausts_persisted_attempt_budget() {
             "outage_closure_cap": 5,
             "delivery_attempt_cap": 2,
             "cwd": "/",
+            "workload": { "isolation": "unprivileged-userns" },
             "harnesses": [{ "id": "quiet", "argv": peer(&state, &["--mode", "insert-then-silent"]), "messages": ["x"] }],
         },
     });
@@ -1353,6 +1351,7 @@ fn attempt_budget_counts_earlier_generations_before_sending() {
                 "outage_closure_cap": 5,
                 "delivery_attempt_cap": 3,
                 "cwd": "/",
+                "workload": { "isolation": "unprivileged-userns" },
                 "harnesses": [{ "id": "flaky", "argv": peer(&state, &["--launch-modes", "insert-then-silent,exit-before-ack-always", "--on-reinit", "exit"]), "messages": ["x"] }],
             },
         }),
@@ -2678,4 +2677,47 @@ fn admitted_follow_up_without_ack_stays_owed_debt() {
         count(&conn, "SELECT count(*) FROM attempt WHERE idx = 1"),
         1
     );
+}
+
+/// A declaration this owner cannot honour is refused before anything is
+/// written or launched: a non-root owner never runs a declared host-root
+/// root, whatever user it names, and never picks its isolation from its
+/// euid. (These tests run unprivileged.)
+#[test]
+fn host_root_declared_by_a_non_root_owner_is_refused_before_any_effect() {
+    let dir = std::env::temp_dir().join(format!("root-supervisor-decl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    for user in ["root", "nobody"] {
+        let request = json!({
+            "store": dir.join("s"),
+            "intent": {
+                "outage_closure_cap": 1,
+                "delivery_attempt_cap": 1,
+                "cwd": "/",
+                "workload": { "isolation": "host-root", "user": user, "ipc_dir": dir.join("ipc") },
+                "harnesses": [{ "id": "h", "argv": ["/bin/true"], "messages": ["x"] }],
+            },
+        });
+        let mut child = Command::new(SUPERVISOR)
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(child.stdin.take().unwrap(), "{request}").unwrap();
+        let output = child.wait_with_output().unwrap();
+        let terminal: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(64), "{terminal}");
+        assert_eq!(terminal["status"], "spec-refused", "{terminal}");
+        assert!(
+            terminal["reason"]
+                .as_str()
+                .unwrap()
+                .contains("host-root declared but the owner is euid"),
+            "{terminal}"
+        );
+        assert!(!dir.join("s").exists() && !dir.join("ipc").exists());
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
 }

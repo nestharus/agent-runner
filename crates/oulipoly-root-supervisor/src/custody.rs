@@ -16,8 +16,9 @@ use serde_json::{Value, json};
 
 use crate::Event;
 use crate::store::{IncarnationRow, Store, StoreError};
-use crate::sys::{self, Isolation};
+use crate::sys;
 use crate::transport::StopSignal;
+use crate::workload::Resolved;
 
 /// Root PID 1's binary, installed next to the owner's.
 pub(crate) const PID1_BINARY: &str = "oulipoly-root-pid1";
@@ -206,11 +207,11 @@ impl Root {
         incarnation: i64,
         token: &str,
         generation: i64,
-        isolation: Isolation,
+        workload: &Resolved,
         stop: Arc<StopSignal>,
     ) -> io::Result<(Arc<Self>, Identity)> {
         let (socket, child_end) = sys::seqpacket_pair()?;
-        let host_pid = sys::spawn_pid1(&pid1_binary()?, &child_end, isolation)?;
+        let host_pid = sys::spawn_pid1(&pid1_binary()?, &child_end, workload.isolation)?;
         drop(child_end);
         // Still our unreaped child, so this pidfd names exactly it.
         let pidfd = sys::pidfd_open(host_pid)?;
@@ -227,11 +228,24 @@ impl Root {
                 "incarnation": incarnation,
                 "token": token,
                 "generation": generation,
+                // Every harness and Bash run of this incarnation is started
+                // as this identity by its work PID 1 (`null`: as root PID 1).
+                "workload": workload.identity.as_ref().map(|identity| json!({
+                    "uid": identity.uid,
+                    "gid": identity.gid,
+                    "groups": identity.groups,
+                })),
             }),
         )
         .and_then(|()| recv_json(&socket));
         match ready {
-            Ok(Some((value, _))) if value["event"] == "ready" => {}
+            Ok(Some((value, _)))
+                if value["event"] == "ready"
+                    && value["workload_uid"].as_u64()
+                        == workload
+                            .identity
+                            .as_ref()
+                            .map(|identity| u64::from(identity.uid)) => {}
             other => {
                 // It never became custodian of anything: stop and reap it.
                 let _ = sys::pidfd_kill(&pidfd);
@@ -668,7 +682,8 @@ fn read_loop(socket: &OwnedFd, shared: &Arc<(Mutex<Shared>, Condvar)>, stop: &St
 pub(crate) struct RootSlot {
     pub(crate) store_dir: PathBuf,
     pub(crate) generation: i64,
-    pub(crate) isolation: Isolation,
+    /// The root's resolved work identity and IPC placement.
+    pub(crate) workload: Arc<Resolved>,
     pub(crate) stop: Arc<StopSignal>,
     root: Mutex<Option<Arc<Root>>>,
 }
@@ -677,14 +692,14 @@ impl RootSlot {
     pub(crate) fn new(
         store_dir: PathBuf,
         generation: i64,
-        isolation: Isolation,
+        workload: Arc<Resolved>,
         stop: Arc<StopSignal>,
         attached: Option<Arc<Root>>,
     ) -> Self {
         Self {
             store_dir,
             generation,
-            isolation,
+            workload,
             stop,
             root: Mutex::new(attached),
         }
@@ -709,14 +724,14 @@ impl RootSlot {
         let id = store
             .lock()
             .expect("store lock")
-            .begin_incarnation(&token, self.isolation.label())
+            .begin_incarnation(&token, self.workload.isolation.label())
             .map_err(Ok)?;
         let started = Root::start(
             &self.store_dir,
             id,
             &token,
             self.generation,
-            self.isolation,
+            &self.workload,
             Arc::clone(&self.stop),
         );
         let (root, identity) = match started {
@@ -745,7 +760,9 @@ impl RootSlot {
             "event": "root-pid1-started",
             "pid": identity.host_pid,
             "incarnation": id,
-            "isolation": self.isolation.label(),
+            "isolation": self.workload.isolation.label(),
+            "workload": self.workload.identity.as_ref().map(crate::workload::Identity::to_json),
+            "observed": crate::workload::observe(identity.host_pid),
             "parent": "this-owner",
         })));
         Ok(root)

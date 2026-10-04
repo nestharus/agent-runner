@@ -13,6 +13,17 @@
 //! among others), plus the owner's ingress and socket variables. Stdout
 //! says which names reach where, never a value.
 //!
+//! `workload` declares who the root's work runs as, never inferred from
+//! this entry's euid: `{"isolation":"host-root","user":NAME}` (this entry,
+//! and so the owner, runs as host root; the native host and every in-root
+//! Bash run are started as host user NAME, which must not be uid 0) or
+//! `{"isolation":"unprivileged-userns"}` (a non-root caller; not host-root
+//! semantics). A declaration this process cannot honour is refused before
+//! any effect. Under `host-root` the launch directory is handed to NAME as
+//! the setup's module docs describe, the store stays the owner's private
+//! directory, and the work's IPC (the harness socket directory and the
+//! Bash ingress) is `<launch_dir>/ipc`, made fresh by the owner.
+//!
 //! `--recover <file>` acts on an existing store: `{"store", "purpose",
 //! "env"}`, `purpose` being `cancel` or `continue-attached`. A new owner
 //! claims the store (the next owner generation; earlier unresolved
@@ -82,7 +93,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use oulipoly_root_supervisor::native::{
     OpenCodeSetup, OpenCodeSetupError, REMOVED_ENV, provision_opencode,
 };
-use oulipoly_root_supervisor::{Endpoint, HarnessSpec, Intent, Recover, Request};
+use oulipoly_root_supervisor::{Endpoint, HarnessSpec, Intent, Recover, Request, Workload};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -117,6 +128,20 @@ pub(crate) struct NativeRootRequest {
     /// The native setup inputs (`deps`, `agent_bash_tool`, `agent_bash_bin`,
     /// `bash_allow`, optional `model` and `provider`).
     opencode: NativeSetup,
+    /// Who the root's work runs as (see the module docs).
+    workload: RequestWorkload,
+}
+
+/// The request's work declaration; the owner's [`Workload`] adds where the
+/// work's IPC is.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "isolation", rename_all = "kebab-case", deny_unknown_fields)]
+enum RequestWorkload {
+    HostRoot {
+        user: String,
+    },
+    /// A struct variant so that a nominated `user` is refused, not ignored.
+    UnprivilegedUserns {},
 }
 
 #[derive(Debug, Deserialize)]
@@ -225,11 +250,23 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
     };
     // The owner's own checks first, so its refusal cannot follow setup's
     // effects. They read only that the argv is non-empty; every
-    // provisioned argv is.
-    if let Err(reason) = owner_request(&request, vec!["/usr/bin/env".to_owned()]).validate() {
+    // provisioned argv is. They include resolving the work declaration
+    // against this process (the owner's euid is this entry's).
+    let checked = owner_request(&request, vec!["/usr/bin/env".to_owned()]);
+    if let Err(reason) = checked.validate() {
         return Ok(refused(&out, format!("owner request: {reason}")));
     }
-    let launch = match provision_opencode(&setup) {
+    let workload = checked
+        .intent
+        .as_ref()
+        .map(|intent| &intent.workload)
+        .expect("a create request")
+        .resolve(Path::new(&request.store));
+    let workload = match workload {
+        Ok(workload) => workload,
+        Err(reason) => return Ok(refused(&out, format!("owner request: {reason}"))),
+    };
+    let launch = match provision_opencode(&setup, workload.identity.as_ref()) {
         Ok(launch) => launch,
         Err(OpenCodeSetupError::InputInvalid(reason)) => {
             return Ok(refused(&out, format!("setup: {reason}")));
@@ -252,6 +289,13 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
         "launch": launch.to_json(),
         "owner": owner,
         "env": env_reach(&request.env, &launch_names),
+        "workload": {
+            "isolation": workload.isolation.label(),
+            "user": workload.identity.as_ref().map(|identity| &identity.user),
+            "uid": workload.identity.as_ref().map(|identity| identity.uid),
+            "gid": workload.identity.as_ref().map(|identity| identity.gid),
+            "ipc_dir": workload.ipc_dir,
+        },
     }));
     let context = json!({
         "store": request.store,
@@ -569,6 +613,16 @@ fn owner_request(request: &NativeRootRequest, argv: Vec<String>) -> Request {
                 session: None,
                 messages: request.messages.clone(),
             }],
+            workload: match &request.workload {
+                RequestWorkload::HostRoot { user } => Workload::HostRoot {
+                    user: user.clone(),
+                    ipc_dir: Path::new(&request.launch_dir)
+                        .join("ipc")
+                        .to_string_lossy()
+                        .into_owned(),
+                },
+                RequestWorkload::UnprivilegedUserns {} => Workload::UnprivilegedUserns {},
+            },
         }),
         recover: None,
     }
@@ -797,6 +851,7 @@ mod tests {
                     "deps": "/d", "agent_bash_tool": "/t", "agent_bash_bin": "/b",
                     "bash_allow": ["true"],
                 },
+                "workload": { "isolation": "unprivileged-userns" },
             })
         };
         let read = |value: Value| {
@@ -812,5 +867,62 @@ mod tests {
         let mut extra = base(&fresh, json!({}));
         extra["inherit_env"] = json!(true);
         assert!(read(extra).unwrap_err().contains("unknown field"));
+    }
+
+    /// The work identity is declared, never taken from the caller's euid:
+    /// no declaration is refused, an unprivileged one names no identity,
+    /// and a host-root one from a non-root caller is refused by the owner's
+    /// own checks, which this entry applies before setup's effects.
+    #[test]
+    fn workload_is_declared_and_refused_when_this_process_cannot_honour_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = |workload: Option<Value>| {
+            let mut value = json!({
+                "store": dir.path().join("store"),
+                "launch_dir": dir.path().join("launch"),
+                "cwd": "/",
+                "env": {},
+                "messages": ["m"],
+                "outage_closure_cap": 1,
+                "delivery_attempt_cap": 1,
+                "opencode": {
+                    "deps": "/d", "agent_bash_tool": "/t", "agent_bash_bin": "/b",
+                    "bash_allow": ["true"],
+                },
+            });
+            if let Some(workload) = workload {
+                value["workload"] = workload;
+            }
+            let path = dir.path().join("request.json");
+            std::fs::write(&path, value.to_string()).unwrap();
+            read_request(&path)
+        };
+        let missing = request(None).unwrap_err();
+        assert!(missing.contains("missing field `workload`"), "{missing}");
+        let nominated = request(Some(
+            json!({ "isolation": "unprivileged-userns", "user": "root" }),
+        ))
+        .unwrap_err();
+        assert!(nominated.contains("unknown field"), "{nominated}");
+        assert!(request(Some(json!({ "isolation": "host-root" }))).is_err());
+        // These tests run unprivileged.
+        let host = request(Some(json!({ "isolation": "host-root", "user": "nobody" }))).unwrap();
+        let checked = owner_request(&host, vec!["/usr/bin/env".to_owned()]);
+        let refused = checked.validate().unwrap_err();
+        assert!(
+            refused.contains("workload-refused: host-root declared but the owner is euid"),
+            "{refused}"
+        );
+        match &checked.intent.unwrap().workload {
+            Workload::HostRoot { ipc_dir, .. } => {
+                assert_eq!(Path::new(ipc_dir), dir.path().join("launch/ipc"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!dir.path().join("launch").exists() && !dir.path().join("store").exists());
+        let unprivileged = request(Some(json!({ "isolation": "unprivileged-userns" }))).unwrap();
+        owner_request(&unprivileged, vec!["/usr/bin/env".to_owned()])
+            .validate()
+            .unwrap();
     }
 }
