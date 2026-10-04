@@ -24,6 +24,15 @@
 //! directory, and the work's IPC (the harness socket directory and the
 //! Bash ingress) is `<launch_dir>/ipc`, made fresh by the owner.
 //!
+//! `opencode.bash_allow` names the only whole commands the native host's
+//! `bash` may run, the default form. `opencode.bash_authority:
+//! "trusted-task"` instead lets it run any command for this task: the
+//! caller's explicit once-per-task authority, never implied by anything
+//! else and refused together with `bash_allow`. Either way every other
+//! native tool is denied and every command goes through the root's Bash
+//! ingress. `setup-completed` reports the effective policy (`launch.policy`,
+//! with the native permission config as written).
+//!
 //! `opencode.auth` (opt-in, with a model) names a private OpenCode
 //! `auth.json` that setup checks before any effect and places in the
 //! launch's own data directory. Such a launch enables OpenCode's built-in
@@ -101,7 +110,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use oulipoly_root_supervisor::native::{
-    OpenCodeSetup, OpenCodeSetupError, REMOVED_ENV, provision_opencode,
+    BashAuthority, OpenCodeSetup, OpenCodeSetupError, REMOVED_ENV, provision_opencode,
 };
 use oulipoly_root_supervisor::{Endpoint, HarnessSpec, Intent, Recover, Request, Workload};
 use serde::Deserialize;
@@ -136,8 +145,8 @@ pub(crate) struct NativeRootRequest {
     outage_closure_cap: u32,
     delivery_attempt_cap: u32,
     /// The native setup inputs (`deps`, `agent_bash_tool`, `agent_bash_bin`,
-    /// `bash_allow`, optional `model` and `provider`, and optional `auth`:
-    /// see the module docs).
+    /// `bash_allow` or `bash_authority`, optional `model` and `provider`,
+    /// and optional `auth`: see the module docs).
     opencode: NativeSetup,
     /// Who the root's work runs as (see the module docs).
     workload: RequestWorkload,
@@ -161,7 +170,10 @@ struct NativeSetup {
     deps: String,
     agent_bash_tool: String,
     agent_bash_bin: String,
+    #[serde(default)]
     bash_allow: Vec<String>,
+    #[serde(default)]
+    bash_authority: Option<BashAuthority>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -258,6 +270,7 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
         agent_bash_tool: request.opencode.agent_bash_tool.clone(),
         agent_bash_bin: request.opencode.agent_bash_bin.clone(),
         bash_allow: request.opencode.bash_allow.clone(),
+        bash_authority: request.opencode.bash_authority,
         model: request.opencode.model.clone(),
         provider: request.opencode.provider.clone(),
         auth: request.opencode.auth.clone(),

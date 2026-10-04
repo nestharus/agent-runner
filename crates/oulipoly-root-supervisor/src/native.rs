@@ -10,13 +10,23 @@
 //! policy. The `argv` is kept in the root's durable intent, so every
 //! launch and relaunch of that harness reads the same directory.
 //!
-//! * **Policy.** Deny by default: every native tool other than `bash` is
-//!   denied (and so hidden), and `bash` runs only the commands the caller
-//!   named, each matched as the whole command string; anything else is a
-//!   native denial, with no permission request to the owner. Native
-//!   OpenCode enforces it; the owner grants nothing. Entries with `*`, `?`
-//!   or `\` are refused, since native matching would treat them as globs.
-//!   The workdir and delivery are not part of a decision.
+//! * **Policy.** Every native tool other than `bash` is denied (and so
+//!   hidden). What `bash` may run is the caller's explicit choice, one of:
+//!   - `bash_allow` (the default form): only the commands the caller
+//!     named, each matched as the whole command string; anything else is a
+//!     native denial, with no permission request to the owner. Entries with
+//!     `*`, `?` or `\` are refused, since native matching would treat them
+//!     as globs.
+//!   - `bash_authority: "trusted-task"`: the caller trusts this task with
+//!     any `bash` command, as once-per-task authority. Every command still
+//!     goes through the agent-bash tool and so the root's own Bash ingress
+//!     (attributed, durably recorded, killed on cancel); nothing else is
+//!     widened. Never selected implicitly, and not with `bash_allow`.
+//!
+//!   Native OpenCode enforces either; the owner grants nothing. The
+//!   workdir and delivery are not part of a decision. The launch receipt
+//!   reports the effective policy, including the native permission config
+//!   exactly as written.
 //! * **Isolation.** HOME and every XDG directory point into the launch
 //!   directory, project config is disabled, and inherited
 //!   `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR`, `OPENCODE_CONFIG_CONTENT` and
@@ -131,7 +141,12 @@ pub struct OpenCodeSetup {
     /// That source's `agent-bash` binary.
     pub agent_bash_bin: String,
     /// The only commands `bash` may run, each the whole command string.
+    /// Required unless `bash_authority` is given.
+    #[serde(default)]
     pub bash_allow: Vec<String>,
+    /// An explicit wider `bash` authority instead of `bash_allow`.
+    #[serde(default)]
+    pub bash_authority: Option<BashAuthority>,
     /// Native model, `provider/model`.
     #[serde(default)]
     pub model: Option<String>,
@@ -144,6 +159,53 @@ pub struct OpenCodeSetup {
     pub auth: Option<String>,
 }
 
+/// A `bash` authority wider than a named-command list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BashAuthority {
+    /// Any command, for this task (see the module docs).
+    TrustedTask,
+}
+
+/// The effective native policy of a launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Policy {
+    /// `None`: `trusted-task`; else the named whole commands.
+    pub bash_allow: Option<Vec<String>>,
+    /// The native permission config as written to `opencode.json`.
+    pub native: String,
+}
+
+impl Policy {
+    /// The policy `setup` selects, refused unless exactly one form is given.
+    pub fn of(setup: &OpenCodeSetup) -> Result<Self, String> {
+        match setup.bash_authority {
+            Some(BashAuthority::TrustedTask) if !setup.bash_allow.is_empty() => {
+                Err("bash_allow and bash_authority are exclusive".to_owned())
+            }
+            Some(BashAuthority::TrustedTask) => Ok(Self {
+                bash_allow: None,
+                native: TRUSTED_TASK_PERMISSION.to_owned(),
+            }),
+            None => Ok(Self {
+                native: permission(&setup.bash_allow)?,
+                bash_allow: Some(setup.bash_allow.clone()),
+            }),
+        }
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "bash": match &self.bash_allow {
+                None => json!("trusted-task"),
+                Some(commands) => json!({ "allow": commands }),
+            },
+            "other": "deny",
+            "native": self.native,
+        })
+    }
+}
+
 /// A provisioned launch: the harness `argv` and what it sets.
 #[derive(Debug, Clone)]
 pub struct OpenCodeLaunch {
@@ -154,6 +216,8 @@ pub struct OpenCodeLaunch {
     pub config_dir: PathBuf,
     /// Where an authenticated launch's secrets are (paths, never values).
     pub auth: Option<AuthPlacement>,
+    /// The effective native policy written for the host.
+    pub policy: Policy,
 }
 
 /// An authenticated launch's secret files.
@@ -178,6 +242,7 @@ impl OpenCodeLaunch {
             "env": env,
             "removed_env": REMOVED_ENV,
             "config_dir": self.config_dir,
+            "policy": self.policy.to_json(),
             "auth": self.auth.as_ref().map(|auth| json!({
                 "auth_file": auth.auth_file,
                 "server_password_file": auth.password_file,
@@ -199,6 +264,10 @@ fn utf8(path: &Path) -> Result<String, String> {
         .map(str::to_owned)
         .ok_or_else(|| format!("{path:?} is not UTF-8"))
 }
+
+/// The native permission config for `trusted-task`: every other tool
+/// denied, `bash` allowed for any command (`*` is a native glob).
+pub const TRUSTED_TASK_PERMISSION: &str = r#"{"*":"deny","bash":{"*":"allow"}}"#;
 
 /// The root's native permission config for `bash_allow`, as JSON text.
 /// Native evaluation takes the last matching rule in config order, so the
@@ -336,7 +405,7 @@ struct SetupInputs<'a> {
     dir: PathBuf,
     deps: PathBuf,
     bin: PathBuf,
-    permission: String,
+    policy: Policy,
     tool_source: String,
     model_provider: Option<&'a str>,
     /// The checked `auth` file's text.
@@ -349,7 +418,7 @@ fn setup_inputs(setup: &OpenCodeSetup) -> Result<SetupInputs<'_>, String> {
     let deps = absolute("deps", &setup.deps)?;
     let tool = absolute("agent_bash_tool", &setup.agent_bash_tool)?;
     let bin = absolute("agent_bash_bin", &setup.agent_bash_bin)?;
-    let permission = permission(&setup.bash_allow)?;
+    let policy = Policy::of(setup)?;
     let model_provider = match (&setup.model, &setup.provider) {
         (Some(model), Some(provider)) => {
             let (name, _) = model
@@ -389,7 +458,7 @@ fn setup_inputs(setup: &OpenCodeSetup) -> Result<SetupInputs<'_>, String> {
         dir,
         deps,
         bin,
-        permission,
+        policy,
         tool_source,
         model_provider,
         auth,
@@ -487,7 +556,7 @@ fn write_launch(setup: &OpenCodeSetup, inputs: SetupInputs<'_>) -> Result<OpenCo
         dir,
         deps,
         bin,
-        permission,
+        policy,
         tool_source,
         model_provider,
         auth,
@@ -554,8 +623,9 @@ fn write_launch(setup: &OpenCodeSetup, inputs: SetupInputs<'_>) -> Result<OpenCo
         None => None,
     };
     let config = format!(
-        r#"{},"permission":{permission}}}"#,
-        config.strip_suffix('}').expect("json object")
+        r#"{},"permission":{}}}"#,
+        config.strip_suffix('}').expect("json object"),
+        policy.native
     );
     write_new(&config_dir.join("opencode.json"), &config)?;
 
@@ -614,6 +684,7 @@ fn write_launch(setup: &OpenCodeSetup, inputs: SetupInputs<'_>) -> Result<OpenCo
         env,
         config_dir,
         auth,
+        policy,
     })
 }
 
@@ -632,6 +703,7 @@ mod tests {
             agent_bash_tool: "/t".to_owned(),
             agent_bash_bin: "/b".to_owned(),
             bash_allow: vec!["true".to_owned()],
+            bash_authority: None,
             model: auth.map(|_| "openai/m".to_owned()),
             provider: auth.map(|_| {
                 serde_json::from_str(r#"{"openai":{"models":{"m":{"name":"m"}}}}"#).unwrap()
@@ -645,7 +717,7 @@ mod tests {
             dir: dir.to_path_buf(),
             deps: "/nonexistent-deps".into(),
             bin: "/b".into(),
-            permission: permission(&["true".to_owned()]).unwrap(),
+            policy: super::Policy::of(&setup(dir, None)).unwrap(),
             tool_source: "// tool".to_owned(),
             model_provider: auth.as_ref().map(|_| "openai"),
             auth,
@@ -942,6 +1014,53 @@ mod tests {
             r#"{"*":"deny","bash":{"*":"deny","true":"allow","printf \"a\"":"allow"}}"#
         );
         serde_json::from_str::<serde_json::Value>(&policy).unwrap();
+    }
+
+    /// `trusted-task` is selected only explicitly, never with a list, and
+    /// a setup naming neither is refused as before.
+    #[test]
+    fn policy_is_the_named_list_unless_trusted_task_is_explicit() {
+        use super::{BashAuthority, Policy};
+        let mut setup = setup(Path::new("/launch"), None);
+        let listed = Policy::of(&setup).unwrap();
+        assert_eq!(listed.native, permission(&["true".to_owned()]).unwrap());
+        assert_eq!(
+            listed.to_json(),
+            serde_json::json!({
+                "bash": { "allow": ["true"] },
+                "other": "deny",
+                "native": r#"{"*":"deny","bash":{"*":"deny","true":"allow"}}"#,
+            })
+        );
+
+        setup.bash_authority = Some(BashAuthority::TrustedTask);
+        assert_eq!(
+            Policy::of(&setup).unwrap_err(),
+            "bash_allow and bash_authority are exclusive"
+        );
+        setup.bash_allow.clear();
+        let trusted = Policy::of(&setup).unwrap();
+        // `*` first at both levels: native evaluation takes the last
+        // matching rule, so nothing but `bash` is allowed.
+        assert_eq!(trusted.native, r#"{"*":"deny","bash":{"*":"allow"}}"#);
+        assert_eq!(trusted.to_json()["bash"], "trusted-task");
+        assert_eq!(trusted.to_json()["other"], "deny");
+
+        setup.bash_authority = None;
+        assert_eq!(
+            Policy::of(&setup).unwrap_err(),
+            "bash_allow names no command"
+        );
+        for text in [r#""trusted""#, r#""TrustedTask""#, "true"] {
+            assert!(
+                serde_json::from_str::<BashAuthority>(text).is_err(),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<BashAuthority>(r#""trusted-task""#).unwrap(),
+            BashAuthority::TrustedTask
+        );
     }
 
     #[test]
