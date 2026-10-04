@@ -444,3 +444,63 @@ fn line_transport_reports_malformed_and_closed() {
     ));
     assert_eq!(transport.recv(), oulipoly_acp::Incoming::Closed);
 }
+
+// (c) A turn's output, notices and agent requests are observed, and every
+// agent request is refused, without changing the insertion ACK.
+
+#[test]
+fn turn_output_notices_and_refused_requests_are_observed() {
+    let lines = [
+        json!({ "jsonrpc": "2.0", "id": 1, "result": {
+            "protocolVersion": 2, "info": { "name": "a", "version": "1" }, "capabilities": { "session": {} } } }),
+        json!({ "jsonrpc": "2.0", "id": 2, "result": { "sessionId": "s" } }),
+        json!({ "jsonrpc": "2.0", "id": 3, "result": { "messageId": "m-user" } }),
+        json!({ "jsonrpc": "2.0", "id": "p1", "method": "session/request_permission", "params": {
+            "sessionId": "s", "title": "bash", "options": [] } }),
+        json!({ "jsonrpc": "2.0", "method": "session/update", "params": { "sessionId": "s", "update": {
+            "sessionUpdate": "notice", "severity": "warning", "title": "permission rejected: bash" } } }),
+        json!({ "jsonrpc": "2.0", "method": "session/update", "params": { "sessionId": "s", "update": {
+            "sessionUpdate": "agent_message", "messageId": "m-agent",
+            "content": [{ "type": "text", "text": "RE" }, { "type": "text", "text": "FUSED" }] } } }),
+        json!({ "jsonrpc": "2.0", "method": "session/update", "params": { "sessionId": "s", "update": {
+            "sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn" } } }),
+    ];
+    let input: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    let mut client = AcpClient::new(
+        LineTransport::new(Cursor::new(input.into_bytes()), Vec::new()),
+        info(),
+    );
+    client.initialize().expect("v2 negotiation");
+    let session = client.open_session(CWD).expect("session/new");
+    let mut msg = message("turn");
+    assert!(matches!(
+        client.submit(&session, &mut msg),
+        DeliveryOutcome::Accepted(_)
+    ));
+    let idle = client.await_session_idle(&session).unwrap();
+    assert_eq!(idle.stop_reason.as_deref(), Some("end_turn"));
+    let events = client.events().to_vec();
+    assert!(events.contains(&SessionEvent::RequestRefused {
+        method: "session/request_permission".to_owned(),
+        session_id: Some("s".to_owned()),
+    }));
+    assert!(events.contains(&SessionEvent::Notice {
+        session_id: "s".to_owned(),
+        severity: "warning".to_owned(),
+        title: "permission rejected: bash".to_owned(),
+        description: None,
+    }));
+    assert!(events.contains(&SessionEvent::AgentMessage {
+        session_id: "s".to_owned(),
+        message_id: "m-agent".to_owned(),
+        text: "REFUSED".to_owned(),
+    }));
+    let (_, written) = client.into_transport().into_parts();
+    let refusal = String::from_utf8(written)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|line| line["id"] == "p1")
+        .expect("a reply to the agent request");
+    assert_eq!(refusal["error"]["code"], -32601);
+}

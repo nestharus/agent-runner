@@ -4,8 +4,13 @@
 //! dependencies of `native/opencode/package.json` installed (`npm ci
 //! --ignore-scripts`) in the directory named by `OULIPOLY_NATIVE_DEPS`.
 //!
-//! The host is insertion-only (`OULIPOLY_ACP_V2_NO_REPLY=1`): no model turn
-//! starts, and no model, provider or credential is configured. Every host
+//! The first test's host is insertion-only (`OULIPOLY_ACP_V2_NO_REPLY=1`): no
+//! model turn starts, and no model, provider or credential is configured.
+//! The second runs real model turns: it also needs `OULIPOLY_NATIVE_MODEL`
+//! (`provider/model`, a model OpenCode's OpenAI ChatGPT-OAuth path accepts)
+//! and `OULIPOLY_NATIVE_AUTH`, a private OpenCode `auth.json` copied into the
+//! fixture's own data directory and never printed; it needs outbound network
+//! to that provider instead of loopback-only. Every host
 //! gets a fresh HOME/XDG state under the scratch directory, shared by the
 //! three runs so that the second host process sees the first one's native
 //! conversation. Run it with loopback-only networking, e.g. inside
@@ -27,6 +32,22 @@ use serde_json::{Value, json};
 const SUPERVISOR: &str = env!("CARGO_BIN_EXE_oulipoly-root-supervisor");
 const WATCHDOG: Duration = Duration::from_secs(150);
 
+/// A real configured model for the second test.
+struct Model {
+    id: String,
+    auth: PathBuf,
+}
+
+impl Model {
+    fn from_env() -> Self {
+        let id = std::env::var("OULIPOLY_NATIVE_MODEL").expect("OULIPOLY_NATIVE_MODEL must be set");
+        let auth = PathBuf::from(
+            std::env::var("OULIPOLY_NATIVE_AUTH").expect("OULIPOLY_NATIVE_AUTH must be set"),
+        );
+        Self { id, auth }
+    }
+}
+
 struct Fixture {
     dir: PathBuf,
     opencode: PathBuf,
@@ -35,7 +56,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new() -> Self {
+    fn new(model: Option<&Model>) -> Self {
         let deps = PathBuf::from(
             std::env::var("OULIPOLY_NATIVE_DEPS").expect("OULIPOLY_NATIVE_DEPS must be set"),
         );
@@ -71,31 +92,62 @@ impl Fixture {
             mkdir(&dir.join(sub));
         }
         let path = |sub: &str| dir.join(sub).to_str().unwrap().to_owned();
-        let config = json!({
+        let mut config = json!({
             "plugin": [format!("file://{}", endpoint.display())],
             "autoupdate": false,
             "share": "disabled",
         });
-        let env = [
+        let mut env = vec![
             ("PATH", "/usr/bin:/bin".to_owned()),
             ("HOME", path("home")),
             ("XDG_CONFIG_HOME", path("xdg/config")),
             ("XDG_DATA_HOME", path("xdg/data")),
             ("XDG_CACHE_HOME", path("xdg/cache")),
             ("XDG_STATE_HOME", path("xdg/state")),
-            ("OPENCODE_CONFIG_CONTENT", config.to_string()),
             ("OPENCODE_DISABLE_AUTOUPDATE", "1".to_owned()),
-            ("OPENCODE_DISABLE_DEFAULT_PLUGINS", "1".to_owned()),
             ("OPENCODE_DISABLE_PROJECT_CONFIG", "1".to_owned()),
             ("OPENCODE_DISABLE_CLAUDE_CODE", "1".to_owned()),
             ("OPENCODE_DISABLE_LSP_DOWNLOAD", "1".to_owned()),
             ("OPENCODE_DISABLE_SHARE", "1".to_owned()),
-            ("OULIPOLY_ACP_V2_NO_REPLY", "1".to_owned()),
             ("OULIPOLY_ACP_V2_LOG", path("acp-v2.log")),
-        ]
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
-        .collect();
+        ];
+        if let Ok(trace) = std::env::var("OULIPOLY_ACP_V2_TRACE") {
+            env.push(("OULIPOLY_ACP_V2_TRACE", trace));
+        }
+        match model {
+            None => {
+                env.push(("OPENCODE_DISABLE_DEFAULT_PLUGINS", "1".to_owned()));
+                env.push(("OULIPOLY_ACP_V2_NO_REPLY", "1".to_owned()));
+            }
+            Some(model) => {
+                // The built-in (default) plugins carry OpenCode's own OpenAI
+                // ChatGPT-OAuth support, which reads `<data>/opencode/auth.json`.
+                let data = dir.join("xdg/data/opencode");
+                mkdir(&data);
+                std::fs::copy(&model.auth, data.join("auth.json")).unwrap();
+                let (provider, name) = model.id.split_once('/').expect("provider/model");
+                config["model"] = json!(model.id);
+                // Every tool call needs permission, so the turn that asks for
+                // one shows the route it takes; nothing else may be used.
+                config["permission"] = json!({ "*": "ask" });
+                // No extra model call to title the conversation.
+                config["agent"] = json!({ "title": { "disable": true } });
+                config["provider"] = json!({ provider: { "models": { name: {
+                    "name": name,
+                    "options": {
+                        "reasoningEffort": "high",
+                        "reasoningSummary": "auto",
+                        "include": ["reasoning.encrypted_content"],
+                        "store": false,
+                    },
+                }}}});
+            }
+        }
+        env.push(("OPENCODE_CONFIG_CONTENT", config.to_string()));
+        let env = env
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .collect();
         Self {
             dir,
             opencode,
@@ -256,7 +308,7 @@ fn assert_cancelled_and_reaped(terminal: &Value, code: Option<i32>) {
 #[test]
 #[ignore = "needs OULIPOLY_NATIVE_DEPS (public OpenCode + ACP SDK) and loopback-only networking"]
 fn native_host_opens_then_resumes_its_conversation_over_the_owner_socket() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new(None);
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -332,4 +384,70 @@ fn native_host_opens_then_resumes_its_conversation_over_the_owner_socket() {
             .count();
         assert_eq!(sockets, 0, "{store}: socket left after observed end");
     }
+}
+
+/// One real configured model turn per root: root A opens a conversation and
+/// its turn answers; root B resumes it with a turn that asks for a tool,
+/// whose permission request reaches the owner, is refused there and is
+/// rejected natively. Each turn's output, refusal and end reach the owner
+/// over ACP v2 as reports distinct from the insertion ACK.
+#[test]
+#[ignore = "needs OULIPOLY_NATIVE_DEPS, OULIPOLY_NATIVE_MODEL, OULIPOLY_NATIVE_AUTH and network to the provider; spends real model turns"]
+fn native_host_runs_a_configured_model_turn_over_the_owner_socket() {
+    let model = Model::from_env();
+    let fixture = Fixture::new(Some(&model));
+
+    let mut run = Run::start(
+        &fixture,
+        &fixture.spec(
+            "root-a",
+            None,
+            "Reply with exactly the single word PONG and nothing else. Do not use any tools.",
+        ),
+    );
+    run.event("endpoint-connected");
+    let session = run.event("session-opened")["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let ack = run.event("ack");
+    assert_eq!(ack["label"], "accepted", "{ack}");
+    let idle = run.event("idle");
+    let answer = run.event("agent-message");
+    println!("turn 1: {answer}\n{idle}");
+    assert_eq!(idle["stop_reason"], "end_turn", "{idle}");
+    assert!(
+        answer["text"].as_str().unwrap().contains("PONG"),
+        "{answer}"
+    );
+    let (terminal, code) = run.cancel();
+    assert_cancelled_and_reaped(&terminal, code);
+
+    let mut run = Run::start(
+        &fixture,
+        &fixture.spec(
+            "root-b",
+            Some(&session),
+            "Use your bash tool exactly once to run: echo oulipoly-permission-probe . \
+             If the tool is refused, do not retry; reply with the single word REFUSED.",
+        ),
+    );
+    run.event("endpoint-connected");
+    run.event("session-resumed");
+    let ack = run.event("ack");
+    assert_eq!(ack["label"], "accepted", "{ack}");
+    let idle = run.event("idle");
+    println!("turn 2: {idle}\nseen: {:#?}", run.seen);
+    let refused = run.event("request-refused");
+    assert_eq!(refused["method"], "session/request_permission", "{refused}");
+    let notice = run.event("notice");
+    assert_eq!(notice["severity"], "warning", "{notice}");
+    let (terminal, code) = run.cancel();
+    assert_cancelled_and_reaped(&terminal, code);
+
+    let exported = fixture.export(&session);
+    println!("export: {exported:?}");
+    let roles: Vec<&str> = exported.iter().map(|(_, role, _)| role.as_str()).collect();
+    assert_eq!(roles.first(), Some(&"user"));
+    assert!(roles.contains(&"assistant"), "{exported:?}");
 }
