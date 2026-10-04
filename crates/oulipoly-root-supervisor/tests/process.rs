@@ -2399,6 +2399,72 @@ fn by_control<'a>(seen: &'a [Value], event: &str, control: u64) -> Vec<&'a Value
         .collect()
 }
 
+/// The peer emits both reply and tagged idle before each insertion ACK.
+/// Correlation must use that ACK's native identity, and the ended input
+/// must allow another live input and close rather than remaining open.
+#[test]
+fn turn_before_ack_preserves_correlation_follow_up_and_close() {
+    let dir = Scratch::new("early");
+    let state = dir.state("a");
+    let mut run = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            1,
+            json!([{
+                "id": "a", "argv": peer(&state, &["--turn-before-ack"]), "messages": ["one"]
+            }]),
+        ),
+    );
+    let mut ids = Vec::new();
+    for (index, text) in [(0, "one"), (1, "two")] {
+        if index == 1 {
+            run.control(&json!({ "cmd": "send", "text": text }).to_string());
+            assert_eq!(run.event("a", "follow-up-admitted")["input"], index);
+        }
+        // Read any reply, including a wrongly unattributed one: the old
+        // ordering fails here immediately instead of hiding behind a wait.
+        let reply = run.until("early reply", |value| {
+            value["event"] == "agent-message" && value["text"] == text
+        });
+        assert_eq!(reply["input"], index, "{reply}");
+        assert_eq!(reply["input_attribution"], "native-parent");
+        let ack = run.until("insertion ACK", |value| {
+            value["event"] == "ack" && value["index"] == index
+        });
+        let turn = run.until("early tagged turn end", |value| {
+            value["event"] == "turn-end" && value["input"] == index
+        });
+        assert_eq!(ack["durable"], true);
+        assert_eq!(reply["parent_message_id"], ack["message_id"]);
+        assert_eq!(turn["message_id"], ack["message_id"]);
+        assert_eq!(turn["last_user_message_id"], ack["message_id"]);
+        assert_eq!(turn["session"], "sess-1");
+        assert_eq!(turn["own_output"], true);
+        ids.push(ack["message_id"].clone());
+    }
+    assert_ne!(ids[0], ids[1]);
+    run.control(r#"{"cmd":"close"}"#);
+    let (terminal, status, seen) = run.terminal();
+    assert_eq!(status.code(), Some(7), "{terminal}");
+    assert_eq!(terminal["status"], "closed");
+    assert_eq!(terminal["owed"], 0);
+    assert_eq!(terminal["cancel_requested"], false);
+    assert_eq!(terminal["all_harnesses_reaped"], true);
+    let a = harness(&terminal, "a");
+    assert_eq!(a["launches"], 1);
+    assert_eq!(a["exits"], json!(["signal:9"]));
+    for message in a["messages"].as_array().unwrap() {
+        assert_eq!(message["completion"], "not-observed");
+    }
+    assert_eq!(events(&seen, "a", "agent-message").len(), 2);
+    assert_eq!(events(&seen, "a", "turn-end").len(), 2);
+    assert!(events(&seen, "a", "follow-up-refused").is_empty());
+    let peer = read_state(&state);
+    assert_eq!(peer["sessions"], json!(["sess-1"]));
+    assert_eq!(peer["prompts"].as_array().unwrap().len(), 2);
+}
+
 /// Live follow-up: a further caller input reaches the same live harness
 /// and session, durably admitted before it is reported, with its own
 /// correlated ack and turn end. Malformed controls admit nothing. `close`
@@ -2496,7 +2562,7 @@ fn follow_up_reaches_the_same_session_and_close_is_not_cancel() {
     assert_eq!(terminal["all_harnesses_reaped"], true);
     let a = harness(&terminal, "a");
     assert_eq!(a["exits"], json!(["signal:9"]), "{a}");
-    assert_eq!(a["close"], "stopped-by-owner-after-turns-ended");
+    assert_eq!(a["close"], "owner-stop-attempted-after-turns-ended");
     assert_eq!(a["launches"], 1);
     assert_eq!(a["messages"][0]["origin"], "intent");
     assert_eq!(a["messages"][1]["origin"], "follow-up");
@@ -2518,8 +2584,8 @@ fn follow_up_reaches_the_same_session_and_close_is_not_cancel() {
     );
 }
 
-/// Unsupported overlap is refused, not queued: while an input's turn is
-/// open a follow-up is not admitted and nothing is sent. A close waits
+/// Overlap at the worker's admission check is refused: while an input's
+/// turn remains open a follow-up is not admitted or sent. A close waits
 /// for that turn; with a turn that never ends, only cancel ends the run,
 /// as `cancelled`, with the close not followed through.
 #[test]

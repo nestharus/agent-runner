@@ -1078,7 +1078,8 @@ mod tests {
     }
 
     /// Fresh-only schema: a store of the previous version is refused, not
-    /// migrated, and nothing is written to it.
+    /// migrated, and no current-schema tables are added. Claim may create
+    /// a lock file and configure WAL before it checks the version.
     #[test]
     fn previous_store_version_is_refused() {
         let dir = Dir::new("v4");
@@ -1097,7 +1098,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(tables, 1, "nothing created in a refused store");
+        assert_eq!(
+            tables, 1,
+            "no current-schema tables added to a refused store"
+        );
     }
 
     #[test]

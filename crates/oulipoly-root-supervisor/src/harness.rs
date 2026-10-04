@@ -96,9 +96,10 @@ pub struct HarnessRecord {
     pub wait_failures: Vec<String>,
     /// Live harnesses left to a newer owner when this one detached.
     pub detached: u32,
-    /// This owner had the harness killed by its work PID 1 because the
-    /// caller closed the conversation (its exit is still in `exits`).
-    pub close_stopped: bool,
+    /// This owner attempted to stop the harness for close after tagged
+    /// turn ends. Request delivery and the actual waited exit are separate
+    /// observations (`close-stopping.signalled` and `exits`).
+    pub close_stop_attempted: bool,
     pub messages: Vec<MessageRecord>,
 }
 
@@ -113,7 +114,7 @@ impl HarnessRecord {
             "prior_unknown_ends": self.prior_unknown_ends,
             "wait_failures": self.wait_failures,
             "detached": self.detached,
-            "close": if self.close_stopped { "stopped-by-owner-after-turns-ended" } else { "not-stopped-by-close" },
+            "close": if self.close_stop_attempted { "owner-stop-attempted-after-turns-ended" } else { "not-stopped-by-close" },
             "messages": self.messages.iter().map(|message| json!({
                 "index": message.index,
                 "origin": if message.follow_up { "follow-up" } else { "intent" },
@@ -206,7 +207,7 @@ struct Worker {
     /// The caller's further input to this harness's live conversation.
     inbox: Arc<Inbox>,
     closing: Arc<Closing>,
-    close_stopped: bool,
+    close_stop_attempted: bool,
 }
 
 /// What one worker is given: its durable harness record and shared state.
@@ -286,7 +287,7 @@ pub(crate) fn run(assignment: Assignment) {
         answered: std::collections::HashSet::new(),
         inbox,
         closing,
-        close_stopped: false,
+        close_stop_attempted: false,
     };
     worker.view(|view| {
         view.id.clone_from(&worker.id);
@@ -976,7 +977,6 @@ impl Worker {
                     }
                 });
                 let outcome = client.submit(&session, &mut self.tracked[index].message);
-                self.report_turn(client, &mut seen);
                 let (resolution, end) = match &outcome {
                     DeliveryOutcome::Accepted(acceptance)
                     | DeliveryOutcome::DuplicateUnknown(acceptance) => {
@@ -1018,6 +1018,10 @@ impl Worker {
                             }
                         });
                         self.tracked[index].ack = Some(ack);
+                        // submit may collect reply/idle notifications before
+                        // the insertion response. Correlate them only after
+                        // this ACK's identity is durable and in the open view.
+                        self.report_turn(client, &mut seen);
                         continue;
                     }
                     DeliveryOutcome::Rejected { code, .. } => {
@@ -1044,6 +1048,9 @@ impl Worker {
                         ("not-sent", Some(ConnEnd::Stop))
                     }
                 };
+                // No ACK: keep native parent attribution unknown rather than
+                // assigning these observations to the attempted input.
+                self.report_turn(client, &mut seen);
                 if self
                     .durable(|store| store.resolve_attempt(attempt, resolution))
                     .is_none()
@@ -1059,7 +1066,7 @@ impl Worker {
             // Between turns the caller's bell may interrupt the wait: a further
             // input is taken only here, and a close acts only here.
             loop {
-                if self.closing.requested() && !self.close_stopped && self.no_open_input() {
+                if self.closing.requested() && !self.close_stop_attempted && self.no_open_input() {
                     self.stop_for_close(live);
                 }
                 observed.wake_armed.set(true);
@@ -1100,17 +1107,17 @@ impl Worker {
     }
 
     /// The caller closed the conversation and every admitted input's turn
-    /// has ended: this owner has the harness killed by its own work PID 1.
-    /// Its end is still known only from that waiter's report.
+    /// has ended: attempt a stop through its work PID 1. Its end is still
+    /// known only from that waiter's report, even if the request was sent.
     fn stop_for_close(&mut self, live: &Live) {
-        self.close_stopped = true;
+        self.close_stop_attempted = true;
         let signalled = live.root.kill(live.work);
         self.report(json!({
             "event": "close-stopping",
             "work": live.work,
             "signalled": signalled,
             "by": "work-pid1-kill",
-            "meaning": "input closed and every admitted input's turn ended; not processing success",
+            "meaning": "owner stop attempted after input closure and tagged turn ends; signalled records request delivery, actual host end is reported separately; not processing success",
         }));
     }
 
@@ -1127,8 +1134,10 @@ impl Worker {
     /// Takes what the caller queued. One input at a time: a follow-up is
     /// admitted only when nothing is owed or open on this harness (every
     /// earlier input acknowledged and its turn ended); otherwise it is
-    /// refused, not deferred. Admission is a durable commit of an owed
-    /// message, reported only after it. Returns false if the store was lost.
+    /// refused at this admission-time check. Receipt may have queued it
+    /// during a turn that has since ended. A check already passed can
+    /// commit after close is requested. Admission is a durable commit of
+    /// an owed message, reported only after it. Returns false on store loss.
     fn take_follow_ups(&mut self) -> bool {
         for follow_up in self.inbox.take() {
             let refused = if self.cancelled() {
@@ -1325,7 +1334,7 @@ impl Worker {
             prior_unknown_ends: self.prior_unknown_ends,
             wait_failures: self.wait_failures.clone(),
             detached: self.detached,
-            close_stopped: self.close_stopped,
+            close_stop_attempted: self.close_stop_attempted,
             messages,
         }
     }
@@ -1419,7 +1428,7 @@ mod tests {
                 answered: std::collections::HashSet::new(),
                 inbox: Arc::new(Inbox::new().unwrap()),
                 closing: Arc::default(),
-                close_stopped: false,
+                close_stop_attempted: false,
             },
             rx,
             dir,

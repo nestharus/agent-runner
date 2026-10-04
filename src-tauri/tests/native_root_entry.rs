@@ -863,7 +863,7 @@ fn native_root_follow_up_reaches_the_live_session_and_close_is_not_cancel() {
     let refused = run.event("follow-up-refused");
     assert_eq!(refused["reason"], "input-closed", "{refused}");
     assert_eq!(refused["ref"], "f2");
-    run.event("close-stopping");
+    assert_eq!(run.event("close-stopping")["signalled"], true);
     let (owner, entry, code, seen) = run.finish();
     println!("close: {close}");
 
@@ -881,7 +881,7 @@ fn native_root_follow_up_reaches_the_live_session_and_close_is_not_cancel() {
     assert_eq!(owner["root_pid1"]["end_observed"], true, "{owner}");
     let host = &owner["harnesses"][0];
     assert_eq!(host["exits"], json!(["signal:9"]), "{host}");
-    assert_eq!(host["close"], "stopped-by-owner-after-turns-ended");
+    assert_eq!(host["close"], "owner-stop-attempted-after-turns-ended");
     assert_eq!(host["messages"][1]["origin"], "follow-up");
     assert_eq!(host["messages"][1]["completion"], "not-observed");
     assert_eq!(entry["stage"], "owner-ended", "{entry}");

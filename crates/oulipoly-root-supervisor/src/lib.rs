@@ -141,33 +141,39 @@
 //!
 //! While an owner drives a harness's session, the caller may address
 //! further input to it (`send`; `harness` names it unless the root has
-//! one). Bounded and sequential, never overlapping:
+//! one). Follow-up admission is bounded and sequential:
 //!
 //! * The control reader answers at once with `follow-up-refused`
 //!   (`malformed`, `cancelled`, `input-closed`, `harness-required`,
 //!   `unknown-harness`, `not-in-conversation`) or `follow-up-received`
 //!   (`queued-not-admitted`, not durable). Neither is an admission.
-//! * The harness's worker takes queued input only between turns, while it
-//!   waits for the agent's next idle. It admits one only when nothing is
+//! * The harness's worker takes queued input while waiting for the agent's
+//!   next idle. It admits one only when nothing is
 //!   owed or open on that harness: every earlier input acknowledged and its
 //!   turn ended (`turn-end`, idle-tag coverage). Otherwise it is refused
-//!   (`input-open`), never deferred; so are queued inputs after a cancel or
-//!   close, and any the worker leaves its conversation without taking
-//!   (`conversation-ended`).
+//!   (`input-open`) at that check. Receipt during an open turn can remain
+//!   provisional until the turn ends; it is not an arrival-time overlap
+//!   refusal. Queued inputs checked after cancel or close are refused, as
+//!   are inputs the worker leaves its conversation without taking
+//!   (`conversation-ended`). Store loss may leave queued controls without
+//!   individual dispositions; the terminal store-loss report qualifies them.
 //! * Admission is `follow-up-admitted` with its `input` index, emitted only
 //!   after the message, a freshly minted key, the control number and the
 //!   caller's `ref` have committed to the store (`origin` `follow-up`). From
 //!   then on it is owed debt like an intent message: attempt, `ack`
 //!   (insertion readback), `agent-message` and `turn-end` name the same
 //!   `input`, and a later recovery resubmits it with its original key.
-//! * `close` ends input for the whole root (`close-requested`). Each
+//! * `close` refuses new input for the whole root (`close-requested`). An
+//!   admission whose check already passed can still commit and be reported
+//!   after this request; that input remains part of the admitted work. Each
 //!   worker, once every admitted input on its harness is acknowledged and
-//!   its turn ended, has its harness killed by its own work PID 1
-//!   (`close-stopping`), and the harness's end is reported by that waiter
-//!   as for any exit (typically `signal:9`). An input whose turn never
-//!   ends (an agent that does not tag its idles) holds the close; only
-//!   cancel ends that. A close is not durable: a recovery after owner death
-//!   knows nothing of it.
+//!   its turn ended, attempts to stop its harness through its work PID 1
+//!   (`close-stopping`, with whether the request was sent). The harness's
+//!   actual end is reported separately by that waiter (typically `signal:9`).
+//!   An input without a tagged turn end holds this stop attempt while the
+//!   harness lives. A harness that ends naturally and is waited can also
+//!   close with no owed insertion, without a tagged idle or owner stop.
+//!   A close is not durable: a recovery after owner death knows nothing of it.
 //! * `cancel` stays what it was, and outranks a close.
 //!
 //! None of this observes processing: a turn's end is the agent's tag, and
@@ -475,10 +481,10 @@ pub const EXIT_STORE_LOST: u8 = 5;
 /// A recovery naming its purpose found no root PID 1 to attach: nothing was
 /// launched and no incarnation started; owed messages stay in the store.
 pub const EXIT_ROOT_ABSENT: u8 = 6;
-/// The caller closed the conversation: input ended, every admitted
-/// input's turn ended (idle-tag coverage), each harness this owner stopped
-/// for it was killed by its work PID 1 and its end reported, and nothing is
-/// owed. Not a cancel, and not processing success.
+/// The caller requested input closure, all harness ends were waited, and
+/// nothing is owed. A live harness's close stop requires tagged turn ends;
+/// a naturally ending harness need not report them. Stop attempts and
+/// actual waited exits are separate. Not a cancel or processing success.
 pub const EXIT_CLOSED: u8 = 7;
 /// The request line was missing or invalid; nothing was written or launched.
 pub const EXIT_SPEC_REFUSED: u8 = 64;
@@ -965,7 +971,7 @@ where
                                         "event": "close-requested",
                                         "control": controls,
                                         "input": "closed",
-                                        "meaning": "no further input is admitted; each harness is stopped by its work PID 1 once its admitted inputs' turns have ended; not a cancel and not processing success",
+                                        "meaning": "new input is refused; an admission already past its check may still commit; live harness stop is attempted after admitted turns end, with request and waited exit reported separately; a naturally ending harness may close without tagged idle; not a cancel or processing success",
                                     }),
                                 );
                                 inboxes.iter().for_each(|inbox| inbox.ring());
@@ -1476,7 +1482,7 @@ mod tests {
             prior_unknown_ends: 0,
             wait_failures: vec![],
             detached: 0,
-            close_stopped: false,
+            close_stop_attempted: false,
             messages: vec![],
         }
     }

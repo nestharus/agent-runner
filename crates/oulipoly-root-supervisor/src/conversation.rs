@@ -118,8 +118,9 @@ impl Inbox {
     }
 }
 
-/// The root-wide `close`: no further input, then each harness is stopped
-/// once its admitted inputs' turns have ended.
+/// The root-wide close request: refuse new input, then attempt to stop
+/// live harnesses after tagged turn ends. In-flight admission can finish
+/// after this flag is set; actual exits are waited separately.
 #[derive(Default)]
 pub(crate) struct Closing(AtomicBool);
 
