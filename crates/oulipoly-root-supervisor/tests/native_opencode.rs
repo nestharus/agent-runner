@@ -283,6 +283,8 @@ impl Fixture {
                 "outage_closure_cap": 1,
                 "delivery_attempt_cap": 1,
                 "cwd": self.project,
+                // Run in an outer user namespace fixture: unprivileged.
+                "workload": { "isolation": "unprivileged-userns" },
                 "harnesses": [{
                     "id": "opencode",
                     // `serve` loads a directory's instance, and so its

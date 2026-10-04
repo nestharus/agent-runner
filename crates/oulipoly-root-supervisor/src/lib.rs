@@ -44,10 +44,20 @@
 //! stdio pipes and hands copies to the attached owner (`SCM_RIGHTS`), so the
 //! owner's death is not end of stream for any harness.
 //!
-//! Host root: a new PID namespace. Unprivileged (any other uid): a new user
-//! namespace mapping only the caller's uid/gid to 0, with the PID
-//! namespaces inside it; the `isolation` field says which. Unprivileged
-//! runs do not stand for host-root semantics.
+//! The intent declares who the work runs as ([`Workload`]; see the
+//! [`workload`] module), never inferred from the owner's euid. `host-root`:
+//! the owner (host root) uses new PID namespaces in the host user
+//! namespace, and every harness and Bash run is started by its work PID 1
+//! as the declared non-root host user, with that user's normal host
+//! capabilities; owner, root PID 1 and work PID 1s stay host root. The
+//! store stays owner-private; harness sockets and the Bash ingress are in
+//! the declared `ipc_dir`. `unprivileged-userns` (a non-root owner): a new
+//! user namespace mapping only the caller's uid/gid to 0, with the PID
+//! namespaces inside it, IPC in the store. The `isolation` field says
+//! which. A declaration the owner cannot honour (host-root without euid 0
+//! or with a root or unknown user; unprivileged as euid 0) is refused
+//! before anything is launched. Unprivileged runs do not stand for
+//! host-root semantics.
 //!
 //! **Owner death kills nothing.** No process here has a parent-death signal
 //! or a timer. When the owner dies, root PID 1 is reparented outside the
@@ -84,10 +94,11 @@
 //!
 //! **Bash.** Bash work started inside one of this owner's harness
 //! namespaces reaches this owner, and only this owner, through the root's
-//! Bash ingress (the [`bash`] module): `<store>/bash.sock`, named to every
-//! harness and its descendants in [`bash::BASH_ENV`]. A peer is accepted
-//! only by positive attribution (same uid, and a member of the exact PID
-//! namespace of one live harness work of this owner); anything else is
+//! Bash ingress (the [`bash`] module): `bash.sock` in the root's IPC
+//! directory, named to every harness and its descendants in
+//! [`bash::BASH_ENV`]. A peer is accepted only by positive attribution
+//! (the work's uid, and a member of the exact PID namespace of one live
+//! harness work of this owner); anything else is
 //! refused and reported (`bash-refused`), never routed to the old Broker,
 //! another root or a fallback. One request per connection, one JSON line:
 //! `{"v":1,"op":"run","argv":[...],"cwd":"/abs"}`. Replies, one JSON line
@@ -186,14 +197,16 @@
 //! the default) or on a Unix socket it listens on itself
 //! (`"unix-socket"`), so a native host serves ACP from inside the process
 //! that owns its conversations, with no bridge process. The owner chooses
-//! the socket path per work (`<store>/acp/w<work>.sock`, refused at intent
-//! validation if the store path is too long for it) and passes it as
+//! the socket path per work (`<ipc>/acp/w<work>.sock`, refused at intent
+//! validation if the path is too long for it) and passes it as
 //! `OULIPOLY_ACP_V2_SOCKET`; root PID 1 starts every harness in the
 //! intent's `cwd`. Custody is unchanged: the harness is still the child of
 //! its work PID 1, its end is still known only from that wait, and its
 //! stdout (drained, not parsed) still passes through root PID 1. The owner
 //! connects when the socket listens; a harness that never listens is waited
-//! for like a silent one. End of stream on the socket is the connection's
+//! for like a silent one. A connected listener is admitted only if it is a
+//! process of the work's uid inside that work's own PID namespace
+//! (`endpoint-refused` otherwise). End of stream on the socket is the connection's
 //! end (`connection-closed`), never the harness's. A restarted owner
 //! reconnects to a survivor's socket. The socket file is removed once the
 //! harness's end is observed.
@@ -402,7 +415,15 @@
 //!   acknowledgement-unknown; recovery reconciliation of it, path custody
 //!   of the store, a cross-restart launch/time budget and retention bounds
 //!   are later work. The store and the custody socket live in the owner's
-//!   private directory, not in privileged owner-private custody.
+//!   private directory (host root's under `host-root`); the path to it
+//!   (its ancestors) is the caller's choice and custody.
+//! * `host-root` work identity: the drop happens in each work PID 1's
+//!   child just before exec; nothing here sets `no_new_privs`, so the work
+//!   user keeps its host sudo/setuid capability by design. The Bash
+//!   ingress and harness listener admit only the work's uid inside a live
+//!   work's namespace; a host-root process (e.g. work that used sudo) is
+//!   refused there. Supplementary groups are read from the host's group
+//!   database when the owner starts; later host changes are not followed.
 //! * Root PID 1 keeps every receipt for its lifetime, and a root PID 1 whose
 //!   owner lost its connection to it mid-run is not restarted by that owner.
 //!   Losing that connection does not stop harness reads already blocked.
@@ -437,8 +458,8 @@
 //! * Turn-end attribution relies on the agent's tags and on its message ids
 //!   ascending; an agent that tags wrongly is believed.
 //! * Socket endpoints: the owner retries connecting every 50 ms without a
-//!   deadline until the socket listens or the harness ends. Nothing
-//!   authenticates the listener beyond the store directory's mode; a closed
+//!   deadline until the socket listens or the harness ends. The listener
+//!   is attributed only by its uid and PID namespace at connection; a closed
 //!   connection to a live harness holds the worker until that harness ends
 //!   or the caller cancels. While no owner is attached, nothing drains a
 //!   survivor's stdout.
@@ -453,6 +474,7 @@ mod store;
 #[doc(hidden)]
 pub mod sys;
 mod transport;
+pub mod workload;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
@@ -466,6 +488,7 @@ use serde_json::{Value, json};
 
 pub use harness::{HarnessRecord, MessageRecord, SOCKET_ENV};
 pub use transport::MAX_LINE_BYTES;
+pub use workload::Workload;
 
 /// Every owned harness exited and was reaped; nothing is owed.
 pub const EXIT_ENDED: u8 = 0;
@@ -486,7 +509,10 @@ pub const EXIT_ROOT_ABSENT: u8 = 6;
 /// a naturally ending harness need not report them. Stop attempts and
 /// actual waited exits are separate. Not a cancel or processing success.
 pub const EXIT_CLOSED: u8 = 7;
-/// The request line was missing or invalid; nothing was written or launched.
+/// The request line was missing or invalid, or its work declaration
+/// cannot be honoured by this owner; nothing was launched. Nothing was
+/// written either, except for a recovery whose stored declaration is
+/// refused after its claim (`workload-refused`).
 pub const EXIT_SPEC_REFUSED: u8 = 64;
 /// The store could not be claimed (live owner, missing or existing intent,
 /// not private, or a store error); nothing was launched.
@@ -551,6 +577,9 @@ pub struct Intent {
     /// given to `session/new` and `session/resume`.
     pub cwd: String,
     pub harnesses: Vec<HarnessSpec>,
+    /// Who the root's work runs as and where it meets this owner; declared,
+    /// never chosen from the owner's euid (see [`workload`]).
+    pub workload: Workload,
 }
 
 /// One owned harness: how to launch it and what to deliver to it, in order.
@@ -621,7 +650,10 @@ impl Request {
             return Ok(());
         };
         intent.validate()?;
-        let longest = harness::socket_path(Path::new(&self.store), i64::MAX);
+        // A declaration this owner cannot honour is refused here, before
+        // anything is written or launched.
+        let resolved = intent.workload.resolve(Path::new(&self.store))?;
+        let longest = harness::socket_path(&resolved.ipc_dir, i64::MAX);
         if intent
             .harnesses
             .iter()
@@ -629,8 +661,15 @@ impl Request {
             && longest.as_os_str().len() > SOCKET_PATH_MAX
         {
             return Err(format!(
-                "store path too long for harness sockets ({} > {SOCKET_PATH_MAX} bytes)",
+                "store or ipc path too long for harness sockets ({} > {SOCKET_PATH_MAX} bytes)",
                 longest.as_os_str().len()
+            ));
+        }
+        let ingress = bash::Ingress::socket_path(&resolved.ipc_dir);
+        if ingress.as_os_str().len() > SOCKET_PATH_MAX {
+            return Err(format!(
+                "ipc path too long for the Bash ingress ({} > {SOCKET_PATH_MAX} bytes)",
+                ingress.as_os_str().len()
             ));
         }
         Ok(())
@@ -651,6 +690,7 @@ impl Intent {
         if self.harnesses.is_empty() {
             return Err("at least one harness is required".to_owned());
         }
+        self.workload.validate()?;
         let mut ids = HashSet::new();
         for harness in &self.harnesses {
             if harness.argv.is_empty() {
@@ -743,7 +783,33 @@ where
         .map(|harness| (harness.id.clone(), harness.messages.len()))
         .collect();
 
-    let isolation = sys::Isolation::current();
+    // The stored declaration, checked against this owner before anything
+    // of the root is attached or launched.
+    let resolved = match claimed
+        .workload
+        .resolve(Path::new(&request.store))
+        .and_then(|resolved| workload::prepare_ipc(&resolved, claimed.created).map(|()| resolved))
+    {
+        Ok(resolved) => Arc::new(resolved),
+        Err(reason) => {
+            emit(
+                &mut out,
+                &json!({
+                    "event": "terminal",
+                    "status": "workload-refused",
+                    "reason": reason,
+                    "launched": false,
+                    "store": "claimed; intent and owed work retained",
+                }),
+            );
+            return EXIT_SPEC_REFUSED;
+        }
+    };
+    emit(
+        &mut out,
+        &json!({ "event": "workload", "declared": claimed.workload, "resolved": resolved.to_json() }),
+    );
+    let isolation = resolved.isolation;
     let stop = match transport::StopSignal::new() {
         Ok(stop) => Arc::new(stop),
         Err(error) => {
@@ -774,7 +840,7 @@ where
     let slot = Arc::new(custody::RootSlot::new(
         PathBuf::from(&request.store),
         generation,
-        isolation,
+        Arc::clone(&resolved),
         Arc::clone(&stop),
         recovery.root,
     ));
@@ -838,7 +904,6 @@ where
             .collect(),
     ));
     let ingress = bash::Ingress::new(
-        PathBuf::from(&request.store),
         claimed.root_id.clone(),
         Arc::clone(&slot),
         Arc::clone(&custody),
@@ -887,7 +952,6 @@ where
         let assignment = harness::Assignment {
             position,
             harness,
-            store_dir: PathBuf::from(&request.store),
             cap: claimed.outage_closure_cap,
             attempt_cap: claimed.delivery_attempt_cap,
             cwd: claimed.cwd.clone(),
@@ -1440,6 +1504,7 @@ mod tests {
                 "delivery_attempt_cap": 1,
                 "cwd": "/",
                 "harnesses": [harness],
+                "workload": { "isolation": "unprivileged-userns" },
             },
         });
         serde_json::from_value::<Request>(line)
@@ -1574,6 +1639,7 @@ mod tests {
                 session: None,
                 messages: vec![],
             }],
+            workload: Workload::UnprivilegedUserns {},
         };
         let mut store = store::Store::claim(&dir, Some(&intent)).unwrap().store;
         assert_eq!(store.begin_incarnation("t", "test").unwrap(), 1);
@@ -1584,7 +1650,7 @@ mod tests {
         let slot = custody::RootSlot::new(
             dir.clone(),
             store.generation(),
-            sys::Isolation::current(),
+            workload::unprivileged_for_tests(&dir),
             stop,
             Some(root),
         );

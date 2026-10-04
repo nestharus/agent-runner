@@ -181,6 +181,8 @@ impl Root {
                     "models": { "scripted": { "name": "scripted", "tool_call": true } },
                 }},
             },
+            // Run in an outer user namespace fixture: unprivileged.
+            "workload": { "isolation": "unprivileged-userns" },
         });
         Self { dir, request }
     }
@@ -888,4 +890,366 @@ fn native_root_follow_up_reaches_the_live_session_and_close_is_not_cancel() {
     assert_eq!(entry["owner_exit"], 7, "{entry}");
     assert_eq!(code, Some(87), "{entry}");
     wait_ended(host_pid, "native host");
+}
+
+/// The prepared host-root trial's in-root command: the Bash run's real and
+/// effective ids and groups, its `no_new_privs` and effective capabilities,
+/// then the disposable setuid-root identity probe's effective uid.
+const IDENTITY: &str = r#"printf 'uid=%s euid=%s gid=%s groups=%s|' "$(id -ru)" "$(id -u)" "$(id -rg)" "$(id -G)"; awk '/^(NoNewPrivs|CapEff):/ {printf "%s|", $0}' /proc/self/status; "$OULIPOLY_SETUID_PROBE" -u"#;
+
+/// `(uid, gid)` of a host user, from the host's own `id`.
+fn host_ids(user: &str) -> (u32, u32) {
+    let id = |flag: &str| {
+        let output = Command::new("/usr/bin/id")
+            .args([flag, user])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "id {flag} {user}: {output:?}");
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap()
+    };
+    (id("-u"), id("-g"))
+}
+
+/// `(real, effective, saved, fs)` uids of a live process, from its status.
+fn proc_uids(pid: u64) -> Option<Vec<u32>> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status.lines().find_map(|line| {
+        line.strip_prefix("Uid:").map(|rest| {
+            rest.split_whitespace()
+                .filter_map(|id| id.parse().ok())
+                .collect()
+        })
+    })
+}
+
+fn proc_field(pid: u64, name: &str) -> Option<String> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(name).map(|rest| rest.trim().to_owned()))
+}
+
+/// `(uid, mode)` of a path, not following a final symlink.
+fn owned(path: impl AsRef<Path>) -> (u32, u32) {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path.as_ref())
+        .unwrap_or_else(|error| panic!("{}: {error}", path.as_ref().display()));
+    (meta.uid(), meta.mode() & 0o7777)
+}
+
+/// A fresh host-root request: the root's own directory is traversable,
+/// its project and Bash HOME are the work user's, and the declared
+/// environment names the setuid probe for the in-root command.
+fn host_root(scratch: &Path, name: &str, base_url: &str, user: &str, ids: (u32, u32)) -> Root {
+    use std::os::unix::fs::PermissionsExt;
+    let mut root = Root::new(scratch, name, base_url, &format!("RUN {IDENTITY}"));
+    std::fs::set_permissions(&root.dir, std::fs::Permissions::from_mode(0o711)).unwrap();
+    for sub in ["owner-home", "project"] {
+        std::os::unix::fs::chown(root.dir.join(sub), Some(ids.0), Some(ids.1)).unwrap();
+    }
+    root.request["workload"] = json!({ "isolation": "host-root", "user": user });
+    root.request["opencode"]["bash_allow"] = json!([IDENTITY]);
+    root.request["env"]["OULIPOLY_SETUID_PROBE"] = json!(var("OULIPOLY_SETUID_PROBE"));
+    root
+}
+
+/// Runs the prototype requester against a live root's Bash ingress from
+/// outside every harness namespace, as `as_user` (or as this process).
+fn outside_request(ingress: &str, cwd: &Path, as_user: Option<(u32, u32)>) -> std::process::Output {
+    use std::os::unix::process::CommandExt;
+    let requester = Path::new(RUNNER)
+        .parent()
+        .unwrap()
+        .join("oulipoly-root-bash");
+    let mut command = Command::new(requester);
+    command
+        .args(["--", "true"])
+        .current_dir(cwd)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("OULIPOLY_ROOT_BASH_V1", ingress)
+        .stdin(Stdio::null());
+    if let Some((uid, gid)) = as_user {
+        command.gid(gid).uid(uid);
+    }
+    command.output().unwrap()
+}
+
+/// THE PREPARED HOST-ROOT TRIAL. Run once, as host uid 0, by ROOT only,
+/// inside the trial script's own network, PID and mount namespaces with
+/// loopback up; never by a model. The owner and its custody run as host
+/// root; the native OpenCode host (answered by the scripted loopback
+/// stand-in) and the in-root Bash run must run as `OULIPOLY_WORKLOAD_USER`
+/// with that user's normal host capability (shown by the disposable
+/// setuid-root probe `OULIPOLY_SETUID_PROBE`), and no other process of the
+/// trial may be host root.
+#[test]
+#[ignore = "PRIVILEGED TRIAL: host uid 0 only, via the prepared trial script; needs the root supervisor binaries beside the Runner, OULIPOLY_NATIVE_DEPS, OULIPOLY_AGENT_BASH_TOOL, AGENT_BASH_BIN, OULIPOLY_NATIVE_SCRATCH, OULIPOLY_WORKLOAD_USER, OULIPOLY_SETUID_PROBE and loopback"]
+fn native_root_host_root_owner_runs_its_native_host_and_bash_as_the_work_user() {
+    // SAFETY: geteuid has no preconditions.
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "the privileged trial runs as host root only"
+    );
+    let user = var("OULIPOLY_WORKLOAD_USER");
+    let (uid, gid) = host_ids(&user);
+    assert_ne!(uid, 0, "the work user must not be root");
+    let scratch = PathBuf::from(var("OULIPOLY_NATIVE_SCRATCH"));
+    let base_url = scripted_model();
+
+    // Pre-model refusals: nothing is created, nothing launched.
+    for (name, workload, reason) in [
+        (
+            "x0",
+            json!({ "isolation": "host-root", "user": "root" }),
+            "is uid 0",
+        ),
+        (
+            "x1",
+            json!({ "isolation": "host-root", "user": "oulipoly-no-such-user" }),
+            "no host user",
+        ),
+        (
+            "x2",
+            json!({ "isolation": "unprivileged-userns" }),
+            "unprivileged-userns declared but the owner is euid 0",
+        ),
+    ] {
+        let mut refused = host_root(&scratch, name, &base_url, &user, (uid, gid));
+        refused.request["workload"] = workload;
+        let mut run = refused.start();
+        let entry = run.entry("terminal");
+        let code = run.child.wait().unwrap().code();
+        println!("refusal {name}: {entry}");
+        assert_eq!(entry["stage"], "refused", "{entry}");
+        assert_eq!(entry["effects"], "none", "{entry}");
+        assert!(
+            entry["reason"].as_str().unwrap().contains(reason),
+            "{entry}"
+        );
+        assert_eq!(code, Some(64), "{entry}");
+        for path in ["launch_dir", "store"] {
+            assert!(
+                !Path::new(refused.request[path].as_str().unwrap()).exists(),
+                "{path}"
+            );
+        }
+    }
+
+    let root = host_root(&scratch, "h", &base_url, &user, (uid, gid));
+    let launch = PathBuf::from(root.request["launch_dir"].as_str().unwrap());
+    let store = PathBuf::from(root.request["store"].as_str().unwrap());
+    let ipc = launch.join("ipc");
+    let mut run = root.start();
+    let setup = run.entry("setup-completed");
+    assert_eq!(setup["workload"]["isolation"], "host-root-pidns", "{setup}");
+    assert_eq!(setup["workload"]["uid"], uid, "{setup}");
+    let owner = run.entry("owner-started")["pid"].as_u64().unwrap();
+    assert_eq!(proc_uids(owner), Some(vec![0; 4]), "owner identity");
+    let resolved = run.event("workload");
+    assert_eq!(resolved["resolved"]["identity"]["uid"], uid, "{resolved}");
+    let started = run.event("started");
+    assert_eq!(started["isolation"], "host-root-pidns", "{started}");
+    let pid1 = run.event("root-pid1-started");
+    assert_eq!(pid1["workload"]["uid"], uid, "{pid1}");
+    assert_eq!(pid1["observed"]["uid"], json!([0, 0, 0, 0]), "{pid1}");
+    let pid1 = pid1["pid"].as_u64().unwrap();
+    let launched = run.event("launched");
+    let host = launched["pid"].as_u64().unwrap();
+    assert_eq!(
+        launched["identity"]["uid"],
+        json!([uid, uid, uid, uid]),
+        "{launched}"
+    );
+    assert_eq!(
+        launched["identity"]["gid"],
+        json!([gid, gid, gid, gid]),
+        "{launched}"
+    );
+    assert_eq!(
+        launched["identity"]["no_new_privs"],
+        json!([0]),
+        "{launched}"
+    );
+    run.event("endpoint-connected");
+    assert_eq!(proc_uids(host), Some(vec![uid; 4]), "native host identity");
+
+    // Placement: the store is the owner's alone; the native config is
+    // readable but not the work user's; the work user's HOME, data and IPC.
+    assert_eq!(owned(&store), (0, 0o700), "store");
+    assert_eq!(owned(launch.as_path()), (0, 0o750), "launch dir");
+    assert_eq!(owned(launch.join("home")), (uid, 0o700), "native HOME");
+    assert_eq!(owned(launch.join("xdg/data")), (uid, 0o700), "native data");
+    let config = launch.join("xdg/config/opencode");
+    assert_eq!(owned(&config), (0, 0o1770), "native config dir");
+    assert_eq!(
+        owned(config.join("opencode.json")),
+        (0, 0o640),
+        "native policy"
+    );
+    assert_eq!(
+        owned(config.join("tool/bash.ts")),
+        (0, 0o640),
+        "native gate"
+    );
+    assert_eq!(owned(&ipc), (0, 0o711), "ipc dir");
+    assert_eq!(owned(ipc.join("acp")), (uid, 0o700), "harness socket dir");
+    assert_eq!(owned(ipc.join("bash.sock")).0, uid, "ingress socket");
+
+    let session = run.event("session-opened")["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(run.event("ack")["label"], "accepted");
+    let accepted = run.event("bash-accepted");
+    assert_eq!(
+        accepted["argv"],
+        json!(["bash", "-lc", IDENTITY]),
+        "{accepted}"
+    );
+    let bash_started = run.event("bash-started");
+    println!("bash started: {bash_started}");
+    if !bash_started["identity"].is_null() {
+        assert_eq!(
+            bash_started["identity"]["uid"],
+            json!([uid, uid, uid, uid]),
+            "{bash_started}"
+        );
+    }
+    let ended = run.event("bash-ended");
+    println!("bash ended: {ended}");
+    let idle = run.event("idle");
+    assert_eq!(idle["stop_reason"], "end_turn", "{idle}");
+    assert_eq!(run.event("agent-message")["text"], "DONE");
+
+    // Census of this trial's own PID namespace while the native host
+    // lives: host root only for this test, the Runner entry, the owner,
+    // root PID 1 and work PID 1s; everything else is the work user.
+    let me = u64::from(std::process::id());
+    let entry = u64::from(run.child.id());
+    let mut census = Vec::new();
+    for proc_entry in std::fs::read_dir("/proc").unwrap() {
+        let Some(pid) = proc_entry
+            .ok()
+            .and_then(|e| e.file_name().to_str()?.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let Some(uids) = proc_uids(pid) else { continue };
+        let name = proc_field(pid, "Name:").unwrap_or_default();
+        let ppid: u64 = proc_field(pid, "PPid:")
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0);
+        census.push((pid, ppid, name, uids));
+    }
+    println!("census: {census:?}");
+    for (pid, ppid, name, uids) in &census {
+        let custody = *pid == me
+            || *pid == entry
+            || *pid == owner
+            || *pid == pid1
+            || (*ppid == pid1 && name.starts_with("oulipoly-root-p"));
+        if uids.contains(&0) {
+            assert!(
+                custody,
+                "host-root process outside custody: {pid} {name} {uids:?}"
+            );
+        } else {
+            assert_eq!(uids, &vec![uid; 4], "unexpected identity: {pid} {name}");
+        }
+    }
+    assert!(
+        census.iter().any(|(pid, ..)| *pid == host),
+        "native host in census"
+    );
+
+    // Owner IPC refuses peers it cannot attribute: host root outside every
+    // harness namespace, and the work user outside every harness namespace.
+    let ingress = ipc.join("bash.sock");
+    let ingress = ingress.to_str().unwrap();
+    let project = PathBuf::from(root.request["cwd"].as_str().unwrap());
+    for (as_user, reason) in [
+        (None, "peer-unattributed: other-uid"),
+        (
+            Some((uid, gid)),
+            "peer-unattributed: outside-every-harness-namespace",
+        ),
+    ] {
+        let output = outside_request(ingress, &project, as_user);
+        println!("outside {as_user:?}: {output:?}");
+        assert_eq!(output.status.code(), Some(69), "{output:?}");
+        let refused = run.event("bash-refused");
+        assert_eq!(refused["reason"], reason, "{refused}");
+        run.seen.retain(|value| value != &refused);
+    }
+
+    let (owner_end, entry_end, code) = run.cancel();
+    assert_eq!(owner_end["status"], "cancelled", "{owner_end}");
+    assert_eq!(owner_end["all_harnesses_reaped"], true, "{owner_end}");
+    assert_eq!(owner_end["root_pid1"]["end_observed"], true, "{owner_end}");
+    assert_eq!(owner_end["bash"]["accepted"], 1, "{owner_end}");
+    assert_eq!(owner_end["bash"]["refused"], 2, "{owner_end}");
+    assert_eq!(code, Some(82), "{entry_end}");
+
+    // What the Bash run itself reported, read by OpenCode as the work user.
+    let parts = {
+        use std::os::unix::process::CommandExt;
+        let opencode = Path::new(&var("OULIPOLY_NATIVE_DEPS"))
+            .join("node_modules/opencode-linux-x64/bin/opencode");
+        let output = Command::new(opencode)
+            .args(["export", "--pure", &session])
+            .current_dir(&project)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .envs(
+                setup["launch"]["env"]
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| (k, v.as_str().unwrap())),
+            )
+            .stdin(Stdio::null())
+            .gid(gid)
+            .uid(uid)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "export: {output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        let exported: Value = serde_json::from_str(&text[text.find('{').unwrap()..]).unwrap();
+        exported["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["parts"].as_array().unwrap().iter())
+            .filter(|part| part["type"] == "tool")
+            .map(|part| {
+                part["state"]["output"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+    };
+    println!("bash run output: {parts:?}");
+    assert_eq!(parts.len(), 1, "{parts:?}");
+    let output = parts[0].trim_end();
+    assert!(
+        output.starts_with("Root v1 work ended: exited with code 0"),
+        "{output}"
+    );
+    let expected = format!("uid={uid} euid={uid} gid={gid} ");
+    assert!(output.contains(&expected), "bash run identity: {output}");
+    assert!(
+        output.contains("NoNewPrivs:\t0|"),
+        "bash run no_new_privs: {output}"
+    );
+    assert!(
+        output.ends_with("|0"),
+        "setuid probe effective uid: {output}"
+    );
 }

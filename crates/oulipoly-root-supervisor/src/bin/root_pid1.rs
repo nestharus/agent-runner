@@ -10,7 +10,15 @@
 //! neither kills anything except on an attested owner's explicit request.
 //!
 //! Descriptor 3 is the starting owner's channel. Its first message is
-//! `{"op":"init","store","incarnation","token","generation"}`. Later
+//! `{"op":"init","store","incarnation","token","generation","workload"}`.
+//! `workload` is `null` or `{"uid","gid","groups"}`, a non-root host
+//! identity: then each harness and Bash run is started as that identity
+//! (supplementary groups, then gid, then uid, all real/effective/saved)
+//! by its work PID 1 just before it changes directory and execs, while
+//! root PID 1 and the work PID 1s stay as they were started. Nothing sets
+//! `no_new_privs`, so the identity keeps its host setuid/sudo capability.
+//! A drop that fails is reported as the work's exec error; nothing runs.
+//! Later
 //! owners connect to `pid1-<incarnation>.sock` in the store directory and
 //! must first send `{"op":"hello","token","generation"}`.
 
@@ -43,6 +51,36 @@ struct Work {
     harness: Option<String>,
 }
 
+/// The host identity work is started as (see the module docs).
+#[derive(Clone)]
+struct WorkIdentity {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    groups: Vec<libc::gid_t>,
+}
+
+impl WorkIdentity {
+    /// `Ok(None)` for `null`; a malformed or root identity is refused.
+    fn parse(value: &Value) -> Result<Option<Self>, ()> {
+        if value.is_null() {
+            return Ok(None);
+        }
+        let id = |value: &Value| value.as_u64().and_then(|id| u32::try_from(id).ok());
+        let uid = id(&value["uid"]).ok_or(())?;
+        let gid = id(&value["gid"]).ok_or(())?;
+        let groups = value["groups"]
+            .as_array()
+            .ok_or(())?
+            .iter()
+            .map(|group| id(group).ok_or(()))
+            .collect::<Result<Vec<_>, ()>>()?;
+        if uid == 0 {
+            return Err(());
+        }
+        Ok(Some(Self { uid, gid, groups }))
+    }
+}
+
 struct Owner {
     socket: OwnedFd,
     generation: i64,
@@ -60,6 +98,7 @@ struct Pid1 {
     works: Vec<Work>,
     receipts: Vec<Value>,
     others_reaped: u64,
+    workload: Option<WorkIdentity>,
 }
 
 fn main() {
@@ -88,6 +127,14 @@ fn main() {
         );
         std::process::exit(64);
     };
+    let Ok(workload) = WorkIdentity::parse(&init["workload"]) else {
+        let _ = reply(
+            &channel,
+            &json!({ "event": "refused", "reason": "bad-init-workload" }),
+            &[],
+        );
+        std::process::exit(64);
+    };
     let store = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_PATH)
@@ -112,10 +159,15 @@ fn main() {
         works: Vec::new(),
         receipts: Vec::new(),
         others_reaped: 0,
+        workload,
     };
     let _ = reply(
         &pid1.owners[0].socket,
-        &json!({ "event": "ready", "pid_in_namespace": std::process::id() }),
+        &json!({
+            "event": "ready",
+            "pid_in_namespace": std::process::id(),
+            "workload_uid": pid1.workload.as_ref().map(|identity| identity.uid),
+        }),
         &[],
     );
     pid1.serve();
@@ -363,7 +415,8 @@ impl Pid1 {
             .collect();
         let _ = reply(
             &owner.socket,
-            &json!({ "event": "attached", "generation": generation, "works": works, "receipts": self.receipts }),
+            &json!({ "event": "attached", "generation": generation, "works": works, "receipts": self.receipts,
+                     "workload_uid": self.workload.as_ref().map(|identity| identity.uid) }),
             &[],
         );
         for work in &self.works {
@@ -401,6 +454,7 @@ impl Pid1 {
             cwd: message["cwd"].as_str().map(str::to_owned),
             merge_stderr: message["stderr"] == "stdout",
             null_stdin: message["stdin"] == "null",
+            identity: self.workload.clone(),
         };
         let refuse = |pid1: &Self, reason: String, not_started: bool| {
             let _ = reply(
@@ -561,6 +615,8 @@ struct Launch {
     cwd: Option<String>,
     merge_stderr: bool,
     null_stdin: bool,
+    /// Who the started process runs as; `None`: as this PID 1.
+    identity: Option<WorkIdentity>,
 }
 
 /// Starts one per-work PID 1 in a new PID namespace and returns its record
@@ -691,6 +747,7 @@ fn work_pid1(
         .and_then(|cwd| std::ffi::CString::new(cwd.as_bytes()).ok());
     let merge_stderr = launch.merge_stderr;
     let null_stdin = launch.null_stdin;
+    let identity = launch.identity.clone();
     // This process is init of the work's new PID namespace, so its own
     // namespace is the work's: every process of the work is in it or below.
     let pidns = std::fs::metadata("/proc/self/ns/pid")
@@ -725,6 +782,17 @@ fn work_pid1(
                 u32::MAX,
                 libc::CLOSE_RANGE_CLOEXEC,
             );
+            // The work identity, before anything of the work's own runs.
+            // A failure is reported negated, apart from an exec error.
+            if let Some(identity) = &identity
+                && (libc::setgroups(identity.groups.len(), identity.groups.as_ptr()) != 0
+                    || libc::setresgid(identity.gid, identity.gid, identity.gid) != 0
+                    || libc::setresuid(identity.uid, identity.uid, identity.uid) != 0)
+            {
+                let errno = -*libc::__errno_location();
+                libc::write(error_w.as_raw_fd(), (&raw const errno).cast(), 4);
+                libc::_exit(127);
+            }
             if cwd
                 .as_ref()
                 .is_none_or(|cwd| libc::chdir(cwd.as_ptr()) == 0)
@@ -743,8 +811,17 @@ fn work_pid1(
         libc::close(stdout.as_raw_fd());
     }
     let mut errno = [0u8; 4];
-    let exec_error = (File::from(error_r).read(&mut errno).unwrap_or(0) == 4)
-        .then(|| io::Error::from_raw_os_error(i32::from_ne_bytes(errno)).to_string());
+    let exec_error = (File::from(error_r).read(&mut errno).unwrap_or(0) == 4).then(|| {
+        let errno = i32::from_ne_bytes(errno);
+        if errno < 0 {
+            format!(
+                "workload-identity: {}",
+                io::Error::from_raw_os_error(-errno)
+            )
+        } else {
+            io::Error::from_raw_os_error(errno).to_string()
+        }
+    });
     let pidfd = (harness > 0)
         .then(|| sys::pidfd_open(harness).ok())
         .flatten();

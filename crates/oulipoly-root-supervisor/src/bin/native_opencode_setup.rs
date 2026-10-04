@@ -10,6 +10,8 @@
 //! "possible", "retry": "do-not-replay"}` means construction failed and may
 //! leave partial effects. Exit 74 means provisioning completed but receipt
 //! delivery failed: the launch directory remains; do not replay setup.
+//! The tree stays the caller's: this entry hands nothing to a work
+//! identity (the Runner's `native-root` entry does, for `host-root`).
 
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
@@ -32,7 +34,7 @@ fn main() -> ExitCode {
             serde_json::from_str::<OpenCodeSetup>(&line).map_err(|error| format!("setup: {error}"))
         })
         .map_err(OpenCodeSetupError::InputInvalid)
-        .and_then(|setup| provision_opencode(&setup));
+        .and_then(|setup| provision_opencode(&setup, None));
     let mut out = io::stdout().lock();
     match result {
         Ok(launch) => match publish(&mut out, &launch.to_json()) {
