@@ -1,25 +1,79 @@
-//! One unprivileged per-root supervisor **process** that owns its ACP v2
-//! harness subprocesses, delivers the messages it originates to them
-//! through [`oulipoly_acp::AcpClient`], and keeps that root's delivery
-//! intent in its own private durable store so that a restarted instance
-//! continues what an earlier one owed. Linux only.
+//! One host-side per-root owner **process** for one root tree: it keeps
+//! that root's PID 1 and one PID 1 per work in new PID namespaces, delivers
+//! the messages it originates to its ACP v2 harnesses through
+//! [`oulipoly_acp::AcpClient`], and keeps that root's delivery intent and
+//! custody record in its own private durable store, so that a restarted
+//! owner continues what an earlier one owed and takes back the harnesses
+//! that outlived it. Linux only.
 //!
 //! # What this is
 //!
-//! A real launchable OS process (the `oulipoly-root-supervisor` binary) that
-//! launches, owns and reaps every harness of one root concurrently: one
-//! process per root owning all its harnesses, never one wrapper per agent.
-//! It is **unwired**: nothing on the installed route launches it, and it
-//! touches no Broker State, opcode, admission record, global debt or fence,
-//! guardian, driver or Bash path. Its owned harnesses in this crate's tests
+//! A real launchable OS process (the `oulipoly-root-supervisor` binary)
+//! owning every harness of one root concurrently, never one wrapper per
+//! agent. It is **unwired**: nothing on the installed route launches it,
+//! and it touches no Broker State, opcode, admission record, global debt or
+//! fence, guardian, driver or Bash path. Its harnesses in this crate's tests
 //! are the deterministic peer binary, not a real harness.
 //!
-//! Absorption target: a later live-placement slice makes this process the
-//! root's harness-delivery owner, replacing the resume-plus-prompt path for
-//! the harnesses it owns. After the global-invariant decision and privileged
-//! per-root custody, the guardian/driver and shared Broker registry duties
-//! move into this lineage. If that lineage is abandoned, this crate is
-//! deleted rather than kept as a fallback.
+//! Absorption target: later slices make this lineage the root's
+//! harness-delivery owner, replacing the resume-plus-prompt path for the
+//! harnesses it owns, and wire its entry and restart trigger into launch
+//! and communication. If that lineage is abandoned, this crate is deleted
+//! rather than kept as a fallback.
+//!
+//! # Placement and custody
+//!
+//! Processes of one root, and nothing else:
+//!
+//! * the **owner** (this process; ephemeral, one at a time per root);
+//! * **root PID 1** (`oulipoly-root-pid1`), started by the owner as its
+//!   direct child in a new PID namespace on the first launch;
+//! * per work: one **work PID 1** in its own nested PID namespace, child of
+//!   root PID 1, and its **harness**, child of the work PID 1.
+//!
+//! The infrastructure count per root is the owner plus root PID 1 whatever
+//! the number of agents; each agent adds only its work PID 1 and its
+//! harness. There is no additional stable host process and no per-agent
+//! wrapper: root PID 1 itself holds the owner-side ends of every harness's
+//! stdio pipes and hands copies to the attached owner (`SCM_RIGHTS`), so the
+//! owner's death is not end of stream for any harness.
+//!
+//! Host root: a new PID namespace. Unprivileged (any other uid): a new user
+//! namespace mapping only the caller's uid/gid to 0, with the PID
+//! namespaces inside it; the `isolation` field says which. Unprivileged
+//! runs do not stand for host-root semantics.
+//!
+//! **Owner death kills nothing.** No process here has a parent-death signal
+//! or a timer. When the owner dies, root PID 1 is reparented outside the
+//! owner (to the host's init or a subreaper) and keeps its work and the
+//! harnesses' stdio. It exits by itself only once it has neither live work
+//! nor an attached owner, after recording what its children's waits
+//! reported (`pid1-<incarnation>.receipts` in the store).
+//!
+//! **Terminal honesty.** A harness's exit status comes only from its work
+//! PID 1's actual wait; a work PID 1's from root PID 1's actual wait; root
+//! PID 1's only from its parent's wait, which is this owner's only if this
+//! owner started it. Otherwise an exit is at most `exit-observed-by-pidfd`
+//! with no status, and a process found gone without a report is
+//! `absent-exit-not-observed`. A harness whose root PID 1 is gone without a
+//! report for it ended with that namespace, status unknown. No `waitpid` is
+//! made for a non-child, and a bare pid is never adopted.
+//!
+//! **Identity and scope.** The root's identity is its store directory plus
+//! a random `root_id` minted with the intent; an agent's identity is a
+//! harness of that root, so it belongs to one root lineage and outlives
+//! owners and root PID 1 incarnations. Each root PID 1 incarnation is
+//! recorded before it starts, with an attestation token, then with its exact
+//! identity (host pid, start time, boot id). Root PID 1 admits an owner only
+//! by positive attribution: same uid, that incarnation's token from the
+//! private store, and an owner generation newer than any admitted (the
+//! store's generation fence); anything else is refused
+//! (`peer-unattributed`, `stale-generation`). A newer owner supersedes an
+//! older one. Two roots share nothing.
+//!
+//! **Bash.** This lineage has no Bash entry and no brokerless path:
+//! nothing here routes a Bash request to the old Broker or accepts one.
+//! A positive Bash path is not implemented.
 //!
 //! # Interface
 //!
@@ -75,7 +129,26 @@
 //!
 //! # Restart recovery
 //!
-//! A recovering instance takes the next owner generation and, in the same
+//! An explicit recover request for the same root (`{"store": dir}`) is the
+//! restart trigger. The new owner first looks for the latest recorded root
+//! PID 1 incarnation not known to have ended:
+//!
+//! * still exactly that process and admitting this owner: **attached**. Each
+//!   surviving harness is **reattached** (same process, its stdio from root
+//!   PID 1): the owner initializes again, resumes the recorded session and
+//!   resubmits what is owed with the original keys. Ends reported while no
+//!   owner was attached are reported as such (`prior-exit`, with their
+//!   waiter) and count as closures like any observed exit.
+//! * not running (gone, or its pid now names another process): **absent**,
+//!   recorded as exactly what was observed. Its harnesses ended with it,
+//!   status unknown unless it recorded a report (`prior-end-unknown`, not a
+//!   closure). The next launch starts a new incarnation under the same root
+//!   identity.
+//! * possibly running but not attachable: **owned-unattached**. Nothing is
+//!   launched, killed or declared ended; the run reports `owned-unattached`
+//!   (exit 4) and owed messages stay in the store.
+//!
+//! The recovering instance takes the next owner generation and, in the same
 //! transaction, labels every earlier-generation attempt that has no recorded
 //! outcome `unknown-prior-owner`: it may or may not have been sent or
 //! inserted. That is neither an acknowledgement nor a closure: the earlier
@@ -89,16 +162,16 @@
 //!
 //! Attempt counts, closures and the `outage` / `attempts-exhausted` stops
 //! persist, so a restart never resets either cap. They are separate facts:
-//! a closure is an observed harness exit, while an attempt is any recorded
-//! send, including ones whose outcome is unknown because their owner died.
+//! a closure is an observed harness exit, while an attempt is a durable
+//! reservation committed before a send: it may or may not have been sent,
+//! including when its owner died before recording an outcome.
 //! [`Intent::delivery_attempt_cap`] bounds attempts per message over every
 //! generation, so a loop of owner restarts with unresolved outcomes cannot
 //! retry forever; when it is used up the message stops as
 //! `attempts-exhausted` with its unknown attempts still unknown, not as an
-//! outage, a closure or an acknowledgement. Harnesses launched by a dead instance are not
-//! re-adopted: recovering processes that outlived their owner needs custody
-//! this unprivileged process does not have. Recovery relaunches under the
-//! same keys instead.
+//! outage, a closure or an acknowledgement. A surviving harness with
+//! nothing left to deliver is still held (`holding-survivor`) until its end
+//! is reported or the caller cancels; it is never dropped as gone.
 //!
 //! # Labels
 //!
@@ -112,8 +185,8 @@
 //!   `attempts-exhausted`. Only `outage` and `attempts-exhausted` are durable
 //!   stops; the others end this instance's attempts and a later recovery
 //!   retries the message.
-//! * A **closure** is a no-acknowledgement end of an attempt whose harness
-//!   exit this process observed by reaping that exact child. Only closures
+//! * A **closure** is a no-acknowledgement end whose harness exit was
+//!   reported by that harness's actual waiter (its work PID 1). Only closures
 //!   count toward [`Intent::outage_closure_cap`]. Rejections and negotiation
 //!   failures keep their own labels and are not closures. A send fault alone
 //!   is labelled `send-fault`, never `PeerGone`; it becomes a closure only
@@ -127,33 +200,40 @@
 //!
 //! # Ending
 //!
-//! * `ended`: every owned harness exited and was reaped by exact child
-//!   identity, and nothing is owed.
-//! * `ended-owed`: every actually spawned direct child exited and was
-//!   successfully reaped, no further attempt is authorized in this instance,
-//!   and debt remains, retained in the store (exit 3).
-//! * `cancelled`: explicit cancellation is visible at run level. Admitted
-//!   live children are sent `SIGKILL` by pidfd; successful waits alone prove
-//!   exits/reaping. Earlier refusal/outage causes survive cancellation.
-//!   Cancel ends this instance; it does not withdraw durable intent.
+//! * `ended`: every launched or reattached harness's end was reported by
+//!   its waiter, and nothing is owed. Root PID 1 is then released.
+//! * `ended-owed`: every launched or reattached harness's end was reported,
+//!   no further attempt is authorized in this instance, and debt remains,
+//!   retained in the store (exit 3).
+//! * `cancelled`: explicit cancellation is visible at run level. Each live
+//!   harness is killed by its own work PID 1 (exact, unreaped child); only
+//!   the waiters' reports prove the ends. Earlier refusal/outage causes
+//!   survive cancellation. Cancel ends this instance; it does not withdraw
+//!   durable intent.
 //! * `authority-lost` / `store-failed`: a store write was refused or failed
-//!   (exit 5). Own harnesses are signalled; what the store holds is
-//!   authoritative, this instance's view is not. Authority loss outranks
-//!   store failure, which outranks cancellation, regardless of arrival order.
+//!   (exit 5). On store failure this owner has its harnesses killed. On
+//!   authority loss it kills nothing and only detaches: a newer owner holds
+//!   the root and its live work. What the store holds is authoritative,
+//!   this instance's view is not. Authority loss outranks store failure,
+//!   which outranks cancellation, regardless of arrival order.
+//! * `owned-unattached`: see restart recovery (exit 4).
 //! * `incomplete`: records or successful exit/reaping observations are
 //!   missing (exit 4). A failed wait reports `wait-failed` / `unproven`,
 //!   never an exit, closure count or relaunch authorization. Even a cancelled
 //!   terminal may have `all_harnesses_reaped:false`; cancellation is not proof.
-//! * `launches` counts this instance's actual OS spawns, including
-//!   custody-open failures.
+//! * `launches` counts launches root PID 1 performed for this instance;
+//!   `reattached` counts survivors it took over.
 //! * `records_complete` checks every durable harness and message record;
-//!   `all_harnesses_reaped` also requires one successful wait per spawn and no
-//!   failed wait. Incomplete records report `owed:null` and `known_owed` as a
-//!   partial count.
+//!   `all_harnesses_reaped` also requires a waiter's report for each launched
+//!   or reattached harness, no missing report and nothing detached.
+//!   Incomplete records report `owed:null` and `known_owed` as a partial
+//!   count.
+//! * `root_pid1` says how root PID 1's end was observed at release, with a
+//!   status only from this owner's own wait as its parent.
 //!
-//! No root PID1 terminal or Broker settlement is visible here, and neither
-//! is inferred. A missing terminal report (this process died) says nothing
-//! about delivery; the store says what was recorded.
+//! No Broker settlement is visible here, and none is inferred. A missing
+//! terminal report (this process died) says nothing about delivery; the
+//! store says what was recorded.
 //!
 //! # Known gaps
 //!
@@ -161,24 +241,37 @@
 //!   life of each connection. Stdout lines from a harness are bounded
 //!   ([`MAX_LINE_BYTES`]).
 //! * The internal event channel is unbounded.
-//! * If this process dies, its harnesses are not signalled by it (the test
-//!   peer arranges its own parent-death signal), and a successor does not
-//!   re-adopt them.
 //! * Between an attempt's commit and its send, a successor that claimed in
 //!   that window could resend the same key concurrently; labels stay honest
 //!   (`duplicate-unknown`) but a non-dedup receiver may insert twice.
+//! * Reattachment begins reading where the dead owner stopped: output the
+//!   dead owner had read but not processed is lost, and output written while
+//!   no owner was attached waits in the pipe (a full pipe blocks the
+//!   harness). Quiet survivors are the case shown here.
+//! * A store refusal after a commit (post-commit refusal) is
+//!   acknowledgement-unknown; recovery reconciliation of it, path custody
+//!   of the store, a cross-restart launch/time budget and retention bounds
+//!   are later work. The store and the custody socket live in the owner's
+//!   private directory, not in privileged owner-private custody.
+//! * Root PID 1 keeps every receipt for its lifetime, and a root PID 1 whose
+//!   owner lost its connection to it mid-run is not restarted by that owner.
+//! * Attach waits up to 2 s to observe an unreachable root PID 1's exit
+//!   before reporting it owned-unattached (observation only).
 //! * Store growth and retention are unbounded; nothing is pruned.
 //! * Exit observation waits for protocol-read progress; a descendant holding
 //!   stdout can delay it. A caller that does not drain output can delay cancel.
 
+mod custody;
 mod harness;
-mod pidfd;
+mod live;
 mod store;
+#[doc(hidden)]
+pub mod sys;
 mod transport;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -351,8 +444,41 @@ where
         .map(|harness| (harness.id.clone(), harness.messages.len()))
         .collect();
 
-    let custody = Arc::new(Mutex::new(pidfd::Custody::default()));
-    let store = Arc::new(Mutex::new(claimed.store));
+    let isolation = sys::Isolation::current();
+    let stop = match transport::StopSignal::new() {
+        Ok(stop) => Arc::new(stop),
+        Err(error) => {
+            emit(
+                &mut out,
+                &json!({ "event": "terminal", "status": "incomplete", "reason": format!("stop-signal: {error}") }),
+            );
+            return EXIT_INCOMPLETE;
+        }
+    };
+    let mut store = claimed.store;
+    let recovery = recover_custody(
+        Path::new(&request.store),
+        claimed.live_incarnation.as_ref(),
+        &claimed.harnesses,
+        &mut store,
+        &stop,
+    );
+    emit(&mut out, &recovery.report(&claimed.root_id, isolation));
+    if let Some(reason) = recovery.unattached {
+        let (report, code) = unattached_report(&claimed.harnesses, &reason);
+        emit(&mut out, &report);
+        return code;
+    }
+    let mut priors = recovery.priors;
+    let slot = Arc::new(custody::RootSlot::new(
+        PathBuf::from(&request.store),
+        generation,
+        isolation,
+        Arc::clone(&stop),
+        recovery.root,
+    ));
+    let custody = Arc::new(Mutex::new(live::Custody::new(Arc::clone(&stop))));
+    let store = Arc::new(Mutex::new(store));
     let (tx, rx) = mpsc::channel();
 
     let control_tx = tx.clone();
@@ -371,6 +497,8 @@ where
             "event": "started",
             "pid": std::process::id(),
             "generation": generation,
+            "root_id": claimed.root_id,
+            "isolation": isolation.label(),
             "harnesses": expected.len(),
             "outage_closure_cap": claimed.outage_closure_cap,
             "delivery_attempt_cap": claimed.delivery_attempt_cap,
@@ -385,6 +513,8 @@ where
             cwd: claimed.cwd.clone(),
             custody: Arc::clone(&custody),
             store: Arc::clone(&store),
+            slot: Arc::clone(&slot),
+            prior: priors.remove(&position),
             tx: tx.clone(),
         };
         thread::spawn(move || harness::run(assignment));
@@ -422,13 +552,200 @@ where
     }
     records.sort_by_key(|record| expected.iter().position(|(id, _)| *id == record.id));
 
-    let stop = custody.lock().expect("custody lock").reason();
-    let store_lost = matches!(stop, Some("authority-lost" | "store-failed"))
-        .then_some(stop)
+    let stopped = custody.lock().expect("custody lock").reason();
+    let store_lost = matches!(stopped, Some("authority-lost" | "store-failed"))
+        .then_some(stopped)
         .flatten();
-    let (report, code) = terminal_report(&expected, &records, cancel_requested, store_lost);
+    let root_pid1 = end_custody(&slot, store_lost, &store);
+    let (mut report, code) = terminal_report(&expected, &records, cancel_requested, store_lost);
+    report["root_pid1"] = root_pid1;
     emit(&mut out, &report);
     code
+}
+
+/// What this owner found of its root's earlier custody on starting.
+struct Recovery {
+    root: Option<Arc<custody::Root>>,
+    priors: HashMap<usize, harness::Prior>,
+    unattached: Option<String>,
+    outcome: &'static str,
+    incarnation: Option<i64>,
+    observed: Option<&'static str>,
+    survivors: usize,
+    receipts: usize,
+}
+
+impl Recovery {
+    fn report(&self, root_id: &str, isolation: sys::Isolation) -> Value {
+        json!({
+            "event": "custody",
+            "root_id": root_id,
+            "isolation": isolation.label(),
+            "outcome": self.outcome,
+            "incarnation": self.incarnation,
+            "observed": self.observed,
+            "unattached_reason": self.unattached,
+            "survivors": self.survivors,
+            "receipts": self.receipts,
+        })
+    }
+}
+
+/// Attaches to the recorded root PID 1 incarnation if it is still the
+/// exact recorded process, and sorts each harness's unresolved launch into
+/// a live survivor, an end its waiter reported, or an unknown end.
+fn recover_custody(
+    store_dir: &Path,
+    recorded: Option<&store::IncarnationRow>,
+    harnesses: &[store::DurableHarness],
+    store: &mut store::Store,
+    stop: &Arc<transport::StopSignal>,
+) -> Recovery {
+    let mut recovery = Recovery {
+        root: None,
+        priors: HashMap::new(),
+        unattached: None,
+        outcome: "fresh",
+        incarnation: None,
+        observed: None,
+        survivors: 0,
+        receipts: 0,
+    };
+    let Some(recorded) = recorded else {
+        return recovery;
+    };
+    recovery.incarnation = Some(recorded.id);
+    let (mut live, receipts, absent) =
+        match custody::Root::attach(store_dir, recorded, store.generation(), stop) {
+            custody::Attach::Attached {
+                root,
+                live,
+                receipts,
+            } => {
+                recovery.outcome = "attached";
+                recovery.root = Some(root);
+                (live, receipts, false)
+            }
+            custody::Attach::Absent { observed, receipts } => {
+                recovery.outcome = "absent";
+                recovery.observed = Some(observed);
+                // Recorded only as what was seen; the store may refuse (stale).
+                let _ = store.end_incarnation(recorded.id, observed);
+                (Vec::new(), receipts, true)
+            }
+            custody::Attach::Unattached { reason } => {
+                recovery.outcome = "owned-unattached";
+                recovery.unattached = Some(reason);
+                return recovery;
+            }
+        };
+    recovery.survivors = live.len();
+    recovery.receipts = receipts.len();
+    for (position, harness) in harnesses.iter().enumerate() {
+        for &(work, incarnation) in &harness.open_works {
+            if incarnation != recorded.id {
+                continue;
+            }
+            let name = custody::work_name(work);
+            let prior = if let Some(index) = live.iter().position(|adopted| adopted.work == work) {
+                harness::Prior::Live(live.swap_remove(index))
+            } else if let Some(receipt) = receipts
+                .iter()
+                .find(|receipt| receipt["work"] == name.as_str())
+            {
+                harness::Prior::Exited {
+                    work,
+                    receipt: receipt.clone(),
+                }
+            } else if absent {
+                harness::Prior::Unknown { work }
+            } else {
+                // The attached root PID 1, the only launcher, never had it:
+                // the launch was recorded but never requested.
+                let _ = store.resolve_work(work, "never-launched", Some("root-pid1-record"));
+                continue;
+            };
+            recovery.priors.insert(position, prior);
+        }
+    }
+    recovery
+}
+
+/// Releases this owner's root PID 1 at the end of its run and reports how
+/// its end was observed. On authority loss nothing is released: the root
+/// and its live work belong to the newer owner.
+fn end_custody(
+    slot: &custody::RootSlot,
+    store_lost: Option<&str>,
+    store: &Mutex<store::Store>,
+) -> Value {
+    let Some(root) = slot.current() else {
+        return json!({ "outcome": "none" });
+    };
+    if store_lost == Some("authority-lost") {
+        root.detach();
+        return json!({ "outcome": "left-to-successor", "incarnation": root.incarnation });
+    }
+    let release = root.release();
+    if release.live.is_empty() {
+        let label = match &release.status {
+            Some(status) => format!("{}:{status}", release.outcome),
+            None => release.outcome.to_owned(),
+        };
+        let _ = store
+            .lock()
+            .expect("store lock")
+            .end_incarnation(root.incarnation, &label);
+    }
+    json!({
+        "outcome": release.outcome,
+        "incarnation": root.incarnation,
+        "pid": root.host_pid,
+        "parent": root.parent,
+        "status": release.status,
+        "status_known": release.status.is_some(),
+        "live": release.live,
+    })
+}
+
+/// The terminal for a root whose recorded PID 1 may still be running but
+/// could not be attached: nothing is launched, killed or declared ended.
+fn unattached_report(harnesses: &[store::DurableHarness], reason: &str) -> (Value, u8) {
+    let records: Vec<Value> = harnesses
+        .iter()
+        .map(|harness| {
+            json!({
+                "id": harness.id,
+                "launches": 0,
+                "messages": harness.messages.iter().enumerate().map(|(index, message)| json!({
+                    "index": index,
+                    "state": if message.ack.is_some() { "acknowledged" } else { "owed" },
+                    "label": message.ack.as_ref().map_or("owned-unattached", |ack| ack.label.as_str()),
+                    "completion": "not-observed",
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let known_owed = harnesses
+        .iter()
+        .flat_map(|harness| &harness.messages)
+        .filter(|message| message.ack.is_none())
+        .count();
+    (
+        json!({
+            "event": "terminal",
+            "status": "owned-unattached",
+            "reason": reason,
+            "cancel_requested": false,
+            "owed": known_owed,
+            "known_owed": known_owed,
+            "owed_history": "retained-in-store",
+            "records_complete": false,
+            "all_harnesses_reaped": false,
+            "harnesses": records,
+        }),
+        EXIT_INCOMPLETE,
+    )
 }
 
 fn terminal_report(
@@ -454,7 +771,9 @@ fn terminal_report(
     let all_reaped = records_complete
         && records.iter().all(|record| {
             record.wait_failures.is_empty()
-                && usize::try_from(record.launches).ok() == Some(record.exits.len())
+                && record.detached == 0
+                && usize::try_from(record.launches + record.reattached).ok()
+                    == Some(record.exits.len())
         });
     let known_owed = records
         .iter()
@@ -513,8 +832,12 @@ mod tests {
         HarnessRecord {
             id: "test".into(),
             launches: 1,
+            reattached: 0,
             exits: vec![],
+            prior_exits: vec![],
+            prior_unknown_ends: 0,
             wait_failures: vec![],
+            detached: 0,
             messages: vec![],
         }
     }
