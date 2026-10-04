@@ -163,18 +163,67 @@ fn write_new(path: &Path, contents: &str) -> Result<(), String> {
         .map_err(|error| format!("{}: {error}", path.display()))
 }
 
+/// Why setup did not return a provisioned launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenCodeSetupError {
+    /// Input or prerequisites were refused before any setup writes.
+    InputInvalid(String),
+    /// Construction was attempted; a partly written directory may remain.
+    /// The caller must inspect effects rather than automatically replay.
+    ConstructionFailed(String),
+}
+
+impl std::fmt::Display for OpenCodeSetupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InputInvalid(reason) | Self::ConstructionFailed(reason) => {
+                formatter.write_str(reason)
+            }
+        }
+    }
+}
+
+impl std::error::Error for OpenCodeSetupError {}
+
 /// Creates the launch directory for `setup` and returns its launch.
-/// Refuses (writing nothing) on an invalid setup; a failure while writing
-/// leaves the partly written directory for the caller.
-pub fn provision_opencode(setup: &OpenCodeSetup) -> Result<OpenCodeLaunch, String> {
+/// [`OpenCodeSetupError::InputInvalid`] means no setup writes occurred.
+/// [`OpenCodeSetupError::ConstructionFailed`] may leave partial effects;
+/// inspect them before any further attempt. Success means provisioning,
+/// not native launch or delivery of a caller's receipt.
+pub fn provision_opencode(setup: &OpenCodeSetup) -> Result<OpenCodeLaunch, OpenCodeSetupError> {
+    let inputs = setup_inputs(setup).map_err(OpenCodeSetupError::InputInvalid)?;
+    write_launch(setup, inputs).map_err(OpenCodeSetupError::ConstructionFailed)
+}
+
+struct SetupInputs<'a> {
+    dir: PathBuf,
+    deps: PathBuf,
+    bin: PathBuf,
+    permission: String,
+    tool_source: String,
+    model_provider: Option<&'a str>,
+}
+
+// All setup input checks finish before entering the writing phase.
+fn setup_inputs(setup: &OpenCodeSetup) -> Result<SetupInputs<'_>, String> {
     let dir = absolute("dir", &setup.dir)?;
     let deps = absolute("deps", &setup.deps)?;
     let tool = absolute("agent_bash_tool", &setup.agent_bash_tool)?;
     let bin = absolute("agent_bash_bin", &setup.agent_bash_bin)?;
     let permission = permission(&setup.bash_allow)?;
-    if setup.model.is_some() != setup.provider.is_some() {
-        return Err("model and provider go together".to_owned());
-    }
+    let model_provider = match (&setup.model, &setup.provider) {
+        (Some(model), Some(provider)) => {
+            let (name, _) = model
+                .split_once('/')
+                .ok_or("model must be provider/model")?;
+            if !provider.contains_key(name) {
+                return Err(format!("provider has no {name}"));
+            }
+            Some(name)
+        }
+        (None, None) => None,
+        _ => return Err("model and provider go together".to_owned()),
+    };
     let opencode = deps.join(OPENCODE);
     if !opencode.is_file() {
         return Err(format!("no OpenCode binary at {}", opencode.display()));
@@ -192,7 +241,25 @@ pub fn provision_opencode(setup: &OpenCodeSetup) -> Result<OpenCodeLaunch, Strin
     if !bin.is_file() {
         return Err(format!("no agent-bash binary at {}", bin.display()));
     }
+    Ok(SetupInputs {
+        dir,
+        deps,
+        bin,
+        permission,
+        tool_source,
+        model_provider,
+    })
+}
 
+fn write_launch(setup: &OpenCodeSetup, inputs: SetupInputs<'_>) -> Result<OpenCodeLaunch, String> {
+    let SetupInputs {
+        dir,
+        deps,
+        bin,
+        permission,
+        tool_source,
+        model_provider,
+    } = inputs;
     let mkdir = |path: &Path| {
         fs::DirBuilder::new()
             .mode(0o700)
@@ -230,13 +297,9 @@ pub fn provision_opencode(setup: &OpenCodeSetup) -> Result<OpenCodeLaunch, Strin
         "share": "disabled",
         "agent": { "title": { "disable": true } },
     });
-    if let (Some(model), Some(provider)) = (&setup.model, &setup.provider) {
-        let (name, _) = model
-            .split_once('/')
-            .ok_or("model must be provider/model")?;
-        if !provider.contains_key(name) {
-            return Err(format!("provider has no {name}"));
-        }
+    if let (Some(model), Some(provider), Some(name)) =
+        (&setup.model, &setup.provider, model_provider)
+    {
         config["model"] = json!(model);
         config["enabled_providers"] = json!([name]);
         config["provider"] = Value::Object(provider.clone());
@@ -278,7 +341,7 @@ pub fn provision_opencode(setup: &OpenCodeSetup) -> Result<OpenCodeLaunch, Strin
     }
     argv.extend(env.iter().map(|(key, value)| format!("{key}={value}")));
     argv.extend([
-        utf8(&opencode)?,
+        utf8(&deps.join(OPENCODE))?,
         "acp".to_owned(),
         "--hostname".to_owned(),
         "127.0.0.1".to_owned(),
