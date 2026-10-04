@@ -3169,6 +3169,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "oulipoly-root-supervisor"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "oulipoly-acp",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "oulipoly-runtime"
 version = "0.1.0"
 dependencies = [
