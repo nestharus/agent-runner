@@ -273,16 +273,20 @@ pub(crate) enum Subcommands {
         output: bool,
     },
     /// Linux, opt-in: start one fresh native OpenCode ACP v2 root from a
-    /// JSON request file whose `env` is the root's whole environment. Needs
-    /// `oulipoly-root-supervisor` built next to this binary. Stdout: JSON
-    /// lines; stdin lines go to the root's owner. See `native_root` docs
-    /// for the exit statuses.
+    /// JSON request file whose `env` is the root's whole environment, or
+    /// recover one for `cancel` or `continue-attached` (never a new root
+    /// incarnation). Needs `oulipoly-root-supervisor` built next to this
+    /// binary. Stdout: JSON lines; stdin lines go to the root's owner. See
+    /// `native_root` docs for the exit statuses.
     #[cfg(target_os = "linux")]
     #[command(name = "native-root")]
     NativeRoot {
-        /// The request file (JSON).
+        /// The fresh root's request file (JSON).
+        #[arg(long, required_unless_present = "recover", conflicts_with = "recover")]
+        request: Option<PathBuf>,
+        /// The recovery request file (JSON): `store`, `purpose`, `env`.
         #[arg(long)]
-        request: PathBuf,
+        recover: Option<PathBuf>,
     },
     /// Run chain-table backfill explicitly.
     MigrateDb,

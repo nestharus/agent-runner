@@ -122,12 +122,18 @@
 //!
 //! The first stdin line is a JSON [`Request`]: `{"store": dir, "intent":
 //! {...}}` creates a root's intent in a new store, and `{"store": dir}`
-//! recovers an existing one. Later stdin lines are control commands;
+//! recovers an existing one. A recovery may name what it is for
+//! (`"recover"`, see [`Recover`]): `cancel` or `continue-attached`. Either
+//! acts only on the surviving recorded root PID 1 it positively attaches,
+//! never starts a new incarnation, and finding none reports
+//! `root-absent` ([`EXIT_ROOT_ABSENT`]) with what the store still owes.
+//! Later stdin lines are control commands;
 //! `{"cmd":"cancel"}` is the only one. Stdin EOF is not a cancel. Stdout
 //! carries one JSON object per line: progress events, then exactly one
 //! `"event":"terminal"` report. Exit codes: [`EXIT_ENDED`],
 //! [`EXIT_ENDED_OWED`], [`EXIT_CANCELLED`], [`EXIT_INCOMPLETE`],
-//! [`EXIT_STORE_LOST`], [`EXIT_SPEC_REFUSED`], [`EXIT_STORE_REFUSED`].
+//! [`EXIT_STORE_LOST`], [`EXIT_ROOT_ABSENT`], [`EXIT_SPEC_REFUSED`],
+//! [`EXIT_STORE_REFUSED`].
 //!
 //! # Endpoints
 //!
@@ -297,6 +303,14 @@
 //!   store failure, which outranks cancellation, regardless of arrival
 //!   order.
 //! * `owned-unattached`: see restart recovery (exit 4).
+//! * `root-absent`: a recovery naming its purpose found no root PID 1 to
+//!   attach (gone, or none recorded). Nothing was launched and no new
+//!   incarnation started; earlier ends are resolved as observed and what is
+//!   owed stays in the store (exit 6). Absence is not an end of the work it
+//!   held: those ends stay unknown unless a report says otherwise.
+//! * A `cancel` recovery is cancellation from its start: a reattached
+//!   survivor is killed by its work PID 1 without being connected to, so
+//!   nothing is resubmitted or newly delivered, and nothing is launched.
 //! * `incomplete`: records or successful exit/reaping observations are
 //!   missing (exit 4). A failed wait reports `wait-failed` / `unproven`,
 //!   never an exit, closure count or relaunch authorization. Even a cancelled
@@ -343,9 +357,10 @@
 //!   owner lost its connection to it mid-run is not restarted by that owner.
 //!   Losing that connection does not stop harness reads already blocked.
 //! * Nothing current supersedes a live owner: the store lock refuses a
-//!   second normal claim. Supersession is handled for the newer-owner
-//!   ingress root PID 1 already admits, and is shown here only with a test
-//!   process standing in for the newer owner.
+//!   second normal claim. (The Runner entry ties its owner's life to its
+//!   own, so a dead entry leaves no live owner behind.) Supersession is
+//!   handled for the newer-owner ingress root PID 1 already admits, and is
+//!   shown here only with a test process standing in for the newer owner.
 //! * Attach waits up to 2 s to observe an unreachable root PID 1's exit
 //!   before reporting it owned-unattached (observation only).
 //! * Store growth and retention are unbounded; nothing is pruned.
@@ -412,6 +427,9 @@ pub const EXIT_INCOMPLETE: u8 = 4;
 /// A store write was refused (stale owner) or failed; own harnesses were
 /// signalled.
 pub const EXIT_STORE_LOST: u8 = 5;
+/// A recovery naming its purpose found no root PID 1 to attach: nothing was
+/// launched and no incarnation started; owed messages stay in the store.
+pub const EXIT_ROOT_ABSENT: u8 = 6;
 /// The request line was missing or invalid; nothing was written or launched.
 pub const EXIT_SPEC_REFUSED: u8 = 64;
 /// The store could not be claimed (live owner, missing or existing intent,
@@ -427,7 +445,40 @@ pub struct Request {
     /// Present to create the root's intent; absent to recover it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intent: Option<Intent>,
+    /// A recovery's purpose. Absent: the plain recovery, which may start a
+    /// new incarnation when the recorded one is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recover: Option<Recover>,
 }
+
+/// What a recovery is for. Both act only on a surviving root PID 1 this
+/// owner positively attaches (store token, exact process, newer
+/// generation); neither starts a new incarnation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Recover {
+    /// End the attached root's work: survivors are killed by their work
+    /// PID 1s, nothing is connected to, resubmitted or launched.
+    Cancel,
+    /// Continue the attached root's work: survivors are reattached and
+    /// what is owed is resubmitted with its original keys (an ACK is then
+    /// at best `duplicate-unknown`, not receiver continuity). A harness
+    /// that needs a relaunch is launched by the attached root PID 1, in its
+    /// original environment.
+    ContinueAttached,
+}
+
+impl Recover {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cancel => "cancel",
+            Self::ContinueAttached => "continue-attached",
+        }
+    }
+}
+
+/// The stop reason of a purposeful recovery that found no root to attach.
+const ROOT_ABSENT: &str = "root-absent";
 
 /// What one root's supervisor owes.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -506,6 +557,9 @@ impl Request {
     pub fn validate(&self) -> Result<(), String> {
         if !self.store.starts_with('/') {
             return Err("store must be absolute".to_owned());
+        }
+        if self.recover.is_some() && self.intent.is_some() {
+            return Err("recover names a recovery's purpose; an intent creates a root".to_owned());
         }
         let Some(intent) = &self.intent else {
             return Ok(());
@@ -657,6 +711,7 @@ where
         emit(&mut out, &report);
         return code;
     }
+    let root_absent = request.recover.is_some() && recovery.root.is_none();
     let mut priors = recovery.priors;
     let slot = Arc::new(custody::RootSlot::new(
         PathBuf::from(&request.store),
@@ -666,6 +721,41 @@ where
         recovery.root,
     ));
     let custody = Arc::new(Mutex::new(live::Custody::new(Arc::clone(&stop))));
+    // A purposeful recovery's limits hold before any survivor is taken over
+    // or anything launched: with no attached root, nothing may start one;
+    // under cancel, nothing is delivered.
+    let mut cancel_requested = false;
+    if let Some(purpose) = request.recover {
+        if root_absent {
+            custody.lock().expect("custody lock").stop(ROOT_ABSENT);
+            let found = if recovery.incarnation.is_some() {
+                recovery.outcome
+            } else {
+                "no-unended-incarnation"
+            };
+            emit(
+                &mut out,
+                &json!({
+                    "event": "recover-limited",
+                    "purpose": purpose.label(),
+                    "reason": ROOT_ABSENT,
+                    "custody": found,
+                    "new_incarnation": "not-started",
+                }),
+            );
+        } else if purpose == Recover::Cancel {
+            cancel_requested = true;
+            let signalled = custody.lock().expect("custody lock").cancel();
+            emit(
+                &mut out,
+                &json!({
+                    "event": "cancel-requested",
+                    "signalled": signalled,
+                    "by": "recover-cancel",
+                }),
+            );
+        }
+    }
     let store = Arc::new(Mutex::new(store));
     let (tx, rx) = mpsc::channel();
     let views: bash::Views = Arc::new(Mutex::new(
@@ -741,7 +831,6 @@ where
     drop(tx);
 
     let mut records = Vec::new();
-    let mut cancel_requested = false;
     // The run ends once every harness's end and every admitted Bash run's
     // end (or why it is unknown) is reported; then the ingress is closed.
     while records.len() < expected.len() || !ingress.close_if_idle() {
@@ -785,6 +874,16 @@ where
             .then_some("authority-lost")
     });
     let (mut report, mut code) = terminal_report(&expected, &records, cancel_requested, store_lost);
+    if root_absent && store_lost.is_none() {
+        // Nothing was attached or launched: not an end of what the earlier
+        // root held, whatever the records say about this instance.
+        report["status"] = json!(ROOT_ABSENT);
+        report["new_incarnation"] = json!("not-started");
+        code = EXIT_ROOT_ABSENT;
+    }
+    if let Some(purpose) = request.recover {
+        report["recover"] = json!(purpose.label());
+    }
     if root_pid1["end_observed"] == false && matches!(code, EXIT_ENDED | EXIT_ENDED_OWED) {
         // Every harness's end was reported, but root PID 1's was not
         // observed: it may still be running, so this is not an end.
