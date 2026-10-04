@@ -12,6 +12,13 @@ name = "oulipoly_root_supervisor"
 name = "oulipoly-root-supervisor"
 path = "src/main.rs"
 
+# Root PID 1 and per-work PID 1 of one root's PID namespace, started only by
+# the supervisor (which finds it next to its own binary).
+[[bin]]
+name = "oulipoly-root-pid1"
+path = "src/bin/root_pid1.rs"
+test = false
+
 # Deterministic ACP v2 peer used only as an owned harness in this crate's
 # process-level tests. It is not a real harness.
 [[bin]]
