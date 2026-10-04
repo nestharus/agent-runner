@@ -127,15 +127,32 @@ impl OutboundMessage {
     }
 
     /// Mint a fresh Linux identity. Random-key uniqueness is the minting
-    /// assumption; no durable registry or restart history is maintained.
+    /// assumption; this crate keeps no durable registry or restart history.
     /// The message cannot be cloned. Calling [`Self::key`] abandons its
     /// complete-history claim; callers/transports must not re-supply keys
     /// captured from the wire, which bypass that downgrade.
     pub fn fresh(text: impl Into<String>) -> std::io::Result<Self> {
+        Self::fresh_recorded(text, |_| Ok(()))
+    }
+
+    /// [`Self::fresh`], handing the new key once to `record` so that the
+    /// origin owner can write it to its own private durable history before
+    /// the message exists. Nothing is created if `record` fails.
+    ///
+    /// The returned message keeps its complete-history claim: `record` is
+    /// trusted to store the key only, not to build another live message
+    /// from it while this one exists. A message later rebuilt from that
+    /// record must use [`Self::new`] and has unknown history; durable
+    /// storage does not make a restored key trusted origin history.
+    pub fn fresh_recorded<E: From<std::io::Error>>(
+        text: impl Into<String>,
+        record: impl FnOnce(&MessageKey) -> Result<(), E>,
+    ) -> Result<Self, E> {
         let mut bytes = [0u8; 32];
         std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-        let key: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-        let mut message = Self::new(MessageKey(key), text);
+        let key = MessageKey(bytes.iter().map(|byte| format!("{byte:02x}")).collect());
+        record(&key)?;
+        let mut message = Self::new(key, text);
         message.complete_history = true;
         Ok(message)
     }

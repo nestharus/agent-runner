@@ -64,9 +64,11 @@
 //! An advertisement says nothing about another receiver, session or store;
 //! same-session resume relies on the receiver's lifetime promise, not a
 //! client-invented continuity proof. No arbitrary provider-effects claim or
-//! durable history is supplied. Messages are bound to their first session-id
-//! string, which is trusted contract scope, not proof of receiver/store identity
-//! or cross-receiver continuity.
+//! durable history is supplied: [`OutboundMessage::fresh_recorded`] only
+//! lets an origin owner store a fresh key, and a message rebuilt from that
+//! store is a supplied key with unknown history. Messages are bound to
+//! their first session-id string, which is trusted contract scope, not proof
+//! of receiver/store identity or cross-receiver continuity.
 //!
 //! Empty `messageId` is conservatively refused (stricter than the schema).
 //! Unknown optional schema fields are ignored, not claimed fully validated.

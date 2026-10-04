@@ -3174,6 +3174,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "oulipoly-acp",
+ "rusqlite",
  "serde",
  "serde_json",
 ]
