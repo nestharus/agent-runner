@@ -56,8 +56,11 @@
 //! owner started it. Otherwise an exit is at most `exit-observed-by-pidfd`
 //! with no status, and a process found gone without a report is
 //! `absent-exit-not-observed`. A harness whose root PID 1 is gone without a
-//! report for it ended with that namespace, status unknown. No `waitpid` is
-//! made for a non-child, and a bare pid is never adopted.
+//! report for it ended with that namespace, status unknown; so did one whose
+//! work PID 1 was waited but ended before reporting the harness's wait. No
+//! `waitpid` is made for a non-child, and a bare pid is never adopted. A
+//! missing reply from root PID 1 is never read as an empty live list or an
+//! end.
 //!
 //! **Identity and scope.** The root's identity is its store directory plus
 //! a random `root_id` minted with the intent; an agent's identity is a
@@ -69,7 +72,9 @@
 //! private store, and an owner generation newer than any admitted (the
 //! store's generation fence); anything else is refused
 //! (`peer-unattributed`, `stale-generation`). A newer owner supersedes an
-//! older one. Two roots share nothing.
+//! older one; for the superseded owner that is authority loss at run level,
+//! learned from the root rather than from a store refusal (see Ending). Two
+//! roots share nothing.
 //!
 //! **Bash.** This lineage has no Bash entry and no brokerless path:
 //! nothing here routes a Bash request to the old Broker or accepts one.
@@ -138,7 +143,10 @@
 //!   PID 1): the owner initializes again, resumes the recorded session and
 //!   resubmits what is owed with the original keys. Ends reported while no
 //!   owner was attached are reported as such (`prior-exit`, with their
-//!   waiter) and count as closures like any observed exit.
+//!   waiter) and count as closures like any observed exit. A report with
+//!   only the work PID 1's status, no harness wait, is `prior-end-unknown`
+//!   (`ended-with-work-namespace-status-unknown`): not a closure, and the
+//!   message is launched again within its attempt budget.
 //! * not running (gone, or its pid now names another process): **absent**,
 //!   recorded as exactly what was observed. Its harnesses ended with it,
 //!   status unknown unless it recorded a report (`prior-end-unknown`, not a
@@ -201,7 +209,8 @@
 //! # Ending
 //!
 //! * `ended`: every launched or reattached harness's end was reported by
-//!   its waiter, and nothing is owed. Root PID 1 is then released.
+//!   its waiter, and nothing is owed. Root PID 1 is then released, and its
+//!   end observed; if its end is not observed the run is `incomplete`.
 //! * `ended-owed`: every launched or reattached harness's end was reported,
 //!   no further attempt is authorized in this instance, and debt remains,
 //!   retained in the store (exit 3).
@@ -213,9 +222,14 @@
 //! * `authority-lost` / `store-failed`: a store write was refused or failed
 //!   (exit 5). On store failure this owner has its harnesses killed. On
 //!   authority loss it kills nothing and only detaches: a newer owner holds
-//!   the root and its live work. What the store holds is authoritative,
-//!   this instance's view is not. Authority loss outranks store failure,
-//!   which outranks cancellation, regardless of arrival order.
+//!   the root and its live work. Root PID 1 reporting this owner
+//!   `superseded` is authority loss too, even when no store write was
+//!   refused (for example, everything already acknowledged); the owner then
+//!   returns without waiting for the root or its work, and work it adopts
+//!   after that is left to the successor at once. What the store holds is
+//!   authoritative, this instance's view is not. Authority loss outranks
+//!   store failure, which outranks cancellation, regardless of arrival
+//!   order.
 //! * `owned-unattached`: see restart recovery (exit 4).
 //! * `incomplete`: records or successful exit/reaping observations are
 //!   missing (exit 4). A failed wait reports `wait-failed` / `unproven`,
@@ -229,7 +243,13 @@
 //!   Incomplete records report `owed:null` and `known_owed` as a partial
 //!   count.
 //! * `root_pid1` says how root PID 1's end was observed at release, with a
-//!   status only from this owner's own wait as its parent.
+//!   status only from this owner's own wait as its parent. `end_observed`
+//!   is true only after that wait or a pidfd exit; only then is the
+//!   incarnation recorded as ended. Without a `releasing` reply
+//!   (`release-unanswered`, or `left-to-successor` if superseded meanwhile)
+//!   the owner observes its exit for at most 2 s and does not wait on it,
+//!   so the incarnation stays recorded as possibly running and a later
+//!   owner attaches to it, finds it gone, or reports it owned-unattached.
 //!
 //! No Broker settlement is visible here, and none is inferred. A missing
 //! terminal report (this process died) says nothing about delivery; the
@@ -255,6 +275,11 @@
 //!   private directory, not in privileged owner-private custody.
 //! * Root PID 1 keeps every receipt for its lifetime, and a root PID 1 whose
 //!   owner lost its connection to it mid-run is not restarted by that owner.
+//!   Losing that connection does not stop harness reads already blocked.
+//! * Nothing current supersedes a live owner: the store lock refuses a
+//!   second normal claim. Supersession is handled for the newer-owner
+//!   ingress root PID 1 already admits, and is shown here only with a test
+//!   process standing in for the newer owner.
 //! * Attach waits up to 2 s to observe an unreachable root PID 1's exit
 //!   before reporting it owned-unattached (observation only).
 //! * Store growth and retention are unbounded; nothing is pruned.
@@ -557,7 +582,18 @@ where
         .then_some(stopped)
         .flatten();
     let root_pid1 = end_custody(&slot, store_lost, &store);
-    let (mut report, code) = terminal_report(&expected, &records, cancel_requested, store_lost);
+    // A newer owner may have superseded this one while it was releasing.
+    let store_lost = store_lost.or_else(|| {
+        (custody.lock().expect("custody lock").reason() == Some("authority-lost"))
+            .then_some("authority-lost")
+    });
+    let (mut report, mut code) = terminal_report(&expected, &records, cancel_requested, store_lost);
+    if root_pid1["end_observed"] == false && matches!(code, EXIT_ENDED | EXIT_ENDED_OWED) {
+        // Every harness's end was reported, but root PID 1's was not
+        // observed: it may still be running, so this is not an end.
+        report["status"] = json!("incomplete");
+        code = EXIT_INCOMPLETE;
+    }
     report["root_pid1"] = root_pid1;
     emit(&mut out, &report);
     code
@@ -673,7 +709,9 @@ fn recover_custody(
 
 /// Releases this owner's root PID 1 at the end of its run and reports how
 /// its end was observed. On authority loss nothing is released: the root
-/// and its live work belong to the newer owner.
+/// and its live work belong to the newer owner. The incarnation is recorded
+/// as ended only once its end was actually observed; otherwise it stays
+/// discoverable, so a later owner attaches to it or finds it gone.
 fn end_custody(
     slot: &custody::RootSlot,
     store_lost: Option<&str>,
@@ -684,10 +722,14 @@ fn end_custody(
     };
     if store_lost == Some("authority-lost") {
         root.detach();
-        return json!({ "outcome": "left-to-successor", "incarnation": root.incarnation });
+        return json!({
+            "outcome": "left-to-successor",
+            "incarnation": root.incarnation,
+            "end_observed": Value::Null,
+        });
     }
     let release = root.release();
-    if release.live.is_empty() {
+    if release.ended {
         let label = match &release.status {
             Some(status) => format!("{}:{status}", release.outcome),
             None => release.outcome.to_owned(),
@@ -705,6 +747,7 @@ fn end_custody(
         "status": release.status,
         "status_known": release.status.is_some(),
         "live": release.live,
+        "end_observed": release.ended,
     })
 }
 
@@ -908,6 +951,50 @@ mod tests {
             );
             assert_eq!(report["owed_history"], "retained-in-store");
         }
+    }
+
+    /// CONFIGURED SEAM (see `custody::Root::seam`): this owner's release
+    /// of a still-running incarnation gets no reply. The incarnation is not
+    /// recorded as ended, so a later claim still finds it.
+    #[test]
+    fn unanswered_release_leaves_incarnation_discoverable() {
+        let dir = std::env::temp_dir().join(format!("root-end-{}", std::process::id()));
+        let intent = Intent {
+            outage_closure_cap: 1,
+            delivery_attempt_cap: 1,
+            cwd: "/".into(),
+            harnesses: vec![HarnessSpec {
+                id: "test".into(),
+                argv: vec!["x".into()],
+                messages: vec![],
+            }],
+        };
+        let mut store = store::Store::claim(&dir, Some(&intent)).unwrap().store;
+        assert_eq!(store.begin_incarnation("t", "test").unwrap(), 1);
+        let stop = Arc::new(transport::StopSignal::new().unwrap());
+        let (root, far) =
+            custody::Root::seam(false, i32::try_from(std::process::id()).unwrap(), &stop);
+        drop(far);
+        let slot = custody::RootSlot::new(
+            dir.clone(),
+            store.generation(),
+            sys::Isolation::current(),
+            stop,
+            Some(root),
+        );
+        let store = Mutex::new(store);
+        let ended = end_custody(&slot, None, &store);
+        assert_eq!(ended["outcome"], "release-unanswered");
+        assert_eq!(ended["end_observed"], false);
+        drop(store);
+        let conn = rusqlite::Connection::open(dir.join(store::DB_FILE)).unwrap();
+        let recorded: Option<String> = conn
+            .query_row("SELECT ended FROM incarnation WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(recorded, None, "a missing reply is not an observed end");
     }
 
     #[test]

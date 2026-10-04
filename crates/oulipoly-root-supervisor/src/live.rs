@@ -29,11 +29,22 @@ impl Custody {
     }
 
     /// Store authority loss outranks store failure, which outranks cancel.
+    /// Root PID 1 superseding this owner is authority loss too, however it
+    /// was learned: from a store refusal or from the root itself.
     pub(crate) fn reason(&self) -> Option<&'static str> {
+        if self.stop.as_ref().is_some_and(|stop| stop.superseded()) {
+            return Some("authority-lost");
+        }
         self.stopped
     }
 
+    /// Registers live work. Work registered after authority loss is already
+    /// known (a survivor adopted late) is left to the successor at once, so
+    /// nothing waits on work this owner may no longer act on.
     pub(crate) fn register(&mut self, root: Arc<Root>, work: i64) -> u64 {
+        if self.reason() == Some("authority-lost") {
+            root.detach();
+        }
         self.next += 1;
         self.live.insert(self.next, (root, work));
         self.next
@@ -56,7 +67,7 @@ impl Custody {
     /// owner holds this root's lineage and its live work, so this owner
     /// only detaches.
     pub(crate) fn stop(&mut self, reason: &'static str) -> usize {
-        self.stopped = Some(match (self.stopped, reason) {
+        self.stopped = Some(match (self.reason(), reason) {
             (Some("authority-lost"), _) | (_, "authority-lost") => "authority-lost",
             (Some("store-failed"), _) | (_, "store-failed") => "store-failed",
             (Some(earlier), _) => earlier,

@@ -1667,3 +1667,274 @@ fn mismatched_incarnation_is_neither_adopted_nor_signalled() {
     assert!(alive(old_root), "unadopted process is not signalled");
     assert!(alive(old_peer));
 }
+
+/// Waits up to `bound` for this test's own supervisor to exit by itself.
+/// `None` means it was still running: a bounded observation of a wait that
+/// has not returned, not by itself a reason it waits.
+fn exits_within(run: &mut Run, bound: Duration) -> Option<ExitStatus> {
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        if let Some(status) = run.child.try_wait().unwrap() {
+            return Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Supersedes this root's current owner the way a newer owner does: a
+/// hello on root PID 1's custody socket with the incarnation's token from
+/// the root's private store and a newer generation.
+///
+/// CONFIGURED, not a production actor: no current producer supersedes a
+/// live owner (the cooperative store lock refuses a second normal claim,
+/// and nothing here bypasses it). This test process is the stand-in. It
+/// does not touch the store or its generation fence, and it closes its
+/// connection at once, leaving root PID 1 with its live work and no owner.
+fn supersede(dir: &Scratch, generation: i64) {
+    let token: String = db(dir)
+        .query_row("SELECT token FROM incarnation WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let reply = probe(
+        &dir.store().join("pid1-1.sock"),
+        &json!({ "op": "hello", "token": token, "generation": generation }),
+    );
+    assert_eq!(reply["event"], "attached", "{reply}");
+}
+
+fn incarnation_ended(dir: &Scratch) -> Option<String> {
+    db(dir)
+        .query_row("SELECT ended FROM incarnation WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+/// (r) O1, outgoing parent. The owner that started root PID 1 has its only
+/// message durably acknowledged and its harness quiet (alive, nothing more
+/// to say), so no further store write could reveal a lost fence. A newer
+/// owner supersedes it (configured, see `supersede`). The outgoing owner
+/// must treat that as authority loss at run level and return promptly,
+/// leaving the root and its quiet work to the successor: nothing killed, no
+/// wait for the root's end, no ended incarnation.
+#[test]
+fn superseded_parent_owner_with_acknowledged_quiet_work_returns_and_kills_nothing() {
+    let dir = Scratch::new("sup-p");
+    let mut owner = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            3,
+            json!([{ "id": "h", "argv": peer(&dir.state("h"), &[]), "messages": ["x"] }]),
+        ),
+    );
+    let root = owner.until("root pid1", |value| value["event"] == "root-pid1-started");
+    assert_eq!(root["parent"], "this-owner");
+    let root_pid = root["pid"].as_u64().unwrap();
+    let peer_pid = owner.event("h", "launched")["pid"].as_u64().unwrap();
+    owner.event("h", "ack");
+    owner.event("h", "idle");
+
+    supersede(&dir, 2);
+    owner.event("h", "detached");
+    let exited = exits_within(&mut owner, Duration::from_secs(5));
+    assert!(
+        exited.is_some(),
+        "superseded parent owner still running 5 s after detaching: it waits on \
+         work it no longer holds\nseen: {:#?}",
+        owner.drain_now()
+    );
+    let (terminal, status, seen) = owner.terminal();
+    assert_eq!(terminal["status"], "authority-lost", "{terminal}");
+    assert_eq!(status.code(), Some(5));
+    assert_eq!(terminal["root_pid1"]["outcome"], "left-to-successor");
+    assert!(terminal["root_pid1"]["status"].is_null());
+    let record = harness(&terminal, "h");
+    assert_eq!(record["detached"], 1);
+    assert_eq!(record["exits"], json!([]), "no fabricated end");
+    assert_eq!(record["wait_failures"], json!([]));
+    assert_eq!(record["messages"][0]["state"], "acknowledged");
+    assert!(events(&seen, "h", "exited").is_empty());
+    assert!(
+        seen.iter()
+            .all(|value| value["event"] != "cancel-requested")
+    );
+    // Quiet survival: the successor's work was neither killed nor ended.
+    std::thread::sleep(QUIET_WINDOW);
+    assert!(alive(root_pid), "root PID 1 survives its superseded parent");
+    assert!(alive(peer_pid), "quiet work survives its superseded owner");
+    assert_eq!(
+        read_state(&dir.state("h"))["launches"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(incarnation_ended(&dir), None, "no end was observed");
+}
+
+/// (s) O1 for a recovered owner, and O3. A restarted owner attached to the
+/// surviving root PID 1 (not its parent) is holding a survivor whose
+/// message is already acknowledged. A newer owner supersedes it
+/// (configured). It leaves the root to the successor at run level, and its
+/// missing release reply is not recorded as an ended incarnation: the next
+/// recovery still finds the possibly-living incarnation and, since it
+/// cannot attach (the stand-in holds a generation it does not exceed),
+/// reports it owned-unattached rather than inferring it gone and starting
+/// a new one.
+#[test]
+fn superseded_recovered_owner_keeps_its_incarnation_discoverable() {
+    let dir = Scratch::new("sup-r");
+    let mut first = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            3,
+            json!([{ "id": "h", "argv": peer(&dir.state("h"), &[]), "messages": ["x"] }]),
+        ),
+    );
+    let root_pid = first.until("root pid1", |value| value["event"] == "root-pid1-started")["pid"]
+        .as_u64()
+        .unwrap();
+    let peer_pid = first.event("h", "launched")["pid"].as_u64().unwrap();
+    first.event("h", "ack");
+    first.kill();
+
+    let mut second = Run::start(&dir, &recover(&dir));
+    assert_eq!(
+        second.until("custody", |value| value["event"] == "custody")["outcome"],
+        "attached"
+    );
+    second.event("h", "holding-survivor");
+    supersede(&dir, 3);
+    second.event("h", "detached");
+    let (terminal, status, _) = second.terminal();
+    assert_eq!(terminal["status"], "authority-lost", "{terminal}");
+    assert_eq!(status.code(), Some(5));
+    assert_eq!(terminal["root_pid1"]["outcome"], "left-to-successor");
+    assert_eq!(harness(&terminal, "h")["exits"], json!([]));
+    assert!(alive(root_pid) && alive(peer_pid), "nothing killed");
+    assert_eq!(
+        incarnation_ended(&dir),
+        None,
+        "a missing release reply is not an observed end"
+    );
+
+    let (terminal, status, seen) = Run::start(&dir, &recover(&dir)).terminal();
+    let found = custody(&seen);
+    assert_eq!(found["outcome"], "owned-unattached", "{found}");
+    assert_eq!(found["incarnation"], 1);
+    assert!(roots_started(&seen).is_empty(), "never inferred gone");
+    assert_eq!(terminal["status"], "owned-unattached");
+    assert_eq!(status.code(), Some(4));
+    assert!(alive(root_pid) && alive(peer_pid));
+    assert_eq!(incarnation_ended(&dir), None);
+}
+
+/// (t) O2. While the owner is dead, a work PID 1 is killed before it can
+/// report its harness's wait (this test signals that exact process through
+/// a pidfd it verified is root PID 1's child holding that harness; the
+/// harness ends with its namespace). Root PID 1 reports the work PID 1's
+/// own status, without a harness status. The restarted owner records that
+/// as an unknown end, not a closure: with a closure cap of 1 the message is
+/// not declared an outage; it is relaunched with the same key and
+/// acknowledged.
+#[test]
+fn work_pid1_end_without_harness_wait_is_unknown_not_a_closure() {
+    let dir = Scratch::new("nowait");
+    let mut first = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            1,
+            json!([
+                { "id": "ends", "argv": peer(&dir.state("ends"), &["--launch-modes", "insert-then-silent,normal", "--exit-after-acks", "1"]), "messages": ["one"] },
+                { "id": "stays", "argv": quiet_until_reattach(&dir.state("stays"), &[]), "messages": ["two"] },
+            ]),
+        ),
+    );
+    let root_pid = first.until("root pid1", |value| value["event"] == "root-pid1-started")["pid"]
+        .as_u64()
+        .unwrap();
+    let ends = first.event("ends", "launched")["pid"].as_u64().unwrap();
+    let stays = first.event("stays", "launched")["pid"].as_u64().unwrap();
+    for id in ["ends", "stays"] {
+        wait_state(&dir.state(id), |state| {
+            state["insertions"].as_array().unwrap().len() == 1
+        });
+    }
+    let works = children(root_pid);
+    let target = *works
+        .iter()
+        .find(|work| children(**work) == vec![ends])
+        .expect("work PID 1 of the ends harness");
+    let work_fd = pidfd(i32::try_from(target).unwrap()).unwrap();
+    // Verified after opening, so the pidfd names that exact work PID 1.
+    assert_eq!(ppid(target), root_pid);
+    assert_eq!(children(target), vec![ends]);
+    first.kill();
+    // SAFETY: pidfd_send_signal on the verified work PID 1's pidfd.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            work_fd.as_raw_fd(),
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    assert_eq!(rc, 0);
+    let deadline = std::time::Instant::now() + WATCHDOG;
+    while children(root_pid).contains(&target) {
+        assert!(std::time::Instant::now() < deadline, "watchdog: root reap");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!alive(ends), "the harness ended with its work namespace");
+    assert!(alive(stays) && alive(root_pid));
+
+    let (terminal, status, seen) = Run::start(&dir, &recover(&dir)).terminal();
+    assert_eq!(terminal["status"], "ended", "{terminal}");
+    assert_eq!(status.code(), Some(0));
+    let found = custody(&seen);
+    assert_eq!(found["outcome"], "attached");
+    assert_eq!(found["receipts"], 1);
+    let unknown = events(&seen, "ends", "prior-end-unknown");
+    assert_eq!(unknown.len(), 1, "{seen:#?}");
+    assert_eq!(
+        unknown[0]["meaning"],
+        "ended-with-work-namespace-status-unknown"
+    );
+    assert_eq!(unknown[0]["work_pid1"], "signal:9");
+    assert!(events(&seen, "ends", "prior-exit").is_empty());
+    assert!(events(&seen, "ends", "closure-observed").is_empty());
+    let record = harness(&terminal, "ends");
+    assert_eq!(
+        record["prior_exits"],
+        json!([]),
+        "no harness status invented"
+    );
+    assert_eq!(record["prior_unknown_ends"], 1);
+    assert_eq!(record["launches"], 1);
+    assert_eq!(record["exits"], json!(["code:0"]));
+    let message = &record["messages"][0];
+    assert_eq!(message["closures"], 0, "no harness wait, no closure");
+    assert_eq!(message["state"], "acknowledged");
+    let state = read_state(&dir.state("ends"));
+    let prompts = state["prompts"].as_array().unwrap();
+    assert_eq!(prompts[0]["key"], prompts[1]["key"]);
+    let (outcome, observer): (String, Option<String>) = db(&dir)
+        .query_row(
+            "SELECT outcome, observer FROM work
+             WHERE incarnation = 1 AND harness = 0 ORDER BY id LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(outcome, "ended-with-work-namespace-status-unknown");
+    assert_eq!(observer, None);
+    assert_eq!(harness(&terminal, "stays")["reattached"], 1);
+}
