@@ -69,12 +69,10 @@ enum Host<'a> {
     InsertionOnly,
     /// Real configured model turns.
     Model(&'a Model),
-    /// Provisioned by the owner setup entry with this root's allowed
-    /// commands; turns answered by a [`ScriptedModel`].
-    ScriptedBash {
-        base_url: &'a str,
-        bash_allow: &'a [&'a str],
-    },
+    /// Provisioned by the owner setup entry with this root's `bash`
+    /// policy fields (`bash_allow` or `bash_authority`); turns answered by
+    /// a [`ScriptedModel`].
+    ScriptedBash { base_url: &'a str, bash: Value },
 }
 
 struct Fixture {
@@ -86,6 +84,8 @@ struct Fixture {
     argv: Option<Vec<String>>,
     /// The environment `opencode export` reads the host's store with.
     export_env: Vec<(String, String)>,
+    /// The owner setup entry's receipt, for a provisioned host.
+    receipt: Option<Value>,
 }
 
 impl Fixture {
@@ -186,19 +186,15 @@ impl Fixture {
                     },
                 }}}});
             }
-            Host::ScriptedBash {
-                base_url,
-                bash_allow,
-            } => {
+            Host::ScriptedBash { base_url, bash } => {
                 // Only the shipped owner setup entry provisions this host.
-                let setup = json!({
+                let mut setup = json!({
                     "dir": dir.join("launch"),
                     "deps": deps,
                     "agent_bash_tool": std::env::var("OULIPOLY_AGENT_BASH_TOOL")
                         .expect("OULIPOLY_AGENT_BASH_TOOL must be set"),
                     "agent_bash_bin": std::env::var("AGENT_BASH_BIN")
                         .expect("AGENT_BASH_BIN must be set"),
-                    "bash_allow": bash_allow,
                     "model": "fixture/scripted",
                     "provider": { "fixture": {
                         "npm": "@ai-sdk/openai-compatible",
@@ -208,6 +204,9 @@ impl Fixture {
                         "models": { "scripted": { "name": "scripted", "tool_call": true } },
                     }},
                 });
+                for (key, value) in bash.as_object().unwrap() {
+                    setup[key] = value.clone();
+                }
                 let mut child = Command::new(SETUP)
                     .env_clear()
                     .stdin(Stdio::piped())
@@ -219,6 +218,7 @@ impl Fixture {
                 let launch: Value = serde_json::from_slice(&output.stdout).unwrap();
                 println!("setup: {launch}");
                 assert!(output.status.success(), "{launch}");
+                let receipt = launch.clone();
                 // The host's own HOME/XDG and policy come from its argv.
                 // The owner keeps its HOME: root v1 Bash work runs in the
                 // owner's environment, not the requester's.
@@ -248,6 +248,7 @@ impl Fixture {
                     json!({ "permission": { "*": "allow", "bash": "allow" } }).to_string(),
                 ));
                 return Self {
+                    receipt: Some(receipt),
                     export_env: launch_env
                         .into_iter()
                         .chain([("PATH".to_owned(), "/usr/bin:/bin".to_owned())])
@@ -272,6 +273,7 @@ impl Fixture {
             export_env: env.clone(),
             env,
             argv: None,
+            receipt: None,
         }
     }
 
@@ -381,9 +383,15 @@ impl Fixture {
 
 /// A loopback stand-in for a model, never a model or provider: an
 /// OpenAI-compatible streaming chat-completions endpoint answering from a
-/// script. After a tool result it answers the text `DONE`; to a user
-/// message `RUN <command>` it calls `bash` once with that command; to
-/// anything else it answers `NO-SCRIPT`. It keeps every request body.
+/// script, the turn's user message:
+///
+/// * `RUN <command>`: calls `bash` once with that command;
+/// * `CALLS <json>`: makes the `[tool, arguments]` calls of that array,
+///   one per model request, the next after each tool result;
+/// * anything else: answers `NO-SCRIPT`.
+///
+/// Once its calls are made it answers the text `DONE`. It keeps every
+/// request (path and body), any path.
 struct ScriptedModel {
     base_url: String,
     requests: Arc<Mutex<Vec<Value>>>,
@@ -452,7 +460,6 @@ impl ScriptedModel {
             })
         };
         let messages = body["messages"].as_array().cloned().unwrap_or_default();
-        let last = messages.last().cloned().unwrap_or(Value::Null);
         let user_text = |message: &Value| match &message["content"] {
             Value::String(text) => text.clone(),
             Value::Array(parts) => parts
@@ -462,31 +469,42 @@ impl ScriptedModel {
                 .join(""),
             _ => String::new(),
         };
-        let command = (last["role"] == "user")
-            .then(|| user_text(&last))
-            .and_then(|text| text.strip_prefix("RUN ").map(str::to_owned));
-        let chunks = match command {
-            Some(command) if last["role"] != "tool" => vec![
+        // The turn's user message and the tool results since it.
+        let user = messages
+            .iter()
+            .rposition(|message| message["role"] == "user");
+        let text = user.map(|at| user_text(&messages[at])).unwrap_or_default();
+        let results = user.map_or(0, |at| {
+            messages[at..]
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .count()
+        });
+        let calls: Vec<(String, Value)> = if let Some(command) = text.strip_prefix("RUN ") {
+            vec![("bash".to_owned(), json!({ "command": command }))]
+        } else if let Some(calls) = text.strip_prefix("CALLS ") {
+            serde_json::from_str::<Vec<(String, Value)>>(calls).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let chunks = match calls.get(results) {
+            Some((name, arguments)) => vec![
                 chunk(
                     json!({ "role": "assistant", "tool_calls": [{
                         "index": 0,
-                        "id": "call_scripted_1",
+                        "id": format!("call_scripted_{}", results + 1),
                         "type": "function",
                         "function": {
-                            "name": "bash",
-                            "arguments": json!({ "command": command }).to_string(),
+                            "name": name,
+                            "arguments": arguments.to_string(),
                         },
                     }]}),
                     Value::Null,
                 ),
                 chunk(json!({}), json!("tool_calls")),
             ],
-            _ => {
-                let text = if last["role"] == "tool" {
-                    "DONE"
-                } else {
-                    "NO-SCRIPT"
-                };
+            None => {
+                let text = if results > 0 { "DONE" } else { "NO-SCRIPT" };
                 vec![
                     chunk(json!({ "role": "assistant", "content": text }), Value::Null),
                     chunk(json!({}), json!("stop")),
@@ -762,7 +780,7 @@ fn owner_setup_launches_a_native_host_whose_policy_decides_the_agent_bash_tool()
     let model = ScriptedModel::start();
     let fixture = Fixture::new(Host::ScriptedBash {
         base_url: &model.base_url,
-        bash_allow: &[ALLOWED],
+        bash: json!({ "bash_allow": [ALLOWED] }),
     });
 
     // The launch the setup provisioned: its own directory, removing
@@ -777,11 +795,15 @@ fn owner_setup_launches_a_native_host_whose_policy_decides_the_agent_bash_tool()
     let config_dir = fixture.dir.join("launch/xdg/config/opencode");
     let config = std::fs::read_to_string(config_dir.join("opencode.json")).unwrap();
     println!("launch config: {config}");
+    let native = format!(r#"{{"*":"deny","bash":{{"*":"deny","{ALLOWED}":"allow"}}}}"#);
     assert!(
-        config.ends_with(&format!(
-            r#""permission":{{"*":"deny","bash":{{"*":"deny","{ALLOWED}":"allow"}}}}}}"#
-        )),
+        config.ends_with(&format!(r#""permission":{native}}}"#)),
         "{config}"
+    );
+    // The receipt reports the policy the config holds.
+    assert_eq!(
+        fixture.receipt.as_ref().unwrap()["policy"],
+        json!({ "bash": { "allow": [ALLOWED] }, "other": "deny", "native": native }),
     );
     for file in ["tool/bash.ts", "agent-bash/bash.ts", "acp-v2-endpoint.ts"] {
         assert!(config_dir.join(file).is_file(), "{file}");
@@ -904,4 +926,258 @@ fn owner_setup_launches_a_native_host_whose_policy_decides_the_agent_bash_tool()
     assert_eq!(unnamed.len(), 1, "{unnamed:?}");
     assert_eq!(unnamed[0].1, "error", "{unnamed:?}");
     assert_eq!(unnamed[0].2["command"], UNNAMED);
+}
+
+/// Every model request's offered tool names.
+fn offered_tools(requests: &[Value]) -> Vec<Vec<String>> {
+    requests
+        .iter()
+        .filter(|request| {
+            request["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("/chat/completions")
+        })
+        .map(|request| {
+            request["body"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["function"]["name"].as_str().unwrap().to_owned())
+                .collect()
+        })
+        .collect()
+}
+
+/// A host provisioned by the owner setup entry with the caller's explicit
+/// `trusted-task` Bash authority: any command the (scripted) model asks
+/// `bash` for runs, each through this root's own Bash ingress, with no
+/// permission request to the owner; every other native tool stays denied.
+/// The turns are driven by a [`ScriptedModel`], not a model.
+///
+/// * open: two commands no list names (a pipeline, then a file read), in
+///   one turn, each accepted by the ingress and returned to the turn;
+/// * other tools: native `read`, `write`, `webfetch`, `task` and `glob`
+///   calls do nothing observable (no file content returned, no file
+///   written, no fetch reaches loopback), and a following `bash` call in
+///   the same turn still runs;
+/// * cancel while a `bash` command is running: the owner's cancel ends the
+///   running work and the root, everything reaped;
+/// * repeat: the same command in three consecutive steps runs each time.
+#[test]
+#[ignore = "needs OULIPOLY_NATIVE_DEPS, OULIPOLY_AGENT_BASH_TOOL, AGENT_BASH_BIN and loopback"]
+fn trusted_task_bash_runs_unlisted_commands_and_other_native_tools_stay_denied() {
+    const PIPELINE: &str = "printf %s oulipoly-trusted-$((6*7)) | tr a-z A-Z";
+    const MARKER: &str = "oulipoly-trusted-marker-7f3a";
+    let model = ScriptedModel::start();
+    let fixture = Fixture::new(Host::ScriptedBash {
+        base_url: &model.base_url,
+        bash: json!({ "bash_authority": "trusted-task" }),
+    });
+    let marker = fixture.project.join("marker.txt");
+    std::fs::write(&marker, MARKER).unwrap();
+    let written = fixture.project.join("written.txt");
+    let fetched = format!("{}/oulipoly-webfetch-probe", model.base_url);
+
+    // The receipt and the config file hold the same open-`bash` policy.
+    let native = r#"{"*":"deny","bash":{"*":"allow"}}"#;
+    let config =
+        std::fs::read_to_string(fixture.dir.join("launch/xdg/config/opencode/opencode.json"))
+            .unwrap();
+    println!("launch config: {config}");
+    assert!(
+        config.ends_with(&format!(r#""permission":{native}}}"#)),
+        "{config}"
+    );
+    assert_eq!(
+        fixture.receipt.as_ref().unwrap()["policy"],
+        json!({ "bash": "trusted-task", "other": "deny", "native": native }),
+    );
+
+    // open
+    let cat = format!("cat {}", marker.display());
+    let calls = json!([["bash", { "command": PIPELINE }], ["bash", { "command": cat }]]);
+    let mut run = Run::start(
+        &fixture,
+        &fixture.spec("root-open", None, &format!("CALLS {calls}")),
+    );
+    run.event("endpoint-connected");
+    let open_session = run.event("session-opened")["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(run.event("ack")["label"], "accepted");
+    let idle = run.event("idle");
+    assert_eq!(idle["stop_reason"], "end_turn", "{idle}");
+    assert_eq!(run.event("agent-message")["text"], "DONE");
+    let accepted: Vec<Value> = run
+        .seen
+        .iter()
+        .filter(|value| value["event"] == "bash-accepted")
+        .map(|value| value["argv"].clone())
+        .collect();
+    assert_eq!(
+        accepted,
+        vec![
+            json!(["bash", "-lc", PIPELINE]),
+            json!(["bash", "-lc", cat])
+        ],
+        "{:#?}",
+        run.seen
+    );
+    assert!(
+        !run.seen
+            .iter()
+            .any(|value| value["event"] == "request-refused"),
+        "{:#?}",
+        run.seen
+    );
+    let (terminal, code) = run.cancel();
+    println!("open terminal: {terminal}");
+    assert_cancelled_and_reaped(&terminal, code);
+    assert_eq!(terminal["bash"]["accepted"], 2, "{terminal}");
+    let open = fixture.tool_parts(&open_session);
+    println!("open: {open:?}");
+    assert_eq!(open.len(), 2, "{open:?}");
+    assert!(
+        open.iter()
+            .all(|(tool, status, _, _)| tool == "bash" && status == "completed"),
+        "{open:?}"
+    );
+    assert!(open[0].3.ends_with("OULIPOLY-TRUSTED-42"), "{open:?}");
+    // A file's content returned through `bash` is visible to this check.
+    assert!(open[1].3.ends_with(MARKER), "{open:?}");
+
+    // other tools
+    let calls = json!([
+        ["read", { "filePath": marker }],
+        ["write", { "filePath": written, "content": "written" }],
+        ["webfetch", { "url": fetched, "format": "text" }],
+        ["task", { "description": "probe", "prompt": "RUN true", "subagent_type": "general" }],
+        ["glob", { "pattern": "*.txt", "path": fixture.project }],
+        ["bash", { "command": "printf oulipoly-after-denied" }],
+    ]);
+    let requests_before = model.requests().len();
+    let mut run = Run::start(
+        &fixture,
+        &fixture.spec("root-other", None, &format!("CALLS {calls}")),
+    );
+    run.event("endpoint-connected");
+    let other_session = run.event("session-opened")["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(run.event("ack")["label"], "accepted");
+    let idle = run.event("idle");
+    println!("other: {idle}\nseen: {:#?}", run.seen);
+    let accepted: Vec<Value> = run
+        .seen
+        .iter()
+        .filter(|value| value["event"] == "bash-accepted")
+        .map(|value| value["argv"].clone())
+        .collect();
+    assert!(
+        !run.seen
+            .iter()
+            .any(|value| value["event"] == "request-refused"),
+        "{:#?}",
+        run.seen
+    );
+    let (terminal, code) = run.cancel();
+    println!("other terminal: {terminal}");
+    assert_cancelled_and_reaped(&terminal, code);
+    let other = fixture.tool_parts(&other_session);
+    println!("other: {other:#?}");
+    let requests = model.requests();
+    println!(
+        "paths: {:?}",
+        requests
+            .iter()
+            .map(|request| &request["path"])
+            .collect::<Vec<_>>()
+    );
+    assert!(!written.exists(), "native write created {written:?}");
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request["path"] == "/v1/oulipoly-webfetch-probe"),
+        "native webfetch reached loopback"
+    );
+    // Denied tools are not offered; a call to one ends as an unavailable
+    // tool, nothing run.
+    assert_eq!(other.len(), 6, "{other:#?}");
+    for (tool, status, _, result) in &other[..5] {
+        assert_eq!(status, "error", "{tool}: {result}");
+        assert!(result.contains("unavailable tool"), "{tool}: {result}");
+        assert!(!result.contains(MARKER), "{tool} returned the marker");
+    }
+    for request in &requests[requests_before..] {
+        assert!(
+            !request["body"].to_string().contains(MARKER)
+                || request["body"]
+                    .to_string()
+                    .contains("oulipoly-after-denied"),
+            "a denied tool returned the marker to the model: {request}"
+        );
+    }
+    assert_eq!(
+        accepted,
+        vec![json!(["bash", "-lc", "printf oulipoly-after-denied"])],
+        "{other:#?}"
+    );
+    assert_eq!(idle["stop_reason"], "end_turn", "{idle}");
+
+    // cancel while running
+    let mut run = Run::start(
+        &fixture,
+        &fixture.spec("root-cancel", None, "RUN sleep 600"),
+    );
+    run.event("endpoint-connected");
+    assert_eq!(run.event("ack")["label"], "accepted");
+    let accepted = run.event("bash-accepted");
+    assert_eq!(accepted["argv"], json!(["bash", "-lc", "sleep 600"]));
+    let (terminal, code) = run.cancel();
+    println!("cancel terminal: {terminal}");
+    assert_cancelled_and_reaped(&terminal, code);
+    assert_eq!(
+        terminal["bash"],
+        json!({ "accepted": 1, "ended": 1, "end_unknown": 0, "not_run": 0, "open": 0, "refused": 0 }),
+        "{terminal}"
+    );
+
+    // repeat: the same command three times in one turn
+    let same = json!(["bash", { "command": "printf oulipoly-same" }]);
+    let calls = json!([same, same, same]);
+    let mut run = Run::start(
+        &fixture,
+        &fixture.spec("root-same", None, &format!("CALLS {calls}")),
+    );
+    run.event("endpoint-connected");
+    let same_session = run.event("session-opened")["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(run.event("ack")["label"], "accepted");
+    let idle = run.event("idle");
+    println!("same: {idle}\nseen: {:#?}", run.seen);
+    let (terminal, code) = run.cancel();
+    println!("same terminal: {terminal}");
+    assert_cancelled_and_reaped(&terminal, code);
+    let same = fixture.tool_parts(&same_session);
+    println!("same: {same:#?}");
+    // No native repeat guard stopped them (one call per model step).
+    assert_eq!(same.len(), 3, "{same:#?}");
+    assert!(
+        same.iter().all(
+            |(_, status, _, result)| status == "completed" && result.ends_with("oulipoly-same")
+        ),
+        "{same:#?}"
+    );
+    assert_eq!(terminal["bash"]["accepted"], 3, "{terminal}");
+    assert_eq!(terminal["bash"]["ended"], 3, "{terminal}");
+
+    // Only `bash` was ever offered.
+    for tools in offered_tools(&model.requests()) {
+        assert_eq!(tools, vec!["bash".to_owned()]);
+    }
 }

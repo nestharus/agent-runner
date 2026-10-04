@@ -155,3 +155,61 @@ fn closed_receipt_recipient_is_non_pass_and_keeps_provisioning() {
     );
     assert!(diagnostic.contains("do not replay"), "{diagnostic}");
 }
+
+#[test]
+fn receipt_reports_the_named_list_policy_the_config_holds() {
+    let fixture = Fixture::new();
+    let output = fixture.call(&fixture.setup(), false);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let native = r#"{"*":"deny","bash":{"*":"deny","printf setup-fixture":"allow"}}"#;
+    assert_eq!(
+        receipt["policy"],
+        json!({ "bash": { "allow": ["printf setup-fixture"] }, "other": "deny", "native": native })
+    );
+    let config =
+        fs::read_to_string(fixture.dir.join("launch/xdg/config/opencode/opencode.json")).unwrap();
+    assert!(
+        config.ends_with(&format!(r#""permission":{native}}}"#)),
+        "{config}"
+    );
+}
+
+#[test]
+fn trusted_task_receipt_reports_open_bash_and_the_config_holds_it() {
+    let fixture = Fixture::new();
+    let mut setup = fixture.setup();
+    setup.as_object_mut().unwrap().remove("bash_allow");
+    setup["bash_authority"] = json!("trusted-task");
+    let output = fixture.call(&setup, false);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let native = r#"{"*":"deny","bash":{"*":"allow"}}"#;
+    assert_eq!(
+        receipt["policy"],
+        json!({ "bash": "trusted-task", "other": "deny", "native": native })
+    );
+    let config =
+        fs::read_to_string(fixture.dir.join("launch/xdg/config/opencode/opencode.json")).unwrap();
+    assert!(
+        config.ends_with(&format!(r#""permission":{native}}}"#)),
+        "{config}"
+    );
+}
+
+#[test]
+fn bash_policy_is_one_explicit_form_or_refused_without_setup_writes() {
+    let fixture = Fixture::new();
+    let mut setup = fixture.setup();
+    setup["bash_authority"] = json!("trusted-task");
+    assert_input_invalid(
+        &fixture,
+        &setup,
+        "bash_allow and bash_authority are exclusive",
+    );
+    setup["bash_authority"] = json!("all");
+    assert_input_invalid(&fixture, &setup, "unknown variant");
+    setup.as_object_mut().unwrap().remove("bash_authority");
+    setup.as_object_mut().unwrap().remove("bash_allow");
+    assert_input_invalid(&fixture, &setup, "bash_allow names no command");
+}

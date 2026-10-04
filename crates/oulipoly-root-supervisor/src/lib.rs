@@ -441,7 +441,8 @@
 //!   OpenCode host loads that tool only behind
 //!   `native/opencode/bash-policy-tool.ts`, whose native permission
 //!   decides each whole command string; the [`native`] setup provisions
-//!   both with the root's deny-default policy (only named commands run).
+//!   both with the root's deny-default policy (only named commands run,
+//!   unless the caller explicitly selects `trusted-task` Bash).
 //!   That is shown with a scripted stand-in for a model, not a model. The
 //!   owner grants no permission request (it answers method-not-found, a
 //!   native rejection). No completion

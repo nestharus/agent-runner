@@ -2,7 +2,8 @@
 //!
 //! Stdin: one JSON [`OpenCodeSetup`] line. Stdout: one JSON line, the
 //! harness launch (`argv`, `endpoint`, the `env` its argv sets,
-//! `removed_env`, `config_dir`), to use as a harness of the root's intent.
+//! `removed_env`, `config_dir`, the effective native `policy`), to use as a
+//! harness of the root's intent.
 //! Exit 0 means provisioning completed and stdout was written and flushed;
 //! it does not acknowledge that the caller consumed the receipt.
 //! Exit 64 with `{"refused": reason, "effects": "none"}` means input-invalid

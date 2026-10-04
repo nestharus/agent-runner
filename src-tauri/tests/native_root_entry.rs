@@ -413,11 +413,34 @@ fn tool_parts(launch: &Value, cwd: &str, session: &str) -> Vec<(String, String, 
         .collect()
 }
 
-/// Runs one root to the native denial or Bash result, checking the
-/// environment at the owner and the native host, then cancels it.
-fn run_root(root: &Root, allowed: bool) -> (Value, String) {
+/// Runs one root to the native denial or the Bash result of `runs`,
+/// checking the environment at the owner and the native host and the
+/// reported policy against the config file, then cancels it.
+fn run_root(root: &Root, runs: Option<&str>) -> (Value, String) {
+    let allowed = runs.is_some();
     let mut run = root.start();
     let setup = run.entry("setup-completed");
+    let policy = &setup["launch"]["policy"];
+    let config = std::fs::read_to_string(
+        Path::new(root.request["launch_dir"].as_str().unwrap())
+            .join("xdg/config/opencode/opencode.json"),
+    )
+    .unwrap();
+    assert!(
+        config.ends_with(&format!(
+            r#""permission":{}}}"#,
+            policy["native"].as_str().unwrap()
+        )),
+        "{policy} {config}"
+    );
+    match root.request["opencode"].get("bash_authority") {
+        Some(authority) => assert_eq!(policy["bash"], *authority, "{policy}"),
+        None => assert_eq!(
+            policy["bash"]["allow"], root.request["opencode"]["bash_allow"],
+            "{policy}"
+        ),
+    }
+    assert_eq!(policy["other"], "deny", "{policy}");
     let reach = &setup["env"];
     assert_eq!(reach["ambient"], "none", "{setup}");
     assert_eq!(
@@ -466,11 +489,11 @@ fn run_root(root: &Root, allowed: bool) -> (Value, String) {
         .to_owned();
     let ack = run.event("ack");
     assert_eq!(ack["label"], "accepted", "{ack}");
-    if allowed {
+    if let Some(command) = runs {
         let accepted = run.event("bash-accepted");
         assert_eq!(
             accepted["argv"],
-            json!(["bash", "-lc", ALLOWED]),
+            json!(["bash", "-lc", command]),
             "{accepted}"
         );
         run.event("bash-ended");
@@ -522,7 +545,7 @@ fn native_root_entry_starts_fresh_roots_with_only_the_declared_environment() {
     // allowed: the command runs through the root's Bash ingress, in the
     // declared environment (declared HOME, no ambient variable).
     let allow = Root::new(&scratch, "a", &base_url, &format!("RUN {ALLOWED}"));
-    let (launch, session) = run_root(&allow, true);
+    let (launch, session) = run_root(&allow, Some(ALLOWED));
     let parts = tool_parts(&launch, allow.request["cwd"].as_str().unwrap(), &session);
     println!("allowed parts: {parts:?}");
     assert_eq!(parts.len(), 1, "{parts:?}");
@@ -541,12 +564,50 @@ fn native_root_entry_starts_fresh_roots_with_only_the_declared_environment() {
 
     // not named: a native denial, nothing reaches the owner.
     let deny = Root::new(&scratch, "d", &base_url, &format!("RUN {UNNAMED}"));
-    let (launch, session) = run_root(&deny, false);
+    let (launch, session) = run_root(&deny, None);
     let parts = tool_parts(&launch, deny.request["cwd"].as_str().unwrap(), &session);
     println!("unnamed parts: {parts:?}");
     assert_eq!(parts.len(), 1, "{parts:?}");
     assert_eq!(parts[0].0, "error", "{parts:?}");
     assert_eq!(parts[0].1, UNNAMED);
+
+    // trusted task: the caller's explicit open `bash` authority runs the
+    // same command no list names, through the root's Bash ingress.
+    let mut open = Root::new(&scratch, "t", &base_url, &format!("RUN {UNNAMED}"));
+    let opencode = open.request["opencode"].as_object_mut().unwrap();
+    opencode.remove("bash_allow");
+    opencode.insert("bash_authority".to_owned(), json!("trusted-task"));
+    let (launch, session) = run_root(&open, Some(UNNAMED));
+    assert_eq!(
+        launch["policy"]["native"],
+        r#"{"*":"deny","bash":{"*":"allow"}}"#
+    );
+    let parts = tool_parts(&launch, open.request["cwd"].as_str().unwrap(), &session);
+    println!("trusted parts: {parts:?}");
+    assert_eq!(parts.len(), 1, "{parts:?}");
+    assert_eq!(parts[0].0, "completed", "{parts:?}");
+    assert!(
+        parts[0].2.ends_with(&format!(
+            // `printf` reuses its format for the extra `x`.
+            "{DECLARED}:unset:{}x::",
+            open.request["env"]["HOME"].as_str().unwrap()
+        )),
+        "{parts:?}"
+    );
+
+    // Both forms at once, or an unknown authority, are refused before any
+    // effect: nothing is widened by guessing.
+    for (name, authority) in [("tb", json!("trusted-task")), ("tx", json!("all"))] {
+        let mut both = Root::new(&scratch, name, &base_url, "RUN true");
+        both.request["opencode"]["bash_authority"] = authority;
+        let mut run = both.start();
+        let entry = run.entry("terminal");
+        let code = run.child.wait().unwrap().code();
+        assert_eq!(entry["stage"], "refused", "{entry}");
+        assert_eq!(entry["effects"], "none", "{entry}");
+        assert_eq!(code, Some(64), "{entry}");
+        assert!(!Path::new(both.request["launch_dir"].as_str().unwrap()).exists());
+    }
 
     // A root is started fresh only: an existing store is refused before
     // any effect, so no launch directory appears.
