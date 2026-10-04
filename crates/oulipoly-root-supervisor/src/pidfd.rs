@@ -32,19 +32,24 @@ fn kill(fd: &OwnedFd) -> bool {
     rc == 0
 }
 
-/// Live owned harness processes and whether the caller has cancelled.
-/// Spawning and cancelling both hold this lock, so no harness can be
-/// launched after a cancel without being signalled.
+/// Live owned harness processes and whether this run has stopped, and why.
+/// Spawning and stopping both hold this lock, so no harness can be
+/// launched after a stop without being signalled.
 #[derive(Default)]
 pub(crate) struct Custody {
-    cancelled: bool,
+    stopped: Option<&'static str>,
     next: u64,
     live: HashMap<u64, OwnedFd>,
 }
 
 impl Custody {
     pub(crate) fn cancelled(&self) -> bool {
-        self.cancelled
+        self.stopped.is_some()
+    }
+
+    /// Store authority loss outranks store failure, which outranks cancel.
+    pub(crate) fn reason(&self) -> Option<&'static str> {
+        self.stopped
     }
 
     pub(crate) fn register(&mut self, fd: OwnedFd) -> u64 {
@@ -58,10 +63,21 @@ impl Custody {
         self.live.remove(&token);
     }
 
-    /// Marks the run cancelled and sends `SIGKILL` to every live owned
-    /// harness. Returns how many signals were delivered.
+    /// Marks the run cancelled by the caller and sends `SIGKILL` to every
+    /// live owned harness. Returns how many signals were delivered.
     pub(crate) fn cancel(&mut self) -> usize {
-        self.cancelled = true;
+        self.stop("cancelled")
+    }
+
+    /// Stops the run, retaining the strongest observed store loss even if
+    /// cancel arrived first, and sends `SIGKILL` to every live owned harness.
+    pub(crate) fn stop(&mut self, reason: &'static str) -> usize {
+        self.stopped = Some(match (self.stopped, reason) {
+            (Some("authority-lost"), _) | (_, "authority-lost") => "authority-lost",
+            (Some("store-failed"), _) | (_, "store-failed") => "store-failed",
+            (Some(earlier), _) => earlier,
+            (None, reason) => reason,
+        });
         self.live.values().filter(|fd| kill(fd)).count()
     }
 }

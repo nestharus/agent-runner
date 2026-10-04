@@ -15,24 +15,31 @@ use oulipoly_acp::{
 };
 use serde_json::{Value, json};
 
+use crate::Event;
 use crate::pidfd::{self, Custody};
+use crate::store::{DurableAck, DurableHarness, Store, StoreError};
 use crate::transport::{HarnessTransport, Observed};
-use crate::{Event, HarnessSpec};
 
 /// Final state of one message, as reported in the terminal report.
 #[derive(Debug, Clone)]
 pub struct MessageRecord {
     pub index: usize,
-    /// No insertion acknowledgement was received.
+    /// No durably recorded insertion acknowledgement.
     pub owed: bool,
     /// `accepted`, `duplicate-unknown`, or the reason it is still owed.
     pub label: String,
     pub at_most_once: bool,
-    pub basis: Option<&'static str>,
+    pub basis: Option<String>,
     pub recovered: bool,
-    /// Attempts without an acknowledgement, as counted by `AcpClient`.
-    pub unacknowledged_attempts: u32,
-    /// Observed no-acknowledgement closures charged to this message.
+    /// Owner generation that recorded the acknowledgement.
+    pub ack_generation: Option<i64>,
+    /// Attempts recorded in the store by every generation, this one included.
+    pub attempts: u32,
+    /// Earlier-owner attempts with no outcome, classified unknown by this
+    /// instance. Each may or may not have been sent or inserted.
+    pub prior_unknown: u32,
+    /// Observed no-acknowledgement closures charged to this message, by
+    /// every generation.
     pub closures: u32,
 }
 
@@ -58,23 +65,30 @@ impl HarnessRecord {
             "wait_failures": self.wait_failures,
             "messages": self.messages.iter().map(|message| json!({
                 "index": message.index,
-                "state": if message.owed { "undelivered-owner-lost" } else { "acknowledged" },
+                "state": if message.owed { "owed" } else { "acknowledged" },
                 "label": message.label,
                 "at_most_once": message.at_most_once,
                 "basis": message.basis,
                 "recovered": message.recovered,
-                "unacknowledged_attempts": message.unacknowledged_attempts,
+                "ack_generation": message.ack_generation,
+                "attempts": message.attempts,
+                "prior_unknown": message.prior_unknown,
                 "closures": message.closures,
+                "completion": "not-observed",
             })).collect::<Vec<_>>(),
         })
     }
 }
 
 struct Tracked {
-    message: Option<OutboundMessage>,
+    message: OutboundMessage,
+    /// Why this instance stopped trying, while still owed.
     label: Option<String>,
-    acked: bool,
+    /// A durably recorded acknowledgement, by any generation.
+    ack: Option<DurableAck>,
     closures: u32,
+    attempts: u32,
+    prior_unknown: u32,
 }
 
 /// How one connection to a launched harness stopped being driven.
@@ -91,10 +105,14 @@ enum ConnEnd {
 }
 
 struct Worker {
-    spec: HarnessSpec,
+    id: String,
+    argv: Vec<String>,
+    position: usize,
     cap: u32,
+    attempt_cap: u32,
     cwd: String,
     custody: Arc<Mutex<Custody>>,
+    store: Arc<Mutex<Store>>,
     tx: Sender<Event>,
     tracked: Vec<Tracked>,
     session: Option<String>,
@@ -103,39 +121,55 @@ struct Worker {
     wait_failures: Vec<String>,
 }
 
-pub(crate) fn run(
-    spec: HarnessSpec,
-    cap: u32,
-    cwd: String,
-    custody: Arc<Mutex<Custody>>,
-    tx: Sender<Event>,
-) {
-    let tracked = spec
+/// What one worker is given: its durable harness record and shared state.
+pub(crate) struct Assignment {
+    pub(crate) position: usize,
+    pub(crate) harness: DurableHarness,
+    pub(crate) cap: u32,
+    pub(crate) attempt_cap: u32,
+    pub(crate) cwd: String,
+    pub(crate) custody: Arc<Mutex<Custody>>,
+    pub(crate) store: Arc<Mutex<Store>>,
+    pub(crate) tx: Sender<Event>,
+}
+
+pub(crate) fn run(assignment: Assignment) {
+    let Assignment {
+        position,
+        harness,
+        cap,
+        attempt_cap,
+        cwd,
+        custody,
+        store,
+        tx,
+    } = assignment;
+    let tracked = harness
         .messages
-        .iter()
-        .map(|text| match OutboundMessage::fresh(text.clone()) {
-            Ok(message) => Tracked {
-                message: Some(message),
-                label: None,
-                acked: false,
-                closures: 0,
-            },
-            Err(_) => Tracked {
-                message: None,
-                label: Some("key-mint-failed".to_owned()),
-                acked: false,
-                closures: 0,
-            },
+        .into_iter()
+        .map(|durable| Tracked {
+            // A durable stop (`outage`, `attempts-exhausted`) keeps the
+            // message from being retried.
+            label: durable.stop,
+            message: durable.message,
+            ack: durable.ack,
+            closures: durable.closures,
+            attempts: durable.attempts,
+            prior_unknown: durable.prior_unknown,
         })
         .collect();
     let mut worker = Worker {
-        spec,
+        id: harness.id,
+        argv: harness.argv,
+        position,
         cap,
+        attempt_cap,
         cwd,
         custody,
+        store,
         tx,
         tracked,
-        session: None,
+        session: harness.session,
         launches: 0,
         exits: Vec::new(),
         wait_failures: Vec::new(),
@@ -147,7 +181,7 @@ pub(crate) fn run(
 
 impl Worker {
     fn report(&self, mut value: Value) {
-        value["harness"] = Value::String(self.spec.id.clone());
+        value["harness"] = Value::String(self.id.clone());
         let _ = self.tx.send(Event::Report(value));
     }
 
@@ -159,18 +193,50 @@ impl Worker {
     fn head(&self) -> Option<usize> {
         self.tracked
             .iter()
-            .position(|tracked| !tracked.acked && tracked.label.is_none())
+            .position(|tracked| tracked.ack.is_none() && tracked.label.is_none())
     }
 
     fn label_remaining(&mut self, label: &str) {
         for tracked in &mut self.tracked {
-            if !tracked.acked && tracked.label.is_none() {
+            if tracked.ack.is_none() && tracked.label.is_none() {
                 tracked.label = Some(label.to_owned());
             }
         }
     }
 
+    /// Why the run stopped: the caller's cancel or lost store authority.
+    fn stop_reason(&self) -> &'static str {
+        self.custody
+            .lock()
+            .expect("custody lock")
+            .reason()
+            .unwrap_or("cancelled")
+    }
+
+    /// Runs one store write. On failure this owner may no longer record
+    /// anything, so it stops the whole run (signalling its own harnesses)
+    /// rather than deliver what it cannot record.
+    fn durable<T>(&mut self, write: impl FnOnce(&mut Store) -> Result<T, StoreError>) -> Option<T> {
+        let result = write(&mut self.store.lock().expect("store lock"));
+        match result {
+            Ok(value) => Some(value),
+            Err(error) => {
+                let label = error.label();
+                self.report(json!({ "event": label, "reason": format!("{error:?}") }));
+                self.custody.lock().expect("custody lock").stop(label);
+                self.label_remaining(label);
+                None
+            }
+        }
+    }
+
     fn supervise(&mut self) {
+        if self.head().is_none() && !self.tracked.is_empty() {
+            // Recovered with every message acknowledged or durably stopped
+            // (`outage`, `attempts-exhausted`): nothing to launch.
+            self.report(json!({ "event": "nothing-deliverable" }));
+            return;
+        }
         loop {
             let Some((child, token)) = self.launch() else {
                 return;
@@ -184,7 +250,8 @@ impl Worker {
 
     fn after_drive(&mut self, end: ConnEnd, observed: &'static str) -> bool {
         if self.cancelled() {
-            self.label_remaining("cancelled");
+            let reason = self.stop_reason();
+            self.label_remaining(reason);
             return false;
         }
         match end {
@@ -198,18 +265,28 @@ impl Worker {
             return false;
         };
         // The exact child exit has been observed: this is a closure.
-        let tracked = &mut self.tracked[index];
-        tracked.closures += 1;
-        let closures = tracked.closures;
+        let position = self.position;
+        let (cap, attempt_cap) = (self.cap, self.attempt_cap);
+        let Some((closures, stop)) =
+            self.durable(|store| store.record_closure(position, index, cap, attempt_cap))
+        else {
+            return false;
+        };
+        self.tracked[index].closures = closures;
         self.report(json!({
             "event": "closure-observed",
             "index": index,
             "cause": observed,
             "closures": closures,
         }));
-        if closures >= self.cap {
-            self.tracked[index].label = Some("outage".to_owned());
-            self.report(json!({ "event": "outage", "index": index, "closures": closures }));
+        if let Some(stop) = stop {
+            self.tracked[index].label = Some(stop.to_owned());
+            self.report(json!({
+                "event": stop,
+                "index": index,
+                "closures": closures,
+                "attempts": self.tracked[index].attempts,
+            }));
             self.label_remaining("not-attempted");
             return false;
         }
@@ -222,13 +299,13 @@ impl Worker {
     fn launch(&mut self) -> Option<(Child, u64)> {
         let shared = Arc::clone(&self.custody);
         let mut custody = shared.lock().expect("custody lock");
-        if custody.cancelled() {
+        if let Some(reason) = custody.reason() {
             drop(custody);
-            self.label_remaining("cancelled");
+            self.label_remaining(reason);
             return None;
         }
-        let spawned = Command::new(&self.spec.argv[0])
-            .args(&self.spec.argv[1..])
+        let spawned = Command::new(&self.argv[0])
+            .args(&self.argv[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -392,7 +469,18 @@ impl Worker {
             Some(id) => client.resume_session(&id, &self.cwd).map(|()| None),
         };
         match session {
-            Ok(Some(id)) => self.session = Some(id),
+            Ok(Some(id)) => {
+                // Durable before any prompt, so a successor resumes this
+                // session string (trusted scope, not continuity proof).
+                let position = self.position;
+                if self
+                    .durable(|store| store.set_session(position, &id))
+                    .is_none()
+                {
+                    return ConnEnd::Stop;
+                }
+                self.session = Some(id);
+            }
             Ok(None) => self.report(json!({ "event": "session-resumed" })),
             Err(RequestFailure::PeerGone) => return self.gone_or_drained(),
             Err(failure) => {
@@ -407,49 +495,78 @@ impl Worker {
             }
         }
         let session = self.session.clone().expect("session id");
+        let position = self.position;
         while let Some(index) = self.head() {
-            let message = self.tracked[index]
-                .message
-                .as_mut()
-                .expect("minted message");
-            match client.submit(&session, message) {
-                DeliveryOutcome::Accepted(acceptance) => {
-                    self.tracked[index].acked = true;
+            // The attempt is durable before it is sent, so no successor can
+            // miss an attempt that may have been inserted.
+            let Some(attempt) = self.durable(|store| store.begin_attempt(position, index)) else {
+                return ConnEnd::Stop;
+            };
+            self.tracked[index].attempts += 1;
+            let outcome = client.submit(&session, &mut self.tracked[index].message);
+            let (resolution, end) = match &outcome {
+                DeliveryOutcome::Accepted(acceptance)
+                | DeliveryOutcome::DuplicateUnknown(acceptance) => {
+                    let ack = DurableAck {
+                        label: if acceptance.at_most_once {
+                            "accepted"
+                        } else {
+                            "duplicate-unknown"
+                        }
+                        .to_owned(),
+                        basis: acceptance.basis.map(|basis| basis_label(basis).to_owned()),
+                        recovered: acceptance.recovered,
+                        generation: self.store.lock().expect("store lock").generation(),
+                    };
+                    // Reported only once durable: an unrecorded ACK leaves
+                    // the attempt unresolved for a successor to classify.
+                    if self
+                        .durable(|store| store.record_ack(position, index, attempt, &ack))
+                        .is_none()
+                    {
+                        return ConnEnd::Stop;
+                    }
                     self.report(json!({
                         "event": "ack",
                         "index": index,
-                        "label": "accepted",
-                        "basis": acceptance.basis.map(basis_label),
-                        "recovered": acceptance.recovered,
+                        "label": ack.label,
+                        "basis": ack.basis,
+                        "recovered": ack.recovered,
+                        "durable": true,
                     }));
-                }
-                DeliveryOutcome::DuplicateUnknown(acceptance) => {
-                    self.tracked[index].acked = true;
-                    self.report(json!({
-                        "event": "ack",
-                        "index": index,
-                        "label": "duplicate-unknown",
-                        "recovered": acceptance.recovered,
-                    }));
+                    self.tracked[index].ack = Some(ack);
+                    continue;
                 }
                 DeliveryOutcome::Rejected { code, .. } => {
                     self.tracked[index].label = Some("rejected".to_owned());
                     self.report(json!({ "event": "rejected", "index": index, "code": code }));
+                    ("rejected", None)
                 }
-                DeliveryOutcome::NotAcknowledged(NoAckCause::PeerGone) => return ConnEnd::Gone,
+                DeliveryOutcome::NotAcknowledged(NoAckCause::PeerGone) => {
+                    ("no-ack:transport-closed", Some(ConnEnd::Gone))
+                }
                 DeliveryOutcome::NotAcknowledged(NoAckCause::InvalidResponse(_)) => {
                     self.tracked[index].label = Some("invalid-response".to_owned());
                     self.report(json!({ "event": "invalid-response", "index": index }));
-                    return ConnEnd::Stop;
+                    ("no-ack:invalid-response", Some(ConnEnd::Stop))
                 }
                 DeliveryOutcome::NotNegotiated => {
                     self.tracked[index].label = Some("not-negotiated".to_owned());
-                    return ConnEnd::Stop;
+                    ("not-sent", Some(ConnEnd::Stop))
                 }
                 DeliveryOutcome::SessionMismatch => {
                     self.tracked[index].label = Some("session-mismatch".to_owned());
-                    return ConnEnd::Stop;
+                    ("not-sent", Some(ConnEnd::Stop))
                 }
+            };
+            if self
+                .durable(|store| store.resolve_attempt(attempt, resolution))
+                .is_none()
+            {
+                return ConnEnd::Stop;
+            }
+            if let Some(end) = end {
+                return end;
             }
         }
         // Nothing owed on this connection. Keep reading through the client
@@ -483,34 +600,30 @@ impl Worker {
             .iter()
             .enumerate()
             .map(|(index, tracked)| {
-                let acceptance = tracked
-                    .message
-                    .as_ref()
-                    .and_then(OutboundMessage::acceptance)
-                    .cloned();
-                let label = match (&acceptance, &tracked.label) {
-                    (Some(acceptance), _) if acceptance.at_most_once => "accepted".to_owned(),
-                    (Some(_), _) => "duplicate-unknown".to_owned(),
+                // Only a durably recorded acknowledgement counts; an ACK held
+                // in memory but not recorded leaves the message owed.
+                let ack = tracked.ack.as_ref();
+                let label = match (ack, &tracked.label) {
+                    (Some(ack), _) => ack.label.clone(),
                     (None, Some(label)) => label.clone(),
                     (None, None) => "not-attempted".to_owned(),
                 };
                 MessageRecord {
                     index,
-                    owed: acceptance.is_none(),
+                    owed: ack.is_none(),
                     label,
-                    at_most_once: acceptance.as_ref().is_some_and(|a| a.at_most_once),
-                    basis: acceptance.as_ref().and_then(|a| a.basis).map(basis_label),
-                    recovered: acceptance.as_ref().is_some_and(|a| a.recovered),
-                    unacknowledged_attempts: tracked
-                        .message
-                        .as_ref()
-                        .map_or(0, OutboundMessage::unacknowledged_attempts),
+                    at_most_once: ack.is_some_and(|ack| ack.label == "accepted"),
+                    basis: ack.and_then(|ack| ack.basis.clone()),
+                    recovered: ack.is_some_and(|ack| ack.recovered),
+                    ack_generation: ack.map(|ack| ack.generation),
+                    attempts: tracked.attempts,
+                    prior_unknown: tracked.prior_unknown,
                     closures: tracked.closures,
                 }
             })
             .collect();
         HarnessRecord {
-            id: self.spec.id.clone(),
+            id: self.id.clone(),
             launches: self.launches,
             exits: self.exits.clone(),
             wait_failures: self.wait_failures.clone(),
@@ -539,38 +652,71 @@ mod tests {
     use super::*;
     use std::sync::mpsc::{Receiver, channel};
 
-    fn worker() -> (Worker, Receiver<Event>) {
+    struct Dir(std::path::PathBuf);
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn worker() -> (Worker, Receiver<Event>, Dir) {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = Dir(std::env::temp_dir().join(format!(
+            "root-harness-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )));
+        let intent = crate::Intent {
+            outage_closure_cap: 3,
+            delivery_attempt_cap: 10,
+            cwd: "/".into(),
+            harnesses: vec![crate::HarnessSpec {
+                id: "test".into(),
+                argv: vec![],
+                messages: vec!["x".into()],
+            }],
+        };
+        let mut claimed = Store::claim(&dir.0, Some(&intent)).unwrap();
+        let harness = claimed.harnesses.remove(0);
         let (tx, rx) = channel();
         (
             Worker {
-                spec: HarnessSpec {
-                    id: "test".into(),
-                    argv: vec![],
-                    messages: vec!["x".into()],
-                },
+                id: "test".into(),
+                argv: vec![],
+                position: 0,
                 cap: 3,
+                attempt_cap: 10,
                 cwd: "/".into(),
                 custody: Arc::new(Mutex::new(Custody::default())),
+                store: Arc::new(Mutex::new(claimed.store)),
                 tx,
-                tracked: vec![Tracked {
-                    message: Some(OutboundMessage::fresh("x").unwrap()),
-                    label: None,
-                    acked: false,
-                    closures: 0,
-                }],
+                tracked: harness
+                    .messages
+                    .into_iter()
+                    .map(|durable| Tracked {
+                        message: durable.message,
+                        label: None,
+                        ack: None,
+                        closures: 0,
+                        attempts: 0,
+                        prior_unknown: 0,
+                    })
+                    .collect(),
                 session: None,
                 launches: 1,
                 exits: vec![],
                 wait_failures: vec![],
             },
             rx,
+            dir,
         )
     }
 
     // Classification seam only: this does not reproduce an OS wait fault.
     #[test]
     fn failed_wait_never_reports_successful_exit() {
-        let (mut worker, rx) = worker();
+        let (mut worker, rx, _dir) = worker();
         worker.observe_wait(Err(io::Error::from_raw_os_error(libc::ECHILD)));
         assert!(
             worker.record().exits.is_empty(),
@@ -590,7 +736,7 @@ mod tests {
 
     #[test]
     fn failed_wait_never_counts_closure_or_authorizes_relaunch() {
-        let (mut worker, rx) = worker();
+        let (mut worker, rx, _dir) = worker();
         let (end, cause) = worker.finish_drive(
             ConnEnd::Gone,
             "eof-then-exit",
@@ -613,7 +759,7 @@ mod tests {
     // This is not a reproduction of a kernel pidfd_open failure.
     #[test]
     fn custody_failure_counts_spawn_and_successful_cleanup_reap() {
-        let (mut worker, rx) = worker();
+        let (mut worker, rx, _dir) = worker();
         worker.launches = 0;
         let child = Command::new("/usr/bin/true").spawn().unwrap();
         let shared = Arc::clone(&worker.custody);
@@ -652,7 +798,7 @@ mod tests {
 
     #[test]
     fn cancellation_preserves_prior_cause_after_failed_wait() {
-        let (mut worker, _) = worker();
+        let (mut worker, _, _dir) = worker();
         worker.tracked[0].label = Some("rejected".into());
         worker.custody.lock().unwrap().cancel();
         let (end, cause) = worker.finish_drive(
@@ -663,5 +809,125 @@ mod tests {
         assert!(!worker.after_drive(end, cause));
         assert_eq!(worker.record().messages[0].label, "rejected");
         assert!(worker.record().exits.is_empty());
+    }
+
+    fn pending_attempt(worker: &mut Worker) -> i64 {
+        // A real in-flight durable reservation, without spawning a harness.
+        worker.launches = 0;
+        let attempt = worker.durable(|store| store.begin_attempt(0, 0)).unwrap();
+        worker.tracked[0].attempts += 1;
+        attempt
+    }
+
+    fn fail_attempt_writes(dir: &Dir) {
+        // Abort a real SQLite write in this test's newly created store.
+        let conn = rusqlite::Connection::open(dir.0.join(crate::store::DB_FILE)).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_resolution BEFORE UPDATE ON attempt
+             BEGIN SELECT RAISE(ABORT, 'test resolution refused'); END;",
+        )
+        .unwrap();
+    }
+
+    fn assert_loss_terminal(worker: &Worker, loss: &str) {
+        let stop = worker.custody.lock().unwrap().reason();
+        // Same state-derived loss selection used by the root's terminal path.
+        let store_lost = matches!(stop, Some("authority-lost" | "store-failed"))
+            .then_some(stop)
+            .flatten();
+        let record = worker.record();
+        let (report, code) =
+            crate::terminal_report(&[(worker.id.clone(), 1)], &[record], true, store_lost);
+        assert_eq!(
+            report["status"], loss,
+            "real write loss must survive stop ordering"
+        );
+        assert_eq!(code, crate::EXIT_STORE_LOST);
+        assert_eq!(report["cancel_requested"], true);
+        assert_eq!(report["owed_history"], "store-holds-authoritative-state");
+        assert_eq!(report["owed"], 1);
+        assert_eq!(report["harnesses"][0]["messages"][0]["attempts"], 1);
+        assert_eq!(report["harnesses"][0]["messages"][0]["closures"], 0);
+        assert_eq!(
+            report["harnesses"][0]["messages"][0]["completion"],
+            "not-observed"
+        );
+    }
+
+    #[test]
+    fn cancel_then_refused_worker_write_reports_authority_loss() {
+        let (mut worker, rx, dir) = worker();
+        let attempt = pending_attempt(&mut worker);
+        worker.custody.lock().unwrap().cancel();
+        std::fs::remove_file(dir.0.join(crate::store::LOCK_FILE)).unwrap();
+        let successor = Store::claim(&dir.0, None).unwrap();
+        assert_eq!(successor.store.generation(), 2);
+        assert_eq!(successor.classified_unknown, 1);
+        assert!(
+            worker
+                .durable(|store| store.resolve_attempt(attempt, "no-ack:transport-closed"))
+                .is_none()
+        );
+        assert!(
+            rx.try_iter()
+                .any(|event| matches!(event, Event::Report(v) if v["event"] == "authority-lost"))
+        );
+        assert_eq!(worker.record().messages[0].label, "authority-lost");
+        assert_loss_terminal(&worker, "authority-lost");
+    }
+
+    #[test]
+    fn cancel_then_failed_worker_write_reports_store_failure() {
+        let (mut worker, rx, dir) = worker();
+        let attempt = pending_attempt(&mut worker);
+        fail_attempt_writes(&dir);
+        worker.custody.lock().unwrap().cancel();
+        assert!(
+            worker
+                .durable(|store| store.resolve_attempt(attempt, "no-ack:transport-closed"))
+                .is_none()
+        );
+        assert!(
+            rx.try_iter()
+                .any(|event| matches!(event, Event::Report(v) if v["event"] == "store-failed"))
+        );
+        assert_eq!(worker.record().messages[0].label, "store-failed");
+        assert_loss_terminal(&worker, "store-failed");
+    }
+
+    #[test]
+    fn failed_then_refused_worker_write_escalates_and_keeps_message_cause() {
+        let (mut worker, rx, dir) = worker();
+        let attempt = pending_attempt(&mut worker);
+        // A per-message cause is independent of the run-level store loss.
+        worker.tracked[0].label = Some("rejected".into());
+        fail_attempt_writes(&dir);
+        assert!(
+            worker
+                .durable(|store| store.resolve_attempt(attempt, "rejected"))
+                .is_none()
+        );
+        std::fs::remove_file(dir.0.join(crate::store::LOCK_FILE)).unwrap();
+        let conn = rusqlite::Connection::open(dir.0.join(crate::store::DB_FILE)).unwrap();
+        conn.execute_batch("DROP TRIGGER refuse_resolution")
+            .unwrap();
+        let successor = Store::claim(&dir.0, None).unwrap();
+        assert_eq!(successor.classified_unknown, 1);
+        assert!(
+            worker
+                .durable(|store| store.resolve_attempt(attempt, "rejected"))
+                .is_none()
+        );
+        let events: Vec<_> = rx
+            .try_iter()
+            .filter_map(|event| match event {
+                Event::Report(v) => Some(v["event"].as_str().unwrap().to_owned()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events, ["store-failed", "authority-lost"]);
+        worker.custody.lock().unwrap().cancel();
+        assert_eq!(worker.record().messages[0].label, "rejected");
+        assert_loss_terminal(&worker, "authority-lost");
     }
 }

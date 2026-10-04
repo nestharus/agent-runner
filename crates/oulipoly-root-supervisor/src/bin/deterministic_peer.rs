@@ -11,8 +11,14 @@
 //!   normal.
 //! * `exit-before-ack-always`: exit on every prompt without acknowledging.
 //! * `silent`: never answer prompts; stay alive reading stdin.
+//! * `insert-then-silent`: insert each prompt (honouring dedup) but never
+//!   acknowledge it; stay alive reading stdin (an owner killed mid-delivery).
 //! * `close-stdin`: close its stdin before answering `session/new`, then stay
 //!   alive without reading or writing.
+//!
+//! `--launch-modes m1,m2,...` picks the mode by this state's launch number
+//! (the last entry repeats), so one test can script successive launches,
+//! including launches by a restarted supervisor.
 //!
 //! `--no-dedup` disables the local dedup contract. `--exit-after-acks N`
 //! exits normally after the Nth acknowledgement and its idle update;
@@ -27,6 +33,7 @@ use serde_json::{Value, json};
 struct Args {
     state: PathBuf,
     mode: String,
+    launch_modes: String,
     dedup: bool,
     exit_after_acks: Option<u64>,
 }
@@ -35,6 +42,7 @@ fn parse_args() -> Args {
     let mut args = Args {
         state: PathBuf::new(),
         mode: "normal".to_owned(),
+        launch_modes: String::new(),
         dedup: true,
         exit_after_acks: None,
     };
@@ -43,6 +51,7 @@ fn parse_args() -> Args {
         match arg.as_str() {
             "--state" => args.state = iter.next().expect("--state path").into(),
             "--mode" => args.mode = iter.next().expect("--mode value"),
+            "--launch-modes" => args.launch_modes = iter.next().expect("--launch-modes value"),
             "--no-dedup" => args.dedup = false,
             "--exit-after-acks" => {
                 args.exit_after_acks = Some(iter.next().expect("count").parse().expect("number"));
@@ -86,7 +95,7 @@ fn linger() -> ! {
 }
 
 fn main() {
-    let args = parse_args();
+    let mut args = parse_args();
     // Test peer only: die with the thread that launched it, so a killed
     // supervisor never leaves this peer behind.
     // SAFETY: prctl with integer arguments.
@@ -101,6 +110,11 @@ fn main() {
         .expect("launches")
         .push(json!({ "pid": std::process::id(), "ppid": parent }));
     save(&args.state, &state);
+    if !args.launch_modes.is_empty() {
+        let modes: Vec<&str> = args.launch_modes.split(',').collect();
+        let launch = state["launches"].as_array().expect("launches").len();
+        args.mode = modes[(launch - 1).min(modes.len() - 1)].to_owned();
+    }
 
     let stdin = std::io::stdin();
     let mut out = std::io::stdout().lock();
@@ -200,6 +214,9 @@ fn main() {
                     Value::String(message_id)
                 });
                 save(&args.state, &state);
+                if args.mode == "insert-then-silent" {
+                    continue;
+                }
                 if args.mode == "exit-before-ack-once" && state["fault_used"] == false {
                     state["fault_used"] = Value::Bool(true);
                     save(&args.state, &state);

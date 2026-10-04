@@ -109,6 +109,31 @@ fn recovered_key_after_lost_ack_is_not_complete_history() {
 }
 
 #[test]
+fn recorded_fresh_key_keeps_origin_history_but_its_record_does_not() {
+    let store = new_store();
+    let (mut client, session) = connect(PeerConfig::v2().without_dedup(), &store, None);
+    let mut recorded = None;
+    let mut origin = OutboundMessage::fresh_recorded("hello", |key: &MessageKey| {
+        recorded = Some(key.as_str().to_owned());
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    let DeliveryOutcome::Accepted(ack) = client.submit(&session, &mut origin) else {
+        panic!("origin message lost its complete history");
+    };
+    assert!(ack.at_most_once);
+    client.await_session_idle(&session).unwrap();
+    let mut rebuilt = OutboundMessage::new(MessageKey::new(recorded.unwrap()).unwrap(), "hello");
+    unknown(client.submit(&session, &mut rebuilt));
+    assert_eq!(store.lock().unwrap().insertions.len(), 2);
+
+    let refused = OutboundMessage::fresh_recorded("hello", |_: &MessageKey| {
+        Err(std::io::Error::other("store refused"))
+    });
+    assert!(refused.is_err(), "nothing is created when recording fails");
+}
+
+#[test]
 fn exporting_and_cloning_a_fresh_key_abandons_both_history_claims() {
     let store = new_store();
     let (mut client, session) = connect(PeerConfig::v2().without_dedup(), &store, None);
