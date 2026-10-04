@@ -18,9 +18,11 @@
 //!   `messageId`. Per the pinned schema it means the agent inserted the user
 //!   message into its ACP conversation. It is **not** turn completion,
 //!   **not** physical drain of any queue, and **not** dedup.
-//! * **Session readiness.** An idle `state_update` observed after an attempt,
-//!   separately with [`AcpClient::await_session_idle`]. The draft provides no
-//!   message-completion correlation.
+//! * **Session readiness.** The next unconsumed idle `state_update` since the
+//!   session's **first tracked attempt**, separately with
+//!   [`AcpClient::await_session_idle`]. Later attempts do not reset this history;
+//!   idle may precede the latest message. The draft provides no completion
+//!   correlation with that message.
 //!   Another foreground task may have caused idle; this is not physical drain.
 //! * **Message identity.** [`OutboundMessage::fresh`] mints a Linux random
 //!   identity for one communication and carries it in the prompt's `_meta` under
@@ -48,9 +50,13 @@
 //! [`Acceptance::basis`] identifies either a single counted attempt for a
 //! fresh unforked identity, or a complete same-session history in which every
 //! attempt advertised the contract and the current answer echoes the key.
-//! Supplied/recreated/recovered/cloned keys have unknown history. Exporting a
-//! fresh key permits forks and abandons its complete-history claim. A current
-//! advertisement cannot repair earlier non-contract or unknown attempts.
+//! Supplied/recreated/recovered/cloned keys have unknown history. Calling
+//! [`OutboundMessage::key`] permits forks and abandons its complete-history
+//! claim. Capturing a key from outgoing wire bytes or a custom transport bypasses
+//! that downgrade; forks made from it are outside the original tracked history.
+//! These labels therefore trust the caller/transport not to re-supply captured
+//! keys. A current advertisement cannot repair earlier non-contract or unknown
+//! attempts.
 //! An insertion ACK without either basis is [`DeliveryOutcome::DuplicateUnknown`].
 //! A valid error stays distinct but counts as an insertion-uncertain attempt.
 //!
@@ -58,10 +64,18 @@
 //! An advertisement says nothing about another receiver, session or store;
 //! same-session resume relies on the receiver's lifetime promise, not a
 //! client-invented continuity proof. No arbitrary provider-effects claim or
-//! durable history is supplied. Messages are bound to their first session.
+//! durable history is supplied. Messages are bound to their first session-id
+//! string, which is trusted contract scope, not proof of receiver/store identity
+//! or cross-receiver continuity.
 //!
 //! Empty `messageId` is conservatively refused (stricter than the schema).
 //! Unknown optional schema fields are ignored, not claimed fully validated.
+//! Consumed response results, notification params and mandatory nested
+//! initialize info require wire objects. Invalid capability shapes cannot
+//! advertise session support. Session updates require `jsonrpc: "2.0"` and
+//! object params/update with the consumed discriminators and fields; malformed
+//! notifications are ignored without retaining events or readiness. Ignored
+//! optional fields and unconsumed update variants are not fully validated.
 //!
 //! Transport limits accepted for this unused primitive: synchronous blocking
 //! reads, no deadline or line-size bound, read/UTF-8 errors reported as closed,
