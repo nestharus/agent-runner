@@ -50,7 +50,7 @@ const LOCK: &str = include_str!("../native/opencode/package-lock.json");
 const OPENCODE: &str = "node_modules/opencode-linux-x64/bin/opencode";
 
 /// Inherited variables that would add config beside the launch's own.
-const REMOVED: [&str; 4] = [
+pub const REMOVED_ENV: [&str; 4] = [
     "OPENCODE_CONFIG",
     "OPENCODE_CONFIG_DIR",
     "OPENCODE_CONFIG_CONTENT",
@@ -100,7 +100,7 @@ impl OpenCodeLaunch {
             "argv": self.argv,
             "endpoint": "unix-socket",
             "env": env,
-            "removed_env": REMOVED,
+            "removed_env": REMOVED_ENV,
             "config_dir": self.config_dir,
         })
     }
@@ -335,7 +335,7 @@ fn write_launch(setup: &OpenCodeSetup, inputs: SetupInputs<'_>) -> Result<OpenCo
     // execs OpenCode: no further process. `acp` loads the config
     // directory's plugins at startup; its own stdio ACP is unused.
     let mut argv = vec!["/usr/bin/env".to_owned()];
-    for name in REMOVED {
+    for name in REMOVED_ENV {
         argv.push("-u".to_owned());
         argv.push(name.to_owned());
     }
