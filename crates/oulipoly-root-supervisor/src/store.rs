@@ -12,6 +12,15 @@
 //!   checks that this instance's generation is still the latest claimed
 //!   one. A stale instance (for example after its lock file was replaced)
 //!   is refused before it changes anything.
+//! * `root` holds this root's identity: 128 random bits minted with the
+//!   intent. Agent identity is a harness position within this root, so it
+//!   belongs to this one root lineage and outlives owners and root PID 1
+//!   incarnations.
+//! * `incarnation` records each root PID 1 this lineage started: its
+//!   attestation token and exact process identity (host pid, start time,
+//!   boot id), and how it was later found ended. `work` records each harness
+//!   launch under an incarnation, written before the launch is requested,
+//!   and the actual waiter's report of its end.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -27,8 +36,9 @@ use crate::Intent;
 
 pub(crate) const LOCK_FILE: &str = "owner.lock";
 pub(crate) const DB_FILE: &str = "intent.sqlite3";
-/// Version of this new per-root lineage. There is no migration chain.
-const SCHEMA_VERSION: i64 = 1;
+/// Version of this new per-root lineage. There is no migration chain: a
+/// store of any other version is refused.
+const SCHEMA_VERSION: i64 = 2;
 /// How long a write waits for a foreign SQLite lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -73,6 +83,31 @@ CREATE TABLE message (
     ack_recovered INTEGER,
     ack_generation INTEGER,
     PRIMARY KEY (harness, idx)
+);
+CREATE TABLE root (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    root_id TEXT NOT NULL
+);
+CREATE TABLE incarnation (
+    id INTEGER PRIMARY KEY,
+    token TEXT NOT NULL,
+    isolation TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    host_pid INTEGER,
+    start_time INTEGER,
+    boot_id TEXT,
+    ended TEXT,
+    ended_generation INTEGER
+);
+CREATE TABLE work (
+    id INTEGER PRIMARY KEY,
+    harness INTEGER NOT NULL REFERENCES harness(position),
+    incarnation INTEGER NOT NULL REFERENCES incarnation(id),
+    generation INTEGER NOT NULL,
+    harness_host_pid INTEGER,
+    outcome TEXT,
+    observer TEXT,
+    resolved_generation INTEGER
 );
 CREATE TABLE attempt (
     id INTEGER PRIMARY KEY,
@@ -172,6 +207,18 @@ pub(crate) struct DurableHarness {
     pub(crate) argv: Vec<String>,
     pub(crate) session: Option<String>,
     pub(crate) messages: Vec<DurableMessage>,
+    /// Launches with no recorded end, as `(work, incarnation)`.
+    pub(crate) open_works: Vec<(i64, i64)>,
+}
+
+/// A root PID 1 incarnation not yet recorded as ended.
+#[derive(Debug, Clone)]
+pub(crate) struct IncarnationRow {
+    pub(crate) id: i64,
+    pub(crate) token: String,
+    pub(crate) host_pid: Option<i32>,
+    pub(crate) start_time: Option<u64>,
+    pub(crate) boot_id: Option<String>,
 }
 
 pub(crate) struct Claimed {
@@ -183,6 +230,9 @@ pub(crate) struct Claimed {
     pub(crate) harnesses: Vec<DurableHarness>,
     /// Earlier-generation attempts this claim classified as unknown.
     pub(crate) classified_unknown: u32,
+    pub(crate) root_id: String,
+    /// The latest root PID 1 incarnation not recorded as ended, if any.
+    pub(crate) live_incarnation: Option<IncarnationRow>,
 }
 
 /// The current owner's handle on its root's store.
@@ -267,6 +317,10 @@ impl Store {
             (Some(_), Some(_)) => return Err(ClaimError::IntentExists),
             (None, None) => return Err(ClaimError::NoIntent),
             (Some(intent), None) => {
+                tx.execute(
+                    "INSERT INTO root (singleton, root_id) VALUES (1, ?1)",
+                    params![crate::sys::random_hex()?],
+                )?;
                 let harnesses = create_intent(&tx, intent, generation)?;
                 (
                     true,
@@ -289,6 +343,23 @@ impl Store {
                 (false, cap, attempt_cap, cwd, load_intent(&tx, generation)?)
             }
         };
+        let root_id: String = tx.query_row("SELECT root_id FROM root", [], |row| row.get(0))?;
+        let live_incarnation = tx
+            .query_row(
+                "SELECT id, token, host_pid, start_time, boot_id FROM incarnation
+                 WHERE ended IS NULL ORDER BY id DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok(IncarnationRow {
+                        id: row.get(0)?,
+                        token: row.get(1)?,
+                        host_pid: row.get(2)?,
+                        start_time: row.get::<_, Option<i64>>(3)?.map(|time| time as u64),
+                        boot_id: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
         tx.commit()?;
         // Make the directory entries of the store files durable too.
         File::open(dir)?.sync_all()?;
@@ -310,6 +381,8 @@ impl Store {
             cwd,
             harnesses,
             classified_unknown: u32::try_from(classified_unknown).unwrap_or(u32::MAX),
+            root_id,
+            live_incarnation,
         })
     }
 
@@ -399,6 +472,103 @@ impl Store {
                     ack.recovered,
                     generation
                 ],
+            )
+            .map(drop)
+        })
+    }
+
+    /// Records a root PID 1 incarnation before it is started, so that a
+    /// successor knows of it even if this owner dies while starting it.
+    pub(crate) fn begin_incarnation(
+        &mut self,
+        token: &str,
+        isolation: &str,
+    ) -> Result<i64, StoreError> {
+        let generation = self.generation;
+        self.write(|tx| {
+            tx.execute(
+                "INSERT INTO incarnation (token, isolation, generation) VALUES (?1, ?2, ?3)",
+                params![token, isolation, generation],
+            )?;
+            Ok(tx.last_insert_rowid())
+        })
+    }
+
+    /// Records the started root PID 1's exact process identity.
+    pub(crate) fn record_incarnation_identity(
+        &mut self,
+        id: i64,
+        host_pid: i32,
+        start_time: u64,
+        boot_id: &str,
+    ) -> Result<(), StoreError> {
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE incarnation SET host_pid = ?2, start_time = ?3, boot_id = ?4 WHERE id = ?1",
+                params![id, host_pid, int(start_time), boot_id],
+            )
+            .map(drop)
+        })
+    }
+
+    /// Records how an incarnation was found ended; `label` says what was
+    /// actually observed, never more.
+    pub(crate) fn end_incarnation(&mut self, id: i64, label: &str) -> Result<(), StoreError> {
+        let generation = self.generation;
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE incarnation SET ended = ?2, ended_generation = ?3
+                 WHERE id = ?1 AND ended IS NULL",
+                params![id, label, generation],
+            )
+            .map(drop)
+        })
+    }
+
+    /// Records a harness launch before it is requested, so a successor
+    /// knows of every launch that may have happened.
+    pub(crate) fn begin_work(
+        &mut self,
+        harness: usize,
+        incarnation: i64,
+    ) -> Result<i64, StoreError> {
+        let generation = self.generation;
+        self.write(|tx| {
+            tx.execute(
+                "INSERT INTO work (harness, incarnation, generation) VALUES (?1, ?2, ?3)",
+                params![int(harness), incarnation, generation],
+            )?;
+            Ok(tx.last_insert_rowid())
+        })
+    }
+
+    pub(crate) fn record_work_spawned(
+        &mut self,
+        work: i64,
+        host_pid: Option<i32>,
+    ) -> Result<(), StoreError> {
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE work SET harness_host_pid = ?2 WHERE id = ?1",
+                params![work, host_pid],
+            )
+            .map(drop)
+        })
+    }
+
+    /// Records a launch's end as reported by `observer`, or why it is unknown.
+    pub(crate) fn resolve_work(
+        &mut self,
+        work: i64,
+        outcome: &str,
+        observer: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let generation = self.generation;
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE work SET outcome = ?2, observer = ?3, resolved_generation = ?4
+                 WHERE id = ?1 AND outcome IS NULL",
+                params![work, outcome, observer, generation],
             )
             .map(drop)
         })
@@ -529,6 +699,7 @@ fn create_intent(
             argv: spec.argv.clone(),
             session: None,
             messages,
+            open_works: Vec::new(),
         });
     }
     Ok(harnesses)
@@ -555,8 +726,14 @@ fn load_intent(tx: &Transaction<'_>, generation: i64) -> Result<Vec<DurableHarne
                     AND a.outcome = ?2 AND a.resolved_generation = ?3)
          FROM message m WHERE m.harness = ?1 ORDER BY m.idx",
     )?;
+    let mut work_rows = tx.prepare(
+        "SELECT id, incarnation FROM work WHERE harness = ?1 AND outcome IS NULL ORDER BY id",
+    )?;
     let mut harnesses = Vec::new();
     for (position, id, argv, session) in rows {
+        let open_works = work_rows
+            .query_map(params![position], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<(i64, i64)>>>()?;
         let argv: Vec<String> =
             serde_json::from_str(&argv).map_err(|e| ClaimError::Store(e.to_string()))?;
         let messages = message_rows
@@ -591,6 +768,7 @@ fn load_intent(tx: &Transaction<'_>, generation: i64) -> Result<Vec<DurableHarne
             argv,
             session,
             messages,
+            open_works,
         });
     }
     Ok(harnesses)

@@ -1,10 +1,6 @@
 //! One worker thread per owned harness. Each worker blocks only on its own
 //! harness, so a silent harness never holds up delivery to another.
 
-use std::io;
-use std::os::fd::OwnedFd;
-use std::os::unix::process::ExitStatusExt;
-use std::process::{Child, Command, ExitStatus, Stdio};
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -16,7 +12,8 @@ use oulipoly_acp::{
 use serde_json::{Value, json};
 
 use crate::Event;
-use crate::pidfd::{self, Custody};
+use crate::custody::{Adopted, ReceiptWait, Root, RootSlot, WorkStdio};
+use crate::live::Custody;
 use crate::store::{DurableAck, DurableHarness, Store, StoreError};
 use crate::transport::{HarnessTransport, Observed};
 
@@ -47,12 +44,23 @@ pub struct MessageRecord {
 #[derive(Debug, Clone)]
 pub struct HarnessRecord {
     pub id: String,
-    /// Actual OS spawns, including failed custody acquisition before admission.
+    /// Harness launches this instance requested and root PID 1 performed.
     pub launches: u32,
-    /// One entry per successfully reaped child, in observed launch order.
+    /// Surviving harnesses of an earlier owner this instance attached to.
+    pub reattached: u32,
+    /// One entry per launched or reattached harness whose end its actual
+    /// waiter (its work PID 1) reported, in order.
     pub exits: Vec<String>,
-    /// Failed waits are unknown exit/reaping observations, never exits.
+    /// Ends of earlier owners' harnesses that happened while no owner was
+    /// attached, as their actual waiters reported them.
+    pub prior_exits: Vec<String>,
+    /// Earlier owners' harnesses whose root PID 1 is gone without a report:
+    /// they ended with its namespace, status unknown.
+    pub prior_unknown_ends: u32,
+    /// Missing waiter reports are unknown ends, never exits.
     pub wait_failures: Vec<String>,
+    /// Live harnesses left to a newer owner when this one detached.
+    pub detached: u32,
     pub messages: Vec<MessageRecord>,
 }
 
@@ -61,8 +69,12 @@ impl HarnessRecord {
         json!({
             "id": self.id,
             "launches": self.launches,
+            "reattached": self.reattached,
             "exits": self.exits,
+            "prior_exits": self.prior_exits,
+            "prior_unknown_ends": self.prior_unknown_ends,
             "wait_failures": self.wait_failures,
+            "detached": self.detached,
             "messages": self.messages.iter().map(|message| json!({
                 "index": message.index,
                 "state": if message.owed { "owed" } else { "acknowledged" },
@@ -100,8 +112,26 @@ enum ConnEnd {
     Stop,
     /// Every message was acknowledged and the stream ended.
     Drained,
-    /// The exact child's wait failed: physical exit/reaping is unproven.
+    /// No waiter reported the harness's end: its exit is unproven.
     WaitUnproven,
+}
+
+/// What an earlier owner left for this harness, found at attach.
+pub(crate) enum Prior {
+    /// Still running under the attached root PID 1.
+    Live(Adopted),
+    /// Ended while no owner was attached; its waiter's report.
+    Exited { work: i64, receipt: Value },
+    /// Its root PID 1 is gone and left no report for it.
+    Unknown { work: i64 },
+}
+
+/// One launched or adopted harness this worker is driving.
+struct Live {
+    work: i64,
+    stdio: WorkStdio,
+    root: Arc<Root>,
+    token: u64,
 }
 
 struct Worker {
@@ -113,12 +143,18 @@ struct Worker {
     cwd: String,
     custody: Arc<Mutex<Custody>>,
     store: Arc<Mutex<Store>>,
+    slot: Arc<RootSlot>,
     tx: Sender<Event>,
     tracked: Vec<Tracked>,
     session: Option<String>,
+    prior: Option<Prior>,
     launches: u32,
+    reattached: u32,
     exits: Vec<String>,
+    prior_exits: Vec<String>,
+    prior_unknown_ends: u32,
     wait_failures: Vec<String>,
+    detached: u32,
 }
 
 /// What one worker is given: its durable harness record and shared state.
@@ -130,6 +166,8 @@ pub(crate) struct Assignment {
     pub(crate) cwd: String,
     pub(crate) custody: Arc<Mutex<Custody>>,
     pub(crate) store: Arc<Mutex<Store>>,
+    pub(crate) slot: Arc<RootSlot>,
+    pub(crate) prior: Option<Prior>,
     pub(crate) tx: Sender<Event>,
 }
 
@@ -142,6 +180,8 @@ pub(crate) fn run(assignment: Assignment) {
         cwd,
         custody,
         store,
+        slot,
+        prior,
         tx,
     } = assignment;
     let tracked = harness
@@ -167,12 +207,18 @@ pub(crate) fn run(assignment: Assignment) {
         cwd,
         custody,
         store,
+        slot,
         tx,
         tracked,
         session: harness.session,
+        prior,
         launches: 0,
+        reattached: 0,
         exits: Vec::new(),
+        prior_exits: Vec::new(),
+        prior_unknown_ends: 0,
         wait_failures: Vec::new(),
+        detached: 0,
     };
     worker.supervise();
     let record = worker.record();
@@ -218,34 +264,132 @@ impl Worker {
     /// rather than deliver what it cannot record.
     fn durable<T>(&mut self, write: impl FnOnce(&mut Store) -> Result<T, StoreError>) -> Option<T> {
         let result = write(&mut self.store.lock().expect("store lock"));
-        match result {
-            Ok(value) => Some(value),
-            Err(error) => {
-                let label = error.label();
-                self.report(json!({ "event": label, "reason": format!("{error:?}") }));
-                self.custody.lock().expect("custody lock").stop(label);
-                self.label_remaining(label);
-                None
-            }
-        }
+        result.map_err(|error| self.store_lost(&error)).ok()
+    }
+
+    /// A store write failed: report it, stop the run, and label the rest.
+    /// Must be called without the custody lock held.
+    fn store_lost(&mut self, error: &StoreError) {
+        let label = error.label();
+        self.report(json!({ "event": label, "reason": format!("{error:?}") }));
+        self.custody.lock().expect("custody lock").stop(label);
+        self.label_remaining(label);
     }
 
     fn supervise(&mut self) {
+        let mut prior = self.prior.take();
         if self.head().is_none() && !self.tracked.is_empty() {
             // Recovered with every message acknowledged or durably stopped
-            // (`outage`, `attempts-exhausted`): nothing to launch.
+            // (`outage`, `attempts-exhausted`): nothing to launch. A
+            // surviving harness is still held until its end is reported or
+            // the caller cancels; it is never dropped as gone.
             self.report(json!({ "event": "nothing-deliverable" }));
+            match prior {
+                Some(Prior::Live(adopted)) => {
+                    let Some(live) = self.adopt(adopted) else {
+                        return;
+                    };
+                    self.report(json!({ "event": "holding-survivor", "work": live.work }));
+                    let (end, observed) = self.finish_live(live, ConnEnd::Stop, "");
+                    let _ = (end, observed);
+                }
+                Some(Prior::Exited { work, receipt }) => {
+                    self.observe_prior_exit(work, &receipt);
+                }
+                Some(Prior::Unknown { work }) => self.observe_prior_unknown(work),
+                None => {}
+            }
             return;
         }
         loop {
-            let Some((child, token)) = self.launch() else {
-                return;
+            let live = match prior.take() {
+                Some(Prior::Live(adopted)) => match self.adopt(adopted) {
+                    Some(live) => live,
+                    None => return,
+                },
+                Some(Prior::Exited { work, receipt }) => {
+                    // An end its waiter observed while no owner was attached:
+                    // a closure of whatever was owed, like any observed exit.
+                    self.observe_prior_exit(work, &receipt);
+                    if !self.after_drive(ConnEnd::Gone, "exit-observed-while-owner-absent") {
+                        return;
+                    }
+                    continue;
+                }
+                Some(Prior::Unknown { work }) => {
+                    // Ended with its root namespace, status unknown: not an
+                    // observed exit, so not a closure. Launch again.
+                    self.observe_prior_unknown(work);
+                    continue;
+                }
+                None => match self.launch() {
+                    Some(live) => live,
+                    None => return,
+                },
             };
-            let (end, observed) = self.drive(child, token);
+            let (end, observed) = self.drive(live);
             if !self.after_drive(end, observed) {
                 return;
             }
         }
+    }
+
+    /// Takes custody of a surviving harness from an earlier owner.
+    fn adopt(&mut self, adopted: Adopted) -> Option<Live> {
+        let root = self.slot.current()?;
+        let shared = Arc::clone(&self.custody);
+        let mut custody = shared.lock().expect("custody lock");
+        let token = custody.register(Arc::clone(&root), adopted.work);
+        let stopped = custody.reason();
+        drop(custody);
+        self.reattached += 1;
+        self.report(json!({
+            "event": "reattached",
+            "work": adopted.work,
+            "pid": adopted.harness_host_pid,
+            "incarnation": root.incarnation,
+        }));
+        if let Some(reason) = stopped {
+            // Stopped before this survivor was registered: stop it the same way.
+            if reason != "authority-lost" {
+                root.kill(adopted.work);
+            }
+        }
+        Some(Live {
+            work: adopted.work,
+            stdio: adopted.stdio,
+            root,
+            token,
+        })
+    }
+
+    fn observe_prior_exit(&mut self, work: i64, receipt: &Value) {
+        let status = receipt["harness"].as_str().map(str::to_owned);
+        self.report(json!({
+            "event": "prior-exit",
+            "work": work,
+            "status": status,
+            "observer": receipt["harness_observer"],
+            "work_pid1": receipt["work_pid1"],
+        }));
+        let outcome = status
+            .clone()
+            .unwrap_or_else(|| "status-unknown".to_owned());
+        let observer = status.as_ref().map(|_| "work-pid1-wait");
+        self.durable(|store| store.resolve_work(work, &outcome, observer));
+        self.prior_exits.push(outcome);
+    }
+
+    fn observe_prior_unknown(&mut self, work: i64) {
+        self.report(json!({
+            "event": "prior-end-unknown",
+            "work": work,
+            "meaning": "ended-with-root-namespace-status-unknown",
+        }));
+        self.durable(|store| {
+            store.resolve_work(work, "ended-with-root-namespace-status-unknown", None)
+        });
+        self.prior_unknown_ends += 1;
     }
 
     fn after_drive(&mut self, end: ConnEnd, observed: &'static str) -> bool {
@@ -294,9 +438,10 @@ impl Worker {
         true
     }
 
-    /// Spawns the harness under the custody lock, so a concurrent cancel
-    /// either prevents the launch or signals the new child.
-    fn launch(&mut self) -> Option<(Child, u64)> {
+    /// Launches the harness through root PID 1 under the custody lock, so a
+    /// concurrent cancel either prevents the launch or stops the new work.
+    /// The launch is recorded before it is requested.
+    fn launch(&mut self) -> Option<Live> {
         let shared = Arc::clone(&self.custody);
         let mut custody = shared.lock().expect("custody lock");
         if let Some(reason) = custody.reason() {
@@ -304,64 +449,89 @@ impl Worker {
             self.label_remaining(reason);
             return None;
         }
-        let spawned = Command::new(&self.argv[0])
-            .args(&self.argv[1..])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn();
-        let child = match spawned {
-            Ok(child) => child,
+        let root = match self.slot.ensure(&self.store, &self.tx) {
+            Ok(root) => root,
+            Err(Ok(error)) => {
+                drop(custody);
+                self.store_lost(&error);
+                return None;
+            }
+            Err(Err(reason)) => {
+                drop(custody);
+                self.report(json!({ "event": "launch-failed", "reason": reason }));
+                self.label_remaining("launch-failed");
+                return None;
+            }
+        };
+        let position = self.position;
+        let begun = self
+            .store
+            .lock()
+            .expect("store lock")
+            .begin_work(position, root.incarnation);
+        let work = match begun {
+            Ok(work) => work,
             Err(error) => {
                 drop(custody);
-                self.report(json!({ "event": "launch-failed", "reason": error.to_string() }));
+                self.store_lost(&error);
+                return None;
+            }
+        };
+        let spawned = match root.spawn(work, &self.argv) {
+            Ok(spawned) => spawned,
+            Err(reason) => {
+                drop(custody);
+                self.report(json!({ "event": "launch-failed", "reason": reason }));
+                self.durable(|store| store.resolve_work(work, "launch-refused", None));
                 self.label_remaining("launch-failed");
                 return None;
             }
         };
-        let fd = pidfd::open(child.id());
-        self.admit_spawned(child, fd, &mut custody)
-    }
-
-    fn admit_spawned(
-        &mut self,
-        mut child: Child,
-        fd: io::Result<OwnedFd>,
-        custody: &mut Custody,
-    ) -> Option<(Child, u64)> {
-        // A successful OS spawn counts even if custody cannot be acquired.
+        let token = custody.register(Arc::clone(&root), work);
+        drop(custody);
         self.launches += 1;
-        self.report(json!({ "event": "launched", "launch": self.launches, "pid": child.id() }));
-        let fd = match fd {
-            Ok(fd) => fd,
-            Err(error) => {
-                // Still unreaped and owned only here, so kill is exact.
-                let signalled = child.kill();
-                self.report(json!({
-                    "event": "launch-cleanup",
-                    "launch": self.launches,
-                    "reason": "custody-failed-before-admission",
-                    "signal_sent": signalled.is_ok(),
-                    "signal_error": signalled.err().map(|error| error.to_string()),
-                }));
-                let status = child.wait();
-                self.report(json!({ "event": "launch-failed", "reason": error.to_string() }));
-                self.label_remaining("launch-failed");
-                self.observe_wait(status);
-                return None;
-            }
+        self.report(json!({
+            "event": "launched",
+            "launch": self.launches,
+            "pid": spawned.harness_host_pid,
+            "work": work,
+            "incarnation": root.incarnation,
+        }));
+        let live = Live {
+            work,
+            stdio: spawned.stdio,
+            root,
+            token,
         };
-        let token = custody.register(fd);
-        Some((child, token))
+        if self
+            .durable(|store| store.record_work_spawned(work, spawned.harness_host_pid))
+            .is_none()
+        {
+            self.finish_live(live, ConnEnd::Stop, "");
+            return None;
+        }
+        if let Some(error) = spawned.exec_error {
+            self.report(json!({ "event": "launch-failed", "reason": error }));
+            self.label_remaining("launch-failed");
+            self.finish_live(live, ConnEnd::Stop, "");
+            return None;
+        }
+        Some(live)
     }
 
-    /// Drives one connection, then waits on the exact child. Only a successful
-    /// wait preserves the connection end as possible closure/relaunch evidence.
-    fn drive(&mut self, mut child: Child, token: u64) -> (ConnEnd, &'static str) {
+    /// Drives one connection, then waits for its harness's end as reported
+    /// by the harness's actual waiter. Only such a report preserves the
+    /// connection end as possible closure/relaunch evidence.
+    fn drive(&mut self, live: Live) -> (ConnEnd, &'static str) {
         let observed = Rc::new(Observed::default());
-        let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = child.stdout.take().expect("piped stdout");
-        let transport = HarnessTransport::new(stdout, stdin, Rc::clone(&observed));
+        let stdin = live.stdio.stdin.try_clone().expect("stdin descriptor");
+        let stdout = live.stdio.stdout.try_clone().expect("stdout descriptor");
+        let transport = HarnessTransport::new(
+            stdout,
+            stdin,
+            Rc::clone(&observed),
+            Arc::clone(&self.slot.stop),
+        );
         let mut client = AcpClient::new(
             transport,
             ClientInfo {
@@ -370,6 +540,10 @@ impl Worker {
             },
         );
         let end = self.converse(&mut client);
+        drop(client);
+        if observed.detached.get() {
+            return self.finish_live(live, ConnEnd::Stop, "");
+        }
         let cause = match end {
             ConnEnd::Gone if observed.eof.get() => {
                 self.report(json!({ "event": "peer-gone", "observed": "eof" }));
@@ -387,24 +561,60 @@ impl Worker {
             }
             _ => "",
         };
-        // Our ends of the pipes stay open until the exit is observed, so
-        // closing them is never a substitute for that observation.
-        let status = child.wait();
-        drop(client);
-        if status.is_ok() {
-            self.custody.lock().expect("custody lock").release(token);
+        self.finish_live(live, end, cause)
+    }
+
+    /// Waits for the harness's end. Our stdio copies stay open until then,
+    /// so closing them is never a substitute for that observation.
+    fn finish_live(
+        &mut self,
+        live: Live,
+        end: ConnEnd,
+        cause: &'static str,
+    ) -> (ConnEnd, &'static str) {
+        let waited = live.root.wait_receipt(live.work);
+        drop(live.stdio);
+        let exit = match waited {
+            ReceiptWait::Receipt(receipt) => {
+                self.custody
+                    .lock()
+                    .expect("custody lock")
+                    .release(live.token);
+                match receipt["harness"].as_str() {
+                    Some(status) => Ok((status.to_owned(), receipt)),
+                    None => Err(format!(
+                        "harness-end-not-reported; work-pid1 {}",
+                        receipt["work_pid1"]
+                    )),
+                }
+            }
+            ReceiptWait::Lost => Err("root-pid1-connection-lost".to_owned()),
+            ReceiptWait::Detached => {
+                self.custody
+                    .lock()
+                    .expect("custody lock")
+                    .release(live.token);
+                self.detached += 1;
+                self.report(
+                    json!({ "event": "detached", "work": live.work, "left_to": "successor" }),
+                );
+                return (ConnEnd::Stop, cause);
+            }
+        };
+        let work = live.work;
+        if let Ok((status, _)) = &exit {
+            self.durable(|store| store.resolve_work(work, status, Some("work-pid1-wait")));
         }
-        // A failed wait leaves custody unproven until this owner exits.
-        self.finish_drive(end, cause, status)
+        self.finish_drive(end, cause, exit)
     }
 
     fn finish_drive(
         &mut self,
         end: ConnEnd,
         cause: &'static str,
-        status: io::Result<ExitStatus>,
+        exit: Result<(String, Value), String>,
     ) -> (ConnEnd, &'static str) {
-        if self.observe_wait(status) {
+        if self.observe_exit(exit) {
             (end, cause)
         } else {
             self.label_remaining("wait-unproven");
@@ -412,11 +622,10 @@ impl Worker {
         }
     }
 
-    fn observe_wait(&mut self, status: io::Result<ExitStatus>) -> bool {
-        let exit = match status {
-            Ok(status) => describe(status),
-            Err(error) => {
-                let reason = error.to_string();
+    fn observe_exit(&mut self, exit: Result<(String, Value), String>) -> bool {
+        let (status, receipt) = match exit {
+            Ok(exit) => exit,
+            Err(reason) => {
                 self.report(json!({
                     "event": "wait-failed",
                     "launch": self.launches,
@@ -427,8 +636,14 @@ impl Worker {
                 return false;
             }
         };
-        self.report(json!({ "event": "exited", "launch": self.launches, "status": exit, "reaped": "exact-child" }));
-        self.exits.push(exit);
+        self.report(json!({
+            "event": "exited",
+            "launch": self.launches,
+            "status": status,
+            "reaped": "work-pid1-wait",
+            "work_pid1": receipt["work_pid1"],
+        }));
+        self.exits.push(status);
         true
     }
 
@@ -625,8 +840,12 @@ impl Worker {
         HarnessRecord {
             id: self.id.clone(),
             launches: self.launches,
+            reattached: self.reattached,
             exits: self.exits.clone(),
+            prior_exits: self.prior_exits.clone(),
+            prior_unknown_ends: self.prior_unknown_ends,
             wait_failures: self.wait_failures.clone(),
+            detached: self.detached,
             messages,
         }
     }
@@ -636,14 +855,6 @@ fn basis_label(basis: AtMostOnceBasis) -> &'static str {
     match basis {
         AtMostOnceBasis::SingleAttempt => "single-attempt",
         AtMostOnceBasis::SessionContract => "session-contract",
-    }
-}
-
-fn describe(status: ExitStatus) -> String {
-    match (status.code(), status.signal()) {
-        (Some(code), _) => format!("code:{code}"),
-        (None, Some(signal)) => format!("signal:{signal}"),
-        _ => "unknown".to_owned(),
     }
 }
 
@@ -690,6 +901,13 @@ mod tests {
                 cwd: "/".into(),
                 custody: Arc::new(Mutex::new(Custody::default())),
                 store: Arc::new(Mutex::new(claimed.store)),
+                slot: Arc::new(RootSlot::new(
+                    dir.0.clone(),
+                    1,
+                    crate::sys::Isolation::current(),
+                    Arc::new(crate::transport::StopSignal::new().unwrap()),
+                    None,
+                )),
                 tx,
                 tracked: harness
                     .messages
@@ -704,20 +922,25 @@ mod tests {
                     })
                     .collect(),
                 session: None,
+                prior: None,
                 launches: 1,
+                reattached: 0,
                 exits: vec![],
+                prior_exits: vec![],
+                prior_unknown_ends: 0,
                 wait_failures: vec![],
+                detached: 0,
             },
             rx,
             dir,
         )
     }
 
-    // Classification seam only: this does not reproduce an OS wait fault.
+    // Classification seam only: this does not reproduce a lost waiter report.
     #[test]
     fn failed_wait_never_reports_successful_exit() {
         let (mut worker, rx, _dir) = worker();
-        worker.observe_wait(Err(io::Error::from_raw_os_error(libc::ECHILD)));
+        worker.observe_exit(Err("root-pid1-connection-lost".to_owned()));
         assert!(
             worker.record().exits.is_empty(),
             "failed wait is not a successful reap"
@@ -740,7 +963,7 @@ mod tests {
         let (end, cause) = worker.finish_drive(
             ConnEnd::Gone,
             "eof-then-exit",
-            Err(io::Error::from_raw_os_error(libc::ECHILD)),
+            Err("root-pid1-connection-lost".to_owned()),
         );
         let retry = worker.after_drive(end, cause);
         assert!(!retry, "failed wait cannot authorize same-key relaunch");
@@ -755,47 +978,6 @@ mod tests {
         }
     }
 
-    // Actual owned child spawn, kill and wait; supplied custody-open error.
-    // This is not a reproduction of a kernel pidfd_open failure.
-    #[test]
-    fn custody_failure_counts_spawn_and_successful_cleanup_reap() {
-        let (mut worker, rx, _dir) = worker();
-        worker.launches = 0;
-        let child = Command::new("/usr/bin/true").spawn().unwrap();
-        let shared = Arc::clone(&worker.custody);
-        let mut custody = shared.lock().unwrap();
-        assert!(
-            worker
-                .admit_spawned(
-                    child,
-                    Err(io::Error::from_raw_os_error(libc::EMFILE)),
-                    &mut custody
-                )
-                .is_none()
-        );
-        let record = worker.record();
-        assert_eq!(
-            record.launches, 1,
-            "custody failure cannot erase an actual spawn"
-        );
-        assert_eq!(record.exits.len(), 1);
-        assert_eq!(record.messages[0].label, "launch-failed");
-        assert_eq!(record.messages[0].closures, 0);
-        let reports: Vec<_> = rx
-            .try_iter()
-            .filter_map(|e| match e {
-                Event::Report(v) => Some(v),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(reports[0]["event"], "launched");
-        assert!(
-            reports
-                .iter()
-                .any(|v| v["event"] == "exited" && v["reaped"] == "exact-child")
-        );
-    }
-
     #[test]
     fn cancellation_preserves_prior_cause_after_failed_wait() {
         let (mut worker, _, _dir) = worker();
@@ -804,7 +986,7 @@ mod tests {
         let (end, cause) = worker.finish_drive(
             ConnEnd::Stop,
             "",
-            Err(io::Error::from_raw_os_error(libc::ECHILD)),
+            Err("root-pid1-connection-lost".to_owned()),
         );
         assert!(!worker.after_drive(end, cause));
         assert_eq!(worker.record().messages[0].label, "rejected");

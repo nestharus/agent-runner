@@ -23,6 +23,14 @@
 //! `--no-dedup` disables the local dedup contract. `--exit-after-acks N`
 //! exits normally after the Nth acknowledgement and its idle update;
 //! otherwise the peer stays alive until stdin ends.
+//!
+//! `--on-reinit normal|exit` acts on a second `initialize` on the same
+//! stdio (a restarted owner attaching to this surviving process): switch to
+//! `normal`, or exit with status 1 without answering. `--exit-when-file P`
+//! makes the state's first launch exit with status 7 once file `P` exists.
+//!
+//! The peer sets no parent-death signal: whether it outlives its owner is
+//! decided by its custody, not by the peer.
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -36,6 +44,8 @@ struct Args {
     launch_modes: String,
     dedup: bool,
     exit_after_acks: Option<u64>,
+    on_reinit: Option<String>,
+    exit_when_file: Option<PathBuf>,
 }
 
 fn parse_args() -> Args {
@@ -45,6 +55,8 @@ fn parse_args() -> Args {
         launch_modes: String::new(),
         dedup: true,
         exit_after_acks: None,
+        on_reinit: None,
+        exit_when_file: None,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -53,6 +65,10 @@ fn parse_args() -> Args {
             "--mode" => args.mode = iter.next().expect("--mode value"),
             "--launch-modes" => args.launch_modes = iter.next().expect("--launch-modes value"),
             "--no-dedup" => args.dedup = false,
+            "--on-reinit" => args.on_reinit = Some(iter.next().expect("--on-reinit value")),
+            "--exit-when-file" => {
+                args.exit_when_file = Some(iter.next().expect("--exit-when-file path").into());
+            }
             "--exit-after-acks" => {
                 args.exit_after_acks = Some(iter.next().expect("count").parse().expect("number"));
             }
@@ -96,12 +112,6 @@ fn linger() -> ! {
 
 fn main() {
     let mut args = parse_args();
-    // Test peer only: die with the thread that launched it, so a killed
-    // supervisor never leaves this peer behind.
-    // SAFETY: prctl with integer arguments.
-    unsafe {
-        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-    }
     let mut state = load(&args.state);
     // SAFETY: getppid has no preconditions.
     let parent = unsafe { libc::getppid() };
@@ -110,11 +120,20 @@ fn main() {
         .expect("launches")
         .push(json!({ "pid": std::process::id(), "ppid": parent }));
     save(&args.state, &state);
+    let launch = state["launches"].as_array().expect("launches").len();
     if !args.launch_modes.is_empty() {
         let modes: Vec<&str> = args.launch_modes.split(',').collect();
-        let launch = state["launches"].as_array().expect("launches").len();
         args.mode = modes[(launch - 1).min(modes.len() - 1)].to_owned();
     }
+    if let Some(path) = args.exit_when_file.clone().filter(|_| launch == 1) {
+        std::thread::spawn(move || {
+            while !path.exists() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            std::process::exit(7);
+        });
+    }
+    let mut initializations = 0u32;
 
     let stdin = std::io::stdin();
     let mut out = std::io::stdout().lock();
@@ -128,6 +147,14 @@ fn main() {
         let params = request.get("params").cloned().unwrap_or(Value::Null);
         match request.get("method").and_then(Value::as_str) {
             Some("initialize") => {
+                initializations += 1;
+                if initializations > 1 {
+                    match args.on_reinit.as_deref() {
+                        Some("exit") => std::process::exit(1),
+                        Some(mode) => args.mode = mode.to_owned(),
+                        None => {}
+                    }
+                }
                 let mut result = json!({
                     "protocolVersion": 2,
                     "info": { "name": "deterministic-peer", "version": "1" },

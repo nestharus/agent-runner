@@ -3,19 +3,32 @@
 //! contract, not real-harness behaviour.
 //!
 //! The only timer here is a test watchdog: if an expected line never
-//! arrives, the test kills its own supervisor (its peers die with it) and
-//! fails, rather than hanging. The supervisor itself has no timer. A
-//! supervisor this test launched is also killed when its `Run` is dropped
-//! (including on a failed assertion) and, through a parent-death signal,
-//! when the test process itself dies, so no test leaves an owner behind.
+//! arrives, the test kills its own supervisor and fails, rather than
+//! hanging. The supervisor itself has no timer. A supervisor this test
+//! launched is also killed when its `Run` is dropped (including on a failed
+//! assertion) and, through a parent-death signal, when the test process
+//! itself dies.
+//!
+//! Peers now run under root PID 1 and their work PID 1s, which outlive a
+//! killed owner by design. Cleanup is exact: each root PID 1 a supervisor
+//! reports starting is watched by a pidfd opened while it is verified to
+//! be the recorded process (pid and start time in the test's own fresh
+//! store), and the test's `Scratch` kills each still-running one through
+//! that pidfd on drop (its namespace, with every peer, ends with it). This
+//! test process is a child subreaper so that root PID 1s orphaned by a
+//! killed owner are reparented to it and reaped here by exact pid. That is
+//! test cleanup only: no owner relies on it (in production an orphaned
+//! root PID 1 goes to the host's init).
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, channel};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -25,18 +38,102 @@ const PEER: &str = env!("CARGO_BIN_EXE_oulipoly-acp-deterministic-peer");
 const WATCHDOG: Duration = Duration::from_secs(60);
 const QUIET_WINDOW: Duration = Duration::from_secs(2);
 
-struct Scratch(PathBuf);
+/// A root PID 1 reported started by one of this test's supervisors.
+struct RootWatch {
+    pid: i32,
+    fd: OwnedFd,
+}
+
+type Roots = Arc<Mutex<Vec<RootWatch>>>;
+
+struct Scratch(PathBuf, Roots);
+
+fn pidfd(pid: i32) -> Option<OwnedFd> {
+    // SAFETY: open an observation fd; verified against the store below.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    // SAFETY: the new fd has no other owner.
+    (raw >= 0).then(|| unsafe { OwnedFd::from_raw_fd(i32::try_from(raw).unwrap()) })
+}
+
+fn start_time(pid: i32) -> Option<i64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+fn exited(fd: &OwnedFd, timeout_ms: i32) -> bool {
+    let mut poll = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll receives one valid pollfd.
+    let ready = unsafe { libc::poll(&mut poll, 1, timeout_ms) };
+    assert!(ready >= 0, "pidfd poll failed");
+    ready == 1
+}
+
+/// Appends a watched root PID 1's exact identity to the file named by
+/// `ROOT_CUSTODY_STAMPS`, when set, so a controller can afterwards check
+/// those exact processes (and only those) are gone.
+fn stamp(pid: i32, start_time: i64) {
+    if let Some(path) = std::env::var_os("ROOT_CUSTODY_STAMPS") {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        writeln!(file, "{pid} {start_time}").unwrap();
+    }
+}
+
+/// The isolation an owner run by this test's uid must report.
+fn expected_isolation() -> &'static str {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        "host-root-pidns"
+    } else {
+        "unprivileged-userns-pidns"
+    }
+}
+
+/// Reaps `pid` if (and only if) it is this test process's child.
+fn reap_if_ours(pid: i32) -> Option<i32> {
+    let mut status = 0;
+    // SAFETY: waitpid on one exact pid; ECHILD if it is not our child.
+    let reaped = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
+    (reaped == pid).then_some(status)
+}
 
 impl Scratch {
     fn new(name: &str) -> Self {
         static NEXT: AtomicU32 = AtomicU32::new(0);
+        // SAFETY: prctl with integer arguments.
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0
+        );
         let dir = std::env::temp_dir().join(format!(
             "root-supervisor-{name}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
+        Self(dir, Roots::default())
+    }
+
+    /// The watched root PID 1 with this host pid.
+    fn root_fd(&self, pid: i32) -> OwnedFd {
+        let roots = self.1.lock().unwrap();
+        let watch = roots
+            .iter()
+            .find(|watch| watch.pid == pid)
+            .expect("watched root pid1");
+        watch.fd.try_clone().unwrap()
     }
 
     fn state(&self, harness: &str) -> PathBuf {
@@ -50,7 +147,25 @@ impl Scratch {
 }
 
 impl Drop for Scratch {
+    /// Kills each still-running root PID 1 of this test through its verified
+    /// pidfd, waits for its exit, and reaps it if it is this process's child.
     fn drop(&mut self) {
+        for watch in self.1.lock().unwrap().drain(..) {
+            if !exited(&watch.fd, 0) {
+                // SAFETY: pidfd_send_signal on a pidfd naming our verified root.
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        watch.fd.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                }
+                let _ = exited(&watch.fd, 10_000);
+            }
+            let _ = reap_if_ours(watch.pid);
+        }
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -89,10 +204,12 @@ struct Run {
     stdin: ChildStdin,
     lines: Receiver<Value>,
     seen: Vec<Value>,
+    store: PathBuf,
+    roots: Roots,
 }
 
 impl Run {
-    fn start(spec: &Value) -> Self {
+    fn start(dir: &Scratch, spec: &Value) -> Self {
         let mut command = Command::new(SUPERVISOR);
         command.stdin(Stdio::piped()).stdout(Stdio::piped());
         // SAFETY: prctl with integer arguments, async-signal-safe.
@@ -123,6 +240,34 @@ impl Run {
             stdin,
             lines,
             seen: Vec::new(),
+            store: PathBuf::from(spec["store"].as_str().unwrap()),
+            roots: Arc::clone(&dir.1),
+        }
+    }
+
+    /// Watches a reported root PID 1, only if it is still the process the
+    /// store recorded (same pid and start time).
+    fn observe(&mut self, value: &Value) {
+        if value["event"] != "root-pid1-started" {
+            return;
+        }
+        let pid = i32::try_from(value["pid"].as_i64().unwrap()).unwrap();
+        let Some(fd) = pidfd(pid) else { return };
+        let conn = rusqlite::Connection::open_with_flags(
+            self.store.join("intent.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let recorded: Option<i64> = conn
+            .query_row(
+                "SELECT start_time FROM incarnation WHERE host_pid = ?1 ORDER BY id DESC",
+                [pid],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(recorded) = recorded.filter(|recorded| Some(*recorded) == start_time(pid)) {
+            stamp(pid, recorded);
+            self.roots.lock().unwrap().push(RootWatch { pid, fd });
         }
     }
 
@@ -136,6 +281,7 @@ impl Run {
         loop {
             match self.lines.recv_timeout(WATCHDOG) {
                 Ok(value) => {
+                    self.observe(&value);
                     self.seen.push(value.clone());
                     if pred(&value) {
                         return value;
@@ -179,6 +325,7 @@ impl Run {
     /// Lines already emitted, without waiting for more.
     fn drain_now(&mut self) -> &[Value] {
         while let Ok(value) = self.lines.try_recv() {
+            self.observe(&value);
             self.seen.push(value);
         }
         &self.seen
@@ -190,6 +337,7 @@ impl Run {
         let status = self.child.wait().unwrap();
         assert_eq!(status.signal(), Some(libc::SIGKILL));
         while let Ok(value) = self.lines.recv_timeout(WATCHDOG) {
+            self.observe(&value);
             self.seen.push(value);
         }
         std::mem::take(&mut self.seen)
@@ -272,15 +420,17 @@ fn recover(dir: &Scratch) -> Value {
 #[test]
 fn separate_process_owns_two_harnesses_and_ends_after_exact_reaping() {
     let dir = Scratch::new("own");
-    let run = Run::start(&spec(
+    let run = Run::start(
         &dir,
-        3,
-        json!([
-            { "id": "a", "argv": peer(&dir.state("a"), &["--exit-after-acks", "2"]), "messages": ["one", "two"] },
-            { "id": "b", "argv": peer(&dir.state("b"), &["--exit-after-acks", "1"]), "messages": ["three"] },
-        ]),
-    ));
-    let supervisor = run.supervisor_pid();
+        &spec(
+            &dir,
+            3,
+            json!([
+                { "id": "a", "argv": peer(&dir.state("a"), &["--exit-after-acks", "2"]), "messages": ["one", "two"] },
+                { "id": "b", "argv": peer(&dir.state("b"), &["--exit-after-acks", "1"]), "messages": ["three"] },
+            ]),
+        ),
+    );
     let (terminal, status, seen) = run.terminal();
     assert_eq!(terminal["status"], "ended", "{terminal}");
     assert_eq!(status.code(), Some(0));
@@ -293,11 +443,22 @@ fn separate_process_owns_two_harnesses_and_ends_after_exact_reaping() {
         assert_eq!(record["exits"], json!(["code:0"]));
         let launches = read_state(&dir.state(id))["launches"].clone();
         assert_eq!(launches.as_array().unwrap().len(), 1);
-        // The peer's parent is the supervisor process, not this test.
-        assert_eq!(launches[0]["ppid"], supervisor);
-        assert_ne!(launches[0]["pid"], supervisor);
-        assert_eq!(events(&seen, id, "exited")[0]["reaped"], "exact-child");
+        // The peer is pid 2 of its own work namespace, whose PID 1 (its
+        // actual parent and waiter) is the per-work PID 1.
+        assert_eq!(launches[0]["ppid"], 1);
+        assert_eq!(launches[0]["pid"], 2);
+        assert_eq!(events(&seen, id, "exited")[0]["reaped"], "work-pid1-wait");
+        assert_eq!(events(&seen, id, "exited")[0]["work_pid1"], "code:0");
     }
+    let started = seen
+        .iter()
+        .find(|value| value["event"] == "root-pid1-started")
+        .unwrap();
+    assert_eq!(started["isolation"], expected_isolation());
+    // This owner started root PID 1, released it, and waited it as parent.
+    assert_eq!(terminal["root_pid1"]["outcome"], "released-exit-waited");
+    assert_eq!(terminal["root_pid1"]["status"], "code:0");
+    assert_eq!(terminal["root_pid1"]["parent"], true);
     let messages = harness(&terminal, "a")["messages"].as_array().unwrap();
     assert!(messages.iter().all(|m| m["state"] == "acknowledged"));
     assert!(messages.iter().all(|m| m["basis"] == "single-attempt"));
@@ -309,14 +470,17 @@ fn separate_process_owns_two_harnesses_and_ends_after_exact_reaping() {
 #[test]
 fn exit_before_ack_relaunches_with_same_key() {
     let dir = Scratch::new("retry");
-    let run = Run::start(&spec(
+    let run = Run::start(
         &dir,
-        3,
-        json!([
-            { "id": "dedup", "argv": peer(&dir.state("dedup"), &["--mode", "exit-before-ack-once", "--exit-after-acks", "1"]), "messages": ["hello"] },
-            { "id": "plain", "argv": peer(&dir.state("plain"), &["--mode", "exit-before-ack-once", "--no-dedup", "--exit-after-acks", "1"]), "messages": ["hello"] },
-        ]),
-    ));
+        &spec(
+            &dir,
+            3,
+            json!([
+                { "id": "dedup", "argv": peer(&dir.state("dedup"), &["--mode", "exit-before-ack-once", "--exit-after-acks", "1"]), "messages": ["hello"] },
+                { "id": "plain", "argv": peer(&dir.state("plain"), &["--mode", "exit-before-ack-once", "--no-dedup", "--exit-after-acks", "1"]), "messages": ["hello"] },
+            ]),
+        ),
+    );
     let (terminal, status, seen) = run.terminal();
     assert_eq!(terminal["status"], "ended", "{terminal}");
     assert_eq!(status.code(), Some(0));
@@ -380,14 +544,17 @@ fn exit_before_ack_relaunches_with_same_key() {
 #[test]
 fn silent_harness_stays_owed_while_other_delivers_until_cancel() {
     let dir = Scratch::new("silent");
-    let mut run = Run::start(&spec(
+    let mut run = Run::start(
         &dir,
-        1,
-        json!([
-            { "id": "quiet", "argv": peer(&dir.state("quiet"), &["--mode", "silent"]), "messages": ["are you there"] },
-            { "id": "busy", "argv": peer(&dir.state("busy"), &["--exit-after-acks", "1"]), "messages": ["hi"] },
-        ]),
-    ));
+        &spec(
+            &dir,
+            1,
+            json!([
+                { "id": "quiet", "argv": peer(&dir.state("quiet"), &["--mode", "silent"]), "messages": ["are you there"] },
+                { "id": "busy", "argv": peer(&dir.state("busy"), &["--exit-after-acks", "1"]), "messages": ["hi"] },
+            ]),
+        ),
+    );
     let quiet_pid = run.event("quiet", "launched")["pid"].as_u64().unwrap();
     run.event("busy", "ack");
     run.event("busy", "exited");
@@ -425,14 +592,17 @@ fn silent_harness_stays_owed_while_other_delivers_until_cancel() {
 #[test]
 fn closure_cap_declares_outage_on_observed_closures() {
     let dir = Scratch::new("outage");
-    let run = Run::start(&spec(
+    let run = Run::start(
         &dir,
-        3,
-        json!([
-            { "id": "flaky", "argv": peer(&dir.state("flaky"), &["--mode", "exit-before-ack-always"]), "messages": ["x", "y"] },
-            { "id": "fine", "argv": peer(&dir.state("fine"), &["--exit-after-acks", "1"]), "messages": ["z"] },
-        ]),
-    ));
+        &spec(
+            &dir,
+            3,
+            json!([
+                { "id": "flaky", "argv": peer(&dir.state("flaky"), &["--mode", "exit-before-ack-always"]), "messages": ["x", "y"] },
+                { "id": "fine", "argv": peer(&dir.state("fine"), &["--exit-after-acks", "1"]), "messages": ["z"] },
+            ]),
+        ),
+    );
     let (terminal, status, seen) = run.terminal();
     assert_eq!(terminal["status"], "ended-owed", "{terminal}");
     assert_eq!(status.code(), Some(3));
@@ -468,14 +638,17 @@ fn closure_cap_declares_outage_on_observed_closures() {
 #[test]
 fn send_fault_without_closure_is_not_peer_gone() {
     let dir = Scratch::new("sendfault");
-    let mut run = Run::start(&spec(
+    let mut run = Run::start(
         &dir,
-        1,
-        json!([
-            { "id": "deaf", "argv": peer(&dir.state("deaf"), &["--mode", "close-stdin"]), "messages": ["hello"] },
-            { "id": "ok", "argv": peer(&dir.state("ok"), &["--exit-after-acks", "1"]), "messages": ["hi"] },
-        ]),
-    ));
+        &spec(
+            &dir,
+            1,
+            json!([
+                { "id": "deaf", "argv": peer(&dir.state("deaf"), &["--mode", "close-stdin"]), "messages": ["hello"] },
+                { "id": "ok", "argv": peer(&dir.state("ok"), &["--exit-after-acks", "1"]), "messages": ["hi"] },
+            ]),
+        ),
+    );
     let deaf_pid = run.event("deaf", "launched")["pid"].as_u64().unwrap();
     run.event("deaf", "send-fault");
     run.event("ok", "exited");
@@ -501,14 +674,17 @@ fn send_fault_without_closure_is_not_peer_gone() {
 #[test]
 fn acknowledgement_alone_does_not_end_before_reaping() {
     let dir = Scratch::new("ackend");
-    let mut run = Run::start(&spec(
+    let mut run = Run::start(
         &dir,
-        1,
-        json!([
-            { "id": "stays", "argv": peer(&dir.state("stays"), &[]), "messages": ["a"] },
-            { "id": "goes", "argv": peer(&dir.state("goes"), &["--exit-after-acks", "1"]), "messages": ["b"] },
-        ]),
-    ));
+        &spec(
+            &dir,
+            1,
+            json!([
+                { "id": "stays", "argv": peer(&dir.state("stays"), &[]), "messages": ["a"] },
+                { "id": "goes", "argv": peer(&dir.state("goes"), &["--exit-after-acks", "1"]), "messages": ["b"] },
+            ]),
+        ),
+    );
     let stays_pid = run.event("stays", "launched")["pid"].as_u64().unwrap();
     run.event("stays", "ack");
     run.event("stays", "idle");
@@ -530,7 +706,7 @@ fn acknowledgement_alone_does_not_end_before_reaping() {
 #[test]
 fn invalid_spec_launches_nothing() {
     let dir = Scratch::new("invalid");
-    let run = Run::start(&spec(&dir, 0, json!([])));
+    let run = Run::start(&dir, &spec(&dir, 0, json!([])));
     let (terminal, status, _) = run.terminal();
     assert_eq!(terminal["status"], "spec-refused");
     assert_eq!(status.code(), Some(64));
@@ -552,8 +728,7 @@ fn watch(pid: u64) -> PeerWatch {
     PeerWatch(unsafe { OwnedFd::from_raw_fd(i32::try_from(raw).unwrap()) })
 }
 
-/// Waits until a watched peer of a killed supervisor has exited (it dies by
-/// its parent-death signal or stdin EOF). Test watchdog only.
+/// Waits until a watched process has exited. Test watchdog only.
 fn wait_gone(peer: &PeerWatch) {
     use std::os::fd::AsRawFd;
     let mut poll = libc::pollfd {
@@ -579,43 +754,151 @@ fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {
     conn.query_row(sql, [], |row| row.get(0)).unwrap()
 }
 
-/// (h) The real owner process is SIGKILLed while a delivery is unanswered
-/// (inserted, no ACK). A new instance on the same store classifies that
-/// attempt unknown, resumes the recorded session and resubmits the SAME
-/// key. The dedup peer inserts once; the non-dedup peer inserts twice and
-/// the ACK is duplicate-unknown. Neither restored ACK is at-most-once.
+/// Direct children of `pid`, a process of this test's own tree.
+fn children(pid: u64) -> Vec<u64> {
+    let mut found = Vec::new();
+    for task in std::fs::read_dir(format!("/proc/{pid}/task")).unwrap() {
+        if let Ok(text) = std::fs::read_to_string(task.unwrap().path().join("children")) {
+            found.extend(
+                text.split_whitespace()
+                    .map(|pid| pid.parse::<u64>().unwrap()),
+            );
+        }
+    }
+    found.sort_unstable();
+    found
+}
+
+fn ppid(pid: u64) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    stat.rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+fn custody(seen: &[Value]) -> &Value {
+    seen.iter()
+        .find(|value| value["event"] == "custody")
+        .unwrap()
+}
+
+fn roots_started(seen: &[Value]) -> Vec<&Value> {
+    seen.iter()
+        .filter(|value| value["event"] == "root-pid1-started")
+        .collect()
+}
+
+/// The quiet peer used by survival tests: inserts each prompt without
+/// acknowledging it until a restarted owner initializes again, then acts
+/// normally and exits after one acknowledgement.
+fn quiet_until_reattach(state: &Path, extra: &[&str]) -> Vec<String> {
+    let mut args = vec![
+        "--mode",
+        "insert-then-silent",
+        "--on-reinit",
+        "normal",
+        "--exit-after-acks",
+        "1",
+    ];
+    args.extend_from_slice(extra);
+    peer(state, &args)
+}
+
+/// (h) The owner is SIGKILLed while two deliveries are inserted but
+/// unanswered (quiet, owed work). Root PID 1 and both peers stay alive: the
+/// owner's death kills nothing. Placement while it ran: owner, then root
+/// PID 1 as its direct child, then one work PID 1 per harness, then the
+/// harness; nothing else. A restarted owner attaches to the same root PID 1
+/// by its recorded identity and token, reattaches to both surviving peers
+/// (no relaunch, same processes), resumes their sessions and resubmits the
+/// SAME keys through `AcpClient`. The dedup peer inserts once; the
+/// non-dedup peer inserts twice; neither restored ACK is at-most-once.
 #[test]
-fn owner_killed_mid_delivery_recovers_same_keys_on_restart() {
-    let dir = Scratch::new("restart");
-    let mut first = Run::start(&spec(
+fn owner_killed_with_quiet_work_leaves_root_and_peers_alive_and_restart_reattaches() {
+    let dir = Scratch::new("survive");
+    let mut first = Run::start(
         &dir,
-        3,
-        json!([
-            { "id": "dedup", "argv": peer(&dir.state("dedup"), &["--launch-modes", "insert-then-silent,normal", "--exit-after-acks", "1"]), "messages": ["hello"] },
-            { "id": "plain", "argv": peer(&dir.state("plain"), &["--launch-modes", "insert-then-silent,normal", "--no-dedup", "--exit-after-acks", "1"]), "messages": ["hello"] },
-        ]),
-    ));
-    first.until("intent-committed", |value| {
-        value["event"] == "intent-committed"
-    });
-    let mut old_peers = Vec::new();
+        &spec(
+            &dir,
+            3,
+            json!([
+                { "id": "dedup", "argv": quiet_until_reattach(&dir.state("dedup"), &[]), "messages": ["hello"] },
+                { "id": "plain", "argv": quiet_until_reattach(&dir.state("plain"), &["--no-dedup"]), "messages": ["hello"] },
+            ]),
+        ),
+    );
+    let root = first.until("root pid1", |value| value["event"] == "root-pid1-started");
+    assert_eq!(root["parent"], "this-owner");
+    let root_pid = root["pid"].as_u64().unwrap();
+    let owner_pid = u64::from(first.supervisor_pid());
+    let mut peers = Vec::new();
     for id in ["dedup", "plain"] {
-        old_peers.push(watch(first.event(id, "launched")["pid"].as_u64().unwrap()));
+        peers.push(first.event(id, "launched")["pid"].as_u64().unwrap());
         wait_state(&dir.state(id), |state| {
             state["insertions"].as_array().unwrap().len() == 1
         });
     }
+    peers.sort_unstable();
+    // Process classes and counts: one root PID 1 per root, one work PID 1
+    // and one harness per work. No other process in the tree.
+    assert_eq!(children(owner_pid), vec![root_pid]);
+    let works = children(root_pid);
+    assert_eq!(works.len(), 2, "one work PID 1 per harness");
+    let mut harnesses = Vec::new();
+    for work in &works {
+        let below = children(*work);
+        assert_eq!(below.len(), 1, "a work PID 1 has exactly its harness");
+        assert!(
+            children(below[0]).is_empty(),
+            "a harness has no wrapper below it"
+        );
+        harnesses.extend(below);
+    }
+    harnesses.sort_unstable();
+    assert_eq!(
+        harnesses, peers,
+        "each harness's parent is its own work PID 1"
+    );
+
     let seen = first.kill();
     assert!(seen.iter().all(|value| value["event"] != "terminal"));
     assert!(seen.iter().all(|value| value["event"] != "ack"));
-    for peer in &old_peers {
-        wait_gone(peer);
+    // A while after the owner's death: nothing it owned was killed.
+    std::thread::sleep(QUIET_WINDOW);
+    assert!(alive(root_pid), "root PID 1 must survive its owner");
+    for peer in &peers {
+        assert!(alive(*peer), "quiet peer {peer} must survive the owner");
     }
+    // Orphaned (reparented to this test, a subreaper), still holding its work.
+    assert_eq!(ppid(root_pid), u64::from(std::process::id()));
+    assert_eq!(children(root_pid), works);
 
-    let second = Run::start(&recover(&dir));
+    let mut second = Run::start(&dir, &recover(&dir));
+    // Checked before delivery proceeds, so a wrong custody choice fails here.
+    let found = second.until("custody", |value| value["event"] == "custody");
+    assert_eq!(found["outcome"], "attached", "{found}");
+    assert_eq!(found["incarnation"], 1);
+    assert_eq!(found["survivors"], 2);
+    for id in ["dedup", "plain"] {
+        let first = second.until("first custody event", |value| {
+            value["harness"] == id
+                && ["reattached", "launched", "prior-end-unknown", "prior-exit"]
+                    .contains(&value["event"].as_str().unwrap_or_default())
+        });
+        assert_eq!(
+            first["event"], "reattached",
+            "{id}: survivor kept, not dropped: {first}"
+        );
+    }
     let (terminal, status, seen) = second.terminal();
     assert_eq!(terminal["status"], "ended", "{terminal}");
     assert_eq!(status.code(), Some(0));
+    assert!(roots_started(&seen).is_empty(), "no new incarnation");
     let recovered = seen
         .iter()
         .find(|value| value["event"] == "intent-recovered")
@@ -628,9 +911,24 @@ fn owner_killed_mid_delivery_recovers_same_keys_on_restart() {
         assert_eq!(prompts.len(), 2, "{id}");
         assert_eq!(prompts[0]["key"], prompts[1]["key"], "{id}: same key");
         assert_eq!(prompts[0]["session"], prompts[1]["session"], "{id}");
-        assert_eq!(state["launches"].as_array().unwrap().len(), 2, "{id}");
+        assert_eq!(
+            state["launches"].as_array().unwrap().len(),
+            1,
+            "{id}: same process"
+        );
+        let reattached = events(&seen, id, "reattached");
+        assert_eq!(reattached.len(), 1, "{id}");
+        assert!(peers.contains(&reattached[0]["pid"].as_u64().unwrap()));
         assert_eq!(events(&seen, id, "session-resumed").len(), 1, "{id}");
-        let message = &harness(&terminal, id)["messages"][0];
+        assert!(
+            events(&seen, id, "launched").is_empty(),
+            "{id}: no relaunch"
+        );
+        let record = harness(&terminal, id);
+        assert_eq!(record["launches"], 0);
+        assert_eq!(record["reattached"], 1);
+        assert_eq!(record["exits"], json!(["code:0"]));
+        let message = &record["messages"][0];
         assert_eq!(message["state"], "acknowledged");
         assert_eq!(message["label"], "duplicate-unknown", "{id}");
         assert_eq!(message["at_most_once"], false);
@@ -662,6 +960,13 @@ fn owner_killed_mid_delivery_recovers_same_keys_on_restart() {
         harness(&terminal, "plain")["messages"][0]["recovered"],
         false
     );
+    // Not its parent: only the exit is observed, never its status.
+    assert_eq!(
+        terminal["root_pid1"]["outcome"],
+        "released-exit-observed-by-pidfd"
+    );
+    assert_eq!(terminal["root_pid1"]["parent"], false);
+    assert!(terminal["root_pid1"]["status"].is_null());
     let conn = db(&dir);
     assert_eq!(
         count(
@@ -670,62 +975,79 @@ fn owner_killed_mid_delivery_recovers_same_keys_on_restart() {
         ),
         2
     );
+    assert_eq!(count(&conn, "SELECT count(*) FROM incarnation"), 1);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM work WHERE outcome = 'code:0' AND observer = 'work-pid1-wait'"
+        ),
+        2
+    );
 }
 
 /// (i) Observed closures persist across an owner kill, so the cap is
-/// reached across restarts and a further restart does not reset it.
+/// reached across restarts and a further restart does not reset it. The
+/// second closure is the surviving harness's exit when the restarted owner
+/// attaches to it, as reported by its work PID 1.
 #[test]
 fn closures_and_outage_cap_persist_across_restart() {
     let dir = Scratch::new("cap");
-    let modes = "exit-before-ack-always,insert-then-silent,exit-before-ack-always";
-    let mut first = Run::start(&spec(
+    let modes = "exit-before-ack-always,insert-then-silent";
+    let mut first = Run::start(
         &dir,
-        2,
-        json!([{ "id": "flaky", "argv": peer(&dir.state("flaky"), &["--launch-modes", modes]), "messages": ["x"] }]),
-    ));
-    first.event("flaky", "closure-observed");
-    let peer = watch(
-        first.until("second launch", |value| {
-            value["event"] == "launched" && value["launch"] == 2
-        })["pid"]
-            .as_u64()
-            .unwrap(),
+        &spec(
+            &dir,
+            2,
+            json!([{ "id": "flaky", "argv": peer(&dir.state("flaky"), &["--launch-modes", modes, "--on-reinit", "exit"]), "messages": ["x"] }]),
+        ),
     );
+    first.event("flaky", "closure-observed");
+    let survivor = first.until("second launch", |value| {
+        value["event"] == "launched" && value["launch"] == 2
+    })["pid"]
+        .as_u64()
+        .unwrap();
     wait_state(&dir.state("flaky"), |state| {
         state["prompts"].as_array().unwrap().len() == 2
     });
     first.kill();
-    wait_gone(&peer);
+    assert!(alive(survivor));
 
-    let (terminal, status, seen) = Run::start(&recover(&dir)).terminal();
+    let (terminal, status, seen) = Run::start(&dir, &recover(&dir)).terminal();
     assert_eq!(terminal["status"], "ended-owed", "{terminal}");
     assert_eq!(status.code(), Some(3));
-    let message = &harness(&terminal, "flaky")["messages"][0];
+    let record = harness(&terminal, "flaky");
+    assert_eq!(record["launches"], 0);
+    assert_eq!(record["reattached"], 1);
+    assert_eq!(record["exits"], json!(["code:1"]));
+    let message = &record["messages"][0];
     assert_eq!(message["label"], "outage");
     assert_eq!(message["closures"], 2);
-    assert_eq!(message["attempts"], 3);
+    assert_eq!(message["attempts"], 2);
     assert_eq!(message["prior_unknown"], 1);
     assert_eq!(events(&seen, "flaky", "outage")[0]["closures"], 2);
-    assert_eq!(harness(&terminal, "flaky")["launches"], 1);
+    assert!(!alive(survivor));
 
-    let (terminal, status, seen) = Run::start(&recover(&dir)).terminal();
+    let (terminal, status, seen) = Run::start(&dir, &recover(&dir)).terminal();
     assert_eq!(terminal["status"], "ended-owed", "{terminal}");
     assert_eq!(status.code(), Some(3));
+    assert_eq!(custody(&seen)["outcome"], "fresh");
     assert_eq!(harness(&terminal, "flaky")["launches"], 0);
+    assert_eq!(harness(&terminal, "flaky")["reattached"], 0);
     let message = &harness(&terminal, "flaky")["messages"][0];
     assert_eq!(message["label"], "outage");
     assert_eq!(
         message["closures"], 2,
         "recovered closures are the persisted ones"
     );
-    assert_eq!(message["attempts"], 3);
+    assert_eq!(message["attempts"], 2);
     assert!(events(&seen, "flaky", "launched").is_empty());
     assert_eq!(
         read_state(&dir.state("flaky"))["launches"]
             .as_array()
             .unwrap()
             .len(),
-        3
+        2
     );
 }
 
@@ -736,11 +1058,14 @@ fn closures_and_outage_cap_persist_across_restart() {
 fn second_owner_is_refused_and_other_root_is_unaffected() {
     let dir = Scratch::new("dup");
     let other = Scratch::new("other");
-    let mut owner = Run::start(&spec(
+    let mut owner = Run::start(
         &dir,
-        1,
-        json!([{ "id": "quiet", "argv": peer(&dir.state("quiet"), &["--mode", "silent"]), "messages": ["x"] }]),
-    ));
+        &spec(
+            &dir,
+            1,
+            json!([{ "id": "quiet", "argv": peer(&dir.state("quiet"), &["--mode", "silent"]), "messages": ["x"] }]),
+        ),
+    );
     wait_state(&dir.state("quiet"), |state| {
         !state["prompts"].as_array().unwrap().is_empty()
     });
@@ -760,7 +1085,7 @@ fn second_owner_is_refused_and_other_root_is_unaffected() {
             json!([{ "id": "q", "argv": ["/bin/false"], "messages": [] }]),
         ),
     ] {
-        let mut duplicate = Run::start(&request);
+        let mut duplicate = Run::start(&dir, &request);
         let first = duplicate.until("first line", |value| value["event"] != "intent-received");
         assert_eq!(first["event"], "terminal", "duplicate proceeded: {first}");
         let (terminal, status, seen) = duplicate.terminal();
@@ -770,7 +1095,7 @@ fn second_owner_is_refused_and_other_root_is_unaffected() {
         assert!(seen.iter().all(|value| value["event"] != "launched"));
     }
 
-    let (terminal, status, _) = Run::start(&spec(
+    let (terminal, status, _) = Run::start(&other, &spec(
         &other,
         1,
         json!([{ "id": "fine", "argv": peer(&other.state("fine"), &["--exit-after-acks", "1"]), "messages": ["y"] }]),
@@ -817,11 +1142,14 @@ fn interface_acceptance_before_commit_is_not_durable() {
     assert_eq!(mode, "wal");
     blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
 
-    let mut run = Run::start(&spec(
+    let mut run = Run::start(
         &dir,
-        1,
-        json!([{ "id": "h", "argv": peer(&dir.state("h"), &[]), "messages": ["x"] }]),
-    ));
+        &spec(
+            &dir,
+            1,
+            json!([{ "id": "h", "argv": peer(&dir.state("h"), &[]), "messages": ["x"] }]),
+        ),
+    );
     let accepted = run.until("intent-received", |value| {
         value["event"] == "intent-received"
     });
@@ -841,7 +1169,7 @@ fn interface_acceptance_before_commit_is_not_durable() {
     blocker.execute_batch("ROLLBACK").unwrap();
     drop(blocker);
 
-    let (terminal, status, _) = Run::start(&recover(&dir)).terminal();
+    let (terminal, status, _) = Run::start(&dir, &recover(&dir)).terminal();
     assert_eq!(terminal["status"], "store-refused");
     assert_eq!(terminal["reason"], "no-durable-intent");
     assert_eq!(status.code(), Some(65));
@@ -851,9 +1179,11 @@ fn interface_acceptance_before_commit_is_not_durable() {
 /// (l) An owner-restart loop with unresolved outcomes cannot buy unlimited
 /// attempts: attempts persist across owner kills and count toward the
 /// intent's delivery-attempt budget, separately from observed closures.
-/// Once used up, a recovery stops the message as `attempts-exhausted`
-/// before launching anything, with the unknown attempts still unknown and
-/// no closure, outage or acknowledgement invented.
+/// The quiet peer survives both owner kills and is resubmitted to by
+/// reattachment. Once the budget is used up, a recovery stops the message
+/// as `attempts-exhausted` with the unknown attempts still unknown and no
+/// closure, outage or acknowledgement invented, and still holds the
+/// surviving peer (never dropped as gone) until explicit cancel.
 #[test]
 fn owner_restart_loop_exhausts_persisted_attempt_budget() {
     let dir = Scratch::new("budget");
@@ -867,33 +1197,57 @@ fn owner_restart_loop_exhausts_persisted_attempt_budget() {
             "harnesses": [{ "id": "quiet", "argv": peer(&state, &["--mode", "insert-then-silent"]), "messages": ["x"] }],
         },
     });
+    let mut survivor = None;
     for (round, request) in [request, recover(&dir)].into_iter().enumerate() {
-        let mut owner = Run::start(&request);
-        let peer = watch(owner.event("quiet", "launched")["pid"].as_u64().unwrap());
+        let mut owner = Run::start(&dir, &request);
+        let event = if round == 0 { "launched" } else { "reattached" };
+        let pid = owner.event("quiet", event)["pid"].as_u64().unwrap();
+        assert_eq!(
+            *survivor.get_or_insert(pid),
+            pid,
+            "the same surviving process"
+        );
         wait_state(&state, |state| {
             state["prompts"].as_array().unwrap().len() == round + 1
         });
         owner.kill();
-        wait_gone(&peer);
+        assert!(alive(pid));
     }
+    let survivor = survivor.unwrap();
 
-    for _ in 0..2 {
-        let mut run = Run::start(&recover(&dir));
-        let first = run.until("first quiet event", |value| value["harness"] == "quiet");
-        assert_eq!(first["event"], "nothing-deliverable", "{first}");
-        let (terminal, status, seen) = run.terminal();
-        assert_eq!(terminal["status"], "ended-owed", "{terminal}");
-        assert_eq!(status.code(), Some(3));
-        assert!(events(&seen, "quiet", "launched").is_empty());
-        let record = harness(&terminal, "quiet");
-        assert_eq!(record["launches"], 0);
-        let message = &record["messages"][0];
-        assert_eq!(message["state"], "owed");
-        assert_eq!(message["label"], "attempts-exhausted");
-        assert_eq!(message["attempts"], 2);
-        assert_eq!(message["closures"], 0, "owner death is not a closure");
-    }
-    assert_eq!(read_state(&state)["launches"].as_array().unwrap().len(), 2);
+    let mut run = Run::start(&dir, &recover(&dir));
+    let first = run.until("first quiet event", |value| value["harness"] == "quiet");
+    assert_eq!(first["event"], "nothing-deliverable", "{first}");
+    run.event("quiet", "holding-survivor");
+    assert!(
+        alive(survivor),
+        "exhausted budget does not drop or kill a survivor"
+    );
+    run.cancel();
+    let (terminal, status, seen) = run.terminal();
+    assert_eq!(terminal["status"], "cancelled", "{terminal}");
+    assert_eq!(status.code(), Some(2));
+    assert!(events(&seen, "quiet", "launched").is_empty());
+    let record = harness(&terminal, "quiet");
+    assert_eq!(record["launches"], 0);
+    assert_eq!(record["reattached"], 1);
+    assert_eq!(record["exits"], json!(["signal:9"]));
+    let message = &record["messages"][0];
+    assert_eq!(message["state"], "owed");
+    assert_eq!(message["label"], "attempts-exhausted");
+    assert_eq!(message["attempts"], 2);
+    assert_eq!(message["closures"], 0, "owner death is not a closure");
+    assert!(!alive(survivor));
+
+    let mut run = Run::start(&dir, &recover(&dir));
+    let first = run.until("first quiet event", |value| value["harness"] == "quiet");
+    assert_eq!(first["event"], "nothing-deliverable", "{first}");
+    let (terminal, status, seen) = run.terminal();
+    assert_eq!(terminal["status"], "ended-owed", "{terminal}");
+    assert_eq!(status.code(), Some(3));
+    assert_eq!(custody(&seen)["outcome"], "fresh");
+    assert_eq!(harness(&terminal, "quiet")["launches"], 0);
+    assert_eq!(read_state(&state)["launches"].as_array().unwrap().len(), 1);
     let conn = db(&dir);
     assert_eq!(
         count(
@@ -914,38 +1268,402 @@ fn owner_restart_loop_exhausts_persisted_attempt_budget() {
 
 /// (m) Within one owner, the budget counts attempts made by earlier
 /// generations too: one unknown attempt from a killed owner plus two
-/// observed-closure attempts use a budget of three, so the second closure
-/// authorizes no further relaunch although the closure cap is not reached.
+/// observed-closure attempts use a budget of three. The survivor's exit at
+/// reattachment is an observed closure but no new attempt.
 #[test]
 fn attempt_budget_counts_earlier_generations_before_sending() {
     let dir = Scratch::new("budget-run");
     let state = dir.state("flaky");
-    let mut first = Run::start(&json!({
-        "store": dir.store(),
-        "intent": {
-            "outage_closure_cap": 5,
-            "delivery_attempt_cap": 3,
-            "cwd": "/",
-            "harnesses": [{ "id": "flaky", "argv": peer(&state, &["--launch-modes", "insert-then-silent,exit-before-ack-always"]), "messages": ["x"] }],
-        },
-    }));
-    let peer = watch(first.event("flaky", "launched")["pid"].as_u64().unwrap());
+    let mut first = Run::start(
+        &dir,
+        &json!({
+            "store": dir.store(),
+            "intent": {
+                "outage_closure_cap": 5,
+                "delivery_attempt_cap": 3,
+                "cwd": "/",
+                "harnesses": [{ "id": "flaky", "argv": peer(&state, &["--launch-modes", "insert-then-silent,exit-before-ack-always", "--on-reinit", "exit"]), "messages": ["x"] }],
+            },
+        }),
+    );
+    let survivor = first.event("flaky", "launched")["pid"].as_u64().unwrap();
     wait_state(&state, |state| {
         !state["prompts"].as_array().unwrap().is_empty()
     });
     first.kill();
-    wait_gone(&peer);
+    assert!(alive(survivor));
 
-    let (terminal, status, seen) = Run::start(&recover(&dir)).terminal();
+    let (terminal, status, seen) = Run::start(&dir, &recover(&dir)).terminal();
     assert_eq!(terminal["status"], "ended-owed", "{terminal}");
     assert_eq!(status.code(), Some(3));
-    let message = &harness(&terminal, "flaky")["messages"][0];
+    let record = harness(&terminal, "flaky");
+    assert_eq!(record["reattached"], 1);
+    assert_eq!(record["launches"], 2);
+    assert_eq!(record["exits"], json!(["code:1", "code:1", "code:1"]));
+    let message = &record["messages"][0];
     assert_eq!(message["label"], "attempts-exhausted");
     assert_eq!(message["attempts"], 3);
     assert_eq!(message["prior_unknown"], 1);
-    assert_eq!(message["closures"], 2);
+    assert_eq!(message["closures"], 3);
     assert!(events(&seen, "flaky", "outage").is_empty());
     assert_eq!(events(&seen, "flaky", "attempts-exhausted").len(), 1);
-    assert_eq!(harness(&terminal, "flaky")["launches"], 2);
     assert_eq!(read_state(&state)["prompts"].as_array().unwrap().len(), 3);
+    assert_eq!(read_state(&state)["launches"].as_array().unwrap().len(), 3);
+}
+
+/// (n) While the owner is dead, one surviving peer exits on its own (status
+/// 7) and another stays quiet. Its work PID 1, its actual parent, waited it;
+/// root PID 1 kept that report. The restarted owner reports that exit as
+/// exactly what was observed (`code:7`, by the work PID 1's wait), counts it
+/// as a closure, relaunches with the same key, and reattaches to the quiet
+/// survivor.
+#[test]
+fn peer_exit_while_owner_dead_is_reported_by_its_actual_waiter() {
+    let dir = Scratch::new("waiter");
+    let gate = dir.0.join("exit-now");
+    let gate_arg = gate.display().to_string();
+    let mut first = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            3,
+            json!([
+                { "id": "ends", "argv": peer(&dir.state("ends"), &["--launch-modes", "insert-then-silent,normal", "--exit-when-file", &gate_arg, "--exit-after-acks", "1"]), "messages": ["one"] },
+                { "id": "stays", "argv": quiet_until_reattach(&dir.state("stays"), &[]), "messages": ["two"] },
+            ]),
+        ),
+    );
+    let root_pid = first.until("root pid1", |value| value["event"] == "root-pid1-started")["pid"]
+        .as_u64()
+        .unwrap();
+    let ends = first.event("ends", "launched")["pid"].as_u64().unwrap();
+    let stays = first.event("stays", "launched")["pid"].as_u64().unwrap();
+    for id in ["ends", "stays"] {
+        wait_state(&dir.state(id), |state| {
+            state["insertions"].as_array().unwrap().len() == 1
+        });
+    }
+    let ends_watch = watch(ends);
+    first.kill();
+    std::fs::write(&gate, b"").unwrap();
+    wait_gone(&ends_watch);
+    assert!(alive(stays));
+    assert!(alive(root_pid));
+
+    let (terminal, status, seen) = Run::start(&dir, &recover(&dir)).terminal();
+    assert_eq!(terminal["status"], "ended", "{terminal}");
+    assert_eq!(status.code(), Some(0));
+    let found = custody(&seen);
+    assert_eq!(found["outcome"], "attached");
+    assert_eq!(found["survivors"], 1);
+    assert_eq!(found["receipts"], 1);
+    let prior = events(&seen, "ends", "prior-exit");
+    assert_eq!(prior.len(), 1);
+    assert_eq!(prior[0]["status"], "code:7");
+    assert_eq!(prior[0]["observer"], "work-pid1-wait");
+    let closure = events(&seen, "ends", "closure-observed");
+    assert_eq!(closure[0]["cause"], "exit-observed-while-owner-absent");
+    let record = harness(&terminal, "ends");
+    assert_eq!(record["prior_exits"], json!(["code:7"]));
+    assert_eq!(record["reattached"], 0);
+    assert_eq!(record["launches"], 1);
+    assert_eq!(record["exits"], json!(["code:0"]));
+    let message = &record["messages"][0];
+    assert_eq!(message["state"], "acknowledged");
+    assert_eq!(message["closures"], 1);
+    assert_eq!(message["recovered"], true);
+    let state = read_state(&dir.state("ends"));
+    let prompts = state["prompts"].as_array().unwrap();
+    assert_eq!(prompts[0]["key"], prompts[1]["key"]);
+    let record = harness(&terminal, "stays");
+    assert_eq!(record["reattached"], 1);
+    assert_eq!(record["launches"], 0);
+    assert_eq!(record["messages"][0]["state"], "acknowledged");
+}
+
+/// Kills this test's watched root PID 1 and waits it as its parent (it was
+/// reparented here when its owner died). Returns the raw wait status.
+fn kill_and_reap_root(dir: &Scratch, pid: i32) -> i32 {
+    let fd = dir.root_fd(pid);
+    // SAFETY: pidfd_send_signal on our verified root PID 1's pidfd.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    assert_eq!(rc, 0);
+    let mut status = 0;
+    // SAFETY: waitpid on one exact pid, our reparented child.
+    assert_eq!(unsafe { libc::waitpid(pid, &raw mut status, 0) }, pid);
+    status
+}
+
+/// (o) While the owner is dead, root PID 1 itself is killed (by this test,
+/// its parent after reparenting, which alone sees its status). Its
+/// namespace ends with it, taking the quiet peer. The restarted owner
+/// finds the recorded incarnation absent and reports exactly that: no exit
+/// observed, no status, and the peer ended with the root namespace, status
+/// unknown. No closure is counted; nothing is fabricated. A new recorded
+/// incarnation under the same root identity relaunches with the same key.
+#[test]
+fn root_pid1_death_while_owner_dead_is_unknown_not_fabricated() {
+    let dir = Scratch::new("absent");
+    let mut first = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            3,
+            json!([{ "id": "h", "argv": peer(&dir.state("h"), &["--launch-modes", "insert-then-silent,normal", "--exit-after-acks", "1"]), "messages": ["x"] }]),
+        ),
+    );
+    let root_pid = first.until("root pid1", |value| value["event"] == "root-pid1-started")["pid"]
+        .as_i64()
+        .unwrap();
+    let peer_pid = first.event("h", "launched")["pid"].as_u64().unwrap();
+    wait_state(&dir.state("h"), |state| {
+        state["insertions"].as_array().unwrap().len() == 1
+    });
+    let root_id = first.until("started", |value| value["event"] == "started")["root_id"].clone();
+    first.kill();
+    let status = kill_and_reap_root(&dir, i32::try_from(root_pid).unwrap());
+    assert!(libc::WIFSIGNALED(status));
+    assert!(!alive(peer_pid), "the peer ends with its root namespace");
+
+    let (terminal, status, seen) = Run::start(&dir, &recover(&dir)).terminal();
+    assert_eq!(terminal["status"], "ended", "{terminal}");
+    assert_eq!(status.code(), Some(0));
+    let found = custody(&seen);
+    assert_eq!(found["outcome"], "absent");
+    assert_eq!(found["observed"], "absent-exit-not-observed");
+    assert_eq!(found["root_id"], root_id, "same durable root identity");
+    let unknown = events(&seen, "h", "prior-end-unknown");
+    assert_eq!(unknown.len(), 1);
+    assert_eq!(
+        unknown[0]["meaning"],
+        "ended-with-root-namespace-status-unknown"
+    );
+    assert!(
+        events(&seen, "h", "prior-exit").is_empty(),
+        "no fabricated exit"
+    );
+    let started = roots_started(&seen);
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0]["incarnation"], 2);
+    let record = harness(&terminal, "h");
+    assert_eq!(record["prior_unknown_ends"], 1);
+    assert_eq!(record["prior_exits"], json!([]));
+    assert_eq!(record["launches"], 1);
+    assert_eq!(record["exits"], json!(["code:0"]));
+    assert_eq!(
+        record["messages"][0]["closures"], 0,
+        "unknown end is not a closure"
+    );
+    assert_eq!(record["messages"][0]["state"], "acknowledged");
+    let conn = db(&dir);
+    let ended: String = conn
+        .query_row("SELECT ended FROM incarnation WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(ended, "absent-exit-not-observed");
+    let (outcome, observer): (String, Option<String>) = conn
+        .query_row(
+            "SELECT outcome, observer FROM work WHERE incarnation = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(outcome, "ended-with-root-namespace-status-unknown");
+    assert_eq!(observer, None);
+}
+
+fn seqpacket(path: &Path) -> OwnedFd {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: plain socket/connect on a new descriptor and local address.
+    unsafe {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0);
+        assert!(fd >= 0);
+        let fd = OwnedFd::from_raw_fd(fd);
+        let mut addr: libc::sockaddr_un = std::mem::zeroed();
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let bytes = path.as_os_str().as_bytes();
+        assert!(bytes.len() < addr.sun_path.len());
+        for (slot, byte) in addr.sun_path.iter_mut().zip(bytes) {
+            *slot = *byte as libc::c_char;
+        }
+        let len = (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
+        assert_eq!(
+            libc::connect(fd.as_raw_fd(), (&raw const addr).cast(), len),
+            0
+        );
+        fd
+    }
+}
+
+/// Sends one request to a root PID 1 custody socket and returns its reply.
+fn probe(path: &Path, request: &Value) -> Value {
+    let socket = seqpacket(path);
+    let mut file = std::fs::File::from(socket);
+    file.write_all(request.to_string().as_bytes()).unwrap();
+    let mut buffer = vec![0u8; 65536];
+    let read = std::io::Read::read(&mut file, &mut buffer).unwrap();
+    serde_json::from_slice(&buffer[..read]).unwrap()
+}
+
+/// (p) Root PID 1 grants authority only by positive attribution: a peer
+/// that does not present this incarnation's token from the root's private
+/// store, or presents it with a generation not newer than the admitted
+/// owner's, is refused, and the live owner is unaffected. Two roots are
+/// independent: killing one root's owner leaves the other root's PID 1,
+/// peers and owner untouched, and its recovery attaches only to its own
+/// root PID 1.
+#[test]
+fn unattributed_peers_are_refused_and_roots_are_independent() {
+    let a = Scratch::new("scope-a");
+    let b = Scratch::new("scope-b");
+    let mut owner_a = Run::start(
+        &a,
+        &spec(
+            &a,
+            1,
+            json!([{ "id": "quiet", "argv": peer(&a.state("quiet"), &["--mode", "silent"]), "messages": ["x"] }]),
+        ),
+    );
+    let mut owner_b = Run::start(
+        &b,
+        &spec(
+            &b,
+            1,
+            json!([{ "id": "quiet", "argv": quiet_until_reattach(&b.state("quiet"), &[]), "messages": ["y"] }]),
+        ),
+    );
+    let root_a = owner_a.until("root a", |value| value["event"] == "root-pid1-started")["pid"]
+        .as_u64()
+        .unwrap();
+    let root_b = owner_b.until("root b", |value| value["event"] == "root-pid1-started")["pid"]
+        .as_u64()
+        .unwrap();
+    assert_ne!(root_a, root_b);
+    let peer_a = owner_a.event("quiet", "launched")["pid"].as_u64().unwrap();
+    let peer_b = owner_b.event("quiet", "launched")["pid"].as_u64().unwrap();
+    wait_state(&a.state("quiet"), |state| {
+        !state["prompts"].as_array().unwrap().is_empty()
+    });
+    wait_state(&b.state("quiet"), |state| {
+        state["insertions"].as_array().unwrap().len() == 1
+    });
+
+    let socket = a.store().join("pid1-1.sock");
+    let token: String = db(&a)
+        .query_row("SELECT token FROM incarnation WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let refusals = [
+        (
+            json!({ "op": "spawn", "work": "w99", "argv": ["/bin/true"] }),
+            "peer-unattributed",
+        ),
+        (
+            json!({ "op": "hello", "token": "0".repeat(32), "generation": 99 }),
+            "peer-unattributed",
+        ),
+        (
+            json!({ "op": "hello", "token": token, "generation": 1 }),
+            "stale-generation",
+        ),
+    ];
+    for (request, reason) in refusals {
+        let reply = probe(&socket, &request);
+        assert_eq!(reply["event"], "refused", "{request}: {reply}");
+        assert_eq!(reply["reason"], reason, "{request}");
+    }
+    assert!(
+        owner_a
+            .drain_now()
+            .iter()
+            .all(|value| value["event"] != "detached")
+    );
+    assert_eq!(
+        read_state(&a.state("quiet"))["launches"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    owner_b.kill();
+    assert!(
+        alive(root_a) && alive(peer_a),
+        "root a is untouched by root b's owner death"
+    );
+    assert!(alive(root_b) && alive(peer_b));
+    let (terminal, status, seen) = Run::start(&b, &recover(&b)).terminal();
+    assert_eq!(terminal["status"], "ended", "{terminal}");
+    assert_eq!(status.code(), Some(0));
+    assert_eq!(custody(&seen)["outcome"], "attached");
+    assert_eq!(events(&seen, "quiet", "reattached")[0]["pid"], peer_b);
+    assert!(alive(root_a) && alive(peer_a));
+
+    owner_a.cancel();
+    let (terminal, status, _) = owner_a.terminal();
+    assert_eq!(terminal["status"], "cancelled");
+    assert_eq!(status.code(), Some(2));
+    assert_eq!(harness(&terminal, "quiet")["exits"], json!(["signal:9"]));
+}
+
+/// (q) A recorded incarnation is adopted only if the process at its pid is
+/// still exactly it (start time and boot id). Here the store's recorded
+/// start time no longer matches the running root PID 1 (as after pid
+/// reuse). The restarted owner neither adopts nor signals that process:
+/// it treats the recorded incarnation as not running, starts a new
+/// incarnation, and relaunches. The unadopted process and its peer are
+/// left alive (this test's cleanup ends them).
+#[test]
+fn mismatched_incarnation_is_neither_adopted_nor_signalled() {
+    let dir = Scratch::new("identity");
+    let mut first = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            3,
+            json!([{ "id": "h", "argv": peer(&dir.state("h"), &["--launch-modes", "insert-then-silent,normal", "--exit-after-acks", "1"]), "messages": ["x"] }]),
+        ),
+    );
+    let old_root = first.until("root pid1", |value| value["event"] == "root-pid1-started")["pid"]
+        .as_u64()
+        .unwrap();
+    let old_peer = first.event("h", "launched")["pid"].as_u64().unwrap();
+    wait_state(&dir.state("h"), |state| {
+        state["insertions"].as_array().unwrap().len() == 1
+    });
+    first.kill();
+    rusqlite::Connection::open(dir.store().join("intent.sqlite3"))
+        .unwrap()
+        .execute(
+            "UPDATE incarnation SET start_time = start_time + 1 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+    let mut second = Run::start(&dir, &recover(&dir));
+    let found = second.until("custody", |value| value["event"] == "custody");
+    assert_eq!(found["outcome"], "absent", "{found}");
+    assert_eq!(found["observed"], "recorded-process-not-running");
+    let (terminal, status, seen) = second.terminal();
+    assert_eq!(terminal["status"], "ended", "{terminal}");
+    assert_eq!(status.code(), Some(0));
+    let record = harness(&terminal, "h");
+    assert_eq!(record["reattached"], 0, "never adopted");
+    assert_eq!(record["prior_unknown_ends"], 1);
+    assert_eq!(record["launches"], 1);
+    let started = roots_started(&seen);
+    assert_eq!(started.len(), 1);
+    assert_ne!(started[0]["pid"], old_root);
+    assert!(alive(old_root), "unadopted process is not signalled");
+    assert!(alive(old_peer));
 }
