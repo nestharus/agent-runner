@@ -2,7 +2,10 @@
 """Linux native ACP v2 bounded privileged front door. Root-owned assets,
 site routes and requester identity determine launch; stdin v1 JSON supplies
 one task, cwd/policy/env/deadline, optional inline access-only credential.
-No requester credential path or raw native-root fields are read.
+No requester credential path or raw native-root fields are read. A Claude
+route (`harness: claude`) takes no credential: Claude Code runs as the
+requester against the route's store below the requester's home, which this
+process names but never reads.
 
 Nonblocking control/output queues keep timers independent of consumers.
 Early close/cancel arms a grace-relative kill; absent controls the backstop
@@ -52,6 +55,11 @@ RUNNER = "bin/oulipoly-agent-runner"
 SUPERVISOR = "bin/oulipoly-root-supervisor"
 PID1 = "bin/oulipoly-root-pid1"
 DEPS = "opencode/deps"
+CLAUDE_DEPS = "claude/deps"
+NODE = "claude/node/bin/node"
+CLAUDE_EXECUTABLE = CLAUDE_DEPS + "/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude"
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+CLAUDE_MODEL = re.compile(r"[A-Za-z0-9._\[\]-]{1,128}")
 BASH_TOOL = "agent-bash/bash.ts"
 BASH_BIN = "agent-bash/agent-bash"
 
@@ -175,11 +183,11 @@ def package_root():
 def check_package(root):
     check_owned(root)
     check_tree(root)
-    for name in (RUNNER, SUPERVISOR, PID1, BASH_BIN):
+    for name in (RUNNER, SUPERVISOR, PID1, BASH_BIN, NODE, CLAUDE_EXECUTABLE):
         path = os.path.join(root, name)
         if not os.path.isfile(path) or not os.access(path, os.X_OK):
             raise Refused(f"package: no executable {name}")
-    for name in (BASH_TOOL, DEPS + "/package-lock.json"):
+    for name in (BASH_TOOL, DEPS + "/package-lock.json", CLAUDE_DEPS + "/package-lock.json"):
         if not os.path.isfile(os.path.join(root, name)):
             raise Refused(f"package: no {name}")
 
@@ -219,17 +227,42 @@ def load_site(path):
     if not isinstance(routes, dict) or not routes:
         raise Refused("site config: routes")
     for name, route in routes.items():
-        if (
-            not isinstance(route, dict)
-            or set(route) - {"model", "provider", "credential"}
-            or not isinstance(route.get("model"), str)
-            or "/" not in route["model"]
-            or not isinstance(route.get("provider"), dict)
-            or route["model"].split("/", 1)[0] not in route["provider"]
-            or route.get("credential") not in ("required", "none")
-        ):
+        if not (opencode_route(route) or claude_route(route)):
             raise Refused(f"site config: route {name}")
     return site
+
+
+def opencode_route(route):
+    return (
+        isinstance(route, dict)
+        and not set(route) - {"model", "provider", "credential"}
+        and isinstance(route.get("model"), str)
+        and "/" in route["model"]
+        and isinstance(route.get("provider"), dict)
+        and route["model"].split("/", 1)[0] in route["provider"]
+        and route.get("credential") in ("required", "none")
+    )
+
+
+def claude_route(route):
+    """A native Claude Code route: model, effort, and the requester's own
+    Claude configuration directory relative to its home. No credential."""
+    store = route.get("config_dir") if isinstance(route, dict) else None
+    return (
+        isinstance(route, dict)
+        and set(route) == {"harness", "model", "effort", "config_dir", "credential"}
+        and route["harness"] == "claude"
+        and isinstance(route["model"], str)
+        and CLAUDE_MODEL.fullmatch(route["model"]) is not None
+        and route["effort"] in CLAUDE_EFFORTS
+        and route["credential"] == "none"
+        and isinstance(store, str)
+        and store
+        and "\0" not in store
+        and not store.startswith("/")
+        and not os.path.normpath(store).startswith("..")
+        and os.path.normpath(store) != "."
+    )
 
 
 # The requester and its request.
@@ -510,6 +543,27 @@ def write_private(path, value):
 
 def entry_request(package, run, user, checked, env, authenticated):
     route = checked["route"]
+    common = {
+        "store": os.path.join(run, "store"),
+        "launch_dir": os.path.join(run, "launch"),
+        "cwd": checked["cwd"],
+        "env": env,
+        "messages": [checked["message"]],
+        "outage_closure_cap": 1,
+        "delivery_attempt_cap": 1,
+        "workload": {"isolation": "host-root", "user": user.pw_name},
+    }
+    if route.get("harness") == "claude":
+        # Named only: the requester's own store, never read here.
+        return dict(common, claude={
+            "deps": os.path.join(package, CLAUDE_DEPS),
+            "node": os.path.join(package, NODE),
+            "agent_bash_bin": os.path.join(package, BASH_BIN),
+            "model": route["model"],
+            "effort": route["effort"],
+            "config_dir": os.path.normpath(os.path.join(user.pw_dir, route["config_dir"])),
+            **checked["policy"],
+        })
     opencode = {
         "deps": os.path.join(package, DEPS),
         "agent_bash_tool": os.path.join(package, BASH_TOOL),
@@ -520,17 +574,7 @@ def entry_request(package, run, user, checked, env, authenticated):
     }
     if authenticated:
         opencode["auth"] = os.path.join(run, "private", "auth.json")
-    return {
-        "store": os.path.join(run, "store"),
-        "launch_dir": os.path.join(run, "launch"),
-        "cwd": checked["cwd"],
-        "env": env,
-        "messages": [checked["message"]],
-        "outage_closure_cap": 1,
-        "delivery_attempt_cap": 1,
-        "opencode": opencode,
-        "workload": {"isolation": "host-root", "user": user.pw_name},
-    }
+    return dict(common, opencode=opencode)
 
 
 # Containment: the entry is PID 1 of a fresh PID and mount namespace.
@@ -911,6 +955,7 @@ def run_locked(argv, environ, stdin_fd=0):
             "run_dir": run_dir,
             "requester": {"user": user.pw_name, "uid": user.pw_uid},
             "route": checked["route_name"],
+            "harness": checked["route"].get("harness", "opencode"),
             "model": checked["route"]["model"],
             "bash": "trusted-task" if "bash_authority" in checked["policy"] else {"allow": checked["policy"]["bash_allow"]},
             "env_names": sorted(env),

@@ -1,0 +1,145 @@
+// A stand-in for the Claude Code executable, used only by this crate's
+// native Claude tests (and the packaging fixture). It is not Claude Code:
+// it speaks the subset of the stream-json control protocol the Agent SDK
+// drives (`initialize`, user messages, `mcp_message` to the SDK's
+// in-process MCP server) and scripts its replies from the prompt text.
+// Tests install it, with a `#!<node>` line, where the SDK's platform
+// package keeps the executable.
+//
+// FAKE_CLAUDE_RECORD names a file it appends JSON lines to: its argv, the
+// environment it got, the MCP tool list and tool results.
+// FAKE_CLAUDE_SCENARIO selects a behavior: normal (default), no-echo,
+// crash, error-result, unattributed, model-mismatch, denial.
+//
+// Prompt text: `RUN <command>` calls the MCP `bash` tool with that command
+// and answers `DONE <first output line>`; anything else is answered
+// `ECHO <text>` in two assistant messages (the first carries the
+// attribution, as Claude Code's first reply does).
+
+import { appendFileSync } from "node:fs"
+import { createInterface } from "node:readline"
+import { randomUUID } from "node:crypto"
+
+const scenario = process.env.FAKE_CLAUDE_SCENARIO || "normal"
+const recordFile = process.env.FAKE_CLAUDE_RECORD
+const session = randomUUID()
+const args = process.argv.slice(2)
+const flag = (name) => {
+  const at = args.indexOf(name)
+  return at >= 0 ? args[at + 1] : undefined
+}
+
+function record(value) {
+  if (recordFile) appendFileSync(recordFile, JSON.stringify(value) + "\n")
+}
+
+function send(value) {
+  process.stdout.write(JSON.stringify(value) + "\n")
+}
+
+record({
+  argv: args,
+  env: Object.fromEntries(Object.entries(process.env).filter(([name]) =>
+    /^(ANTHROPIC_|CLAUDE|ENABLE_TOOL_SEARCH|DISABLE_|OULIPOLY_|AGENT_BASH_|HOME$|NODE_OPTIONS)/.test(name))),
+  cwd: process.cwd(),
+})
+
+let requests = 0
+const pending = new Map()
+function mcp(message) {
+  const request_id = `fake-${++requests}`
+  send({ type: "control_request", request_id, request: { subtype: "mcp_message", server_name: "oulipoly", message } })
+  return new Promise((resolve) => pending.set(request_id, resolve))
+}
+
+let initSent = false
+let mcpReady = false
+async function turn(user) {
+  const text = user.message.content.map((block) => block.text).join("")
+  const uuids = [user.uuid]
+  const attribution = scenario === "unattributed" ? {} : { user_message_uuid: user.uuid, user_message_uuids: uuids }
+  if (!initSent) {
+    initSent = true
+    const tools = (flag("--tools") || "").split(",").filter(Boolean)
+    send({
+      type: "system", subtype: "init", session_id: session, uuid: randomUUID(),
+      claude_code_version: "fake", cwd: process.cwd(), apiKeySource: "none",
+      model: scenario === "model-mismatch" ? "claude-other" : flag("--model"),
+      permissionMode: flag("--permission-mode"), tools: [...tools, "mcp__oulipoly__bash"],
+      mcp_servers: [{ name: "oulipoly", status: "connected" }], slash_commands: [], output_style: "default",
+      skills: [], plugins: [], capabilities: ["fake_capability_v1"],
+    })
+  }
+  const assistant = (content, extra = {}) => send({
+    type: "assistant", uuid: randomUUID(), session_id: session, parent_tool_use_id: null,
+    message: { id: randomUUID(), role: "assistant", model: flag("--model"), content, stop_reason: null }, ...extra,
+  })
+  const result = (fields) => send({
+    type: "result", subtype: "success", uuid: randomUUID(), session_id: session, duration_ms: 1,
+    duration_api_ms: 1, is_error: false, num_turns: 1, result: "", stop_reason: "end_turn",
+    total_cost_usd: 0, usage: {}, modelUsage: {}, permission_denials: [], ...attribution, ...fields,
+  })
+  if (scenario === "crash") {
+    assistant([{ type: "text", text: "about to fail" }], attribution)
+    process.exit(1)
+  }
+  if (scenario === "error-result") {
+    assistant([{ type: "text", text: "model not available" }], { ...attribution, error: "model_not_found" })
+    result({ is_error: true, result: "model not available", api_error_status: 404 })
+    return
+  }
+  if (text.startsWith("RUN ")) {
+    const command = text.slice(4)
+    if (!mcpReady) {
+      mcpReady = true
+      await mcp({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "fake-claude", version: "0" } } })
+      await mcp({ jsonrpc: "2.0", method: "notifications/initialized" })
+      const listed = await mcp({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} })
+      record({ tools_list: listed })
+    }
+    assistant([{ type: "tool_use", id: "toolu_1", name: "mcp__oulipoly__bash", input: { command } }], attribution)
+    const called = await mcp({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "bash", arguments: { command } } })
+    record({ tool_result: called })
+    const body = called?.mcp_response?.result?.content?.[0]?.text ?? ""
+    send({ type: "user", uuid: randomUUID(), session_id: session, parent_tool_use_id: null,
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: body }] } })
+    assistant([{ type: "text", text: `DONE ${body.split("\n")[0]}` }])
+    result({ result: `DONE ${body.split("\n")[0]}` })
+    return
+  }
+  assistant([{ type: "text", text: "thinking about it" }], attribution)
+  assistant([{ type: "text", text: `ECHO ${text}` }])
+  const denials = scenario === "denial" ? [{ tool_name: "Write", tool_use_id: "toolu_9", tool_input: {} }] : []
+  result({ result: `ECHO ${text}`, permission_denials: denials })
+}
+
+let chain = Promise.resolve()
+const lines = createInterface({ input: process.stdin })
+lines.on("line", (line) => {
+  let message
+  try {
+    message = JSON.parse(line)
+  } catch {
+    return
+  }
+  if (message.type === "control_request") {
+    if (message.request?.subtype === "initialize")
+      record({ initialize: { sdkMcpServers: message.request.sdkMcpServers, hooks: message.request.hooks ?? null } })
+    send({ type: "control_response", response: { subtype: "success", request_id: message.request_id,
+      response: message.request?.subtype === "initialize" ? { commands: [], models: [], account: {} } : {} } })
+    return
+  }
+  if (message.type === "control_response") {
+    const resolve = pending.get(message.response?.request_id)
+    pending.delete(message.response?.request_id)
+    resolve?.(message.response?.response)
+    return
+  }
+  if (message.type === "user") {
+    record({ user: { uuid: message.uuid, client_composed: message.client_composed ?? null } })
+    if (scenario === "no-echo") return
+    if (args.includes("--replay-user-messages")) send({ ...message, session_id: session, isReplay: true })
+    chain = chain.then(() => turn(message))
+  }
+})
+lines.on("close", () => chain.then(() => process.exit(0)))

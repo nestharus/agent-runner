@@ -1,6 +1,6 @@
-//! `native-root`: start one fresh native OpenCode ACP v2 root, or recover
-//! one this entry started, for cancel or attached continuation (Linux,
-//! opt-in, source build).
+//! `native-root`: start one fresh native ACP v2 root (OpenCode or Claude
+//! Code harness), or recover one this entry started, for cancel or attached
+//! continuation (Linux, opt-in, source build).
 //!
 //! `--request <file>` starts a root. The request file names everything the
 //! root gets: a new launch directory and a new store, the native setup
@@ -32,6 +32,15 @@
 //! native tool is denied and every command goes through the root's Bash
 //! ingress. `setup-completed` reports the effective policy (`launch.policy`,
 //! with the native permission config as written).
+//!
+//! The request names exactly one harness: `opencode` (above and below) or
+//! `claude` (`deps`, `node`, `agent_bash_bin`, `bash_allow` or
+//! `bash_authority`, `model`, `effort`, `config_dir`): one native Claude
+//! Code harness through the owner crate's ACP v2 receiver (`stdio`), as
+//! its `native_claude` module docs describe. No credential passes: Claude
+//! Code uses the work user's own login in `config_dir`, which this entry
+//! never reads. Its policy is the same named-list or `trusted-task` choice;
+//! `trusted-task` also offers the built-in Read, Write and Edit tools.
 //!
 //! `opencode.auth` (opt-in, with a model) names a private OpenCode
 //! `auth.json` that setup checks before any effect and places in the
@@ -112,6 +121,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use oulipoly_root_supervisor::native::{
     BashAuthority, OpenCodeSetup, OpenCodeSetupError, REMOVED_ENV, provision_opencode,
 };
+use oulipoly_root_supervisor::native_claude::{
+    self, ClaudeSetup, ClaudeSetupError, Effort, provision_claude,
+};
 use oulipoly_root_supervisor::{Endpoint, HarnessSpec, Intent, Recover, Request, Workload};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -144,10 +156,14 @@ pub(crate) struct NativeRootRequest {
     messages: Vec<String>,
     outage_closure_cap: u32,
     delivery_attempt_cap: u32,
-    /// The native setup inputs (`deps`, `agent_bash_tool`, `agent_bash_bin`,
-    /// `bash_allow` or `bash_authority`, optional `model` and `provider`,
-    /// and optional `auth`: see the module docs).
-    opencode: NativeSetup,
+    /// The native OpenCode setup inputs (`deps`, `agent_bash_tool`,
+    /// `agent_bash_bin`, `bash_allow` or `bash_authority`, optional `model`
+    /// and `provider`, and optional `auth`: see the module docs).
+    #[serde(default)]
+    opencode: Option<NativeSetup>,
+    /// The native Claude Code setup inputs, instead of `opencode`.
+    #[serde(default)]
+    claude: Option<ClaudeRequest>,
     /// Who the root's work runs as (see the module docs).
     workload: RequestWorkload,
 }
@@ -180,6 +196,31 @@ struct NativeSetup {
     provider: Option<Map<String, Value>>,
     #[serde(default)]
     auth: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaudeRequest {
+    deps: String,
+    node: String,
+    agent_bash_bin: String,
+    #[serde(default)]
+    bash_allow: Vec<String>,
+    #[serde(default)]
+    bash_authority: Option<BashAuthority>,
+    model: String,
+    effort: Effort,
+    config_dir: String,
+}
+
+/// One provisioned harness, whichever kind.
+struct Provisioned {
+    argv: Vec<String>,
+    receipt: Value,
+    /// Names the harness's own launch sets for itself.
+    set: Vec<String>,
+    /// Names the harness's launch removes.
+    removed: Vec<&'static str>,
 }
 
 /// The recovery request file.
@@ -264,17 +305,6 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
         Ok(owner) => owner,
         Err(reason) => return Ok(refused(&out, reason)),
     };
-    let setup = OpenCodeSetup {
-        dir: request.launch_dir.clone(),
-        deps: request.opencode.deps.clone(),
-        agent_bash_tool: request.opencode.agent_bash_tool.clone(),
-        agent_bash_bin: request.opencode.agent_bash_bin.clone(),
-        bash_allow: request.opencode.bash_allow.clone(),
-        bash_authority: request.opencode.bash_authority,
-        model: request.opencode.model.clone(),
-        provider: request.opencode.provider.clone(),
-        auth: request.opencode.auth.clone(),
-    };
     // The owner's own checks first, so its refusal cannot follow setup's
     // effects. They read only that the argv is non-empty; every
     // provisioned argv is. They include resolving the work declaration
@@ -293,12 +323,10 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
         Ok(workload) => workload,
         Err(reason) => return Ok(refused(&out, format!("owner request: {reason}"))),
     };
-    let launch = match provision_opencode(&setup, workload.identity.as_ref()) {
-        Ok(launch) => launch,
-        Err(OpenCodeSetupError::InputInvalid(reason)) => {
-            return Ok(refused(&out, format!("setup: {reason}")));
-        }
-        Err(OpenCodeSetupError::ConstructionFailed(reason)) => {
+    let provisioned = match provision(&request, workload.identity.as_ref()) {
+        Ok(provisioned) => provisioned,
+        Err((false, reason)) => return Ok(refused(&out, format!("setup: {reason}"))),
+        Err((true, reason)) => {
             out.entry(json!({
                 "entry": "terminal",
                 "stage": "setup-failed",
@@ -310,12 +338,17 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
             return Ok(out.exit(EXIT_SETUP_FAILED));
         }
     };
-    let launch_names: Vec<&str> = launch.env.iter().map(|(name, _)| name.as_str()).collect();
+    let set: Vec<&str> = provisioned.set.iter().map(String::as_str).collect();
+    let mut reach = env_reach(&request.env, &set, &provisioned.removed);
+    if request.claude.is_some() {
+        reach["claude_code"] = claude_code_reach(&request.env);
+    }
     out.entry(json!({
         "entry": "setup-completed",
-        "launch": launch.to_json(),
+        "harness": harness_kind(&request).0,
+        "launch": provisioned.receipt,
         "owner": owner,
-        "env": env_reach(&request.env, &launch_names),
+        "env": reach,
         "workload": {
             "isolation": workload.isolation.label(),
             "user": workload.identity.as_ref().map(|identity| &identity.user),
@@ -330,7 +363,7 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
         "setup": "retained",
         "retry": "do-not-replay",
     });
-    let owner_request = owner_request(&request, launch.argv.clone());
+    let owner_request = owner_request(&request, provisioned.argv);
     Ok(start_owner(
         &out,
         &owner,
@@ -338,6 +371,70 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
         &owner_request,
         &context,
     ))
+}
+
+/// Provisions the request's one harness. `Err((false, _))`: refused before
+/// any setup write; `Err((true, _))`: construction failed, effects possible.
+fn provision(
+    request: &NativeRootRequest,
+    identity: Option<&oulipoly_root_supervisor::workload::Identity>,
+) -> Result<Provisioned, (bool, String)> {
+    if let Some(claude) = &request.claude {
+        let setup = ClaudeSetup {
+            dir: request.launch_dir.clone(),
+            deps: claude.deps.clone(),
+            node: claude.node.clone(),
+            agent_bash_bin: claude.agent_bash_bin.clone(),
+            bash_allow: claude.bash_allow.clone(),
+            bash_authority: claude.bash_authority,
+            model: claude.model.clone(),
+            effort: claude.effort,
+            config_dir: claude.config_dir.clone(),
+            start_timeout_s: None,
+            ack_timeout_s: None,
+        };
+        return match provision_claude(&setup, identity) {
+            Ok(launch) => Ok(Provisioned {
+                receipt: launch.to_json(),
+                argv: launch.argv,
+                set: Vec::new(),
+                removed: native_claude::REMOVED_ENV.to_vec(),
+            }),
+            Err(ClaudeSetupError::InputInvalid(reason)) => Err((false, reason)),
+            Err(ClaudeSetupError::ConstructionFailed(reason)) => Err((true, reason)),
+        };
+    }
+    let opencode = request.opencode.as_ref().expect("checked: one harness");
+    let setup = OpenCodeSetup {
+        dir: request.launch_dir.clone(),
+        deps: opencode.deps.clone(),
+        agent_bash_tool: opencode.agent_bash_tool.clone(),
+        agent_bash_bin: opencode.agent_bash_bin.clone(),
+        bash_allow: opencode.bash_allow.clone(),
+        bash_authority: opencode.bash_authority,
+        model: opencode.model.clone(),
+        provider: opencode.provider.clone(),
+        auth: opencode.auth.clone(),
+    };
+    match provision_opencode(&setup, identity) {
+        Ok(launch) => Ok(Provisioned {
+            receipt: launch.to_json(),
+            set: launch.env.iter().map(|(name, _)| name.clone()).collect(),
+            argv: launch.argv,
+            removed: REMOVED_ENV.to_vec(),
+        }),
+        Err(OpenCodeSetupError::InputInvalid(reason)) => Err((false, reason)),
+        Err(OpenCodeSetupError::ConstructionFailed(reason)) => Err((true, reason)),
+    }
+}
+
+/// The harness id and endpoint of the request's one harness.
+fn harness_kind(request: &NativeRootRequest) -> (&'static str, Endpoint) {
+    if request.claude.is_some() {
+        ("claude", Endpoint::Stdio)
+    } else {
+        ("opencode", Endpoint::UnixSocket)
+    }
 }
 
 /// `--recover`: one new owner for an existing store, for `cancel` or
@@ -587,6 +684,9 @@ fn read_request(path: &Path) -> Result<NativeRootRequest, String> {
     if request.messages.is_empty() {
         return Err("messages names nothing to deliver".to_owned());
     }
+    if request.opencode.is_some() == request.claude.is_some() {
+        return Err("request names exactly one of opencode and claude".to_owned());
+    }
     Ok(request)
 }
 
@@ -627,6 +727,7 @@ fn owner_binary() -> Result<PathBuf, String> {
 }
 
 fn owner_request(request: &NativeRootRequest, argv: Vec<String>) -> Request {
+    let (id, endpoint) = harness_kind(request);
     Request {
         store: request.store.clone(),
         intent: Some(Intent {
@@ -634,9 +735,9 @@ fn owner_request(request: &NativeRootRequest, argv: Vec<String>) -> Request {
             delivery_attempt_cap: request.delivery_attempt_cap,
             cwd: request.cwd.clone(),
             harnesses: vec![HarnessSpec {
-                id: "opencode".to_owned(),
+                id: id.to_owned(),
                 argv,
-                endpoint: Endpoint::UnixSocket,
+                endpoint,
                 session: None,
                 messages: request.messages.clone(),
             }],
@@ -656,12 +757,12 @@ fn owner_request(request: &NativeRootRequest, argv: Vec<String>) -> Request {
 }
 
 /// Which declared names reach where: names only, never values.
-fn env_reach(declared: &BTreeMap<String, String>, launch: &[&str]) -> Value {
+fn env_reach(declared: &BTreeMap<String, String>, launch: &[&str], removal: &[&str]) -> Value {
     let names: Vec<&str> = declared.keys().map(String::as_str).collect();
     let removed: Vec<&str> = names
         .iter()
         .copied()
-        .filter(|name| REMOVED_ENV.contains(name))
+        .filter(|name| removal.contains(name))
         .collect();
     let overridden: Vec<&str> = names
         .iter()
@@ -687,6 +788,36 @@ fn env_reach(declared: &BTreeMap<String, String>, launch: &[&str]) -> Value {
                 oulipoly_root_supervisor::SOCKET_ENV,
             ],
         },
+    })
+}
+
+/// Which declared names the Claude receiver withholds from Claude Code
+/// itself (names only), besides its own launch settings.
+fn claude_code_reach(declared: &BTreeMap<String, String>) -> Value {
+    let withheld = |name: &str| {
+        [
+            "ANTHROPIC_",
+            "CLAUDE",
+            "OULIPOLY_",
+            "AGENT_BASH_",
+            "NODE_",
+            "OTEL_",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+            || [
+                "AWS_BEARER_TOKEN_BEDROCK",
+                "ENABLE_TOOL_SEARCH",
+                "DEBUG_CLAUDE_AGENT_SDK",
+                "DEBUG",
+            ]
+            .contains(&name)
+    };
+    let names: Vec<&str> = declared.keys().map(String::as_str).collect();
+    json!({
+        "withheld": names.iter().copied().filter(|name| withheld(name)).collect::<Vec<_>>(),
+        "inherited": names.iter().copied().filter(|name| !withheld(name)).collect::<Vec<_>>(),
+        "set_by_launch": "launch.claude_env_set",
     })
 }
 
@@ -843,7 +974,7 @@ mod tests {
             ("OPENCODE_CONFIG_CONTENT".to_owned(), "{}".to_owned()),
             ("TOKEN".to_owned(), "secret-value".to_owned()),
         ]);
-        let reach = env_reach(&declared, &["HOME", "XDG_CONFIG_HOME"]);
+        let reach = env_reach(&declared, &["HOME", "XDG_CONFIG_HOME"], &REMOVED_ENV);
         assert_eq!(
             reach["declared"],
             json!(["HOME", "OPENCODE_CONFIG_CONTENT", "TOKEN"])
@@ -897,9 +1028,66 @@ mod tests {
         let mut authed = base(&fresh, json!({}));
         authed["opencode"]["auth"] = json!("/private/auth.json");
         assert_eq!(
-            read(authed).unwrap().opencode.auth.as_deref(),
+            read(authed).unwrap().opencode.unwrap().auth.as_deref(),
             Some("/private/auth.json")
         );
+        // Exactly one harness kind.
+        let mut both = base(&fresh, json!({}));
+        both["claude"] = claude_setup();
+        assert!(read(both).unwrap_err().contains("exactly one"), "both");
+        let mut neither = base(&fresh, json!({}));
+        neither.as_object_mut().unwrap().remove("opencode");
+        assert!(
+            read(neither).unwrap_err().contains("exactly one"),
+            "neither"
+        );
+        let mut claude = base(&fresh, json!({}));
+        claude.as_object_mut().unwrap().remove("opencode");
+        claude["claude"] = claude_setup();
+        let request = read(claude.clone()).unwrap();
+        assert_eq!(harness_kind(&request), ("claude", Endpoint::Stdio));
+        let owner = owner_request(&request, vec!["/usr/bin/env".to_owned()]);
+        let spec = &owner.intent.as_ref().unwrap().harnesses[0];
+        assert_eq!(
+            (spec.id.as_str(), spec.endpoint),
+            ("claude", Endpoint::Stdio)
+        );
+        claude["claude"]["credential"] = json!("x");
+        assert!(read(claude).unwrap_err().contains("unknown field"));
+    }
+
+    fn claude_setup() -> Value {
+        json!({
+            "deps": "/d", "node": "/n", "agent_bash_bin": "/b",
+            "bash_authority": "trusted-task",
+            "model": "claude-opus-5-5", "effort": "medium",
+            "config_dir": "/home/nes/.claude5",
+        })
+    }
+
+    /// The Claude receiver's withheld names are reported by name only.
+    #[test]
+    fn claude_code_reach_names_withheld_credentials_never_values() {
+        let declared = BTreeMap::from([
+            ("ANTHROPIC_API_KEY".to_owned(), "secret-key".to_owned()),
+            (
+                "CLAUDE_CODE_OAUTH_TOKEN".to_owned(),
+                "secret-token".to_owned(),
+            ),
+            ("PATH".to_owned(), "/usr/bin".to_owned()),
+        ]);
+        let reach = claude_code_reach(&declared);
+        assert_eq!(
+            reach["withheld"],
+            json!(["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"])
+        );
+        assert_eq!(reach["inherited"], json!(["PATH"]));
+        let full = env_reach(&declared, &[], &native_claude::REMOVED_ENV);
+        assert_eq!(
+            full["native_host"]["removed_by_launch"],
+            json!(["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"])
+        );
+        assert!(!reach.to_string().contains("secret"));
     }
 
     /// The work identity is declared, never taken from the caller's euid:
