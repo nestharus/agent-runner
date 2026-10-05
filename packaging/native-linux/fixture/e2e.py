@@ -19,6 +19,8 @@ credential (staging, removal, no leak); refusals before any effect.
 """
 
 import argparse
+import importlib.machinery
+import importlib.util
 import json
 import os
 import shutil
@@ -167,6 +169,62 @@ def scenarios(out, model):
         """Recorded, not asserted: native behaviour this fixture shows but
         this package does not own."""
         checks.append({"check": name, "ok": None, **evidence})
+
+    # The fixed cleanup class, under real uid separation in this user
+    # namespace. Inner root is host nes; this is not host-root evidence.
+    loader = importlib.machinery.SourceFileLoader("cleanup_frontdoor", PKG + "/libexec/oulipoly-native-frontdoor")
+    spec = importlib.util.spec_from_loader("cleanup_frontdoor", loader)
+    cleanup = importlib.util.module_from_spec(spec)
+    loader.exec_module(cleanup)
+    cleanup.TRUSTED_OWNERS = frozenset({0, 65534})
+    outside = ROOT + "/private/outside"
+    os.mkdir(outside, 0o700)
+    outside_auth = outside + "/auth.json"
+    with open(outside_auth, "w") as file:
+        file.write("fake-root-owned-outside-file")
+    os.chmod(outside_auth, 0o600)
+    user_dir = RUNS + "/1000"
+    os.mkdir(user_dir, 0o711)
+    os.chmod(user_dir, 0o711)
+    for mode in ("keep", "discard", "sweep"):
+        run = user_dir + "/cleanup-" + mode
+        for sub in ("private", "launch/xdg/data/opencode", "launch/secret"):
+            os.makedirs(run + "/" + sub, exist_ok=True)
+        os.chmod(run, 0o711)
+        with open(run + "/private/lock", "w"):
+            pass
+        with open(run + "/private/retention", "w") as file:
+            file.write("discard" if mode == "sweep" else mode)
+        for rel in cleanup.CREDENTIAL_FILES:
+            with open(run + "/" + rel, "w") as file:
+                file.write("fake-run-credential")
+        data_dir = run + "/launch/xdg/data"
+        os.chown(data_dir, WORK_UID, WORK_UID)
+        os.chown(data_dir + "/opencode", WORK_UID, WORK_UID)
+        os.chown(data_dir + "/opencode/auth.json", WORK_UID, WORK_UID)
+        child = os.fork()
+        if child == 0:
+            try:
+                os.setgroups([])
+                os.setgid(WORK_UID)
+                os.setuid(WORK_UID)
+                shutil.rmtree(data_dir + "/opencode")
+                os.symlink(outside, data_dir + "/opencode")
+                os._exit(0)
+            except BaseException:
+                os._exit(1)
+        _, status = os.waitpid(child, 0)
+        if os.waitstatus_to_exitcode(status) != 0:
+            raise RuntimeError("work-side symlink fixture failed")
+        result = cleanup.sweep(user_dir)[0] if mode == "sweep" else cleanup.retire(run, mode)
+        check("cleanup: " + mode + " preserves namespace-root outside file",
+              os.path.exists(outside_auth) and os.stat(outside_auth).st_uid == 0 and not result["ok"],
+              owner="namespace uid 0 (host nes)", result=result)
+        # Remove only these just-created fixture objects, using fd-safe
+        # rmtree; no privileged traversal through the replaced ancestor.
+        shutil.rmtree(run)
+    os.unlink(outside_auth)
+    os.rmdir(outside)
 
     base = ["--route", "fixture"]
 

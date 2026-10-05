@@ -1,40 +1,28 @@
 #!/usr/bin/python3 -I
-"""Install, plan or uninstall one native-root package (run as root).
+"""Plan, install or recover/remove one Linux native ACP v2 package.
+
+Plan performs transient private-copy writes, then reports destination
+effects. Installation writes a cleanup record before private-copy or
+persistent effects, validates resolved destination custody, hashes only
+its private archive copy, verifies the extracted package and enables the
+recorded visudo-checked rule last. Failures leave the exact record for
+explicit recovery; uninstall preserves changed content and live uses,
+and keeps its record until removals finish. No service/runtime is started.
 
     install_package.py plan|install --archive A --sha256 HEX --user NAME
-        [--prefix /opt/oulipoly-native] [--etc /etc/oulipoly-native]
-        [--run-base /var/lib/oulipoly-native/runs]
-        [--sudoers /etc/sudoers.d/oulipoly-native]
-    install_package.py uninstall --record <prefix>/<id>.install.json [--purge-site]
+    install_package.py uninstall --record RECORD [--purge-site]
 
-`install` copies the archive into a root-private temporary file, checks
-the digest of that copy and uses only it, extracts it member by member (regular
-files, directories and in-package relative symlinks only) into a fresh
-`<prefix>/.<id>.partial`, root-owned with the archive's normalized modes,
-checks every file against `MANIFEST.json`, and renames it to
-`<prefix>/<id>`. It then makes the run base (`0711`) if absent, writes the
-site config from `share/frontdoor.example.json` (only if absent: an
-existing one is left and reported), and writes the sudoers rule for
-exactly this package's front door and `--user`, checked by `visudo -cf`
-before it is put in place (`0440`; an existing file is refused). Every
-path it created, and its digest, goes to `<prefix>/<id>.install.json`.
-
-`plan` prints the same effects and changes nothing. `uninstall` removes
-exactly what the record names, where it is unchanged: the sudoers file,
-the package directory and the record; with `--purge-site`, also the site
-config it wrote and the run base if empty. Nothing is started; no service
-is enabled. The old `/usr/local/libexec/oulipoly` path is refused as a
-prefix.
-
-`--dest-root DIR` (tests) puts every path under DIR; with
-`--unprivileged-test` ownership is left to the caller and `visudo` is
-skipped when absent.
+Administrative paths and unprivileged dest-root seam: --help.
+Full effects/failure paths and limitations: share/README.md.
 """
 
 import argparse
 import hashlib
 import json
 import os
+import fcntl
+import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -80,6 +68,8 @@ class Paths:
 
     def host(self, path):
         """Where `path` (as installed) is on this filesystem."""
+        if not path.startswith("/") or os.path.normpath(path) != path:
+            raise Stop("record contains a noncanonical path")
         return os.path.join(self.dest, path.lstrip("/")) if self.dest != "/" else path
 
 
@@ -91,6 +81,8 @@ def members(tar, package_id):
         name = os.path.normpath(member.name)
         if name != package_id and not name.startswith(package_id + "/"):
             raise Stop(f"archive member {member.name!r} is outside {package_id}")
+        if name != member.name.rstrip("/") or name in {n for n, _ in checked}:
+            raise Stop("noncanonical or duplicate archive member")
         if member.isdir() or member.isfile():
             pass
         elif member.issym():
@@ -108,7 +100,10 @@ def package_id_of(archive):
         first = tar.next()
         if first is None or not first.isdir() or "/" in first.name.strip("/"):
             raise Stop("archive does not start with its package directory")
-        return first.name.strip("/")
+        value = first.name.strip("/")
+        if not re.fullmatch(r"oulipoly-native-linux-x86_64-[A-Za-z0-9-]+", value):
+            raise Stop("invalid package id")
+        return value
 
 
 def extract(archive, package_id, partial, unprivileged):
@@ -121,6 +116,12 @@ def extract(archive, package_id, partial, unprivileged):
                 if rel != ".":
                     os.mkdir(path, 0o700)
             elif member.isfile():
+                # No extraction through a previously extracted symlink.
+                parent = os.path.dirname(path)
+                while parent != partial:
+                    if os.path.islink(parent):
+                        raise Stop("archive has a symlink directory ancestor")
+                    parent = os.path.dirname(parent)
                 source = tar.extractfile(member)
                 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
                 with os.fdopen(fd, "wb") as out:
@@ -152,8 +153,10 @@ def verify(root):
         if "symlink" in entry:
             if os.readlink(path) != entry["symlink"]:
                 raise Stop(f"{rel}: symlink differs from MANIFEST.json")
-        elif sha256_file(path) != entry["sha256"]:
+        elif os.path.islink(path) or not stat.S_ISREG(os.lstat(path).st_mode) or sha256_file(path) != entry["sha256"]:
             raise Stop(f"{rel}: digest differs from MANIFEST.json")
+        if "mode" in entry and oct(os.lstat(path).st_mode & 0o7777) != entry["mode"]:
+            raise Stop(f"{rel}: mode differs from MANIFEST.json")
     return manifest
 
 
@@ -180,22 +183,6 @@ def write_new(path, data, mode, unprivileged):
     os.chmod(path, mode)
 
 
-def make_dirs(path, mode, unprivileged, created):
-    missing = []
-    current = path
-    while not os.path.lexists(current):
-        missing.append(current)
-        current = os.path.dirname(current)
-    for directory in reversed(missing):
-        os.mkdir(directory, 0o755)
-        if not unprivileged:
-            os.chown(directory, 0, 0)
-        os.chmod(directory, 0o755)
-        created.append(directory)
-    if missing:
-        os.chmod(path, mode)
-
-
 def plan(args, paths, package_id):
     installed = os.path.join(paths.prefix, package_id)
     frontdoor = os.path.join(installed, FRONTDOOR)
@@ -208,20 +195,46 @@ def plan(args, paths, package_id):
             {"create-if-absent": paths.run_base, "mode": "0711", "parents": "0755"},
             {"create-if-absent": config, "mode": "0644", "from": "share/frontdoor.example.json", "allowed_users": [args.user]},
             {"create": paths.sudoers, "mode": "0440", "rule": f"{args.user} ALL=(root) NOPASSWD: {frontdoor} run", "checked_by": "visudo -cf"},
-            {"create": os.path.join(paths.prefix, package_id + ".install.json"), "mode": "0644"},
+            {"create": os.path.join(paths.prefix, package_id + ".install.json"), "mode": "0600"},
         ],
+        "transient_writes": "private 0700 temporary directory and 0600 archive copy, removed after reading; plan does not modify destinations",
+        "recovery": "bootstrap record in nearest existing prefix ancestor, moved to <id>.install.json; rule enabled last; failed effects recovered only on explicit uninstall",
         "not_done": ["no service, no old canonical path, no Broker, no existing file replaced, nothing started"],
     }
 
 
 def install(args, paths):
-    unprivileged = args.unprivileged_test
-    if args.command == "install" and not unprivileged and os.geteuid() != 0:
+    test = args.unprivileged_test
+    if args.command == "install" and not test and os.geteuid() != 0:
         raise Stop("install runs as root")
-    # The archive may sit where its owner can still change it: everything
-    # below reads only this private copy, hashed as it is made.
-    private = tempfile.mkdtemp(prefix="oulipoly-native-install-")
+    if not re.fullmatch(r"[a-f0-9]{64}", args.sha256):
+        raise Stop("sha256 must be 64 lowercase hex characters")
+    journal = None
+    if args.command == "plan":
+        private = tempfile.mkdtemp(prefix="oulipoly-native-plan-", dir=paths.dest if paths.dest != "/" else None)
+    else:
+        for configured in (paths.prefix, paths.etc, paths.run_base, paths.sudoers):
+            custody(paths.host(configured), test)
+        if os.path.lexists(paths.host(paths.sudoers)) or os.path.lexists(paths.host(paths.sudoers) + ".partial"):
+            raise Stop("sudoers or its stage exists; not replaced")
+        prefix = paths.host(paths.prefix)
+        custody(prefix, test)
+        parent = prefix
+        while not os.path.isdir(parent):
+            parent = os.path.dirname(parent)
+        record_path = os.path.join(parent, ".oulipoly-native-" + args.sha256[:12] + ".install.json")
+        private = os.path.join(parent, ".oulipoly-native-copy-" + secrets.token_hex(8))
+        private_installed = "/" + os.path.relpath(private, paths.dest) if paths.dest != "/" else private
+        data = {"v": 2, "id": "copy-" + args.sha256[:12], "package": "", "run_base": paths.run_base,
+                "sudoers": paths.sudoers, "status": "copying", "archive_sha256": args.sha256,
+                "effects": [{"kind": "private-copy", "path": private_installed, "state": "planned"}]}
+        synced_json(record_path, data, new=True)
+        journal = Record(record_path, data)
+        print(json.dumps({"recovery_record": record_path, "state": "copying"}), flush=True)
     try:
+        if journal is not None:
+            os.mkdir(private, 0o700)
+            journal.done(journal.data["effects"][0], private)
         archive = os.path.join(private, "package.tar.gz")
         if private_copy(args.archive, archive) != args.sha256:
             raise Stop("archive digest differs from --sha256")
@@ -229,9 +242,28 @@ def install(args, paths):
         if args.command == "plan":
             print(json.dumps(plan(args, paths, package_id), indent=1))
             return 0
-        return install_from(args, paths, archive, package_id)
+        return install_from(args, paths, archive, package_id, journal)
+    except BaseException as error:
+        if journal is None:
+            raise
+        journal.data.update(status="failed-or-interrupted", failure=type(error).__name__)
+        journal.save()
+        print(json.dumps({"stopped": type(error).__name__, "recovery_record": journal.path}), file=sys.stderr)
+        return 3
     finally:
-        shutil.rmtree(private, ignore_errors=True)
+        try:
+            if os.path.lexists(private):
+                shutil.rmtree(private)
+            if journal is not None:
+                journal.data["effects"][0]["state"] = "removed"
+                journal.save()
+        except OSError as error:
+            if journal is not None:
+                print(json.dumps({"stopped": "private-copy-cleanup-failed", "reason": type(error).__name__, "recovery_record": journal.path}), file=sys.stderr)
+                return 3
+            else:
+                raise
+
 
 
 def private_copy(source, target):
@@ -246,112 +278,375 @@ def private_copy(source, target):
     return digest.hexdigest()
 
 
-def install_from(args, paths, archive, package_id):
-    unprivileged = args.unprivileged_test
+def custody(path, unprivileged=False):
+    """Validate literal and resolved existing ancestry before root effects.
+    Test mode skips ownership only, and stays below its private dest-root."""
+    existing = path
+    while not os.path.lexists(existing):
+        existing = os.path.dirname(existing)
+    for start in (existing, os.path.realpath(existing)):
+        current = start
+        while True:
+            st = os.lstat(current)
+            if not unprivileged and (st.st_uid != 0 or (st.st_mode & 0o022 and not stat.S_ISLNK(st.st_mode))):
+                raise Stop("destination ancestry is not root custody")
+            if current == "/":
+                break
+            current = os.path.dirname(current)
+    if os.path.lexists(path) and os.path.islink(path):
+        raise Stop("destination is a symlink")
+
+
+def synced_json(path, value, new=False):
+    data = (json.dumps(value, indent=1, sort_keys=True) + "\n").encode()
+    if new:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as file:
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+    else:
+        staged = path + ".writing"
+        fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as file:
+                file.write(data)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(staged, path)
+        finally:
+            if os.path.lexists(staged):
+                os.unlink(staged)
+    directory = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def tree_inventory(root):
+    result = {}
+    for directory, dirs, files in os.walk(root):
+        for name in dirs + files:
+            path = os.path.join(directory, name)
+            rel = os.path.relpath(path, root)
+            st = os.lstat(path)
+            if stat.S_ISLNK(st.st_mode):
+                result[rel] = {"symlink": os.readlink(path)}
+            elif stat.S_ISDIR(st.st_mode):
+                result[rel] = {"directory": True}
+            elif stat.S_ISREG(st.st_mode):
+                result[rel] = {"sha256": sha256_file(path)}
+            else:
+                raise Stop("package has an unexpected object")
+    return result
+
+
+def expected_tree(archive, package_id):
+    with tarfile.open(archive, "r:gz") as tar:
+        checked = members(tar, package_id)
+        manifest_bytes = tar.extractfile(package_id + "/MANIFEST.json").read()
+        manifest = json.loads(manifest_bytes)
+        result = {}
+        for name, member in checked:
+            rel = os.path.relpath(name, package_id)
+            if rel == ".":
+                continue
+            if member.isdir():
+                result[rel] = {"directory": True}
+            elif member.issym():
+                result[rel] = {"symlink": member.linkname}
+            elif rel == "MANIFEST.json":
+                result[rel] = {"sha256": sha256_bytes(manifest_bytes)}
+            else:
+                result[rel] = {"sha256": manifest["files"][rel]["sha256"]}
+        return result
+
+
+# A small write-ahead cleanup record, not an automatic rollback platform.
+# A crash may leave a planned effect; recovery checks its contents before
+# removal. The enabling rule is the last destination effect.
+class Record:
+    def __init__(self, path, data):
+        self.path, self.data = path, data
+
+    def save(self):
+        synced_json(self.path, self.data)
+
+    def prepare(self, path, kind, **fields):
+        effect = {"path": path, "kind": kind, "state": "planned", **fields}
+        self.data["effects"].append(effect)
+        self.save()
+        return effect
+
+    def done(self, effect, host):
+        st = os.lstat(host)
+        effect.update(state="created", dev=st.st_dev, ino=st.st_ino)
+        self.save()
+
+
+def install_from(args, paths, archive, package_id, journal):
+    test = args.unprivileged_test
+    for path in (paths.prefix, paths.etc, paths.run_base, paths.sudoers):
+        custody(paths.host(path), test)
     sudoers = paths.host(paths.sudoers)
     if not os.path.isdir(os.path.dirname(sudoers)):
-        raise Stop(f"{os.path.dirname(paths.sudoers)} is not a directory")
+        raise Stop("sudoers parent is not a directory")
     if os.path.lexists(sudoers) or os.path.lexists(sudoers + ".partial"):
-        raise Stop(f"{paths.sudoers} exists; not replaced")
-    created = []
+        raise Stop("sudoers or its stage exists; not replaced")
     prefix = paths.host(paths.prefix)
-    make_dirs(prefix, 0o755, unprivileged, created)
     final = os.path.join(prefix, package_id)
-    record_path = final + ".install.json"
-    if os.path.lexists(final) or os.path.lexists(record_path):
-        raise Stop(f"{final} is already installed")
     partial = os.path.join(prefix, "." + package_id + ".partial")
-    if os.path.lexists(partial):
-        raise Stop(f"{partial} is left from an earlier attempt; inspect and remove it")
-    extract(archive, package_id, partial, unprivileged)
-    manifest = verify(partial)
-    os.rename(partial, final)
-    created.append(final)
-    record = {"id": package_id, "archive_sha256": args.sha256, "package": os.path.join(paths.prefix, package_id),
-              "manifest_runner": manifest["runner"], "manifest_agent_bash": manifest["agent_bash"],
-              "created": [], "files": {}, "left": []}
+    record_path = final + ".install.json"
+    for path in (final, partial, record_path, record_path + ".writing"):
+        if os.path.lexists(path):
+            raise Stop("package or prior recovery record exists; inspect its record")
+    expected = expected_tree(archive, package_id)
+    data = journal.data
+    data.update(id=package_id, package=os.path.join(paths.prefix, package_id),
+                status="installing", left=[])
+    bootstrap = journal.path
+    journal.save()
+    def mkdirs(host, mode):
+        missing = []
+        current = host
+        while not os.path.lexists(current):
+            missing.append(current)
+            current = os.path.dirname(current)
+        for directory in reversed(missing):
+            installed = "/" + os.path.relpath(directory, paths.dest) if paths.dest != "/" else directory
+            effect = journal.prepare(installed, "directory")
+            os.mkdir(directory, mode if directory == host else 0o755)
+            os.chmod(directory, mode if directory == host else 0o755)
+            journal.done(effect, directory)
 
-    run_base = paths.host(paths.run_base)
-    if os.path.lexists(run_base):
-        record["left"].append({"path": paths.run_base, "why": "exists"})
-    else:
-        make_dirs(run_base, 0o711, unprivileged, created)
+    def file_effect(path, content, mode):
+        host = paths.host(path)
+        effect = journal.prepare(path, "file", sha256=sha256_bytes(content))
+        write_new(host, content, mode, test)
+        journal.done(effect, host)
+        return effect
 
-    etc = paths.host(paths.etc)
-    config = os.path.join(etc, "frontdoor.json")
-    if os.path.lexists(config):
-        record["left"].append({"path": os.path.join(paths.etc, "frontdoor.json"), "why": "exists"})
-    else:
-        make_dirs(etc, 0o755, unprivileged, created)
-        data = site_config(os.path.join(final, "share/frontdoor.example.json"), args.user, paths.run_base)
-        write_new(config, data, 0o644, unprivileged)
-        record["files"][os.path.join(paths.etc, "frontdoor.json")] = sha256_bytes(data)
+    try:
+        mkdirs(prefix, 0o755)
+        # Save the relocation before doing it; either name remains usable.
+        data["record_final"] = record_path
+        journal.save()
+        os.rename(bootstrap, record_path)
+        journal.path = record_path
+        journal.save()
+        print(json.dumps({"recovery_record": record_path}), flush=True)
+        partial_path = os.path.join(paths.prefix, "." + package_id + ".partial")
+        tree = journal.prepare(partial_path, "tree", expected=expected, partial=True,
+                               alternate=data["package"])
+        extract(archive, package_id, partial, test)
+        manifest = verify(partial)
+        journal.done(tree, partial)
+        os.rename(partial, final)
+        tree.update(path=data["package"], partial=False)
+        journal.done(tree, final)
+        data["manifest_runner"] = manifest["runner"]
+        data["manifest_agent_bash"] = manifest["agent_bash"]
+        mkdirs(paths.host(paths.run_base), 0o711)
+        config_path = os.path.join(paths.etc, "frontdoor.json")
+        config = paths.host(config_path)
+        if os.path.lexists(config):
+            custody(config, test)
+            data["left"].append({"path": config_path, "why": "pre-existing; not owned by this install"})
+        else:
+            mkdirs(paths.host(paths.etc), 0o755)
+            file_effect(config_path, site_config(os.path.join(final, "share/frontdoor.example.json"), args.user, paths.run_base), 0o644)
+        staged_path = paths.sudoers + ".partial"
+        rule = sudoers_rule(os.path.join(final, "share/sudoers.template"), os.path.join(data["package"], FRONTDOOR), args.user)
+        effect = file_effect(staged_path, rule, 0o440)
+        if os.path.exists(VISUDO):
+            checked = subprocess.run([VISUDO, "-cf", paths.host(staged_path)], capture_output=True, timeout=10)
+            if checked.returncode:
+                raise Stop("visudo refused the rule")
+            data["sudoers_checked"] = "visudo -cf (syntax only)"
+        elif not test:
+            raise Stop("visudo absent; rule not enabled")
+        else:
+            data["sudoers_checked"] = "skipped: unprivileged test"
+        # Last enabling effect is already described durably at BOTH names.
+        effect["alternate"] = paths.sudoers
+        data["status"] = "ready-to-enable"
+        journal.save()
+        os.rename(paths.host(staged_path), sudoers)
+        effect["path"] = paths.sudoers
+        journal.done(effect, sudoers)
+        data["status"] = "installed"
+        journal.save()
+        print(json.dumps({"installed": data["package"], "record": record_path,
+                          "frontdoor": os.path.join(data["package"], FRONTDOOR)}))
+        return 0
+    except BaseException as error:
+        data["status"] = "failed-or-interrupted"
+        data["failure"] = type(error).__name__
+        try:
+            journal.save()
+        except OSError:
+            pass  # The last write-ahead version still describes effects.
+        print(json.dumps({"stopped": type(error).__name__, "recovery_record": journal.path,
+                          "action": "inspect then uninstall --record with --purge-site"}), file=sys.stderr)
+        return 3
 
-    rule = sudoers_rule(os.path.join(final, "share/sudoers.template"), os.path.join(paths.prefix, package_id, FRONTDOOR), args.user)
-    staged = sudoers + ".partial"
-    write_new(staged, rule, 0o440, unprivileged)
-    if os.path.exists(VISUDO):
-        checked = subprocess.run([VISUDO, "-cf", staged], capture_output=True, text=True)
-        if checked.returncode != 0:
-            os.unlink(staged)
-            raise Stop(f"visudo refused the rule: {checked.stdout.strip()} {checked.stderr.strip()}")
-        record["sudoers_checked"] = "visudo -cf"
-    elif not unprivileged:
-        os.unlink(staged)
-        raise Stop(f"no {VISUDO}; the rule is not installed unchecked")
-    else:
-        record["sudoers_checked"] = "skipped (unprivileged test, no visudo)"
-    os.rename(staged, sudoers)
-    record["files"][paths.sudoers] = sha256_bytes(rule)
-    record["created"] = [
-        "/" + os.path.relpath(path, paths.dest) if paths.dest != "/" else path for path in created if path != final
-    ]
-    write_new(record_path, (json.dumps(record, indent=1, sort_keys=True) + "\n").encode(), 0o644, unprivileged)
-    print(json.dumps({"installed": record["package"], "record": os.path.join(paths.prefix, package_id + ".install.json"),
-                      "frontdoor": os.path.join(record["package"], FRONTDOOR)}))
-    return 0
+
+def live_runs(base):
+    """Live/unknown locks prevent removal; no PID markers or proc scans."""
+    live = []
+    if not os.path.isdir(base):
+        return live
+    for user in os.scandir(base):
+        if not user.is_dir(follow_symlinks=False):
+            live.append(user.path)
+            continue
+        for run in os.scandir(user.path):
+            try:
+                if not run.is_dir(follow_symlinks=False):
+                    raise OSError
+                private = os.path.join(run.path, "private")
+                if os.path.islink(private):
+                    raise OSError
+                fd = os.open(os.path.join(private, "lock"), os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(fd)
+            except OSError:
+                live.append(run.path)
+    return live
+
+
+def uninstall_locked(args, paths, record_path, record):
+    test = args.unprivileged_test
+    active = live_runs(paths.host(record["run_base"]))
+    if active:
+        print(json.dumps({"stopped": "live-or-unknown-runs", "runs": active, "record_retained": record_path}))
+        return 3
+    removed, left = [], []
+    journal = Record(record_path, record)
+    # Disabling the owned rule first; package removal cannot leave an entry
+    # enabled. Changed rules stop removal and retain the record.
+    effects = sorted(record["effects"], key=lambda e: (0 if e.get("alternate") == record["sudoers"] or e["path"] == record["sudoers"] else 1,
+                                                      -len(e["path"])))
+    for effect in effects:
+        if effect.get("state") == "removed":
+            continue
+        if not args.purge_site and effect["kind"] not in ("tree", "private-copy") and effect["path"] not in (record["sudoers"], record["sudoers"] + ".partial"):
+            left.append({"path": effect["path"], "why": "purge-site not selected; record retained"})
+            continue
+        candidates = [effect["path"]]
+        if effect.get("alternate") and effect["alternate"] not in candidates:
+            candidates.append(effect["alternate"])
+        remaining = False
+        for path in candidates:
+            host = paths.host(path)
+            if not os.path.lexists(host):
+                continue
+            try:
+                custody(host, test)
+                st = os.lstat(host)
+                if effect["kind"] == "private-copy":
+                    if not stat.S_ISDIR(st.st_mode) or st.st_mode & 0o077 or (effect.get("ino") is not None and (st.st_ino, st.st_dev) != (effect["ino"], effect["dev"])):
+                        raise Stop("changed private copy directory")
+                    entries = list(os.scandir(host))
+                    if any(e.name != "package.tar.gz" or not e.is_file(follow_symlinks=False) for e in entries):
+                        raise Stop("private copy contains an unexpected object")
+                    shutil.rmtree(host)
+                elif effect["kind"] == "file":
+                    if not stat.S_ISREG(st.st_mode) or sha256_file(host) != effect["sha256"]:
+                        raise Stop("changed file")
+                    os.unlink(host)
+                elif effect["kind"] == "tree":
+                    if not stat.S_ISDIR(st.st_mode):
+                        raise Stop("changed package type")
+                    actual = tree_inventory(host)
+                    expected = effect["expected"]
+                    if (not effect.get("partial") and actual != expected) or any(expected.get(k) != v for k, v in actual.items()):
+                        raise Stop("changed package or partial tree")
+                    if not shutil.rmtree.avoids_symlink_attacks:
+                        raise Stop("safe tree removal unavailable")
+                    shutil.rmtree(host)
+                else:
+                    if not stat.S_ISDIR(st.st_mode) or (effect.get("ino") is not None and (st.st_ino, st.st_dev) != (effect["ino"], effect["dev"])):
+                        raise Stop("changed directory")
+                    # The record lives in prefix: remove that directory last.
+                    if record_path.startswith(host + "/"):
+                        child = os.path.relpath(record_path, host).split("/")[0]
+                        if set(os.listdir(host)) != {child}:
+                            raise Stop("record ancestor not empty")
+                        effect["state"] = "record-parent-pending"
+                        journal.save()
+                        continue
+                    os.rmdir(host)
+                removed.append(path)
+            except (Stop, OSError) as error:
+                remaining = True
+                left.append({"path": path, "why": str(error) if isinstance(error, Stop) else type(error).__name__})
+        if not remaining:
+            if effect.get("state") != "record-parent-pending":
+                effect["state"] = "removed"
+            journal.save()
+        elif effect["path"] in (record["sudoers"], record["sudoers"] + ".partial"):
+            break
+    record["status"] = "removal-incomplete" if left else "removals-finished"
+    record["cleanup_left"] = left
+    journal.save()
+    if not left:
+        # Move the record into an existing ancestor before removing its own
+        # parent. Keep it until every owned directory removal is finished.
+        pending = [e for e in effects if e.get("state") == "record-parent-pending"]
+        if pending:
+            top_parent = min((paths.host(e["path"]) for e in pending), key=len)
+            recovery = os.path.join(os.path.dirname(top_parent), "." + record["id"] + ".removal.json")
+            if os.path.lexists(recovery):
+                raise Stop("removal recovery record already exists")
+            os.rename(record_path, recovery)
+            journal.path = recovery
+            record_path = recovery
+            try:
+                for e in sorted(pending, key=lambda e: -len(e["path"])):
+                    os.rmdir(paths.host(e["path"]))
+                    e["state"] = "removed"
+                    journal.save()
+            except OSError:
+                print(json.dumps({"stopped": "directory-removal-failed", "record_retained": recovery}))
+                return 3
+        # Other parent directories may still have been left solely because
+        # they contain the record's parent: retry only recorded empty dirs.
+        os.unlink(record_path)
+        removed.append(args.record)
+    print(json.dumps({"removed": removed, "left": left, "record_retained": record_path if left else None}, indent=1))
+    return 3 if left else 0
 
 
 def uninstall(args, paths):
     if not args.unprivileged_test and os.geteuid() != 0:
         raise Stop("uninstall runs as root")
     record_path = paths.host(args.record)
+    custody(record_path, args.unprivileged_test)
     with open(record_path, encoding="utf-8") as file:
         record = json.load(file)
-    removed, left = [], []
-    sudoers = [path for path in record["files"] if path.startswith("/etc/sudoers") or path == paths.sudoers]
-    for path in sudoers:
-        host = paths.host(path)
-        if os.path.lexists(host) and sha256_file(host) == record["files"][path]:
-            os.unlink(host)
-            removed.append(path)
-        else:
-            left.append({"path": path, "why": "absent or changed"})
-    package = paths.host(record["package"])
-    if os.path.isdir(package) and not os.path.islink(package):
-        shutil.rmtree(package)
-        removed.append(record["package"])
-    os.unlink(record_path)
-    removed.append(args.record)
-    if args.purge_site:
-        for path, digest in record["files"].items():
-            if path in sudoers:
-                continue
-            host = paths.host(path)
-            if os.path.lexists(host) and sha256_file(host) == digest:
-                os.unlink(host)
-                removed.append(path)
-            else:
-                left.append({"path": path, "why": "absent or changed"})
-        for path in sorted(record["created"], key=len, reverse=True):
-            host = paths.host(path)
+    if record.get("v") != 2:
+        raise Stop("old record schema: inspect manually; no automatic removal")
+    # Directory flock also excludes in-flight admission, before a run's
+    # private lock exists. It holds through retirement/removal.
+    package = paths.host(record["package"]) if record["package"] else None
+    package_lock = None
+    try:
+        if package is not None and os.path.lexists(package):
+            custody(package, args.unprivileged_test)
+            package_lock = os.open(package, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
             try:
-                os.rmdir(host)
-                removed.append(path)
-            except OSError:
-                left.append({"path": path, "why": "not empty or absent"})
-    print(json.dumps({"removed": removed, "left": left}, indent=1))
-    return 0
+                fcntl.flock(package_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print(json.dumps({"stopped": "package-in-use-or-admitting", "record_retained": record_path}))
+                return 3
+        return uninstall_locked(args, paths, record_path, record)
+    finally:
+        if package_lock is not None:
+            os.close(package_lock)
 
 
 def main(argv):
@@ -382,8 +677,8 @@ def main(argv):
         if args.user == "root" or not args.user:
             raise Stop("--user must be a non-root user")
         return install(args, paths)
-    except Stop as stop:
-        print(json.dumps({"stopped": str(stop)}), file=sys.stderr)
+    except (Stop, OSError, ValueError, KeyError, TypeError, tarfile.TarError, subprocess.SubprocessError) as stop:
+        print(json.dumps({"stopped": str(stop) if isinstance(stop, Stop) else type(stop).__name__}), file=sys.stderr)
         return 3
 
 

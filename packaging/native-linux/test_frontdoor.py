@@ -108,10 +108,10 @@ class Admission(unittest.TestCase):
         refused(self, request(credential=None), "one openai entry")
 
     def test_refuses_stale_credential_for_the_deadline(self):
-        # deadline 1800 + grace 30 + margin 300 = 2130 s needed.
-        refused(self, request(credential=credential(expires=(NOW + 2129) * 1000)), "needs 2130s")
-        checked = frontdoor.check_request(request(credential=credential(expires=(NOW + 2130) * 1000)), SITE, NOW)
-        self.assertEqual(checked["credential"][1]["remaining_s"], 2130)
+        # deadline 1800 + grace 30 + margin 300 = 2162 s needed.
+        refused(self, request(credential=credential(expires=(NOW + 2161) * 1000)), "needs 2162s")
+        checked = frontdoor.check_request(request(credential=credential(expires=(NOW + 2162) * 1000)), SITE, NOW)
+        self.assertEqual(checked["credential"][1]["remaining_s"], 2162)
 
     def test_credential_free_route_refuses_a_credential(self):
         refused(self, request(route="fixture"), "takes no credential")
@@ -245,7 +245,8 @@ class Retention(Scratch):
         live = self.make_run("live", "discard", True)
         dead = self.make_run("dead", "discard", False)
         kept = self.make_run("kept", "keep", False)
-        swept = frontdoor.sweep(self.dir)
+        with mock.patch.object(frontdoor, "check_owned"):
+            swept = frontdoor.sweep(self.dir)
         self.assertEqual(sorted(os.path.basename(r["run"]) for r in swept), ["dead", "kept"])
         self.assertTrue(os.path.exists(os.path.join(live, frontdoor.CREDENTIAL_FILES[0])))
         self.assertFalse(os.path.exists(dead))

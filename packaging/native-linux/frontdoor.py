@@ -1,73 +1,21 @@
 #!/usr/bin/python3 -I
-"""oulipoly-native-frontdoor: the bounded privileged entry to one host-root
-native ACP v2 root for an unprivileged requester (Linux x86_64).
+"""Linux native ACP v2 bounded privileged front door. Root-owned assets,
+site routes and requester identity determine launch; stdin v1 JSON supplies
+one task, cwd/policy/env/deadline, optional inline access-only credential.
+No requester credential path or raw native-root fields are read.
 
-Installed root-owned as `<package>/libexec/oulipoly-native-frontdoor` and
-reached only through one sudoers rule naming that exact path with the
-exact argument `run` (see `sudoers.template`). The requester is the user
-sudo names (`SUDO_UID`); the work runs as that user with its normal host
-rights; the owner, root PID 1 and the entry run as root.
+Nonblocking control/output queues keep timers independent of consumers.
+Early close/cancel arms a grace-relative kill; absent controls the backstop
+is N+2G. Admission and collection are bounded; kernel/FS stalls remain
+outside a finite guarantee. Descriptor-relative no-follow credential
+cleanup and fd-safe discard never traverse a work-replaced symlink.
 
-What the requester may choose, on the first stdin line (one JSON object,
-at most 4 MiB, `"v": 1`): a named `route` from the site config (model and
-provider come only from there), one `message`, the `cwd` (checked as the
-requester), the Bash policy (`{"authority": "trusted-task"}` or
-`{"allow": [whole commands]}`), extra environment names (filtered), a
-`deadline_s` (at most the site's), an access-only `credential` when the
-route takes one, and `retention` (`discard`, or `keep` when the site
-allows it). Nothing else: no user, no store or launch path, no file this
-process reads on the requester's behalf, no provider config, no raw
-`native-root` request. Unknown fields are refused.
-
-What this process fixes: the work user (the requester), a fresh run
-directory under the site's root-owned run base, the root environment
-(the requester's passwd HOME/USER/LOGNAME/SHELL, the site PATH unless
-given, `LANG`; loader, libc-unsafe and owner-reserved names refused), the
-package's own co-located binaries, dependencies and agent-bash assets, and
-the containment: the entry is PID 1 of a fresh PID namespace (with its own
-mount namespace and /proc) that is this process's direct child and dies
-with it (parent-death SIGKILL). Killing it, or its own end, ends every
-process of the root, its root PID 1 and Bash work included; this process
-waits for it. Recovery (`--recover`) is not offered: post-death stance is
-containment.
-
-Credentials. Only an access-only OAuth entry the requester sends inline
-(`refresh` must be empty: no refresh grant is accepted, so nothing can be
-rotated or copied back) for the route's provider, whose `expires` covers
-the deadline plus the site margin. It is written root-only (`0600`) into
-the run's private directory, named to the entry as `auth`, and removed as
-soon as the entry reports `setup-completed`. After the root ends the
-launch directory's copies (`auth.json`, `server-password`) are removed by
-exact path; the result is reported. Never in argv, environment, logs or
-this process's output.
-
-Stdin after the first line: control lines relayed to the entry unchanged
-only if they are exactly `{"cmd":"cancel"}`, `{"cmd":"close"}` or
-`{"cmd":"send","text":...,"ref"?:...}`; anything else is refused and
-reported. Stdin EOF, a failed write to stdout, SIGHUP/SIGINT/SIGTERM are
-abandonment: a cancel, then after the site's grace a kill of the
-namespace. The deadline (`deadline_s` + grace) does the same. Nothing is
-retried or replayed.
-
-Stdout: this process's own lines carry a `frontdoor` key; every other line
-is the entry's, relayed unchanged. The last is `{"frontdoor":"terminal"}`.
-
-Exit status, one meaning each:
-
-* the entry's own status when it ended by itself (`0`, `64`, `66`, `69`,
-  `70`, `73`, `74`, `82`-`87`; see `native-root`);
-* `90`: refused before any effect;
-* `91`: refused or failed after the run directory was made (no entry, or
-  an entry that could not start); do not replay;
-* `92`: this process killed the namespace (deadline or abandonment);
-* `93`: the entry's end is unknown to this process;
-* `94`: the root ended but a credential file could not be removed (the
-  terminal line names it); this outranks the entry status.
-
-The run directory is removed after the root ends (`discard`) or kept,
-credential files removed, for the site's review (`keep`). A run left by a
-killed front door is found by its free lock on this requester's next run:
-its credential files are removed and a `discard` run is removed.
+Native exit status or 90 refusal, 91 setup failure, 92 kill requested,
+93 stop/collection unknown, 94 cleanup/residue failed. No replay.
+Access-only staging avoids intentional credential echo, but arbitrary
+native/task output is unredacted and can contain secrets. Requester env
+uses the accepted denylist and reaches root Rust processes too. Full
+contract, limits and prepared ROOT operations: share/README.md.
 """
 
 import ctypes
@@ -89,6 +37,10 @@ SITE_CONFIG = "/etc/oulipoly-native/frontdoor.json"
 REQUEST_LIMIT = 4 * 1024 * 1024
 CONTROL_LIMIT = 4 * 1024 * 1024
 MESSAGE_LIMIT = 1024 * 1024
+ADMISSION_S = 30
+COLLECTION_S = 2
+OUTPUT_LIMIT = 8 * 1024 * 1024
+MAX_EXPIRY_MS = 253402300799000
 
 EXIT_REFUSED = 90
 EXIT_RUN_FAILED = 91
@@ -144,17 +96,35 @@ class RunFailed(Exception):
 OUT_FD = 1
 
 
+def encoded(line):
+    return (line if isinstance(line, bytes) else json.dumps(line, sort_keys=True).encode()) + b"\n"
+
+
 def emit(line):
-    """Writes one line to stdout; False once stdout is gone."""
-    data = (line if isinstance(line, bytes) else json.dumps(line, sort_keys=True).encode()) + b"\n"
+    """Best effort bounded write, including admission/failure terminals."""
+    old = os.get_blocking(OUT_FD)
+    end = time.monotonic() + 0.25
+    data = encoded(line)
     try:
-        view = memoryview(data)
-        while view:
-            written = os.write(OUT_FD, view)
-            view = view[written:]
+        os.set_blocking(OUT_FD, False)
+        while data:
+            if time.monotonic() >= end:
+                return False
+            if not select.select([], [OUT_FD], [], max(0, end - time.monotonic()))[1]:
+                return False
+            try:
+                written = os.write(OUT_FD, data)
+                data = data[written:]
+            except BlockingIOError:
+                pass
         return True
     except OSError:
         return False
+    finally:
+        try:
+            os.set_blocking(OUT_FD, old)
+        except OSError:
+            pass
 
 
 # Custody: what root runs or reads must be root's alone.
@@ -167,16 +137,17 @@ def check_owned(path):
     st = os.lstat(path)
     if stat.S_ISLNK(st.st_mode):
         raise Refused(f"custody: {path} is a symlink")
-    current = path
-    while True:
-        st = os.lstat(current)
-        if st.st_uid not in TRUSTED_OWNERS:
-            raise Refused(f"custody: {current} is not owned by root")
-        if st.st_mode & 0o022 and not stat.S_ISLNK(st.st_mode):
-            raise Refused(f"custody: {current} is writable by group or others")
-        if current == "/":
-            return
-        current = os.path.dirname(current)
+    for start in (path, os.path.realpath(path)):
+        current = start
+        while True:
+            st = os.lstat(current)
+            if st.st_uid not in TRUSTED_OWNERS:
+                raise Refused(f"custody: {current} is not owned by root")
+            if st.st_mode & 0o022 and not stat.S_ISLNK(st.st_mode):
+                raise Refused(f"custody: {current} is writable by group or others")
+            if current == "/":
+                break
+            current = os.path.dirname(current)
 
 
 def check_tree(root):
@@ -290,7 +261,11 @@ def check_request(request, site, now):
         raise Refused("request: v must be 1")
     unknown = set(request) - known
     if unknown:
-        raise Refused(f"request: unknown fields {sorted(unknown)}")
+        raise Refused("request: unknown fields")
+    try:
+        json.dumps(request, ensure_ascii=False).encode("utf-8")
+    except UnicodeError:
+        raise Refused("request: invalid Unicode") from None
     route_name = request.get("route")
     route = site["routes"].get(route_name) if isinstance(route_name, str) else None
     if route is None:
@@ -356,12 +331,12 @@ def check_credential(route, credential, deadline, site, now):
     if not isinstance(access, str) or not access or len(access) > 16384 or any(c.isspace() for c in access):
         raise Refused("request: credential access")
     expires = entry.get("expires")
-    if type(expires) is not int or expires <= 0:
+    if type(expires) is not int or not 0 < expires <= MAX_EXPIRY_MS:
         raise Refused("request: credential expires")
     if "accountId" in entry and (not isinstance(entry["accountId"], str) or not entry["accountId"]):
         raise Refused("request: credential accountId")
     remaining = expires // 1000 - int(now)
-    needed = deadline + site["cancel_grace_s"] + site["credential_margin_s"]
+    needed = deadline + 2 * site["cancel_grace_s"] + COLLECTION_S + site["credential_margin_s"]
     if remaining < needed:
         raise Refused(f"request: credential expires in {remaining}s, needs {needed}s")
     return {provider: dict(entry)}, {
@@ -392,7 +367,7 @@ def root_env(user, site, extra):
     return env
 
 
-def check_cwd_as(user, cwd):
+def check_cwd_as(user, cwd, timeout=ADMISSION_S):
     """The requester itself can enter and read `cwd` (checked in a child
     with the requester's identity, never with root's)."""
     pid = os.fork()
@@ -405,7 +380,17 @@ def check_cwd_as(user, cwd):
             os._exit(0 if ok else 1)
         except BaseException:
             os._exit(2)
-    _, status = os.waitpid(pid, 0)
+    end = time.monotonic() + timeout
+    while True:
+        collected, status = os.waitpid(pid, os.WNOHANG)
+        if collected:
+            break
+        if time.monotonic() >= end:
+            os.kill(pid, signal.SIGKILL)
+            # No blocking wait on a possible kernel stall.
+            os.waitpid(pid, os.WNOHANG)
+            raise Refused("request: cwd check timed out; stop unknown")
+        time.sleep(0.01)
     if os.waitstatus_to_exitcode(status) != 0:
         raise Refused("request: cwd is not a directory the requester can enter and read")
 
@@ -424,8 +409,10 @@ def stale_runs(user_dir):
         run = os.path.join(user_dir, name)
         lock = os.path.join(run, "private", "lock")
         try:
+            check_owned(run)
+            check_owned(os.path.join(run, "private"))
             fd = os.open(lock, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
-        except OSError:
+        except (Refused, OSError):
             continue
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -436,21 +423,30 @@ def stale_runs(user_dir):
     return found
 
 
+def unlink_beneath(run, relative):
+    """No privileged traversal through work-replaceable symlinks. Each
+    directory is pinned by an fd; unlink affects only its own directory."""
+    fd = os.open(run, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        parts = relative.split("/")
+        for part in parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        os.unlink(parts[-1], dir_fd=fd)
+    finally:
+        os.close(fd)
+
+
 def remove_credentials(run):
     records = []
     for name in CREDENTIAL_FILES:
         path = os.path.join(run, name)
         try:
-            os.lstat(path)
+            unlink_beneath(run, name)
+            records.append({"path": path, "result": "removed"})
         except FileNotFoundError:
             records.append({"path": path, "result": "absent"})
-            continue
-        except OSError as error:
-            records.append({"path": path, "result": "FAILED", "error": type(error).__name__})
-            continue
-        try:
-            os.unlink(path)
-            records.append({"path": path, "result": "removed"})
         except OSError as error:
             records.append({"path": path, "result": "FAILED", "error": type(error).__name__})
     return {"ok": all(record["result"] != "FAILED" for record in records), "files": records}
@@ -462,11 +458,14 @@ def retire(run, retention):
     removed = None
     if retention == "discard" and credentials["ok"]:
         try:
+            if not shutil.rmtree.avoids_symlink_attacks:
+                raise OSError("descriptor-safe tree removal unavailable")
             shutil.rmtree(run)
             removed = True
         except OSError as error:
             removed = type(error).__name__
-    return {"credentials": credentials, "run_removed": removed}
+    return {"ok": credentials["ok"] and (retention != "discard" or removed is True),
+            "credentials": credentials, "run_removed": removed}
 
 
 def sweep(user_dir):
@@ -633,19 +632,50 @@ class Relay:
         self.out_eof = False
         self.staged_removed = None
         self.signals = []
+        self.output = b""
+        self.controls = b""
+        self.collection_errors = []
+        os.set_blocking(OUT_FD, False)
+        os.set_blocking(self.entry.stdin.fileno(), False)
+
+    def queue_output(self, line):
+        if self.stdout_gone:
+            return
+        data = encoded(line)
+        if len(self.output) + len(data) > OUTPUT_LIMIT:
+            self.stdout_gone = True
+            self.output = b""
+            self.collection_errors.append("output-backpressure")
+            self.abandon("stdout not draining")
+        else:
+            self.output += data
 
     def say(self, fields):
-        if not self.stdout_gone and not emit({"frontdoor": fields.pop("frontdoor"), **fields}):
-            self.stdout_gone = True
-            self.abandon("stdout-gone")
+        self.queue_output(fields)
+
+    def flush(self):
+        os.set_blocking(OUT_FD, False)
+        for fd, attribute in ((OUT_FD, "output"), (self.entry.stdin.fileno(), "controls")):
+            data = getattr(self, attribute)
+            if not data:
+                continue
+            try:
+                count = os.write(fd, data)
+                setattr(self, attribute, data[count:])
+            except BlockingIOError:
+                pass
+            except OSError:
+                setattr(self, attribute, b"")
+                if attribute == "output":
+                    self.stdout_gone = True
+                    self.abandon("stdout-gone")
 
     def to_entry(self, value):
-        try:
-            self.entry.stdin.write(json.dumps(value).encode() + b"\n")
-            self.entry.stdin.flush()
-            return True
-        except OSError:
+        data = encoded(value)
+        if len(self.controls) + len(data) > CONTROL_LIMIT:
             return False
+        self.controls += data
+        return True
 
     def cancel(self, why):
         if self.cancel_at is None:
@@ -666,9 +696,7 @@ class Relay:
             self.say({"frontdoor": "killed", "why": self.why})
 
     def entry_line(self, line):
-        if not self.stdout_gone and not emit(line):
-            self.stdout_gone = True
-            self.abandon("stdout-gone")
+        self.queue_output(line)
         if self.staged_removed is None and b'"setup-completed"' in line:
             try:
                 value = json.loads(line)
@@ -680,7 +708,7 @@ class Relay:
     def remove_staged(self):
         path = os.path.join(self.run, CREDENTIAL_FILES[0])
         try:
-            os.unlink(path)
+            unlink_beneath(self.run, CREDENTIAL_FILES[0])
             self.staged_removed = "removed"
         except FileNotFoundError:
             self.staged_removed = "absent"
@@ -692,10 +720,22 @@ class Relay:
         value = control(line)
         if value is None:
             self.say({"frontdoor": "control-refused", "reason": "not cancel, close or send"})
-        elif not self.to_entry(value):
-            self.say({"frontdoor": "control-undelivered", "cmd": value["cmd"]})
+        else:
+            if value["cmd"] in ("cancel", "close"):
+                # Native close/cancel may never complete. Arm before I/O.
+                if self.cancel_at is None:
+                    self.cancel_at = self.clock()
+                    self.kill_at = self.cancel_at + self.grace
+                    self.why = "requester " + value["cmd"]
+            if not self.to_entry(value):
+                self.say({"frontdoor": "control-undelivered", "cmd": value["cmd"]})
+                self.abandon("control backpressure")
 
     def step(self, stdin_fd, timeout=0.2):
+        self.flush()
+        while b"\n" in self.stdin_buffer:
+            line, self.stdin_buffer = self.stdin_buffer.split(b"\n", 1)
+            self.requester_line(line)
         now = self.clock()
         if self.signals:
             self.abandon(f"signal {self.signals[0]}")
@@ -722,6 +762,10 @@ class Relay:
                     self.out_buffer = b""
             else:
                 self.out_buffer += chunk
+                if len(self.out_buffer) > OUTPUT_LIMIT:
+                    self.out_buffer = b""
+                    self.collection_errors.append("entry-line-too-long")
+                    self.abandon("unterminated entry output")
                 while b"\n" in self.out_buffer:
                     line, self.out_buffer = self.out_buffer.split(b"\n", 1)
                     self.entry_line(line)
@@ -741,16 +785,31 @@ class Relay:
                     self.say({"frontdoor": "control-refused", "reason": "control line too long"})
 
     def run_to_end(self, stdin_fd):
-        eof_at = None
-        while not (self.out_eof and self.entry.poll() is not None):
-            self.step(stdin_fd)
-            if self.out_eof and eof_at is None:
-                eof_at = self.clock()
-            # Its output ended but it has not: give it the grace, then kill.
-            if eof_at is not None and self.clock() >= eof_at + self.grace and self.entry.poll() is None:
-                self.why = self.why or "output ended but the entry did not"
+        ended_at = None
+        while True:
+            self.step(stdin_fd, timeout=0.02)
+            now = self.clock()
+            status = self.entry.poll()
+            if self.out_eof and status is not None:
+                self.flush()
+                return status
+            if (self.out_eof or status is not None) and ended_at is None:
+                ended_at = now
+            if ended_at is not None and now >= ended_at + self.grace:
+                self.why = self.why or "entry/output ended without complete collection"
                 self.kill()
-        return self.entry.wait()
+                self.collection_errors.append("entry-collection-incomplete")
+                return self.entry.poll()
+            if self.kill_at is not None and now >= self.kill_at + COLLECTION_S:
+                self.collection_errors.append("stop-or-eof-not-observed")
+                return self.entry.poll()
+
+    def finish_output(self):
+        end = self.clock() + COLLECTION_S
+        while self.output and self.clock() < end:
+            self.flush()
+            time.sleep(0.01)
+        return not self.output and not self.stdout_gone
 
 
 def entry_exit(status, killed):
@@ -761,10 +820,14 @@ def entry_exit(status, killed):
     return status
 
 
-def read_first_line(fd, limit):
+def read_first_line(fd, limit, timeout=ADMISSION_S):
     """The first line from `fd` and whatever followed it, read unbuffered."""
     data = b""
+    end = time.monotonic() + timeout
     while b"\n" not in data:
+        remaining = end - time.monotonic()
+        if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+            raise Refused("request admission timed out")
         if len(data) > limit:
             raise Refused("request line too long")
         chunk = os.read(fd, 65536)
@@ -798,6 +861,7 @@ def admit(argv, environ, stdin_fd, now):
     site = load_site(site_path)
     user = requester(site, environ)
     line, rest = read_first_line(stdin_fd, REQUEST_LIMIT)
+    now = time.time()
     try:
         request = json.loads(line)
     except ValueError:
@@ -805,16 +869,18 @@ def admit(argv, environ, stdin_fd, now):
     checked = check_request(request, site, now)
     env = root_env(user, site, checked["extra_env"])
     check_cwd_as(user, checked["cwd"])
+    if checked["credential"] is not None:
+        checked["credential"] = check_credential(checked["route"], checked["credential"][0], checked["deadline"], site, time.time())
     return package, site, user, checked, env, rest
 
 
-def run(argv, environ, stdin_fd=0):
+def run_locked(argv, environ, stdin_fd=0):
     try:
         package, site, user, checked, env, rest = admit(argv, environ, stdin_fd, time.time())
     except Refused as refusal:
         emit({"frontdoor": "terminal", "stage": "refused", "reason": str(refusal), "effects": "none"})
         return EXIT_REFUSED
-    except OSError as error:
+    except (OSError, ValueError, TypeError, OverflowError) as error:
         emit({"frontdoor": "terminal", "stage": "refused", "reason": type(error).__name__, "effects": "none"})
         return EXIT_REFUSED
 
@@ -823,7 +889,7 @@ def run(argv, environ, stdin_fd=0):
     try:
         run_id, run_dir, lock, swept = make_run(site, user)
     except (Refused, OSError) as error:
-        emit({"frontdoor": "terminal", "stage": "run-failed", "reason": str(error), "effects": "possible"})
+        emit({"frontdoor": "terminal", "stage": "run-failed", "reason": type(error).__name__, "effects": "possible"})
         return EXIT_RUN_FAILED
     for record in swept:
         emit({"frontdoor": "swept", **record})
@@ -854,10 +920,14 @@ def run(argv, environ, stdin_fd=0):
             "retention": checked["retention"],
             "containment": "entry is PID 1 of a new PID and mount namespace and dies with this process",
         })
+        if credential_public is not None:
+            # Setup elapsed since admission; recheck just before native launch.
+            with open(os.path.join(run_dir, "private", "auth.json")) as file:
+                check_credential(checked["route"], json.load(file), checked["deadline"], site, time.time())
         try:
             entry, alive = start_entry(package, request_path)
         except (OSError, subprocess.SubprocessError) as error:
-            raise RunFailed(f"entry not started: {type(error).__name__}: {error}") from None
+            raise RunFailed(f"entry not started: {type(error).__name__}") from None
         relay = Relay(entry, run_dir, checked["deadline"] + site["cancel_grace_s"], site["cancel_grace_s"])
         relay.stdin_buffer = rest
         for number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
@@ -865,8 +935,10 @@ def run(argv, environ, stdin_fd=0):
         status = relay.run_to_end(stdin_fd)
         os.close(alive)
         code = entry_exit(status, relay.killed)
-        retired = retire(run_dir, checked["retention"])
-        if not retired["credentials"]["ok"]:
+        retired = retire(run_dir, checked["retention"]) if status is not None else {"ok": False, "stop": "unknown", "run_removed": False}
+        if relay.collection_errors:
+            code = EXIT_UNKNOWN
+        if status is not None and (not retired["ok"] or any(not record["ok"] for record in swept)):
             code = EXIT_CLEANUP_FAILED
         relay.say({
             "frontdoor": "terminal",
@@ -877,9 +949,13 @@ def run(argv, environ, stdin_fd=0):
             "cancel": relay.why,
             "staged_credential": relay.staged_removed,
             "retire": retired,
+            "swept": swept,
+            "collection_errors": relay.collection_errors,
             "exit": code,
             "retry": "do-not-replay",
         })
+        if not relay.finish_output():
+            return EXIT_UNKNOWN
         return code
     except BaseException as failure:
         killed = False
@@ -888,8 +964,11 @@ def run(argv, environ, stdin_fd=0):
             if entry.poll() is None:
                 os.kill(entry.pid, signal.SIGKILL)
                 killed = True
-            status = entry.wait()
-        retired = retire(run_dir, checked["retention"])
+            end = time.monotonic() + COLLECTION_S
+            while entry.poll() is None and time.monotonic() < end:
+                time.sleep(0.01)
+            status = entry.poll()
+        retired = retire(run_dir, checked["retention"]) if entry is None or status is not None else {"ok": False, "stop": "unknown"}
         stage = "run-failed" if isinstance(failure, RunFailed) else "front-door-failed"
         emit({
             "frontdoor": "terminal",
@@ -902,13 +981,31 @@ def run(argv, environ, stdin_fd=0):
             "effects": "possible",
             "retry": "do-not-replay",
         })
-        if not retired["credentials"]["ok"]:
+        if status is None and entry is not None:
+            return EXIT_UNKNOWN
+        if not retired["ok"]:
             return EXIT_CLEANUP_FAILED
         if entry is None:
             return EXIT_RUN_FAILED
         return EXIT_KILLED if killed else EXIT_UNKNOWN
     finally:
         os.close(lock)
+
+
+def run(argv, environ, stdin_fd=0):
+    package_lock = None
+    try:
+        package = package_root()
+        check_owned(package)
+        package_lock = os.open(package, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fcntl.flock(package_lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return run_locked(argv, environ, stdin_fd)
+    except (Refused, OSError, ValueError, TypeError) as error:
+        emit({"frontdoor": "terminal", "stage": "refused", "reason": type(error).__name__, "effects": "none"})
+        return EXIT_REFUSED
+    finally:
+        if package_lock is not None:
+            os.close(package_lock)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,5 @@
 #!/usr/bin/python3 -I
-"""oulipoly-native-call: run one task on a host-root native ACP v2 root
-through the installed front door, as the calling user (Linux x86_64).
+"""Run one Linux native ACP v2 task through its installed front door.
 
     oulipoly-native-call --route NAME --prompt-file FILE --cwd DIR --out DIR
         (--trusted-task | --allow-file FILE) [--deadline SECONDS]
@@ -8,54 +7,12 @@ through the installed front door, as the calling user (Linux x86_64).
         [--credential-opencode-auth FILE --credential-provider ID
          | --credential-codex-profile DIR]
 
-It sends one request through `sudo -n <front door> run` (the front door
-next to this script in the same package unless `--frontdoor` names one),
-keeps the front door's stdin open as its control channel, and captures its
-whole stdout. On the first turn end of the message it sends `close`; at
-the deadline, or on SIGINT/SIGTERM, it sends `cancel` (the front door kills
-the root after its grace). It never retries, replays or falls back.
-
-Credential (only when the route takes one): read here, as the caller, from
-exactly the source named, never searched for:
-
-* `--credential-opencode-auth FILE --credential-provider ID`: an OpenCode
-  `auth.json`; its `ID` entry must be `oauth`.
-* `--credential-codex-profile DIR`: a Codex CLI profile's `DIR/auth.json`;
-  its access token's own expiry is used and the entry is for `openai`.
-
-Either way only the access token, its expiry and an account id are sent
-(`refresh` empty): no refresh grant leaves the source, and nothing is
-written back. It is refused here, before anything starts, if it expires
-before the deadline plus `--credential-margin`. The value goes only into
-the front door's stdin; never into argv, the environment, a log or `--out`.
-
-`--out` (must not exist; made `0700`) receives, all non-secret:
-
-* `events.jsonl`: the front door's whole stdout, byte for byte (the entry's
-  and owner's JSON lines, which carry turn text and Bash argv);
-* `stderr.log`: the front door's and entry's stderr;
-* `caller.jsonl`: what this caller did and when;
-* `request.public.json`: the request with the credential replaced by its
-  provider and expiry;
-* `final.md`: the last agent message linked to the task's message before
-  its turn end, when there is one;
-* `result.json`: the outcome class, exits and counts.
-
-Retention of `--out` is the caller's; it holds turn text and Bash argv and
-no credential. Exit status (also `result.json` `class`):
-
-* `0` answered: an answer text, its turn end, a close followed through
-  (entry `87`) or a clean end (`0`), credentials removed, complete capture;
-* `1` no-answer: complete and closed, but no linked answer;
-* `2` usage;
-* `3` refused-locally: nothing was started (input or credential);
-* `4` front-door-refused (`90`), nothing started there;
-* `5` cancelled: deadline or signal;
-* `6` incomplete: no front door terminal, or capture or exit not observed;
-* `7` cleanup-failed: the front door could not remove a credential file;
-* `8` launch-failed: the front door could not be started;
-* `9` ended-otherwise: any other front door or entry status (see
-  `result.json`).
+Explicit caller-selected access-only source; no search/refresh/copyback.
+Nonblocking admission/control and bounded terminal/EOF/exit collection;
+unknown stop is incomplete, without pretending a privileged child ended.
+Output is captured without a redactor and can contain arbitrary secrets.
+Answered/0 means linked text plus complete transport, not task correctness.
+Exit classes and runtime/credential bounds: share/README.md.
 """
 
 import argparse
@@ -70,6 +27,10 @@ import sys
 import time
 
 EOF_GRACE_S = 30
+STOP_GRACE_S = 65
+LINE_LIMIT = 8 * 1024 * 1024
+CAPTURE_LIMIT = 64 * 1024 * 1024
+MAX_EXPIRY_MS = 253402300799000
 FRONTDOOR = "libexec/oulipoly-native-frontdoor"
 
 
@@ -87,6 +48,9 @@ def read_private(path):
         raise LocalRefusal("credential source is not the caller's own file")
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.getuid():
+            raise LocalRefusal("credential source changed or is not the caller's own regular file")
         chunks = []
         while True:
             chunk = os.read(fd, 65536)
@@ -152,6 +116,8 @@ def credential_public(credential, now):
     if credential is None:
         return None
     (provider, entry), = credential.items()
+    if type(entry["expires"]) is not int or not 0 < entry["expires"] <= MAX_EXPIRY_MS:
+        raise LocalRefusal("credential expiry is out of range")
     return {
         "provider": provider,
         "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(entry["expires"] // 1000)),
@@ -195,6 +161,8 @@ def parse_args(argv):
         parser.error("--credential-opencode-auth needs --credential-provider")
     if args.credential_provider and not args.credential_opencode_auth:
         parser.error("--credential-provider goes with --credential-opencode-auth")
+    if args.credential_margin < 0:
+        parser.error("--credential-margin must be nonnegative")
     if args.deadline < 1:
         parser.error("--deadline must be positive")
     return args
@@ -224,7 +192,7 @@ def build_request(args, now):
     for item in args.env:
         name, sep, value = item.partition("=")
         if not sep or not name:
-            raise LocalRefusal(f"--env {item!r} is not NAME=VALUE")
+            raise LocalRefusal("--env is not NAME=VALUE")
         env[name] = value
     credential = None
     if args.credential_opencode_auth:
@@ -243,6 +211,10 @@ def build_request(args, now):
         "deadline_s": args.deadline,
         "retention": args.retention,
     }
+    try:
+        json.dumps(request, ensure_ascii=False).encode("utf-8")
+    except UnicodeError:
+        raise LocalRefusal("request: invalid Unicode") from None
     public = dict(request, credential=credential_public(credential, now))
     if credential is not None:
         request["credential"] = credential
@@ -271,6 +243,8 @@ class Call:
         self.events = []
         self.sends = {}
         self.signals = []
+        self.pending = b""
+        self.stop_at = None
         self.actions = open(os.path.join(out, "caller.jsonl"), "w", encoding="utf-8")
         self.capture = open(os.path.join(out, "events.jsonl"), "wb")
 
@@ -282,13 +256,16 @@ class Call:
         if cmd in self.sends or "cancel" in self.sends or proc.stdin.closed:
             return
         self.sends[cmd] = {"why": why, "t": round(time.monotonic() - self.start, 3)}
-        try:
-            proc.stdin.write(json.dumps({"cmd": cmd}).encode() + b"\n")
-            proc.stdin.flush()
-            self.sends[cmd]["sent"] = True
-        except (OSError, ValueError) as error:
+        self.stop_at = min(self.stop_at or float("inf"), time.monotonic() + STOP_GRACE_S)
+        if self.pending:
+            # Admission is still blocked; close stdin rather than completing
+            # a cancelled request. The privileged side bounds admission too.
+            self.pending = b""
+            proc.stdin.close()
             self.sends[cmd]["sent"] = False
-            self.sends[cmd]["error"] = type(error).__name__
+        else:
+            self.pending = json.dumps({"cmd": cmd}).encode() + b"\n"
+            self.sends[cmd]["sent"] = "queued"
         self.log(action="send", cmd=cmd, why=why, sent=self.sends[cmd]["sent"])
 
     def line(self, proc, raw):
@@ -318,72 +295,126 @@ class Call:
 
     def run(self, request):
         argv, env = self.argv()
+        payload = json.dumps(request).encode() + b"\n"
         stderr = open(os.path.join(self.out, "stderr.log"), "wb")
         try:
-            proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, env=env, cwd="/")
+            proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, env=env, cwd="/", bufsize=0)
         except OSError as error:
             self.log(action="launch-failed", error=type(error).__name__)
+            stderr.close()
             return None, {"stdout_eof": False, "exit": None, "errors": ["launch-failed"]}
-        self.log(action="started", argv=argv, deadline_s=self.args.deadline)
         errors = []
-        try:
-            proc.stdin.write(json.dumps(request).encode() + b"\n")
-            proc.stdin.flush()
-        except OSError as error:
-            errors.append(f"request-write-{type(error).__name__}")
-        request = None
+        buffers = {"stdout": b"", "stderr": b""}
+        eof = {"stdout": False, "stderr": False}
+        total = 0
+        code = None
+        self.pending = payload
         deadline = self.start + self.args.deadline
+        total_end = deadline + STOP_GRACE_S
         old = {sig: signal.signal(sig, lambda sig, frame: self.signals.append(sig)) for sig in (signal.SIGINT, signal.SIGTERM)}
         selector = selectors.DefaultSelector()
-        selector.register(proc.stdout, selectors.EVENT_READ)
-        buffer = b""
-        eof = False
-        terminal_at = None
+        for pipe, name in ((proc.stdout, "stdout"), (proc.stderr, "stderr")):
+            os.set_blocking(pipe.fileno(), False)
+            selector.register(pipe, selectors.EVENT_READ, name)
+        os.set_blocking(proc.stdin.fileno(), False)
+        input_registered = False
         try:
-            while not eof:
+            while True:
                 now = time.monotonic()
                 if self.signals:
-                    self.send(proc, "cancel", f"caller signal {self.signals[0]}")
+                    self.send(proc, "cancel", "caller signal")
                 if now >= deadline:
-                    self.send(proc, "cancel", f"deadline {self.args.deadline}s")
-                if terminal_at is not None and now >= terminal_at + EOF_GRACE_S:
-                    errors.append("stdout-eof-not-observed-after-terminal")
+                    self.send(proc, "cancel", "deadline")
+                if now >= min(total_end, self.stop_at or float("inf")):
+                    errors.append("collection-bound-reached; stop-unknown")
                     break
-                for key, _ in selector.select(timeout=0.2):
-                    chunk = os.read(key.fileobj.fileno(), 65536)
-                    if not chunk:
-                        eof = True
-                        break
-                    self.capture.write(chunk)
-                    self.capture.flush()
-                    buffer += chunk
-                    while b"\n" in buffer:
-                        raw, buffer = buffer.split(b"\n", 1)
-                        self.line(proc, raw)
-                        if self.events[-1].get("frontdoor") == "terminal" and terminal_at is None:
-                            terminal_at = time.monotonic()
+                if all(eof.values()) and proc.poll() is not None:
+                    code = proc.poll()
+                    break
+                if self.pending and not proc.stdin.closed and not input_registered:
+                    selector.register(proc.stdin, selectors.EVENT_WRITE, "stdin")
+                    input_registered = True
+                elif (not self.pending or proc.stdin.closed) and input_registered:
+                    # unregister by saved fd if the pipe was closed by send.
+                    selector.unregister(input_fd)
+                    input_registered = False
+                if input_registered:
+                    input_fd = proc.stdin.fileno()
+                for key, _ in selector.select(timeout=0.02):
+                    if key.data == "stdin":
+                        if proc.stdin.closed:
+                            continue
+                        try:
+                            n = os.write(key.fd, self.pending)
+                            self.pending = self.pending[n:]
+                        except BlockingIOError:
+                            pass
+                        except OSError:
+                            self.pending = b""
                             proc.stdin.close()
-            if buffer:
+                            errors.append("request-or-control-undelivered")
+                            self.stop_at = min(self.stop_at or float("inf"), time.monotonic() + EOF_GRACE_S)
+                        continue
+                    name = key.data
+                    chunk = os.read(key.fd, 65536)
+                    if not chunk:
+                        eof[name] = True
+                        selector.unregister(key.fileobj)
+                        self.stop_at = min(self.stop_at or float("inf"), time.monotonic() + EOF_GRACE_S)
+                        continue
+                    total += len(chunk)
+                    if total > CAPTURE_LIMIT:
+                        errors.append("capture-limit; stop-unknown")
+                        break
+                    if name == "stderr":
+                        stderr.write(chunk)
+                        continue
+                    self.capture.write(chunk)
+                    buffers[name] += chunk
+                    if len(buffers[name]) > LINE_LIMIT:
+                        errors.append("stdout-line-limit; stop-unknown")
+                        break
+                    while b"\n" in buffers[name]:
+                        raw, buffers[name] = buffers[name].split(b"\n", 1)
+                        self.line(proc, raw)
+                        if self.events[-1].get("frontdoor") == "terminal":
+                            self.pending = b""
+                            if not proc.stdin.closed:
+                                proc.stdin.close()
+                            self.stop_at = min(self.stop_at or float("inf"), time.monotonic() + EOF_GRACE_S)
+                if errors and any("stop-unknown" in e for e in errors):
+                    break
+            if buffers["stdout"]:
                 errors.append("unterminated-stdout-line")
-                self.line(proc, buffer)
-            try:
-                code = proc.wait(timeout=EOF_GRACE_S)
-            except subprocess.TimeoutExpired:
-                code = None
-                errors.append("front-door-exit-not-observed")
+            code = proc.poll()
+        except (OSError, ValueError, TypeError) as error:
+            errors.append("capture-failed:" + type(error).__name__ + "; stop-unknown")
         finally:
             selector.close()
             for sig, handler in old.items():
                 signal.signal(sig, handler)
-            if not proc.stdin.closed:
+            # Closing requests abandonment, but does not prove the privileged
+            # child or its namespace was reaped. No wait without a bound.
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
                 try:
-                    proc.stdin.close()
+                    pipe.close()
                 except OSError:
                     pass
-            proc.stdout.close()
             stderr.close()
-        self.log(action="ended", exit=code, stdout_eof=eof)
-        return code, {"stdout_eof": eof, "exit": code, "errors": errors}
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    pass
+            code = proc.poll()
+        self.log(action="ended", exit=code, stdout_eof=eof["stdout"])
+        return code, {"stdout_eof": eof["stdout"], "stderr_eof": eof["stderr"],
+                      "exit": code, "errors": errors, "stop": "unknown" if errors else "observed"}
 
 
 def classify(code, collection, events, sends):
@@ -397,9 +428,9 @@ def classify(code, collection, events, sends):
         cls = "launch-failed"
     elif code == 90:
         cls = "front-door-refused"
-    elif code == 94:
+    elif code == 94 or (terminal and terminal.get("retire", {}).get("ok") is False and terminal.get("retire", {}).get("stop") != "unknown"):
         cls = "cleanup-failed"
-    elif not complete or (code in (0, 87) and not relay_complete):
+    elif not complete or code == 93 or (code in (0, 87) and not relay_complete):
         cls = "incomplete"
     elif "cancel" in sends or code == 92:
         cls = "cancelled"
@@ -424,18 +455,18 @@ def write_json(path, value):
         file.write("\n")
 
 
-def main(argv):
+def main_checked(argv):
     args = parse_args(argv)
     try:
         os.mkdir(args.out, 0o700)
     except OSError as error:
-        print(f"oulipoly-native-call: --out {args.out}: {error}", file=sys.stderr)
+        print(json.dumps({"class": "refused-locally", "reason": type(error).__name__, "started": False}), file=sys.stderr)
         return 2
     now = time.time()
     try:
         request, public = build_request(args, now)
-    except LocalRefusal as refusal:
-        write_json(os.path.join(args.out, "result.json"), {"class": "refused-locally", "reason": str(refusal), "started": False})
+    except (LocalRefusal, OSError, ValueError, TypeError, OverflowError) as refusal:
+        write_json(os.path.join(args.out, "result.json"), {"class": "refused-locally", "reason": str(refusal) if isinstance(refusal, LocalRefusal) else type(refusal).__name__, "started": False})
         return EXITS["refused-locally"]
     write_json(os.path.join(args.out, "request.public.json"), public)
     call = Call(args, args.out)
@@ -463,7 +494,7 @@ def main(argv):
         "correctness": "not-established",
         "retention": {
             "out": args.out,
-            "holds": "turn text, Bash argv, owner and entry records; no credential",
+            "holds": "turn text, Bash argv, owner and entry records; arbitrary output may contain secrets",
             "removal": "the caller's",
         },
         "retry": "do-not-replay",
@@ -471,6 +502,22 @@ def main(argv):
     call.actions.close()
     call.capture.close()
     return EXITS[cls]
+
+
+def main(argv):
+    try:
+        return main_checked(argv)
+    except (OSError, ValueError, TypeError, OverflowError) as error:
+        # result.json itself may be unwritable. Always expose a type-only
+        # machine-readable failure on stderr, without echoing inputs.
+        result = {"class": "incomplete", "reason": type(error).__name__, "stop": "unknown", "retry": "do-not-replay"}
+        try:
+            args = parse_args(argv)
+            write_json(os.path.join(args.out, "result.json"), result)
+        except (OSError, ValueError, TypeError, OverflowError):
+            pass
+        print(json.dumps(result), file=sys.stderr)
+        return EXITS["incomplete"]
 
 
 if __name__ == "__main__":
