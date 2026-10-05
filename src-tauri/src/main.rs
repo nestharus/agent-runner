@@ -548,6 +548,18 @@ fn run_cli_entrypoint() -> ExitCode {
             return ExitCode::from(code);
         }
     };
+    // native.toml selects the per-root ACP v2 native root for ordinary
+    // launches. It precedes legacy maintenance scheduling, owner bootstrap,
+    // State and provider registries; its refusals never fall through.
+    #[cfg(target_os = "linux")]
+    match commands::native_entry::run_if_selected(&cli) {
+        Ok(None) => {}
+        selected => {
+            let exit = cli_exit(selected.map(|code| code.unwrap_or(0)));
+            emit_cli_error_if_needed(&exit);
+            return cli_exit_to_code(&exit);
+        }
+    }
     schedule_entrypoint_opportunity(
         Some(&cli),
         maintenance_worker::schedule_daily_opportunity_fail_open,
