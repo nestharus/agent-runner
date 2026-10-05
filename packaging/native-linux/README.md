@@ -134,7 +134,8 @@ boundaries until ROOT separately runs them.
 First stdin line (v1 JSON, at most 4 MiB): named site route, message,
 absolute cwd, `bash` (`{"authority":"trusted-task"}` or
 `{"allow":[whole commands]}`), extra env, positive site-bounded deadline,
-optional inline access-only credential and `retention` (`discard`, or
+optional inline access-only credential, `children`, separate Claude-parent
+`child_credential`, and `retention` (`discard`, or
 site-allowed `keep`). Unknown fields are refused. No raw native-root
 paths, user, provider config, credential path or recovery are exposed.
 The cwd check drops to the requester identity.
@@ -202,7 +203,14 @@ collection allowance; then unknown is an intentional outcome.
 
 Output directory (0700, must be new): `request.public.json` (credential
 field reduced to provider/expiry), `events.jsonl`, `stderr.log`,
-`caller.jsonl`, `final.md` when linked text exists, `result.json`.
+`caller.jsonl`, `final.md` when parent-linked text exists, `result.json`,
+and `children.json` (also written as an empty inventory on no-child calls).
+The final answer and automatic close ignore child-marked events. Bash
+counts combine parent and child Bash. Child records are owner exports,
+not parent consumption: the local parent result can precede owner export
+while tracked Bash drains. Zero exported results does not mean zero local
+parent results. Terminal children summaries cover the owner generation,
+not a complete recovered history.
 Type-only unexpected failures are machine-readable; if the directory
 itself is unwritable, stderr supplies the class instead of promising a
 result file that cannot be written.
@@ -217,13 +225,15 @@ or tool echo can be answered/0; entry 87 means close followed through.
 ## Native Claude routes
 
 A route with `"harness": "claude"` names `model`, `effort`
-(`low|medium|high|xhigh|max`), `config_dir` and `"credential": "none"`;
-nothing else. The example site config carries `opus-medium` and
-`opus-high` (`claude-opus-5-5`, `.claude5`); `sol-high` is unchanged.
+(`low|medium|high|xhigh|max`), `config_dir` and `"credential": "none"`, and
+may offer named `children`. The example site config carries `opus-medium` and
+`opus-high` (`claude-opus-5-5`, `.claude5`), with `luna-max` offered on
+these and `sol-high`.
 `config_dir` is relative to the requester's passwd home (no absolute path,
 no `..`): the requester's own Claude configuration directory. The front
 door, runner and owner only name it; nothing of root reads it, and no
-credential is accepted, staged or removed for these routes.
+parent credential is accepted, staged or removed for these routes.
+Opted-in explorers have a separate child-provider grant, described below.
 
 The owner runs the receiver (`claude/node/bin/node` with the owner crate's
 `native/claude/acp-v2-receiver.mjs`, a `stdio` harness) as the requester.
@@ -252,14 +262,98 @@ failure is a visible error notice and a bounded end of the harness (no
 deadline-long wait, no replay); error results, unattributed results, a
 different reported model and permission denials are visible notices and
 `_claude_*` stop reasons. No CLI version gate: support is observed at
-runtime. The caller works unchanged: `--route opus-medium` without any
-credential option.
+runtime. For no-child calls, use `--route opus-medium` without a credential
+option.
 
 The offline controls use a stand-in for the Claude Code executable
 (the crate's `tests/fixtures/fake-claude.mjs`); they check the receiver,
 SDK wiring, owner contract and package path, not Claude Code, a login, a
 subscription or a model. A real native Claude run remains ROOT's separate
 witness.
+
+## Registered orientation explorers (explicit opt-in)
+
+The site owns `child_routes`, each parent route's `children` offer list,
+and `child_limits` (at most **4 starts / 2 funded concurrent**, depth 1).
+The requester opts in with `--child-route NAME` (repeatable), optionally
+lowering `--child-max-starts` and `--child-max-concurrent`. A request can
+name only offered routes; it cannot select models, providers, paths or
+credentials' locations for the owner. A child never offers children.
+The root owns its children's lifetime; close, cancel, requester loss,
+parent-work end and the outer deadline stop them, without replay.
+
+`frontdoor.example.json` offers `luna-max`: **openai/gpt-6-luna** with
+model `options.reasoningEffort: "max"`, `reasoningSummary: "auto"`,
+`include: ["reasoning.encrypted_content"]` and `store: false`, using
+`@ai-sdk/openai` Responses rather than Chat Completions. The provider's
+[model page](https://developers.openai.com/api/docs/models/gpt-6-luna)
+lists this model id and `max`; tool use at non-`none` effort requires
+Responses. The locked OpenCode 1.18.30
+[provider](https://github.com/anomalyco/opencode/blob/v1.18.30/packages/opencode/src/provider/provider.ts)
+selects Responses, merges model options, and its
+[transform](https://github.com/anomalyco/opencode/blob/v1.18.30/packages/opencode/src/provider/transform.ts)
+forwards explicit reasoning options with `forceReasoning`. Its generated
+OpenAI variants do not enumerate `max`: this example uses explicit model
+options, not variant inference. OpenCode's bundled `@ai-sdk/openai` 3.0.88
+accepts a string effort and serializes it as `reasoning.effort`.
+The built-in [Codex plugin](https://github.com/anomalyco/opencode/blob/v1.18.30/packages/opencode/src/plugin/openai/codex.ts)
+admits GPT major versions above 5 and redirects OAuth Responses to its
+Codex endpoint. These are public configuration/source facts, **not** a
+runtime witness of Luna, effort, subscription or account-limit support.
+First ordinary opted-in use after ROOT's paired deployment is that witness;
+no probe, forced renewal, substituted model or fallback is implied.
+
+An OpenCode/Sol parent reuses its admitted matching-provider access-only
+grant. A Claude parent opts in with a separate explicit
+`--child-credential-codex-profile PROFILE`, or
+`--child-credential-opencode-auth AUTH --child-credential-provider openai`.
+Claude's own login is not read by the caller/front door for this grant.
+No-child Claude calls stage no child grant. The grant is snapshotted once
+into root-private `private/child-auth.json` and copied per child launch;
+it is retained past parent setup-completed for later admissions. A child
+grant that ages during admission can leave setup files before its final
+freshness refusal; local freshness is not issuer or account validation.
+
+After ROOT's review and installation, example caller opt-ins are:
+
+```bash
+<package>/bin/oulipoly-native-call --route sol-high --prompt-file TASK \
+  --cwd TREE --out NEW-DIR --trusted-task --deadline 1800 \
+  --credential-codex-profile EXPLICIT-PROFILE --child-route luna-max
+
+<package>/bin/oulipoly-native-call --route opus-medium --prompt-file TASK \
+  --cwd TREE --out NEW-DIR --trusted-task --deadline 1800 \
+  --child-route luna-max --child-credential-codex-profile EXPLICIT-PROFILE
+```
+
+The parent's `explore` / `mcp__oulipoly__explore` tool returns orientation
+and separate lifecycle text. `answered` is content only. Known child end
+and Bash drain are separate observations. Unknown possible child/Bash ends
+stay charged until positive end (untracked unknowns conservatively for the
+owner's remaining life); tracked Bash holds the slot through its waiter's
+end. Even the ordinary local result says **release pending** while still
+live, rather than promising an immediately available slot. A stalled Bash
+waiter can hold the slot and owner export until the root's outer backstop;
+no local drain timer or unbounded-progress guarantee is supplied. A setup
+refusal starts no child process but may leave a shared base or partial
+files; an exec failure can follow a positively started work. Neither
+permission configuration nor the read-only brief is an arbitrary-shell
+write barrier.
+
+The offline package fixture invokes the real OpenCode custom-tool loader
+and the published Claude SDK with a fake executable and scripted loopback
+provider on both parent kinds. The separate published-SDK MCP control
+checks explore registration/invocation and abort closing the ingress.
+To run it without adding dependencies to the product worktree, copy
+`crates/oulipoly-root-supervisor/native/` into a B-owned source overlay,
+copy its `explore-client.mjs` beside `claude/acp-v2-receiver.mjs` (the actual
+provisioned layout), link the published Claude deps' `node_modules` at the
+overlay's `native/node_modules`, and run the packaged Node as:
+`OULIPOLY_CLAUDE_RECEIVER_NO_MAIN=1 <node> --test <overlay>/native/test/claude-explore-sdk.test.mjs`.
+
+Their captures must be collected for the candidate: source/control
+existence alone is not execution or supported activation. ROOT separately
+owns installed proc/identity readback and AI caller pin/opt-in/site rollout.
 
 ## Credential and evidence scope
 
@@ -273,9 +367,14 @@ Front-door freshness is checked after admission/cwd and just before
 launch, and must cover N+2G+2+site margin. Caller margin defaults to 600 s;
 the site-side check is authoritative for its actual grace/margin.
 
-The staged access entry is root-private until setup-completed, then removed;
-launch copies are removed after observed exit. A killed front door can
-leave staged copies until the next same-user sweep. Access-only staging
+The parent staged access entry is root-private until setup-completed, then
+removed;
+the child snapshot stays for later admissions until normal retirement;
+normal-path launch copies are removed after known entry end when cleanup
+succeeds. Unknown entry stop skips retirement; abrupt front-door loss can
+leave staged and derived copies until the next same-user stale-run sweep.
+The access-only expiry window is accepted residue exposure, not a universal
+deletion or provider-validity guarantee. Access-only staging
 intentionally does not put the access token in argv/env/capture.
 **There is no output redactor.** Arbitrary task output, environment values,
 diagnostics or model text can contain secrets. The native server password

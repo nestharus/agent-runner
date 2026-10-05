@@ -38,7 +38,14 @@ def reply(body):
         call = {"index": 0, "id": "call_scripted_1", "type": "function",
                 "function": {"name": "bash", "arguments": json.dumps({"command": text[4:].strip()})}}
         return [chunk({"role": "assistant", "tool_calls": [call]}, None), chunk({}, "tool_calls")]
-    answer = "ANSWER:\n" + _text(results[-1]) if results else "NO-SCRIPT"
+    if text.startswith("EXPLORE ") and not results:
+        call = {"index": 0, "id": "call_explore_1", "type": "function",
+                "function": {"name": "explore", "arguments": json.dumps({"question": text[8:]})}}
+        return [chunk({"role": "assistant", "tool_calls": [call]}, None), chunk({}, "tool_calls")]
+    if "The parent's question:" in text:
+        answer = "ORIENTATION: packaging/native-linux/frontdoor.py wires child admission to native_root.rs."
+    else:
+        answer = "ANSWER:\n" + _text(results[-1]) if results else "NO-SCRIPT"
     return [chunk({"role": "assistant", "content": answer}, None), chunk({}, "stop")]
 
 

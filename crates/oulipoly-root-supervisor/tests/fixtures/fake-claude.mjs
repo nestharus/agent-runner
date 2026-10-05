@@ -11,7 +11,9 @@
 // FAKE_CLAUDE_SCENARIO selects a behavior: normal (default), no-echo,
 // crash, error-result, unattributed, model-mismatch, denial.
 //
-// Prompt text: `RUN <command>` calls the MCP `bash` tool with that command
+// Prompt text: `EXPLORE <question>` invokes the published SDK explore
+// callback and returns its complete text; `RUN <command>` calls the MCP
+// `bash` tool with that command
 // and answers `DONE <first output line>`; anything else is answered
 // `ECHO <text>` in two assistant messages (the first carries the
 // attribution, as Claude Code's first reply does).
@@ -88,8 +90,10 @@ async function turn(user) {
     result({ is_error: true, result: "model not available", api_error_status: 404 })
     return
   }
-  if (text.startsWith("RUN ")) {
-    const command = text.slice(4)
+  if (text.startsWith("RUN ") || text.startsWith("EXPLORE ")) {
+    const exploring = text.startsWith("EXPLORE ")
+    const name = exploring ? "explore" : "bash"
+    const arguments_ = exploring ? { question: text.slice(8) } : { command: text.slice(4) }
     if (!mcpReady) {
       mcpReady = true
       await mcp({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "fake-claude", version: "0" } } })
@@ -97,14 +101,14 @@ async function turn(user) {
       const listed = await mcp({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} })
       record({ tools_list: listed })
     }
-    assistant([{ type: "tool_use", id: "toolu_1", name: "mcp__oulipoly__bash", input: { command } }], attribution)
-    const called = await mcp({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "bash", arguments: { command } } })
+    assistant([{ type: "tool_use", id: "toolu_1", name: `mcp__oulipoly__${name}`, input: arguments_ }], attribution)
+    const called = await mcp({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name, arguments: arguments_ } })
     record({ tool_result: called })
     const body = called?.mcp_response?.result?.content?.[0]?.text ?? ""
     send({ type: "user", uuid: randomUUID(), session_id: session, parent_tool_use_id: null,
       message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: body }] } })
-    assistant([{ type: "text", text: `DONE ${body.split("\n")[0]}` }])
-    result({ result: `DONE ${body.split("\n")[0]}` })
+    assistant([{ type: "text", text: `DONE ${exploring ? body : body.split("\n")[0]}` }])
+    result({ result: `DONE ${exploring ? body : body.split("\n")[0]}` })
     return
   }
   assistant([{ type: "text", text: "thinking about it" }], attribution)

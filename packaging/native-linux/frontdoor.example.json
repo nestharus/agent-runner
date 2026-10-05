@@ -1,6 +1,8 @@
 {
  "v": 1,
- "allowed_users": ["nes"],
+ "allowed_users": [
+  "nes"
+ ],
  "run_base": "/var/lib/oulipoly-native/runs",
  "max_deadline_s": 7200,
  "cancel_grace_s": 30,
@@ -20,25 +22,71 @@
        "name": "GPT-6.1 Sol",
        "tool_call": true,
        "reasoning": true,
-       "options": {"reasoningEffort": "high"}
+       "options": {
+        "reasoningEffort": "high"
+       }
       }
      }
     }
-   }
+   },
+   "children": [
+    "luna-max"
+   ]
   },
   "opus-medium": {
    "harness": "claude",
    "model": "claude-opus-5-5",
    "effort": "medium",
    "config_dir": ".claude5",
-   "credential": "none"
+   "credential": "none",
+   "children": [
+    "luna-max"
+   ]
   },
   "opus-high": {
    "harness": "claude",
    "model": "claude-opus-5-5",
    "effort": "high",
    "config_dir": ".claude5",
-   "credential": "none"
+   "credential": "none",
+   "children": [
+    "luna-max"
+   ]
+  }
+ },
+ "child_limits": {
+  "max_starts": 4,
+  "max_concurrent": 2
+ },
+ "child_routes": {
+  "luna-max": {
+   "model": "openai/gpt-6-luna",
+   "credential": "required",
+   "provider": {
+    "openai": {
+     "npm": "@ai-sdk/openai",
+     "name": "OpenAI",
+     "models": {
+      "gpt-6-luna": {
+       "name": "GPT-6 Luna",
+       "tool_call": true,
+       "reasoning": true,
+       "limit": {
+        "context": 1050000,
+        "output": 128000
+       },
+       "options": {
+        "reasoningEffort": "max",
+        "reasoningSummary": "auto",
+        "include": [
+         "reasoning.encrypted_content"
+        ],
+        "store": false
+       }
+      }
+     }
+    }
+   }
   }
  }
 }
