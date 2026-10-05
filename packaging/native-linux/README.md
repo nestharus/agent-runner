@@ -1,8 +1,10 @@
 # Native-root package (Linux x86_64)
 
 A co-located native ACP v2 application payload: runner, per-root owner,
-root PID 1, agent-bash and locked OpenCode dependencies, plus a privileged
-front door and an explicit programmatic caller. Work runs with the
+root PID 1, agent-bash, locked OpenCode dependencies, and the native
+Claude receiver's locked dependencies (published Claude Agent SDK with its
+unmodified Claude Code executable) with a pinned Node runtime, plus a
+privileged front door and an explicit programmatic caller. Work runs with the
 requester's normal host rights; the owner and root PID 1 run as root.
 Host Python, its standard library and dynamic libraries remain trusted
 runtime dependencies. This is not a static or verified privileged
@@ -20,6 +22,9 @@ security closure. No existing workflow's route is changed.
   agent-bash/agent-bash
   agent-bash/bash.ts
   opencode/deps/
+  claude/deps/          (Agent SDK, ACP SDK; Claude Code executable
+                         node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude)
+  claude/node/bin/node  (official Node release, pinned sha256)
   share/install_package.py
   share/sudoers.template
   share/frontdoor.example.json
@@ -36,8 +41,16 @@ python3 packaging/native-linux/build_package.py --build-dir B \
   --runner-repo W --agent-bash-repo T --agent-bash-commit C
 ```
 
-Only B receives builds, dependency snapshots, cargo/npm caches, stage and
-archive. Cargo uses `--locked`; npm uses `ci --ignore-scripts`. Runner
+Only B receives builds, dependency snapshots, cargo/npm caches, the Node
+download, stage and archive. Cargo uses `--locked`; npm uses `ci
+--ignore-scripts` for both lockfiles; Node is the official
+`node-v24.21.0-linux-x64.tar.xz`, checked against its pinned sha256, of
+which only `bin/node` and `LICENSE` are staged. The locked musl Claude
+Code platform package, never selected by the receiver, is not staged
+(MANIFEST `claude_deps_not_staged`). The Claude Code and Node
+executables are copied and hashed, never run; their dynamic dependencies
+are read with `readelf`. MANIFEST also records the Claude lock hash, the
+Claude Code package/version/sha256 and the Node release. Runner
 features are the defaults. Dirty sources are refused unless explicitly
 selected for construction. The id includes both commits; MANIFEST records
 file hashes/modes, toolchain and Rust binaries' dynamic dependencies.
@@ -200,6 +213,53 @@ Caller codes: 0 answered, 1 no-answer, 2 usage, 3 local refusal,
 `answered` requires linked text, its end_turn, complete transport and clean
 retirement; it **does not prove task completion or correctness**. A denial
 or tool echo can be answered/0; entry 87 means close followed through.
+
+## Native Claude routes
+
+A route with `"harness": "claude"` names `model`, `effort`
+(`low|medium|high|xhigh|max`), `config_dir` and `"credential": "none"`;
+nothing else. The example site config carries `opus-medium` and
+`opus-high` (`claude-opus-5-5`, `.claude5`); `sol-high` is unchanged.
+`config_dir` is relative to the requester's passwd home (no absolute path,
+no `..`): the requester's own Claude configuration directory. The front
+door, runner and owner only name it; nothing of root reads it, and no
+credential is accepted, staged or removed for these routes.
+
+The owner runs the receiver (`claude/node/bin/node` with the owner crate's
+`native/claude/acp-v2-receiver.mjs`, a `stdio` harness) as the requester.
+It drives the packaged Claude Code executable through the Agent SDK with
+`CLAUDE_CONFIG_DIR` set to that store, so Claude Code's own login there
+pays and refreshes, and its transcripts land there, outside the run's
+discard. Inherited `ANTHROPIC_*`/`CLAUDE*` variables (API keys, OAuth
+tokens, base URL and provider redirects) are withheld from Claude Code.
+No user/project/local settings, hooks, plugins, CLAUDE.md or auto memory
+load; MCP is strict (only the receiver's server); permission mode is
+`dontAsk`; built-in Bash, Agent/Task, Monitor, background, web and skill
+tools are not offered. `bash` is the receiver's tool running `agent-bash
+run --delivery sync` into the root's Bash ingress (attributed, recorded,
+killed on cancel); an allow list is enforced by the tool before anything
+runs; `trusted-task` also offers built-in Read, Write and Edit, whose edits
+are the harness's own, not Bash records. A trusted shell keeps the
+requester's host rights: this is constructed configuration, not a sandbox
+or absence certificate. Claude Code's managed settings still apply.
+
+Each input gets an ascending `messageId` and a random SDK uuid; the ACK
+waits for Claude Code's consumption echo (`--replay-user-messages`) or a
+reply/result naming that uuid. Answers and turn ends are linked only
+through Claude Code's explicit `user_message_uuid(s)` mapped back to the
+receiver's ids. No echo within 120 s, Claude Code exiting, or an SDK
+failure is a visible error notice and a bounded end of the harness (no
+deadline-long wait, no replay); error results, unattributed results, a
+different reported model and permission denials are visible notices and
+`_claude_*` stop reasons. No CLI version gate: support is observed at
+runtime. The caller works unchanged: `--route opus-medium` without any
+credential option.
+
+The offline controls use a stand-in for the Claude Code executable
+(the crate's `tests/fixtures/fake-claude.mjs`); they check the receiver,
+SDK wiring, owner contract and package path, not Claude Code, a login, a
+subscription or a model. A real native Claude run remains ROOT's separate
+witness.
 
 ## Credential and evidence scope
 

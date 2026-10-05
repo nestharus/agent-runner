@@ -15,7 +15,13 @@ namespace.
 
 Scenarios: trusted-task Bash answered; allow-list denial; deadline
 cancel of a running Bash; abandonment by stdin EOF; an inline access-only
-credential (staging, removal, no leak); refusals before any effect.
+credential (staging, removal, no leak); refusals before any effect; a
+native Claude route answered with attributed Bash, and Claude Code ending
+mid-turn. For the Claude rows the crate's stand-in executable
+(`tests/fixtures/fake-claude.mjs`, run by the packaged Node) is
+bind-mounted over the packaged Claude Code executable inside this mount
+namespace only: Claude Code itself is never run, and nothing here is
+evidence about it, a login or a model.
 """
 
 import argparse
@@ -23,6 +29,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import pwd
 import shutil
 import subprocess
 import sys
@@ -40,6 +47,10 @@ PROJECT = ROOT + "/project"
 WRAPPER = ROOT + "/frontdoor-test-root.py"
 MARKER = "e2e-fake-access-token-marker"
 WORK_UID = 1000
+FAKE_CLAUDE = os.path.join(HERE, "../../../crates/oulipoly-root-supervisor/tests/fixtures/fake-claude.mjs")
+CLAUDE_EXECUTABLE = PKG + "/claude/deps/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude"
+CLAUDE_RECORDS = ROOT + "/claude-records"
+CLAUDE_STORE = ".claude-e2e-fixture-store"
 
 LOADER = f"""import importlib.machinery, importlib.util, os, sys
 loader = importlib.machinery.SourceFileLoader("frontdoor", "{PKG}/libexec/oulipoly-native-frontdoor")
@@ -78,6 +89,16 @@ def prepare(stage):
     sh("mount", "-o", "remount,bind,ro", PKG)
     os.mkdir(PROJECT, 0o755)
     os.chown(PROJECT, WORK_UID, WORK_UID)
+    # The stand-in over the packaged Claude Code executable, here only.
+    with open(FAKE_CLAUDE) as file:
+        source = file.read()
+    fake = ROOT + "/fake-claude"
+    with open(fake, "w") as file:
+        file.write(f"#!{PKG}/claude/node/bin/node\n{source}")
+    os.chmod(fake, 0o755)
+    sh("mount", "--bind", fake, CLAUDE_EXECUTABLE)
+    os.mkdir(CLAUDE_RECORDS, 0o755)
+    os.chown(CLAUDE_RECORDS, WORK_UID, WORK_UID)
     with open(WRAPPER, "w") as file:
         file.write(LOADER)
 
@@ -95,6 +116,8 @@ def site(base_url):
         "routes": {
             "fixture": {"model": "fixture/scripted", "provider": provider, "credential": "none"},
             "fixture-auth": {"model": "fixture/scripted", "provider": provider, "credential": "required"},
+            "claude-fixture": {"harness": "claude", "model": "claude-opus-5-5", "effort": "medium",
+                               "config_dir": CLAUDE_STORE, "credential": "none"},
         },
     }
     with open(SITE, "w") as file:
@@ -316,6 +339,61 @@ def scenarios(out, model):
           cls=r["result"]["class"], answer=r["answer"], frontdoor_exit=fd.get("exit"),
           model_saw_authorization=sorted({str(q.get("authorization"))[:16] for q in model.requests}))
     check("credential: nothing left", clean(), left=leftovers())
+
+    # 7. A native Claude route: answered, with attributed Bash, no
+    #    credential, the requester's own store only named.
+    store = os.path.join(pwd.getpwuid(WORK_UID).pw_dir, CLAUDE_STORE)
+    record = CLAUDE_RECORDS + "/answered.jsonl"
+    r = call(out, "claude", "RUN id -un; pwd", "--route", "claude-fixture", "--trusted-task", "--deadline", "120",
+             "--env", "FAKE_CLAUDE_RECORD=" + record, "--env", "ANTHROPIC_API_KEY=e2e-not-a-key",
+             "--env", "CLAUDE_CODE_OAUTH_TOKEN=e2e-not-a-token")
+    fd = frontdoor_terminal(r["events"])
+    accepted = of(r["events"], "bash-accepted")
+    setup = [e for e in r["events"] if e.get("entry") == "setup-completed"]
+    admitted = [e for e in r["events"] if e.get("frontdoor") == "admitted"]
+    check("claude: answered and closed", r["exit"] == 0 and r["result"]["class"] == "answered" and fd.get("exit") == 87,
+          exit=r["exit"], cls=r["result"]["class"], frontdoor_exit=fd.get("exit"))
+    check("claude: answer is the attributed Bash result",
+          r["answer"] is not None and r["answer"].startswith("DONE Root v1 work ended: exited with code 0"),
+          answer=r["answer"])
+    check("claude: one attributed Bash as the requester",
+          len(accepted) == 1 and accepted[0].get("argv") == ["bash", "-lc", "id -un; pwd"],
+          accepted=[a.get("argv") for a in accepted])
+    check("claude: admitted without a credential", bool(admitted) and admitted[0].get("credential") is None
+          and admitted[0].get("harness") == "claude", admitted=admitted[:1])
+    launch = setup[0]["launch"] if setup else {}
+    check("claude: stdio receiver launch names the requester's own store",
+          bool(setup) and setup[0].get("harness") == "claude" and launch.get("endpoint") == "stdio"
+          and launch.get("config_dir") == store and launch.get("policy", {}).get("bash") == "trusted-task",
+          launch=launch)
+    try:
+        with open(record) as file:
+            seen = [json.loads(line) for line in file if line.strip()]
+    except OSError as error:
+        seen = [{"error": type(error).__name__}]
+    started = next((v for v in seen if "argv" in v), {})
+    argv, env = started.get("argv", []), started.get("env", {})
+    check("claude: Claude Code launch as constructed (stand-in's view)",
+          env.get("CLAUDE_CONFIG_DIR") == store and "ANTHROPIC_API_KEY" not in env
+          and "CLAUDE_CODE_OAUTH_TOKEN" not in env and "--setting-sources=" in argv and "--strict-mcp-config" in argv
+          and argv[argv.index("--model") + 1] == "claude-opus-5-5" and argv[argv.index("--effort") + 1] == "medium"
+          and argv[argv.index("--permission-mode") + 1] == "dontAsk",
+          argv=argv, env=env)
+    check("claude: the store was only named, never made", not os.path.exists(store))
+    check("claude: run retired", fd.get("retire", {}).get("run_removed") is True)
+    check("claude: nothing left", clean(), left=leftovers())
+
+    # 8. Claude Code ends mid-turn: a visible no-answer, bounded, no cancel.
+    r = call(out, "claude-exit", "hello", "--route", "claude-fixture", "--trusted-task", "--deadline", "120",
+             "--env", "FAKE_CLAUDE_SCENARIO=crash")
+    fd = frontdoor_terminal(r["events"])
+    ends = [e for e in r["events"] if e.get("event") == "turn-end"]
+    check("claude-exit: no-answer with a _claude_exited turn end, without cancel",
+          r["result"]["class"] == "no-answer" and ends and ends[0].get("stop_reason") == "_claude_exited"
+          and "cancel" not in r["result"]["sends"] and r["elapsed_s"] < 60,
+          cls=r["result"]["class"], ends=ends, sends=r["result"]["sends"], elapsed_s=r["elapsed_s"],
+          frontdoor_exit=fd.get("exit"))
+    check("claude-exit: nothing left", clean(), left=leftovers())
 
     # 6. Refusals before any effect.
     good = {"v": 1, "route": "fixture", "message": "x", "cwd": PROJECT, "bash": {"authority": "trusted-task"}, "deadline_s": 60}

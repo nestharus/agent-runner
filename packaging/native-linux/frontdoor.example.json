@@ -25,6 +25,20 @@
      }
     }
    }
+  },
+  "opus-medium": {
+   "harness": "claude",
+   "model": "claude-opus-5-5",
+   "effort": "medium",
+   "config_dir": ".claude5",
+   "credential": "none"
+  },
+  "opus-high": {
+   "harness": "claude",
+   "model": "claude-opus-5-5",
+   "effort": "high",
+   "config_dir": ".claude5",
+   "credential": "none"
   }
  }
 }

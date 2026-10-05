@@ -32,6 +32,8 @@ SITE = {
     "routes": {
         "sol-high": {"model": "openai/gpt-6.1-sol", "credential": "required", "provider": {"openai": {}}},
         "fixture": {"model": "fixture/scripted", "credential": "none", "provider": {"fixture": {}}},
+        "opus-medium": {"harness": "claude", "model": "claude-opus-5-5", "effort": "medium",
+                        "config_dir": ".claude5", "credential": "none"},
     },
 }
 
@@ -113,6 +115,12 @@ class Admission(unittest.TestCase):
         checked = frontdoor.check_request(request(credential=credential(expires=(NOW + 2162) * 1000)), SITE, NOW)
         self.assertEqual(checked["credential"][1]["remaining_s"], 2162)
 
+    def test_claude_route_takes_no_credential(self):
+        refused(self, request(route="opus-medium"), "takes no credential")
+        checked = frontdoor.check_request(request(route="opus-medium", credential=None), SITE, NOW)
+        self.assertIsNone(checked["credential"])
+        self.assertEqual(checked["route"]["harness"], "claude")
+
     def test_credential_free_route_refuses_a_credential(self):
         refused(self, request(route="fixture"), "takes no credential")
         self.assertIsNone(frontdoor.check_request(request(route="fixture", credential=None), SITE, NOW)["credential"])
@@ -189,6 +197,35 @@ class Custody(Scratch):
                 json.dump(dict(SITE, routes={"x": {"model": "a/b", "provider": {"c": {}}, "credential": "none"}}), file)
             with self.assertRaisesRegex(frontdoor.Refused, "route x"):
                 frontdoor.load_site(path)
+            good = SITE["routes"]["opus-medium"]
+            for bad in (
+                dict(good, config_dir="/home/nes/.claude5"),
+                dict(good, config_dir="../other/.claude5"),
+                dict(good, config_dir="."),
+                dict(good, effort="Medium"),
+                dict(good, credential="required"),
+                dict(good, model="claude opus"),
+                dict(good, provider={}),
+                {k: v for k, v in good.items() if k != "config_dir"},
+            ):
+                with open(path, "w") as file:
+                    json.dump(dict(SITE, routes={"x": bad}), file)
+                with self.assertRaisesRegex(frontdoor.Refused, "route x"):
+                    frontdoor.load_site(path)
+
+    def test_example_site_routes_are_valid(self):
+        with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "frontdoor.example.json")) as file:
+            example = json.load(file)
+        path = os.path.join(self.dir, "frontdoor.json")
+        with open(path, "w") as file:
+            json.dump(example, file)
+        with mock.patch.object(frontdoor, "check_owned"):
+            routes = frontdoor.load_site(path)["routes"]
+        self.assertEqual(sorted(routes), ["opus-high", "opus-medium", "sol-high"])
+        self.assertEqual(routes["sol-high"]["credential"], "required")
+        for name, effort in (("opus-medium", "medium"), ("opus-high", "high")):
+            self.assertEqual(routes[name], {"harness": "claude", "model": "claude-opus-5-5", "effort": effort,
+                                            "config_dir": ".claude5", "credential": "none"})
 
     def test_writable_and_escaping_entries_refused(self):
         owners = frozenset({os.getuid()})
@@ -389,6 +426,24 @@ class EntryRequest(unittest.TestCase):
         self.assertEqual(value["opencode"]["deps"], "/opt/p/opencode/deps")
         self.assertNotIn("fixture-access-marker", json.dumps(value))
         self.assertEqual(value["messages"], ["look"])
+        self.assertNotIn("claude", value)
+
+    def test_claude_route_names_the_requesters_own_store_and_no_credential(self):
+        user = types.SimpleNamespace(pw_name="nes", pw_uid=1000, pw_gid=1000, pw_dir="/home/nes", pw_shell="/bin/bash")
+        checked = frontdoor.check_request(request(route="opus-medium", credential=None, bash={"allow": ["ls"]}), SITE, NOW)
+        value = frontdoor.entry_request("/opt/p", "/var/r/1000/run", user, checked, {"PATH": "/usr/bin"}, False)
+        self.assertNotIn("opencode", value)
+        self.assertEqual(value["claude"], {
+            "deps": "/opt/p/claude/deps",
+            "node": "/opt/p/claude/node/bin/node",
+            "agent_bash_bin": "/opt/p/agent-bash/agent-bash",
+            "model": "claude-opus-5-5",
+            "effort": "medium",
+            "config_dir": "/home/nes/.claude5",
+            "bash_allow": ["ls"],
+        })
+        self.assertEqual(value["workload"], {"isolation": "host-root", "user": "nes"})
+        self.assertEqual(value["store"], "/var/r/1000/run/store")
 
 
 if __name__ == "__main__":
