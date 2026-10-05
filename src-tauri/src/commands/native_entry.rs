@@ -26,10 +26,12 @@
 //! agent's frontmatter, must have an explicit `[models."NAME"]` mapping to a
 //! site route. Anything else, including resume/REPL/provider pinning and
 //! unmapped models, is refused: never a legacy launch, never a substitute
-//! model. Without `native.toml`, nothing here applies.
+//! model. A resolved root without `native.toml` leaves the entry unselected;
+//! an unresolved config root is refused, never treated as an absent file.
 //!
 //! The caller is one attempt, with no replay. Its exit code is returned as
-//! is; `answered` (0) is not task correctness.
+//! is unless answer presentation fails after caller success (entry exit 6);
+//! `answered` (0) is not task correctness.
 
 use crate::usage::cli::{Cli, Subcommands};
 use serde::Deserialize;
@@ -90,8 +92,13 @@ pub(crate) fn run_if_selected(cli: &Cli) -> Result<Option<i32>, String> {
     if !is_launch_form(cli) {
         return Ok(None);
     }
-    let Ok(root) = crate::cli::paths::default_config_root() else {
-        return Ok(None);
+    let root = match crate::cli::paths::default_config_root() {
+        Ok(root) => root,
+        Err(reason) => {
+            return refuse(&format!(
+                "cannot determine native configuration selection: {reason}"
+            ));
+        }
     };
     let config = match selected_config(&root) {
         Ok(None) => return Ok(None),
@@ -398,15 +405,15 @@ fn launch(
 }
 
 fn report(out: &Path, status: std::process::ExitStatus) -> Result<i32, String> {
+    report_to(out, status, &mut std::io::stdout().lock())
+}
+
+fn report_to(
+    out: &Path,
+    status: std::process::ExitStatus,
+    stdout: &mut impl Write,
+) -> Result<i32, String> {
     use std::os::unix::process::ExitStatusExt;
-    if let Ok(answer) = std::fs::read_to_string(out.join("final.md")) {
-        let mut stdout = std::io::stdout().lock();
-        let _ = stdout.write_all(answer.as_bytes());
-        if !answer.ends_with('\n') {
-            let _ = stdout.write_all(b"\n");
-        }
-        let _ = stdout.flush();
-    }
     let result: Option<serde_json::Value> = std::fs::read(out.join("result.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok());
@@ -429,7 +436,34 @@ fn report(out: &Path, status: std::process::ExitStatus) -> Result<i32, String> {
         "native entry: class {class}; caller exit {code}; front door exit {front_door}; records {} (answered is not correctness)",
         out.display()
     );
+    if let Err(reason) = present_answer(out, stdout, code == 0 || class == "answered") {
+        // Presentation is this entry's boundary, separate from caller custody.
+        // Keep every non-successful caller code; never upgrade its outcome.
+        let entry_code = if code == 0 { 6 } else { code };
+        eprintln!("native entry: answer presentation failed: {reason}; entry exit {entry_code}");
+        return Ok(entry_code);
+    }
     Ok(code)
+}
+
+fn present_answer(out: &Path, stdout: &mut impl Write, required: bool) -> Result<(), String> {
+    let path = out.join("final.md");
+    let answer = match std::fs::read_to_string(&path) {
+        Ok(answer) => answer,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => return Ok(()),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    stdout
+        .write_all(answer.as_bytes())
+        .map_err(|error| format!("cannot write answer to stdout: {error}"))?;
+    if !answer.ends_with('\n') {
+        stdout
+            .write_all(b"\n")
+            .map_err(|error| format!("cannot write answer newline to stdout: {error}"))?;
+    }
+    stdout
+        .flush()
+        .map_err(|error| format!("cannot flush answer to stdout: {error}"))
 }
 
 #[cfg(test)]
