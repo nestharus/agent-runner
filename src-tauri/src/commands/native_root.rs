@@ -63,10 +63,12 @@
 //! routes. Everything named is checked before any effect; the owner
 //! enforces route, depth, budget and lineage. The caller owns `auth` and
 //! the children's launch copies after the root ends, as for `opencode.auth`.
-//! Experimental and unexposed: the packaged front door and the caller do
-//! not pass `children` or tell a child's turn end and answer from the
-//! parent's yet, and no Claude-parent child credential is prepared. Do not
-//! use it outside owned fixtures until that follow-up lands.
+//! The packaged front door passes `children` only as its site allows a
+//! parent route to offer them, stages `auth` once per root (an OpenCode
+//! parent's own grant reused, or a Claude parent's separate child-provider
+//! grant; never Claude's login), and removes it and every child launch's
+//! copy when it retires the run. The packaged caller takes its answer and
+//! close from the parent's own events only. Not yet installed.
 //!
 //! `--recover <file>` acts on an existing store: `{"store", "purpose",
 //! "env"}`, `purpose` being `cancel` or `continue-attached`. A new owner

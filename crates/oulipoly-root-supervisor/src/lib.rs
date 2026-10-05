@@ -953,7 +953,7 @@ where
     if claimed.children_lost > 0 {
         emit(
             &mut out,
-            &json!({ "event": "children-lost", "count": claimed.children_lost, "meaning": "admitted by an earlier owner, never launched or resolved; not relaunched or delivered" }),
+            &json!({ "event": "children-lost", "count": claimed.children_lost, "meaning": "admitted by an earlier owner and unresolved, with no launch of it still open (it may have launched and ended earlier, unrecorded); not relaunched or delivered" }),
         );
     }
     for prior in recovery.children.drain(..) {
@@ -1396,11 +1396,9 @@ fn recover_child<W: Write>(
                 true,
             ),
         },
-        ChildFound::Unknown => (
-            "ended-with-root-namespace-status-unknown".to_owned(),
-            None,
-            true,
-        ),
+        // Absent from the attached root's live and receipt lists: its end is
+        // unknown; no root-namespace end was observed.
+        ChildFound::Unknown => ("absent-from-root-lists-end-unknown".to_owned(), None, true),
     };
     {
         let mut store = store.lock().expect("store lock");

@@ -13,8 +13,20 @@
 //!   room, and the exact parent work attributed before the request was read
 //!   is **still current** at commit. Then the lineage (child harness row,
 //!   its one message, parent position and work, route, requester and the
-//!   parent inputs open) commits before `accepted` is written. Nothing is
+//!   parent inputs open **as attributed when the request arrived**: a
+//!   snapshot, not rechecked at commit) commits before `accepted` is
+//!   written. "Current" means the parent's whole work (its namespace) is
+//!   still in this owner's live view, not that the parent's agent leader is
+//!   alive: a parent whose leader died while a descendant keeps its work
+//!   and connection can still ask, within the budget, until its work's
+//!   receipt, its requester's loss, a stop or the deadline. Nothing is
 //!   retried; a refusal records and starts nothing.
+//! * **Budget.** `max_concurrent` charges every admitted child until its
+//!   end and its attributed Bash runs' ends are positively observed. A
+//!   child whose launch or end is unknown (possible start, failed waiter,
+//!   left to a successor), or one of whose Bash runs ended unknown, stays
+//!   charged for the rest of this owner's life: it may still be running,
+//!   so it can exhaust the root's capacity rather than let more start.
 //! * **Life.** The child is driven like any harness, with one attempt and
 //!   one closure (no relaunch or replay), its prompt prefixed with
 //!   [`CHILD_BRIEF`]. After its tagged turn end its harness is stopped
@@ -27,8 +39,13 @@
 //!   is `result` with the outcome (`answered`, `no-answer`,
 //!   `launch-failed`, `launch-unknown`, `stopped`,
 //!   `ended-without-turn-end`), the answer text (the last linked agent text
-//!   before the child's tagged turn end, if any) and the end. None of it is
-//!   delivered to any harness as a new input.
+//!   before the child's tagged turn end, if any), the end, and `lifecycle`:
+//!   whether its end was observed, how many of its Bash runs were still
+//!   open (their kill requested, their drain not yet seen) and whether its
+//!   budget is still charged. `answered` is a content outcome only: it
+//!   does not say the child ended, its Bash drained, or that the parent
+//!   consumed anything. The child's slot is held after `result` until its
+//!   Bash runs end. None of it is delivered to any harness as a new input.
 
 use std::collections::BTreeMap;
 use std::io::{BufReader, Read};
@@ -58,7 +75,7 @@ pub const CHILD_BRIEF: &str = "You are a registered read-only orientation explor
 
 Purpose: find where things are and how they are wired together (files, modules, call paths, configuration, history), so that the parent can then look into the areas that matter itself. Answer concisely with concrete paths, names and relationships, and say what you could not establish.
 
-Bounds: read only. Do not edit, create, move or delete files; do not run tests, builds, installers or package managers; do not use root, sudo or services; make no network requests; do not read private credential or session stores (for example ~/.codex*, ~/.claude*, auth or token files); do not start agents, model CLIs or dispatchers of any kind. You cannot have children. Your shell, where you have one, is the parent's attributed shell and has no technical write barrier: these bounds are yours to keep.
+Bounds: read only. Do not edit, create, move or delete files; do not run tests, builds, installers or package managers; do not use root, sudo or services; make no network requests; do not read private credential or session stores (for example ~/.codex*, ~/.claude*, auth or token files); do not start agents, model CLIs or dispatchers of any kind. You cannot have children. Your shell, where you have one, runs through this root's Bash ingress attributed to you (this child, under the parent's lineage) and has no technical write barrier: these bounds are yours to keep.
 
 The parent's question:";
 
@@ -215,8 +232,12 @@ struct State {
     closed: Option<&'static str>,
     /// Live Bash runs requested from a child's namespace, by work.
     runs: BTreeMap<i64, (usize, Arc<Root>)>,
+    /// Children whose Bash run ended unknown (position), counted once.
+    runs_unknown: Vec<usize>,
     finished: Vec<Value>,
     refused: u64,
+    /// Children whose end (or a Bash run's end) is unknown: still charged
+    /// against `max_concurrent` (they may still be running).
     unknown: u64,
 }
 
@@ -276,8 +297,37 @@ impl Registry {
         }
     }
 
-    pub(crate) fn remove_run(&self, work: i64) {
-        self.state.lock().expect("children").runs.remove(&work);
+    /// A child's Bash run ended (`ended`: its waiter reported the end) or
+    /// its end became unknown (not `ended`).
+    pub(crate) fn remove_run(&self, work: i64, ended: bool) {
+        let mut state = self.state.lock().expect("children");
+        if let Some((position, _)) = state.runs.remove(&work)
+            && !ended
+            && !state.runs_unknown.contains(&position)
+        {
+            state.runs_unknown.push(position);
+        }
+    }
+
+    /// A child's Bash run whose launch is unknown (it may run, untracked).
+    pub(crate) fn note_run_unknown(&self, position: usize) {
+        let mut state = self.state.lock().expect("children");
+        if self.is_child(position) && !state.runs_unknown.contains(&position) {
+            state.runs_unknown.push(position);
+        }
+    }
+
+    /// The child's Bash runs not yet ended, and whether one ended unknown.
+    fn runs_of(&self, position: usize) -> (usize, bool) {
+        let state = self.state.lock().expect("children");
+        (
+            state
+                .runs
+                .values()
+                .filter(|(owner, _)| *owner == position)
+                .count(),
+            state.runs_unknown.contains(&position),
+        )
     }
 
     /// Stops one child and its Bash runs; returns how many kill requests
@@ -422,8 +472,10 @@ impl Registry {
             "starts": state.starts,
             "refused": state.refused,
             "end_unknown": state.unknown,
+            "end_unknown_meaning": "charged against max_concurrent for the rest of this owner: possibly still running",
             "live": state.live.len(),
             "children": state.finished,
+            "children_scope": "this owner generation's finished admissions and recovered open children only; `starts` counts every start over the root's life; an empty list is not 'no children'",
         })
     }
 }
@@ -525,7 +577,7 @@ impl ChildLink {
             "launch-failed" | "launch-unknown" => {
                 seen.launch = Some(report.clone());
                 Some(
-                    json!({ "event": event, "reason": report["reason"], "not_started": event == "launch-failed" }),
+                    json!({ "event": event, "reason": report["reason"], "not_started": event == "launch-failed", "setup_effects": report.get("setup_effects") }),
                 )
             }
             "ack" if report["index"] == 0 => {
@@ -596,6 +648,7 @@ impl ChildLink {
         let seen = self.seen.lock().expect("child seen");
         let stopped = self.stopped();
         let end_unknown = !record.wait_failures.is_empty()
+            || record.detached > 0
             || seen
                 .launch
                 .as_ref()
@@ -735,23 +788,26 @@ pub(crate) fn serve(
                 link: Arc::clone(&link),
             })
         }
-        Err((reason, not_started)) => {
+        Err((reason, setup_effects)) => {
+            // No process was started: a positive no-start, whatever files
+            // setup may have left (a separate fact, reported as such).
             link.observe(&json!({
-                "event": if not_started { "launch-failed" } else { "launch-unknown" },
+                "event": "launch-failed",
                 "reason": reason,
+                "setup_effects": setup_effects,
             }));
             let _ = ctx.tx.send(Event::Report(json!({
                 "event": "child-setup-failed",
                 "harness": id,
                 "reason": reason,
-                "setup_effects": if not_started { "none" } else { "possible" },
+                "setup_effects": setup_effects,
                 "process_started": false,
             })));
             HarnessRecord::empty(&id)
         }
     };
-    let (result, outcome, end_unknown) = link.result(&record);
-    let _ = ctx.store.lock().expect("store lock").resolve_child(
+    let (mut result, outcome, end_unknown) = link.result(&record);
+    let recorded = ctx.store.lock().expect("store lock").resolve_child(
         position,
         &match link.stopped() {
             Some(reason) if outcome == "stopped" => format!("stopped:{reason}"),
@@ -759,13 +815,38 @@ pub(crate) fn serve(
         },
     );
     // Its Bash ends with it (normally already ended: tools are sync).
-    ctx.registry.kill_runs_of(position);
+    let bash_signalled = ctx.registry.kill_runs_of(position);
+    let (open_runs, run_unknown) = ctx.registry.runs_of(position);
+    result["lifecycle"] = json!({
+        "end": if end_unknown { "unknown" } else if result["end"].is_null() { "no-process" } else { "observed" },
+        "bash_runs_open": open_runs,
+        "bash_kill_requests": bash_signalled,
+        "bash_run_end_unknown": run_unknown,
+        "budget": if end_unknown || run_unknown {
+            "still charged (an end is unknown: it may be running)"
+        } else if open_runs > 0 {
+            "still charged until its Bash runs end"
+        } else {
+            "released"
+        },
+        "outcome_recorded": recorded.is_ok(),
+        "meaning": "outcome/answer are content; this says what is known of its end and drain. Neither is parent consumption.",
+    });
     link.send(&result);
     watcher.0.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = stream.shutdown(std::net::Shutdown::Both);
     if let Some(handle) = watcher.1 {
         let _ = handle.join();
     }
+    // Its slot stays charged until its Bash runs end (their waiters'
+    // reports), however long: no bound here; the root's stop and deadline
+    // are the backstop.
+    let mut drained_open = open_runs;
+    while drained_open > 0 {
+        thread::sleep(std::time::Duration::from_millis(20));
+        drained_open = ctx.registry.runs_of(position).0;
+    }
+    let run_unknown = ctx.registry.runs_of(position).1;
     let mut summary = json!({
         "id": id,
         "position": position,
@@ -776,6 +857,10 @@ pub(crate) fn serve(
         "stopped": link.stopped(),
         "answered": result["answer"].is_string(),
         "end": result["end"],
+        "end_unknown": end_unknown,
+        "bash_runs_open_at_result": open_runs,
+        "bash_run_end_unknown": run_unknown,
+        "outcome_recorded": recorded.is_ok(),
         "record": record.to_json(),
     });
     let mut owner = result;
@@ -783,12 +868,14 @@ pub(crate) fn serve(
     owner["harness"] = json!(id);
     owner["child"] = link.marker();
     let _ = ctx.tx.send(Event::Report(owner));
+    // "written": the local writes raised no error; not consumption.
     summary["requester"] = json!(if link.sink.lock().expect("child sink").connected() {
-        "delivered"
+        "written"
     } else {
         "gone"
     });
-    ctx.registry.finish(position, summary, end_unknown);
+    ctx.registry
+        .finish(position, summary, end_unknown || run_unknown);
     crate::bash::leave_child(ctx.gate, ctx.tx);
 }
 
@@ -830,11 +917,12 @@ fn admit(
             state.starts, policy.max_starts
         ));
     }
-    let live = u32::try_from(state.live.len()).unwrap_or(u32::MAX);
-    if live >= policy.max_concurrent {
+    // Unknown ends stay charged: they may still be running.
+    let charged = u32::try_from(state.live.len() as u64 + state.unknown).unwrap_or(u32::MAX);
+    if charged >= policy.max_concurrent {
         return Err(format!(
-            "budget-concurrent: {live} of {}",
-            policy.max_concurrent
+            "budget-concurrent: {charged} of {} ({} unknown-end charged)",
+            policy.max_concurrent, state.unknown
         ));
     }
     let mut views = ctx.views.lock().expect("views");
@@ -910,13 +998,15 @@ fn admit(
         "parent_session": who.session,
         "requester_pid": requester,
         "inputs_open": open,
+        "inputs_open_meaning": "snapshot when the request was attributed, not rechecked at commit",
+        "parent_currentness": "the parent's whole work was in the live view at commit; not an observation of its agent leader",
         "input_attribution": match who.open.len() {
             0 => "no-open-input",
             1 => "single-open-input",
             _ => "ambiguous-open-inputs",
         },
         "starts": { "used": state.starts, "max": policy.max_starts },
-        "concurrent": { "live": state.live.len(), "max": policy.max_concurrent },
+        "concurrent": { "live": state.live.len(), "unknown_charged": state.unknown, "max": policy.max_concurrent },
         "meaning": "durably admitted; not a start",
     });
     drop(state);
@@ -931,14 +1021,15 @@ fn admit(
 }
 
 /// The child's harness argv: a fixed one, or a fresh OpenCode launch
-/// provisioned now. `Err((reason, not_started))`: nothing was launched;
-/// `not_started` false means setup effects may remain (retired with the
-/// run), still with no process started.
+/// provisioned now. `Err((reason, setup_effects))`: no process was started
+/// either way; `setup_effects` is `"none"` only when setup refused before
+/// any write, else `"possible"` (files, a copied credential among them, can
+/// remain under the launch base until the caller retires the run).
 fn launch_argv(
     ctx: &Context<'_>,
     position: usize,
     route: &ChildRoute,
-) -> Result<Vec<String>, (String, bool)> {
+) -> Result<Vec<String>, (String, &'static str)> {
     match route {
         ChildRoute::Fixed { argv, .. } => Ok(argv.clone()),
         ChildRoute::Opencode { .. } => {
@@ -949,7 +1040,7 @@ fn launch_argv(
                 .expect("admitted under a policy");
             let base = std::path::Path::new(&policy.launch_base);
             let identity = ctx.slot.workload.identity.as_ref();
-            make_base(base, identity).map_err(|reason| (reason, true))?;
+            make_base(base, identity).map_err(|reason| (reason, "possible"))?;
             // Each child's launch is fresh: an existing directory (an
             // earlier owner's) is refused by setup, never reused.
             let dir = base.join(format!("c{position}"));
@@ -958,11 +1049,12 @@ fn launch_argv(
                 .expect("opencode route");
             match provision_opencode(&setup, identity) {
                 Ok(launch) => Ok(launch.argv),
+                // The base itself may have been made just now: shared, empty.
                 Err(OpenCodeSetupError::InputInvalid(reason)) => {
-                    Err((format!("setup-refused: {reason}"), true))
+                    Err((format!("setup-refused: {reason}"), "none"))
                 }
                 Err(OpenCodeSetupError::ConstructionFailed(reason)) => {
-                    Err((format!("setup-failed: {reason}"), true))
+                    Err((format!("setup-failed: {reason}"), "possible"))
                 }
             }
         }
@@ -1197,6 +1289,48 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(closing, "closing: root-closing");
+    }
+
+    /// D2/D3: a child whose end is unknown (or one of whose Bash runs
+    /// ended unknown) keeps its concurrency charge after it is finished;
+    /// a known end releases it. Unknowns can exhaust the root's capacity.
+    #[test]
+    fn unknown_ends_stay_charged_against_concurrency() {
+        let f = fixture("charged", 4);
+        let first = admit(&ctx(&f), &who(0, f.parent), 7, &request()).unwrap();
+        let second = admit(&ctx(&f), &who(0, f.parent), 7, &request()).unwrap();
+        let full = admit(&ctx(&f), &who(0, f.parent), 7, &request())
+            .err()
+            .unwrap();
+        assert_eq!(full, "budget-concurrent: 2 of 2 (0 unknown-end charged)");
+        // A known end releases its slot.
+        f.registry.finish(first.position, json!({}), false);
+        let third = admit(&ctx(&f), &who(0, f.parent), 7, &request()).unwrap();
+        // A Bash run of `second` ends unknown: `second` stays charged after
+        // it finishes, together with `third` still live.
+        let (root, _far) = Root::seam(
+            false,
+            i32::try_from(std::process::id()).unwrap(),
+            &f.slot.stop,
+        );
+        f.registry.add_run(second.position, &root, 99);
+        assert_eq!(f.registry.runs_of(second.position), (1, false));
+        f.registry.remove_run(99, false);
+        assert_eq!(f.registry.runs_of(second.position), (0, true));
+        f.registry.finish(second.position, json!({}), true);
+        let refused = admit(&ctx(&f), &who(0, f.parent), 7, &request())
+            .err()
+            .unwrap();
+        assert_eq!(refused, "budget-concurrent: 2 of 2 (1 unknown-end charged)");
+        // With nothing live, one slot is free: the unknown still holds the
+        // other, and the admission says so.
+        f.registry.finish(third.position, json!({}), false);
+        let fourth = admit(&ctx(&f), &who(0, f.parent), 7, &request()).unwrap();
+        assert_eq!(fourth.accepted["concurrent"]["unknown_charged"], 1);
+        assert_eq!(fourth.accepted["concurrent"]["live"], 1);
+        let summary = f.registry.summary();
+        assert_eq!(summary["end_unknown"], 1);
+        assert_eq!(summary["starts"], 4);
     }
 
     #[test]

@@ -36,8 +36,10 @@
 //! * A `harness` of kind `child` is a registered child an intent harness
 //!   asked for through the ingress; `child` keeps the durable lineage: the
 //!   requesting (parent) harness and the exact parent **work** it was
-//!   current under at commit, the site route, the requester and the parent
-//!   inputs open then, and how the child ended (`outcome`). Its prompt is
+//!   current under at commit (its whole work in the live view, not its
+//!   agent leader), the site route, the requester and the parent inputs
+//!   open as attributed when the request arrived (a snapshot, not
+//!   rechecked at commit), and how the child ended (`outcome`). Its prompt is
 //!   its one message. A `bash_run` also keeps the requesting harness work.
 //!   Version 7 added both (no migration: no legacy data is kept).
 

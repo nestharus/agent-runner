@@ -83,11 +83,18 @@ export function renderChild(stages, lost) {
     : undefined
   const head = `Explorer ${last.child} (route ${last.route}): ${last.outcome}` +
     (last.stopped ? `; stopped by the root (${last.stopped})` : "") + "."
+  const life = last.lifecycle
+  const status = life
+    ? `\nLifecycle status: end ${life.end}; its Bash runs still open at this result: ${life.bash_runs_open}` +
+      (life.bash_run_end_unknown ? " (one ended unknown)" : "") + `; root budget: ${life.budget}. ` +
+      "The outcome above is about the answer's content only; it does not prove the child or its Bash ended or drained."
+    : "\nLifecycle status: not reported by the root (end and drain unknown to this tool)."
   const body = answer !== undefined
     ? `\nAnswer (the child's last reply before its turn ended; verify what matters yourself):\n${answer}`
     : "\nNo answer was received from the child."
   return {
-    text: `${head}${body}\nLifecycle: ${lifecycle}${noticeText}`,
+    text: `${head}${body}${status}\nLifecycle: ${lifecycle}${noticeText}`,
+    // Error/success concerns the answer only (see the status line).
     isError: last.outcome !== "answered",
   }
 }

@@ -476,6 +476,10 @@ impl Ingress {
                     );
                 }
                 // Unknown stays unresolved for a successor; never retry here.
+                // A child's possible run keeps that child charged.
+                if !not_started {
+                    self.children.note_run_unknown(who.position);
+                }
                 sink.send(&json!({ "event": event, "reason": reason.reason(), "not_started": not_started }));
                 self.report(json!({ "event": format!("bash-{event}"), "work": work, "reason": reason.reason(), "not_started": not_started }));
                 self.leave(if not_started {
@@ -557,7 +561,8 @@ impl Ingress {
         };
         event["output"] = output;
         self.custody.lock().expect("custody lock").release(token);
-        self.children.remove_run(work);
+        self.children
+            .remove_run(work, matches!(outcome, Outcome::Ended));
         let caller = match sink {
             Some(sink) => {
                 sink.send(&event);
