@@ -84,6 +84,10 @@ const DENIED_TOOLS = [
   "WebFetch", "WebSearch", "Skill", "NotebookEdit", "PowerShell", "Glob", "Grep",
 ]
 const OUTPUT_LIMIT = 64 * 1024 * 1024
+// Claude can replace an oversized MCP result with a spill-file error,
+// including its wait receipt. Keep a useful encoded payload prefix here;
+// this is a presentation policy, not a claim about the SDK's token limit.
+const BASH_PAYLOAD_TEXT_BYTES = 4096
 const ROOT_V1_SURFACE = "agent-bash-root-v1"
 const ROOT_V1_OUTCOMES = ["refused", "not-started", "ended", "ended-output-unproven", "unknown"]
 
@@ -167,10 +171,25 @@ export function renderRootV1(exitCode, stdout, stderr) {
   const faults = value.faults.length ? `\nfaults: ${value.faults.join("; ")}` : ""
   const text = bytes.toString("utf8")
   const utf8 = !bytes.includes(0) && Buffer.from(text, "utf8").equals(bytes)
-  const presentation = `\nOutput: ${presented} shown bytes of ${output.bytes} received; ${omitted} omitted; ` +
-    (omitted ? "remainder discarded, not retained." : "remainder none.")
-  const body = `\n--- output (stderr joined; ${bytes.length} shown bytes, ${utf8 ? "utf8" : "hex"}) ---\n` +
-    (utf8 ? text : bytes.toString("hex"))
+  let shown = Math.min(bytes.length, utf8 ? BASH_PAYLOAD_TEXT_BYTES : BASH_PAYLOAD_TEXT_BYTES / 2)
+  // The whole prefix is valid UTF-8 here. Back off if the cut would split
+  // a character; binary output uses hex and budgets its 2x expansion.
+  if (utf8 && shown < bytes.length) {
+    while (shown > 0 && (bytes[shown] & 0xc0) === 0x80) shown--
+  }
+  const consumerOmitted = presented - shown
+  const totalOmitted = output.bytes - shown
+  const presentation = consumerOmitted
+    ? `\nProducer output: ${presented} carried bytes of ${output.bytes} received; ${omitted} omitted; ` +
+      (omitted ? "remainder discarded, not retained." : "remainder none.") +
+      `\nClaude presentation: ${shown} shown bytes of ${presented} producer-carried; ` +
+      `${consumerOmitted} additionally omitted; ${totalOmitted} total omitted of ${output.bytes} received; ` +
+      "additional remainder not presented, not retained by this receiver."
+    : `\nOutput: ${presented} shown bytes of ${output.bytes} received; ${omitted} omitted; ` +
+      (omitted ? "remainder discarded, not retained." : "remainder none.")
+  const prefix = bytes.subarray(0, shown)
+  const body = `\n--- output (stderr joined; ${shown} shown bytes, ${utf8 ? "utf8" : "hex"}) ---\n` +
+    (utf8 ? prefix.toString("utf8") : prefix.toString("hex"))
   switch (value.outcome) {
     case "refused":
       return { text: `Root v1 refused by ${value.refusal?.by} (${value.refusal?.reason})` +
@@ -185,7 +204,7 @@ export function renderRootV1(exitCode, stdout, stderr) {
         ? `exited with code ${value.wait.exit.code}`
         : `signaled with signal ${value.wait.exit?.signal}`
       const status = value.outcome === "ended"
-        ? `output ${delivery} (full stream counted, closed, matched by the end)`
+        ? `output ${totalOmitted ? "partial" : "complete"} (full stream counted, closed, matched by the end)`
         : "output delivery unproven: the output below may be incomplete; do not replay"
       return { text: `Root v1 work ended: ${wait} (${value.wait.status}, observer ${value.wait.observer}); ` +
         `${status}.\n${stages}${faults}${presentation}${body}`, error: false }
