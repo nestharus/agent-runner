@@ -191,6 +191,8 @@ def scenarios(out, model):
         for sub in ("private", "launch/xdg/data/opencode", "launch/secret"):
             os.makedirs(run + "/" + sub, exist_ok=True)
         os.chmod(run, 0o711)
+        for ancestor in ("launch", "launch/xdg"):
+            os.chmod(run + "/" + ancestor, 0o755)
         with open(run + "/private/lock", "w"):
             pass
         with open(run + "/private/retention", "w") as file:
@@ -202,19 +204,14 @@ def scenarios(out, model):
         os.chown(data_dir, WORK_UID, WORK_UID)
         os.chown(data_dir + "/opencode", WORK_UID, WORK_UID)
         os.chown(data_dir + "/opencode/auth.json", WORK_UID, WORK_UID)
-        child = os.fork()
-        if child == 0:
-            try:
-                os.setgroups([])
-                os.setgid(WORK_UID)
-                os.setuid(WORK_UID)
-                shutil.rmtree(data_dir + "/opencode")
-                os.symlink(outside, data_dir + "/opencode")
-                os._exit(0)
-            except BaseException:
-                os._exit(1)
-        _, status = os.waitpid(child, 0)
-        if os.waitstatus_to_exitcode(status) != 0:
+        # Popen's uid/gid options avoid Python pre-exec/fork handlers in
+        # the threaded scripted-model fixture. This helper is no model.
+        changed = subprocess.run(
+            [sys.executable, "-c", "import os,shutil,sys; shutil.rmtree(sys.argv[1]); os.symlink(sys.argv[2],sys.argv[1])",
+             data_dir + "/opencode", outside],
+            user=WORK_UID, group=WORK_UID, extra_groups=[],
+            env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}, cwd="/", timeout=5)
+        if changed.returncode != 0:
             raise RuntimeError("work-side symlink fixture failed")
         result = cleanup.sweep(user_dir)[0] if mode == "sweep" else cleanup.retire(run, mode)
         check("cleanup: " + mode + " preserves namespace-root outside file",
