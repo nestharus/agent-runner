@@ -7,6 +7,8 @@ pub(crate) mod mailbox;
 pub(crate) mod maintenance_control;
 pub(crate) mod migrate;
 #[cfg(target_os = "linux")]
+pub(crate) mod native_entry;
+#[cfg(target_os = "linux")]
 pub(crate) mod native_root;
 pub(crate) mod notify;
 pub(crate) mod notify_continuation;

@@ -222,6 +222,42 @@ Caller codes: 0 answered, 1 no-answer, 2 usage, 3 local refusal,
 retirement; it **does not prove task completion or correctness**. A denial
 or tool echo can be answered/0; entry 87 means close followed through.
 
+## Ordinary `agents` entry (`native.toml`)
+
+When `<runner config root>/native.toml` exists (normally
+`~/.config/oulipoly-agent-runner/native.toml`), the ordinary launch forms
+`agents -m MODEL PROMPT`, `agents AGENT PROMPT` and `--agent-file` run as one
+call of the configured installed caller, before any legacy
+maintenance/owner/State/provider path. The selected model name, from `-m` or
+from the agent's frontmatter `model:`, must be mapped explicitly; the site
+route then fixes provider, model and effort:
+
+```toml
+caller = "/opt/oulipoly-native/<id>/bin/oulipoly-native-call"
+runs_dir = "/home/nes/.local/state/oulipoly-native-runs"   # prompt files + caller records
+deadline_s = 1800                                            # optional; 1..7200
+
+[models."codex~high"]
+route = "sol-high"
+bash = "trusted-task"                    # or bash_allow = ["whole command", ...]
+credential_codex_profile = "/home/nes/.codex4"
+children = ["luna-max"]                  # optional explicit explorer opt-in
+child_max_starts = 1
+
+[models."claude~medium"]
+route = "opus-medium"
+bash = "trusted-task"
+```
+
+The final answer goes to stdout; a status line (class, caller and front-door
+exits, record directory) goes to stderr; the exit code is the caller's own
+(0 answered, which is not correctness). Unmapped models, an invalid file,
+`--resume`, `repl`, `resume`, `--new`, provider pinning/rotation and `-i`
+with `-m` are refused with exit 3 and nothing launched: no legacy launch and
+no substitute model. Without the file, nothing changes. The credential is
+the explicitly named profile only: no rotation, lease or renewal (the caller
+refuses a stale one). One attempt, synchronous, no streaming or resume yet.
+
 ## Native Claude routes
 
 A route with `"harness": "claude"` names `model`, `effort`
