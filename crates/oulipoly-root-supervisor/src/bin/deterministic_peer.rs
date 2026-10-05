@@ -41,6 +41,13 @@
 //! stays alive until killed or `--exit-after-acks`. `close-stdin` is
 //! stdio-only.
 //!
+//! Commands are read from the prompt's last paragraph (after the last blank
+//! line), so an owner-prefixed brief does not hide them. Besides `bash:`:
+//! `echo:TEXT` replies TEXT; `explore:ROUTE:QUESTION` asks the root's owner
+//! for a registered child through `oulipoly-root-child` (next to this
+//! binary) and replies with its result line; `spawn:COMMAND` starts
+//! `/bin/sh -c COMMAND` without waiting for it and replies with its pid.
+//!
 //! Message ids are `msg-NNNN`, ascending. Every idle after an
 //! acknowledgement carries `_meta` [`TURN_INPUT_META`] naming that message.
 //! A prompt whose text starts with `bash:` runs the rest with `/bin/sh -c`
@@ -352,7 +359,33 @@ impl Peer {
                             }),
                         );
                     }
-                    if let Some(command) = text.strip_prefix("bash:") {
+                    let command = text.rsplit_once("\n\n").map_or(text, |(_, last)| last);
+                    let reply = if let Some(echo) = command.strip_prefix("echo:") {
+                        Some(echo.to_owned())
+                    } else if let Some(child) = command.strip_prefix("explore:") {
+                        Some(run_child(child))
+                    } else {
+                        command.strip_prefix("spawn:").map(spawn)
+                    };
+                    if let Some(result) = reply {
+                        let mut update = json!({
+                            "sessionUpdate": "agent_message",
+                            "messageId": format!("reply-{}", message_id.as_str().unwrap_or_default()),
+                            "content": [{ "type": "text", "text": result }],
+                        });
+                        if args.tagged {
+                            update["_meta"] = json!({ PARENT_MESSAGE_META: message_id });
+                        }
+                        send(
+                            out,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "method": "session/update",
+                                "params": { "sessionId": session_id, "update": update },
+                            }),
+                        );
+                    }
+                    if let Some(command) = command.strip_prefix("bash:") {
                         let result = run_bash(command);
                         // Kept too, in case no owner is attached to read it.
                         state["bash"]
@@ -408,6 +441,41 @@ impl Peer {
                 ),
             }
         }
+    }
+}
+
+/// Asks for one registered child (`ROUTE:QUESTION`) through the prototype
+/// child requester and returns its stdout (the result or refusal line).
+fn run_child(request: &str) -> String {
+    let client = std::env::current_exe()
+        .expect("own path")
+        .with_file_name("oulipoly-root-child");
+    let (route, question) = request.split_once(':').unwrap_or((request, ""));
+    match std::process::Command::new(client)
+        .args([route, question])
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        Ok(output) => format!(
+            "exit={:?}\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).trim()
+        ),
+        Err(error) => format!("requester-not-run: {error}"),
+    }
+}
+
+/// Starts `/bin/sh -c command` and does not wait for it.
+fn spawn(command: &str) -> String {
+    match std::process::Command::new("/bin/sh")
+        .args(["-c", command])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => format!("spawned={}", child.id()),
+        Err(error) => format!("spawn-failed: {error}"),
     }
 }
 

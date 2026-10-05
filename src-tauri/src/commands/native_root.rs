@@ -52,6 +52,22 @@
 //! entry does not refresh, copy back or remove them: the caller owns the
 //! source file and the launch directory's copy after the root ends.
 //!
+//! `children` (opt-in) lets the root's harness ask the owner for registered
+//! read-only children: `{"routes": {NAME: {"model", "provider"}},
+//! "opencode": {"deps", "agent_bash_tool", "agent_bash_bin"}, "auth"?,
+//! "max_starts", "max_concurrent"}`. Each child is a native OpenCode host
+//! the owner provisions at its admission under `<launch_dir>/children`,
+//! with the parent's `bash` policy and `auth` (a private access-only
+//! OpenCode `auth.json`, read again for each child; absent for a
+//! credential-free route). The harness gets an `explore` tool naming the
+//! routes. Everything named is checked before any effect; the owner
+//! enforces route, depth, budget and lineage. The caller owns `auth` and
+//! the children's launch copies after the root ends, as for `opencode.auth`.
+//! Experimental and unexposed: the packaged front door and the caller do
+//! not pass `children` or tell a child's turn end and answer from the
+//! parent's yet, and no Claude-parent child credential is prepared. Do not
+//! use it outside owned fixtures until that follow-up lands.
+//!
 //! `--recover <file>` acts on an existing store: `{"store", "purpose",
 //! "env"}`, `purpose` being `cancel` or `continue-attached`. A new owner
 //! claims the store (the next owner generation; earlier unresolved
@@ -118,8 +134,10 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use oulipoly_root_supervisor::children::{ChildPolicy, ChildRoute};
 use oulipoly_root_supervisor::native::{
-    BashAuthority, OpenCodeSetup, OpenCodeSetupError, REMOVED_ENV, provision_opencode,
+    BashAuthority, ExploreTool, OpenCodeSetup, OpenCodeSetupError, REMOVED_ENV, check_opencode,
+    provision_opencode,
 };
 use oulipoly_root_supervisor::native_claude::{
     self, ClaudeSetup, ClaudeSetupError, Effort, provision_claude,
@@ -164,8 +182,37 @@ pub(crate) struct NativeRootRequest {
     /// The native Claude Code setup inputs, instead of `opencode`.
     #[serde(default)]
     claude: Option<ClaudeRequest>,
+    /// Registered children the harness may ask for (see the module docs).
+    #[serde(default)]
+    children: Option<ChildrenRequest>,
     /// Who the root's work runs as (see the module docs).
     workload: RequestWorkload,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChildrenRequest {
+    routes: BTreeMap<String, ChildRouteRequest>,
+    opencode: ChildOpenCode,
+    #[serde(default)]
+    auth: Option<String>,
+    max_starts: u32,
+    max_concurrent: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChildRouteRequest {
+    model: String,
+    provider: Map<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChildOpenCode {
+    deps: String,
+    agent_bash_tool: String,
+    agent_bash_bin: String,
 }
 
 /// The request's work declaration; the owner's [`Workload`] adds where the
@@ -313,6 +360,23 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
     if let Err(reason) = checked.validate() {
         return Ok(refused(&out, format!("owner request: {reason}")));
     }
+    // Each child route's setup inputs, checked now (no write), so that an
+    // unusable child launch refuses the root before any effect rather than
+    // only when the harness first asks.
+    if let Some(children) = checked
+        .intent
+        .as_ref()
+        .and_then(|intent| intent.children.as_ref())
+    {
+        for (name, route) in &children.routes {
+            let setup = route.opencode_setup(format!("{}/check", children.launch_base));
+            if let Some(setup) = setup
+                && let Err(reason) = check_opencode(&setup)
+            {
+                return Ok(refused(&out, format!("children: route {name}: {reason}")));
+            }
+        }
+    }
     let workload = checked
         .intent
         .as_ref()
@@ -392,6 +456,7 @@ fn provision(
             config_dir: claude.config_dir.clone(),
             start_timeout_s: None,
             ack_timeout_s: None,
+            explore: explore_tool(request),
         };
         return match provision_claude(&setup, identity) {
             Ok(launch) => Ok(Provisioned {
@@ -415,6 +480,7 @@ fn provision(
         model: opencode.model.clone(),
         provider: opencode.provider.clone(),
         auth: opencode.auth.clone(),
+        explore: explore_tool(request),
     };
     match provision_opencode(&setup, identity) {
         Ok(launch) => Ok(Provisioned {
@@ -426,6 +492,57 @@ fn provision(
         Err(OpenCodeSetupError::InputInvalid(reason)) => Err((false, reason)),
         Err(OpenCodeSetupError::ConstructionFailed(reason)) => Err((true, reason)),
     }
+}
+
+/// The parent's `explore` tool, when the request allows children.
+fn explore_tool(request: &NativeRootRequest) -> Option<ExploreTool> {
+    request.children.as_ref().map(|children| ExploreTool {
+        routes: children.routes.keys().cloned().collect(),
+        max_starts: children.max_starts,
+        max_concurrent: children.max_concurrent,
+    })
+}
+
+/// The parent harness's `bash` policy, which its children inherit.
+fn bash_policy(request: &NativeRootRequest) -> (Vec<String>, Option<BashAuthority>) {
+    match (&request.opencode, &request.claude) {
+        (Some(opencode), _) => (opencode.bash_allow.clone(), opencode.bash_authority),
+        (None, Some(claude)) => (claude.bash_allow.clone(), claude.bash_authority),
+        (None, None) => (Vec::new(), None),
+    }
+}
+
+/// The intent's child policy, from the request's `children`.
+fn child_policy(request: &NativeRootRequest) -> Option<ChildPolicy> {
+    let children = request.children.as_ref()?;
+    let (bash_allow, bash_authority) = bash_policy(request);
+    Some(ChildPolicy {
+        routes: children
+            .routes
+            .iter()
+            .map(|(name, route)| {
+                (
+                    name.clone(),
+                    ChildRoute::Opencode {
+                        deps: children.opencode.deps.clone(),
+                        agent_bash_tool: children.opencode.agent_bash_tool.clone(),
+                        agent_bash_bin: children.opencode.agent_bash_bin.clone(),
+                        bash_allow: bash_allow.clone(),
+                        bash_authority,
+                        model: route.model.clone(),
+                        provider: route.provider.clone(),
+                        auth: children.auth.clone(),
+                    },
+                )
+            })
+            .collect(),
+        max_starts: children.max_starts,
+        max_concurrent: children.max_concurrent,
+        launch_base: Path::new(&request.launch_dir)
+            .join("children")
+            .to_string_lossy()
+            .into_owned(),
+    })
 }
 
 /// The harness id and endpoint of the request's one harness.
@@ -751,6 +868,7 @@ fn owner_request(request: &NativeRootRequest, argv: Vec<String>) -> Request {
                 },
                 RequestWorkload::UnprivilegedUserns {} => Workload::UnprivilegedUserns {},
             },
+            children: child_policy(request),
         }),
         recover: None,
     }

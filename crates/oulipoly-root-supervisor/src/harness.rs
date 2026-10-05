@@ -20,8 +20,9 @@ use oulipoly_acp::{
 use serde_json::{Value, json};
 
 use crate::bash::{self, OpenInput, Views};
+use crate::children::{ChildLink, Registry};
 use crate::conversation::{Closing, FollowUp, Inbox};
-use crate::custody::{self, Adopted, PidNs, ReceiptWait, Root, RootSlot, WorkStdio};
+use crate::custody::{self, Adopted, PidNs, ReceiptWait, Root, RootSlot, SpawnError, WorkStdio};
 use crate::live::Custody;
 use crate::store::{DurableAck, DurableHarness, Store, StoreError};
 use crate::transport::{self, HarnessTransport, Observed};
@@ -104,6 +105,22 @@ pub struct HarnessRecord {
 }
 
 impl HarnessRecord {
+    /// A harness that was never launched.
+    pub(crate) fn empty(id: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            launches: 0,
+            reattached: 0,
+            exits: Vec::new(),
+            prior_exits: Vec::new(),
+            prior_unknown_ends: 0,
+            wait_failures: Vec::new(),
+            detached: 0,
+            close_stop_attempted: false,
+            messages: Vec::new(),
+        }
+    }
+
     pub(crate) fn to_json(&self) -> Value {
         json!({
             "id": self.id,
@@ -207,6 +224,9 @@ struct Worker {
     inbox: Arc<Inbox>,
     closing: Arc<Closing>,
     close_stop_attempted: bool,
+    children: Arc<Registry>,
+    /// Set for a registered child: its requester and lineage.
+    child: Option<Arc<ChildLink>>,
 }
 
 /// What one worker is given: its durable harness record and shared state.
@@ -224,67 +244,74 @@ pub(crate) struct Assignment {
     pub(crate) views: Views,
     pub(crate) inbox: Arc<Inbox>,
     pub(crate) closing: Arc<Closing>,
+    pub(crate) children: Arc<Registry>,
+}
+
+/// What a registered child's worker is given (see [`crate::children`]).
+pub(crate) struct ChildAssignment {
+    pub(crate) position: usize,
+    pub(crate) harness: DurableHarness,
+    pub(crate) cwd: String,
+    pub(crate) custody: Arc<Mutex<Custody>>,
+    pub(crate) store: Arc<Mutex<Store>>,
+    pub(crate) slot: Arc<RootSlot>,
+    pub(crate) tx: Sender<Event>,
+    pub(crate) views: Views,
+    pub(crate) children: Arc<Registry>,
+    pub(crate) link: Arc<ChildLink>,
+}
+
+/// Drives one registered child to its end and returns its record. One
+/// attempt, one closure: never relaunched or delivered to again. Its
+/// conversation is closed from the start, so its harness is stopped once
+/// its one input's tagged turn ended.
+pub(crate) fn run_child(assignment: ChildAssignment) -> HarnessRecord {
+    let ChildAssignment {
+        position,
+        harness,
+        cwd,
+        custody,
+        store,
+        slot,
+        tx,
+        views,
+        children,
+        link,
+    } = assignment;
+    let closing = Arc::new(Closing::default());
+    closing.request();
+    let inbox = match Inbox::new() {
+        Ok(inbox) => Arc::new(inbox),
+        Err(error) => {
+            link.observe(&json!({ "event": "launch-failed", "reason": format!("inbox: {error}") }));
+            return HarnessRecord::empty(&harness.id);
+        }
+    };
+    let mut worker = Worker::build(
+        Assignment {
+            position,
+            harness,
+            cap: 1,
+            attempt_cap: 1,
+            cwd,
+            custody,
+            store,
+            slot,
+            prior: None,
+            tx,
+            views,
+            inbox,
+            closing,
+            children,
+        },
+        Some(link),
+    );
+    worker.supervise();
+    worker.record()
 }
 
 pub(crate) fn run(assignment: Assignment) {
-    let Assignment {
-        position,
-        harness,
-        cap,
-        attempt_cap,
-        cwd,
-        custody,
-        store,
-        slot,
-        prior,
-        tx,
-        views,
-        inbox,
-        closing,
-    } = assignment;
-    let tracked = harness
-        .messages
-        .into_iter()
-        .map(|durable| Tracked {
-            // A durable stop (`outage`, `attempts-exhausted`) keeps the
-            // message from being retried.
-            label: durable.stop,
-            message: durable.message,
-            ack: durable.ack,
-            closures: durable.closures,
-            attempts: durable.attempts,
-            prior_unknown: durable.prior_unknown,
-            follow_up: durable.follow_up,
-        })
-        .collect();
-    let mut worker = Worker {
-        id: harness.id,
-        argv: harness.argv,
-        endpoint: harness.endpoint,
-        position,
-        cap,
-        attempt_cap,
-        cwd,
-        custody,
-        store,
-        slot,
-        tx,
-        tracked,
-        session: harness.session,
-        prior,
-        launches: 0,
-        reattached: 0,
-        exits: Vec::new(),
-        prior_exits: Vec::new(),
-        prior_unknown_ends: 0,
-        wait_failures: Vec::new(),
-        detached: 0,
-        views,
-        answered: std::collections::HashSet::new(),
-        inbox,
-        closing,
-        close_stop_attempted: false,
-    };
+    let mut worker = Worker::build(assignment, None);
     worker.view(|view| {
         view.id.clone_from(&worker.id);
         view.session.clone_from(&worker.session);
@@ -295,6 +322,70 @@ pub(crate) fn run(assignment: Assignment) {
 }
 
 impl Worker {
+    fn build(assignment: Assignment, child: Option<Arc<ChildLink>>) -> Self {
+        let Assignment {
+            position,
+            harness,
+            cap,
+            attempt_cap,
+            cwd,
+            custody,
+            store,
+            slot,
+            prior,
+            tx,
+            views,
+            inbox,
+            closing,
+            children,
+        } = assignment;
+        let tracked = harness
+            .messages
+            .into_iter()
+            .map(|durable| Tracked {
+                // A durable stop (`outage`, `attempts-exhausted`) keeps the
+                // message from being retried.
+                label: durable.stop,
+                message: durable.message,
+                ack: durable.ack,
+                closures: durable.closures,
+                attempts: durable.attempts,
+                prior_unknown: durable.prior_unknown,
+                follow_up: durable.follow_up,
+            })
+            .collect();
+        Worker {
+            id: harness.id,
+            argv: harness.argv,
+            endpoint: harness.endpoint,
+            position,
+            cap,
+            attempt_cap,
+            cwd,
+            custody,
+            store,
+            slot,
+            tx,
+            tracked,
+            session: harness.session,
+            prior,
+            launches: 0,
+            reattached: 0,
+            exits: Vec::new(),
+            prior_exits: Vec::new(),
+            prior_unknown_ends: 0,
+            wait_failures: Vec::new(),
+            detached: 0,
+            views,
+            answered: std::collections::HashSet::new(),
+            inbox,
+            closing,
+            close_stop_attempted: false,
+            children,
+            child,
+        }
+    }
+
     fn view(&self, change: impl FnOnce(&mut bash::View)) {
         let mut views = self.views.lock().expect("views");
         if let Some(view) = views.get_mut(self.position) {
@@ -317,6 +408,10 @@ impl Worker {
 
     fn report(&self, mut value: Value) {
         value["harness"] = Value::String(self.id.clone());
+        if let Some(link) = &self.child {
+            value["child"] = link.marker();
+            link.observe(&value);
+        }
         let _ = self.tx.send(Event::Report(value));
     }
 
@@ -606,6 +701,11 @@ impl Worker {
             self.label_remaining(reason);
             return false;
         }
+        if let Some(reason) = self.child.as_ref().and_then(|link| link.stopped()) {
+            // A stopped child's end is its stop, not a closure.
+            self.label_remaining(reason);
+            return false;
+        }
         match end {
             ConnEnd::Drained | ConnEnd::Stop | ConnEnd::WaitUnproven => {
                 self.label_remaining("not-attempted");
@@ -657,6 +757,14 @@ impl Worker {
             self.label_remaining(reason);
             return None;
         }
+        // A child stopped before its launch (requester or parent gone,
+        // root closing) is not started; the stop holds this same lock.
+        if let Some(reason) = self.child.as_ref().and_then(|link| link.stopped()) {
+            drop(custody);
+            self.report(json!({ "event": "launch-failed", "reason": format!("stopped-before-launch: {reason}") }));
+            self.label_remaining(reason);
+            return None;
+        }
         let root = match self.slot.ensure(&self.store, &self.tx) {
             Ok(root) => root,
             Err(Ok(error)) => {
@@ -687,18 +795,34 @@ impl Worker {
         };
         let spawned = match self
             .launch_env(work)
-            .and_then(|env| root.spawn(work, &self.argv, &env, &self.cwd, false))
+            .map_err(SpawnError::NotStarted)
+            .and_then(|env| root.spawn_observed(work, &self.argv, &env, &self.cwd, false))
         {
             Ok(spawned) => spawned,
-            Err(reason) => {
+            Err(SpawnError::NotStarted(reason)) => {
                 drop(custody);
-                self.report(json!({ "event": "launch-failed", "reason": reason }));
+                self.report(
+                    json!({ "event": "launch-failed", "reason": reason, "not_started": true }),
+                );
                 self.durable(|store| store.resolve_work(work, "launch-refused", None));
                 self.label_remaining("launch-failed");
                 return None;
             }
+            Err(SpawnError::Unknown(reason)) => {
+                // A lost or unproven reply after root PID 1 may have
+                // created the work: possible effects, never a no-start
+                // and never retried. The work stays unresolved durably.
+                drop(custody);
+                self.report(json!({ "event": "launch-unknown", "work": work, "reason": reason, "not_started": false }));
+                self.wait_failures.push(format!("launch-unknown: {reason}"));
+                self.label_remaining("launch-unknown");
+                return None;
+            }
         };
         let token = custody.register(Arc::clone(&root), work);
+        if let Some(link) = &self.child {
+            link.set_work(&root, work);
+        }
         drop(custody);
         self.launches += 1;
         self.report(json!({
@@ -833,6 +957,20 @@ impl Worker {
             view.works.retain(|(work, _)| *work != live.work);
             view.open.clear();
         });
+        // Children are subordinate to this exact work: they stop with it
+        // (a relaunch is another work, never their parent). A child's own
+        // Bash ends with the child.
+        match &self.child {
+            None => {
+                let signalled = self.children.stop_children_of(live.work, "parent-ended");
+                if signalled > 0 {
+                    self.report(json!({ "event": "children-stopping", "work": live.work, "reason": "parent-ended", "signalled": signalled }));
+                }
+            }
+            Some(link) => {
+                self.children.kill_runs_of(link.position);
+            }
+        }
         let exit = match waited {
             ReceiptWait::Receipt(receipt) => {
                 self.custody
@@ -905,6 +1043,10 @@ impl Worker {
             "status": status,
             "reaped": "work-pid1-wait",
             "work_pid1": receipt["work_pid1"],
+            // Separate facts: whether a stop was asked of the work's PID 1,
+            // and its report that nothing was left in its namespace.
+            "stop_requested": receipt["stop_requested"],
+            "namespace": receipt["namespace"],
         }));
         self.exits.push(status);
         true
@@ -1409,6 +1551,7 @@ mod tests {
                 messages: vec!["x".into()],
             }],
             workload: crate::Workload::UnprivilegedUserns {},
+            children: None,
         };
         let mut claimed = Store::claim(&dir.0, Some(&intent)).unwrap();
         let harness = claimed.harnesses.remove(0);
@@ -1459,10 +1602,82 @@ mod tests {
                 inbox: Arc::new(Inbox::new().unwrap()),
                 closing: Arc::default(),
                 close_stop_attempted: false,
+                children: Registry::new(None, 1, 0, Arc::new(Mutex::new(Custody::default()))),
+                child: None,
             },
             rx,
             dir,
         )
+    }
+
+    /// CONFIGURED SEAM (A6): a harness launch whose spawn reply is lost or
+    /// unproven after root PID 1 may have created the work is possible
+    /// effects: reported `launch-unknown`, the work row stays unresolved,
+    /// the run cannot read as reaped, and nothing is relaunched. Only a
+    /// positive no-start reply resolves the work as never started.
+    #[test]
+    fn lost_or_unproven_spawn_reply_is_launch_unknown_not_refused() {
+        for mode in ["lost", "unproven", "refused"] {
+            let (mut worker, rx, dir) = worker();
+            let stop = Arc::new(crate::transport::StopSignal::new().unwrap());
+            let (root, far) = Root::seam(false, i32::try_from(std::process::id()).unwrap(), &stop);
+            worker.slot = Arc::new(RootSlot::new(
+                dir.0.clone(),
+                1,
+                crate::workload::unprivileged_for_tests(&dir.0),
+                stop,
+                Some(root),
+            ));
+            worker.argv = vec!["peer".into()];
+            worker
+                .store
+                .lock()
+                .unwrap()
+                .begin_incarnation("t", "test")
+                .unwrap();
+            let replier = std::thread::spawn(move || {
+                let (bytes, _) = crate::sys::recv(&far).unwrap().unwrap();
+                let request: Value = serde_json::from_slice(&bytes).unwrap();
+                match mode {
+                    "lost" => drop(far),
+                    "unproven" => crate::sys::send(&far, json!({ "req": request["req"], "event": "refused", "reason": "after-clone", "not_started": false }).to_string().as_bytes(), &[]).unwrap(),
+                    _ => crate::sys::send(&far, json!({ "req": request["req"], "event": "refused", "reason": "bad-spawn", "not_started": true }).to_string().as_bytes(), &[]).unwrap(),
+                }
+            });
+            assert!(worker.launch().is_none());
+            replier.join().unwrap();
+            let events: Vec<Value> = rx
+                .try_iter()
+                .filter_map(|event| match event {
+                    Event::Report(value) => Some(value),
+                    _ => None,
+                })
+                .collect();
+            let conn = rusqlite::Connection::open(dir.0.join(crate::store::DB_FILE)).unwrap();
+            let outcome: Option<String> = conn
+                .query_row("SELECT outcome FROM work", [], |row| row.get(0))
+                .unwrap();
+            let record = worker.record();
+            if mode == "refused" {
+                assert!(
+                    events.iter().any(|e| e["event"] == "launch-failed"),
+                    "{events:?}"
+                );
+                assert_eq!(outcome.as_deref(), Some("launch-refused"));
+                assert!(record.wait_failures.is_empty());
+            } else {
+                assert!(
+                    events.iter().any(|e| e["event"] == "launch-unknown"),
+                    "{mode}: {events:?}"
+                );
+                assert_eq!(outcome, None, "{mode}: possible effects stay unresolved");
+                assert_eq!(record.messages[0].label, "launch-unknown");
+                let (report, _) =
+                    crate::terminal_report(&[("test".into(), 1)], &[record], false, false, None);
+                assert_eq!(report["all_harnesses_reaped"], false, "{mode}: {report}");
+                assert_ne!(report["status"], "ended-owed");
+            }
+        }
     }
 
     // Classification seam only: this does not reproduce a lost waiter report.
