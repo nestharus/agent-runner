@@ -45,7 +45,9 @@ Only B receives builds, dependency snapshots, cargo/npm caches, the Node
 download, stage and archive. Cargo uses `--locked`; npm uses `ci
 --ignore-scripts` for both lockfiles; Node is the official
 `node-v24.21.0-linux-x64.tar.xz`, checked against its pinned sha256, of
-which only `bin/node` and `LICENSE` are staged. The Claude Code and Node
+which only `bin/node` and `LICENSE` are staged. The locked musl Claude
+Code platform package, never selected by the receiver, is not staged
+(MANIFEST `claude_deps_not_staged`). The Claude Code and Node
 executables are copied and hashed, never run; their dynamic dependencies
 are read with `readelf`. MANIFEST also records the Claude lock hash, the
 Claude Code package/version/sha256 and the Node release. Runner

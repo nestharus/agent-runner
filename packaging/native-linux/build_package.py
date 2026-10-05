@@ -33,6 +33,9 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 LOCK_DIR = "crates/oulipoly-root-supervisor/native/opencode"
 CLAUDE_LOCK_DIR = "crates/oulipoly-root-supervisor/native/claude"
 CLAUDE_PLATFORM = "node_modules/@anthropic-ai/claude-agent-sdk-linux-x64"
+# Locked optional platform packages `npm ci` installs on Linux x64 that the
+# receiver never selects (it names the glibc executable): not staged.
+CLAUDE_UNUSED = ("node_modules/@anthropic-ai/claude-agent-sdk-linux-x64-musl",)
 # The Node runtime of the Claude receiver: an official release, pinned.
 NODE_VERSION = "v24.21.0"
 NODE_TARBALL = f"node-{NODE_VERSION}-linux-x64.tar.xz"
@@ -281,7 +284,9 @@ def main(argv):
         shutil.copy2(os.path.join(build, product), os.path.join(stage, target))
     shutil.copy2(os.path.join(bash_source, BASH_TOOL), os.path.join(stage, "agent-bash", "bash.ts"))
     shutil.copytree(deps, os.path.join(stage, "opencode", "deps"), symlinks=True)
-    shutil.copytree(claude_deps, os.path.join(stage, "claude", "deps"), symlinks=True)
+    unused = {os.path.join(claude_deps, path) for path in CLAUDE_UNUSED}
+    shutil.copytree(claude_deps, os.path.join(stage, "claude", "deps"), symlinks=True,
+                    ignore=lambda directory, names: [n for n in names if os.path.join(directory, n) in unused])
     shutil.copytree(node, os.path.join(stage, "claude", "node"), symlinks=True)
     for target, source, mode in ASSETS:
         os.makedirs(os.path.join(stage, os.path.dirname(target)), exist_ok=True)
@@ -305,6 +310,7 @@ def main(argv):
         "opencode_lock_sha256": lock_hash,
         "claude_lock_sha256": claude_lock_hash,
         "claude_code": claude_code_identity(stage),
+        "claude_deps_not_staged": list(CLAUDE_UNUSED),
         "node": {"version": NODE_VERSION, "url": NODE_URL, "tarball_sha256": NODE_SHA256,
                  "files": ["bin/node", "LICENSE"]},
         "toolchain": toolchain,
