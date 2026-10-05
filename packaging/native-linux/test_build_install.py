@@ -118,6 +118,10 @@ class Install(Scratch):
         left = sorted(os.path.relpath(os.path.join(d, n), dest) for d, ds, fs in os.walk(dest) for n in ds + fs)
         self.assertEqual(left, ["etc", "etc/sudoers.d"])
 
+    def test_plan_needs_no_privilege(self):
+        archive, digest = self.archive(self.stage())
+        self.assertEqual(install_package.main(["plan", "--archive", archive, "--sha256", digest, "--user", "nes"]), 0)
+
     def test_plan_changes_nothing(self):
         archive, digest = self.archive(self.stage())
         code, dest = self.install(archive, digest, command="plan")

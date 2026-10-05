@@ -214,14 +214,14 @@ def plan(args, paths, package_id):
 
 def install(args, paths):
     unprivileged = args.unprivileged_test
-    if not unprivileged and os.geteuid() != 0:
-        raise Stop("install runs as root")
     if sha256_file(args.archive) != args.sha256:
         raise Stop("archive digest differs from --sha256")
     package_id = package_id_of(args.archive)
     if args.command == "plan":
         print(json.dumps(plan(args, paths, package_id), indent=1))
         return 0
+    if not unprivileged and os.geteuid() != 0:
+        raise Stop("install runs as root")
     sudoers = paths.host(paths.sudoers)
     if not os.path.isdir(os.path.dirname(sudoers)):
         raise Stop(f"{os.path.dirname(paths.sudoers)} is not a directory")
