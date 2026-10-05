@@ -15,6 +15,15 @@ cleanup and fd-safe discard never traverse a work-replaced symlink.
 
 Native exit status or 90 refusal, 91 setup failure, 92 kill requested,
 93 stop/collection unknown, 94 cleanup/residue failed. No replay.
+Registered children (opt-in): the site names child routes, which parent
+routes may offer them and the ceilings; the requester picks among them.
+An OpenCode parent's children reuse its admitted grant; a Claude parent's
+take a separate access-only child-provider grant (never Claude's login).
+That grant is staged once per root (private/child-auth.json, each child's
+launch copies it) and every staged and derived copy, the children's
+included, is removed at retirement, keep or discard, after partial
+setup or failure too.
+
 Access-only staging avoids intentional credential echo, but arbitrary
 native/task output is unredacted and can contain secrets. Requester env
 uses the accepted denylist and reaches root Rust processes too. Full
@@ -80,9 +89,16 @@ ENV_VALUE_LIMIT = 32 * 1024
 CREDENTIAL_FIELDS = frozenset({"type", "refresh", "access", "expires", "accountId"})
 CREDENTIAL_FILES = (
     "private/auth.json",
+    "private/child-auth.json",
     "launch/xdg/data/opencode/auth.json",
     "launch/secret/server-password",
 )
+# Below each child's launch directory (`launch/children/c<N>`).
+CHILD_CREDENTIAL_FILES = ("xdg/data/opencode/auth.json", "secret/server-password")
+CHILD_LAUNCH = re.compile(r"c[0-9]{1,9}")
+# The owner's ceilings for this first child capability.
+CHILD_MAX_STARTS = 4
+CHILD_MAX_CONCURRENT = 2
 
 ENTRY_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
 
@@ -207,6 +223,7 @@ def load_site(path):
     known = {
         "v", "allowed_users", "run_base", "max_deadline_s", "cancel_grace_s",
         "credential_margin_s", "allow_keep", "default_path", "routes",
+        "child_routes", "child_limits",
     }
     if not isinstance(site, dict) or site.get("v") != 1 or set(site) - known:
         raise Refused("site config: not a v1 config")
@@ -229,13 +246,42 @@ def load_site(path):
     for name, route in routes.items():
         if not (opencode_route(route) or claude_route(route)):
             raise Refused(f"site config: route {name}")
+    check_site_children(site)
     return site
+
+
+def check_site_children(site):
+    """`child_routes` (OpenCode routes a child may run on), each parent
+    route's `children` (the child routes it may offer) and `child_limits`
+    (at most the owner's ceilings)."""
+    child_routes = site.setdefault("child_routes", {})
+    if not isinstance(child_routes, dict):
+        raise Refused("site config: child_routes")
+    for name, route in child_routes.items():
+        if (
+            not isinstance(name, str)
+            or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name)
+            or not opencode_route(route)
+            or "children" in route
+        ):
+            raise Refused(f"site config: child route {name}")
+    limits = site.setdefault("child_limits", {})
+    if not isinstance(limits, dict) or set(limits) - {"max_starts", "max_concurrent"}:
+        raise Refused("site config: child_limits")
+    for key, ceiling in (("max_starts", CHILD_MAX_STARTS), ("max_concurrent", CHILD_MAX_CONCURRENT)):
+        value = limits.setdefault(key, ceiling)
+        if type(value) is not int or not 1 <= value <= ceiling:
+            raise Refused(f"site config: child_limits.{key} must be 1..{ceiling}")
+    for name, route in site["routes"].items():
+        offered = route.get("children", [])
+        if not isinstance(offered, list) or not all(isinstance(child, str) and child in child_routes for child in offered):
+            raise Refused(f"site config: route {name} children")
 
 
 def opencode_route(route):
     return (
         isinstance(route, dict)
-        and not set(route) - {"model", "provider", "credential"}
+        and not set(route) - {"model", "provider", "credential", "children"}
         and isinstance(route.get("model"), str)
         and "/" in route["model"]
         and isinstance(route.get("provider"), dict)
@@ -250,7 +296,7 @@ def claude_route(route):
     store = route.get("config_dir") if isinstance(route, dict) else None
     return (
         isinstance(route, dict)
-        and set(route) == {"harness", "model", "effort", "config_dir", "credential"}
+        and set(route) - {"children"} == {"harness", "model", "effort", "config_dir", "credential"}
         and route["harness"] == "claude"
         and isinstance(route["model"], str)
         and CLAUDE_MODEL.fullmatch(route["model"]) is not None
@@ -289,7 +335,8 @@ def check_request(request, site, now):
     """Returns the checked request; refuses anything outside its shape."""
     if not isinstance(request, dict):
         raise Refused("request is not an object")
-    known = {"v", "route", "message", "cwd", "bash", "env", "deadline_s", "credential", "retention"}
+    known = {"v", "route", "message", "cwd", "bash", "env", "deadline_s", "credential", "retention",
+             "children", "child_credential"}
     if request.get("v") != 1:
         raise Refused("request: v must be 1")
     unknown = set(request) - known
@@ -329,6 +376,7 @@ def check_request(request, site, now):
     if retention not in ("discard", "keep") or (retention == "keep" and not site["allow_keep"]):
         raise Refused("request: retention")
     credential = check_credential(route, request.get("credential"), deadline, site, now)
+    children = check_children(route, request, credential, deadline, site, now)
     return {
         "route_name": route_name,
         "route": route,
@@ -339,7 +387,61 @@ def check_request(request, site, now):
         "deadline": deadline,
         "retention": retention,
         "credential": credential,
+        "children": children,
     }
+
+
+def check_children(route, request, credential, deadline, site, now):
+    """The requester's opt-in to registered children, within what the site
+    lets this parent route offer, and the children's one grant; or None.
+    `credential` is the parent's checked one (an OpenCode parent's
+    children reuse it). Never Claude's login."""
+    asked = request.get("children")
+    if asked is None:
+        if "child_credential" in request:
+            raise Refused("request: child_credential without children")
+        return None
+    if not isinstance(asked, dict) or set(asked) - {"routes", "max_starts", "max_concurrent"}:
+        raise Refused("request: children must be {routes, max_starts?, max_concurrent?}")
+    names = asked.get("routes")
+    offered = route.get("children", [])
+    if (
+        not isinstance(names, list)
+        or not names
+        or len(set(names)) != len(names)
+        or not all(isinstance(name, str) and name in offered for name in names)
+    ):
+        raise Refused("request: children.routes must name child routes this route offers")
+    limits = {}
+    for key in ("max_starts", "max_concurrent"):
+        ceiling = site["child_limits"][key]
+        value = asked.get(key, ceiling)
+        if type(value) is not int or not 1 <= value <= ceiling:
+            raise Refused(f"request: children.{key} must be 1..{ceiling}")
+        limits[key] = value
+    child_routes = {name: site["child_routes"][name] for name in names}
+    needs = {name: child["credential"] == "required" for name, child in child_routes.items()}
+    providers = {child["model"].split("/", 1)[0] for name, child in child_routes.items() if needs[name]}
+    if len(providers) > 1:
+        raise Refused("request: children's credential-requiring routes must share one provider")
+    grant = None
+    if providers:
+        (provider,) = providers
+        if route.get("harness") == "claude":
+            if "child_credential" not in request:
+                raise Refused("request: a Claude parent's children need child_credential (access-only, the child provider's)")
+            pseudo = {"model": provider + "/child", "credential": "required"}
+            grant = check_credential(pseudo, request["child_credential"], deadline, site, now)
+            grant = (grant[0], dict(grant[1], source="separate-child-grant"))
+        else:
+            if "child_credential" in request:
+                raise Refused("request: an OpenCode parent's children reuse its own grant; no child_credential")
+            if credential is None or set(credential[0]) != {provider}:
+                raise Refused(f"request: children need this route's own {provider} grant to reuse")
+            grant = (credential[0], dict(credential[1], source="reused-parent-grant"))
+    elif "child_credential" in request:
+        raise Refused("request: these child routes take no credential")
+    return {"routes": child_routes, **limits, "grant": grant}
 
 
 def check_credential(route, credential, deadline, site, now):
@@ -471,9 +573,33 @@ def unlink_beneath(run, relative):
         os.close(fd)
 
 
+def child_credential_files(run):
+    """Each child launch's credential files (relative), found without
+    following a symlink; an unlistable children directory is a failure."""
+    names, failed = [], []
+    try:
+        fd = os.open(run, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            for part in ("launch", "children"):
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+                os.close(fd)
+                fd = child
+            entries = os.listdir(fd)
+        finally:
+            os.close(fd)
+    except FileNotFoundError:
+        return names, failed
+    except OSError as error:
+        return names, [{"path": os.path.join(run, "launch/children"), "result": "FAILED", "error": type(error).__name__}]
+    for entry in sorted(entries):
+        if CHILD_LAUNCH.fullmatch(entry):
+            names += [f"launch/children/{entry}/{name}" for name in CHILD_CREDENTIAL_FILES]
+    return names, failed
+
+
 def remove_credentials(run):
-    records = []
-    for name in CREDENTIAL_FILES:
+    child_files, records = child_credential_files(run)
+    for name in CREDENTIAL_FILES + tuple(child_files):
         path = os.path.join(run, name)
         try:
             unlink_beneath(run, name)
@@ -541,6 +667,25 @@ def write_private(path, value):
         file.write(value if isinstance(value, str) else json.dumps(value))
 
 
+def children_request(package, run, checked):
+    children = checked.get("children")
+    if children is None:
+        return {}
+    value = {
+        "routes": {name: {"model": child["model"], "provider": child["provider"]} for name, child in children["routes"].items()},
+        "opencode": {
+            "deps": os.path.join(package, DEPS),
+            "agent_bash_tool": os.path.join(package, BASH_TOOL),
+            "agent_bash_bin": os.path.join(package, BASH_BIN),
+        },
+        "max_starts": children["max_starts"],
+        "max_concurrent": children["max_concurrent"],
+    }
+    if children["grant"] is not None:
+        value["auth"] = os.path.join(run, "private", "child-auth.json")
+    return {"children": value}
+
+
 def entry_request(package, run, user, checked, env, authenticated):
     route = checked["route"]
     common = {
@@ -552,6 +697,7 @@ def entry_request(package, run, user, checked, env, authenticated):
         "outage_closure_cap": 1,
         "delivery_attempt_cap": 1,
         "workload": {"isolation": "host-root", "user": user.pw_name},
+        **children_request(package, run, checked),
     }
     if route.get("harness") == "claude":
         # Named only: the requester's own store, never read here.
@@ -930,6 +1076,10 @@ def run_locked(argv, environ, stdin_fd=0):
 
     credential, credential_public = checked["credential"] or (None, None)
     checked["credential"] = None
+    children = checked["children"]
+    child_grant, child_public = (children or {}).get("grant") or (None, None)
+    if children is not None:
+        children["grant"] = (None, child_public) if child_grant is not None else None
     try:
         run_id, run_dir, lock, swept = make_run(site, user)
     except (Refused, OSError) as error:
@@ -944,6 +1094,10 @@ def run_locked(argv, environ, stdin_fd=0):
             write_private(os.path.join(run_dir, "private", "retention"), checked["retention"])
             if credential is not None:
                 write_private(os.path.join(run_dir, "private", "auth.json"), credential)
+            if child_grant is not None:
+                # One snapshot for the root's life; retired with the run.
+                write_private(os.path.join(run_dir, "private", "child-auth.json"), child_grant)
+                child_grant = None
             request_path = os.path.join(run_dir, "private", "request.json")
             write_private(request_path, entry_request(package, run_dir, user, checked, env, credential is not None))
             credential = None
@@ -960,6 +1114,15 @@ def run_locked(argv, environ, stdin_fd=0):
             "bash": "trusted-task" if "bash_authority" in checked["policy"] else {"allow": checked["policy"]["bash_allow"]},
             "env_names": sorted(env),
             "credential": credential_public,
+            "children": None if children is None else {
+                "routes": sorted(children["routes"]),
+                "models": {name: child["model"] for name, child in children["routes"].items()},
+                "max_starts": children["max_starts"],
+                "max_concurrent": children["max_concurrent"],
+                "depth": 1,
+                "credential": child_public,
+                "credential_copies": "private/child-auth.json once; each child's launch copies it; all removed at retirement",
+            },
             "deadline_s": checked["deadline"],
             "cancel_grace_s": site["cancel_grace_s"],
             "retention": checked["retention"],
@@ -969,6 +1132,10 @@ def run_locked(argv, environ, stdin_fd=0):
             # Setup elapsed since admission; recheck just before native launch.
             with open(os.path.join(run_dir, "private", "auth.json")) as file:
                 check_credential(checked["route"], json.load(file), checked["deadline"], site, time.time())
+        if child_public is not None:
+            with open(os.path.join(run_dir, "private", "child-auth.json")) as file:
+                staged = json.load(file)
+            check_credential({"model": child_public["provider"] + "/child", "credential": "required"}, staged, checked["deadline"], site, time.time())
         try:
             entry, alive = start_entry(package, request_path)
         except (OSError, subprocess.SubprocessError) as error:

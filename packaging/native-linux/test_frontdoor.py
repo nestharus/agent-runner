@@ -266,7 +266,7 @@ class Retention(Scratch):
         run = self.make_run("a", "discard", False)
         record = frontdoor.retire(run, "discard")
         self.assertTrue(record["credentials"]["ok"])
-        self.assertEqual([f["result"] for f in record["credentials"]["files"]], ["removed"] * 3)
+        self.assertEqual([f["result"] for f in record["credentials"]["files"]], ["removed"] * len(frontdoor.CREDENTIAL_FILES))
         self.assertTrue(record["run_removed"])
         self.assertFalse(os.path.exists(run))
 

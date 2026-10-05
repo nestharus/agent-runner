@@ -6,12 +6,21 @@
         [--env NAME=VALUE ...] [--retention discard|keep]
         [--credential-opencode-auth FILE --credential-provider ID
          | --credential-codex-profile DIR]
+        [--child-route NAME ... [--child-max-starts N] [--child-max-concurrent N]
+         [--child-credential-codex-profile DIR
+          | --child-credential-opencode-auth FILE --child-credential-provider ID]]
 
 Explicit caller-selected access-only source; no search/refresh/copyback.
 Nonblocking admission/control and bounded terminal/EOF/exit collection;
 unknown stop is incomplete, without pretending a privileged child ended.
 Output is captured without a redactor and can contain arbitrary secrets.
 Answered/0 means linked text plus complete transport, not task correctness.
+The answer and the automatic close are the parent's only: events marked
+as a registered child's (`child`) never supply either. Child results and
+lifecycles are kept separately (children.json); they are what the owner
+reported, not proof any child or its Bash drained beyond what they say.
+--child-credential-* is a Claude parent's separate access-only grant for
+the child provider; never Claude's own login.
 Exit classes and runtime/credential bounds: share/README.md.
 """
 
@@ -31,6 +40,8 @@ STOP_GRACE_S = 65
 LINE_LIMIT = 8 * 1024 * 1024
 CAPTURE_LIMIT = 64 * 1024 * 1024
 MAX_EXPIRY_MS = 253402300799000
+# The front door's default site bound; a site may admit less (it refuses).
+MAX_DEADLINE_S = 7200
 FRONTDOOR = "libexec/oulipoly-native-frontdoor"
 
 
@@ -150,6 +161,13 @@ def parse_args(argv):
     source.add_argument("--credential-codex-profile")
     parser.add_argument("--credential-provider")
     parser.add_argument("--credential-margin", type=int, default=600)
+    parser.add_argument("--child-route", action="append", default=[])
+    parser.add_argument("--child-max-starts", type=int)
+    parser.add_argument("--child-max-concurrent", type=int)
+    child = parser.add_mutually_exclusive_group()
+    child.add_argument("--child-credential-opencode-auth")
+    child.add_argument("--child-credential-codex-profile")
+    parser.add_argument("--child-credential-provider")
     parser.add_argument("--frontdoor")
     parser.add_argument("--sudo", default="/usr/bin/sudo")
     # Test seam only: run the front door directly (the caller is root in a
@@ -163,8 +181,20 @@ def parse_args(argv):
         parser.error("--credential-provider goes with --credential-opencode-auth")
     if args.credential_margin < 0:
         parser.error("--credential-margin must be nonnegative")
-    if args.deadline < 1:
-        parser.error("--deadline must be positive")
+    if not 1 <= args.deadline <= MAX_DEADLINE_S:
+        parser.error(f"--deadline must be 1..{MAX_DEADLINE_S}")
+    if args.child_credential_opencode_auth and not args.child_credential_provider:
+        parser.error("--child-credential-opencode-auth needs --child-credential-provider")
+    if args.child_credential_provider and not args.child_credential_opencode_auth:
+        parser.error("--child-credential-provider goes with --child-credential-opencode-auth")
+    child_options = (args.child_max_starts, args.child_max_concurrent,
+                     args.child_credential_opencode_auth, args.child_credential_codex_profile)
+    if not args.child_route and any(value is not None for value in child_options):
+        parser.error("--child-* options need --child-route")
+    for name in ("child_max_starts", "child_max_concurrent"):
+        value = getattr(args, name)
+        if value is not None and not 1 <= value <= 4:
+            parser.error(f"--{name.replace('_', '-')} out of range")
     return args
 
 
@@ -201,6 +231,13 @@ def build_request(args, now):
         credential = from_codex_profile(args.credential_codex_profile)
     if credential is not None:
         check_fresh(credential, args.deadline, args.credential_margin, now)
+    child_credential = None
+    if args.child_credential_opencode_auth:
+        child_credential = from_opencode_auth(args.child_credential_opencode_auth, args.child_credential_provider)
+    elif args.child_credential_codex_profile:
+        child_credential = from_codex_profile(args.child_credential_codex_profile)
+    if child_credential is not None:
+        check_fresh(child_credential, args.deadline, args.credential_margin, now)
     request = {
         "v": 1,
         "route": args.route,
@@ -215,15 +252,32 @@ def build_request(args, now):
         json.dumps(request, ensure_ascii=False).encode("utf-8")
     except UnicodeError:
         raise LocalRefusal("request: invalid Unicode") from None
+    if args.child_route:
+        children = {"routes": list(args.child_route)}
+        if args.child_max_starts is not None:
+            children["max_starts"] = args.child_max_starts
+        if args.child_max_concurrent is not None:
+            children["max_concurrent"] = args.child_max_concurrent
+        request["children"] = children
     public = dict(request, credential=credential_public(credential, now))
+    if args.child_route:
+        public["child_credential"] = credential_public(child_credential, now)
     if credential is not None:
         request["credential"] = credential
+    if child_credential is not None:
+        request["child_credential"] = child_credential
     return request, public
+
+
+def parent_event(event):
+    """Not a registered child's event (the owner marks those `child`)."""
+    return "child" not in event
 
 
 def answer_of(events):
     """The last agent message linked to input 0 before input 0's first
     turn end, and that turn end."""
+    events = [e for e in events if parent_event(e)]
     acks = {e.get("message_id") for e in events if e.get("event") == "ack" and e.get("index") == 0 and e.get("message_id")}
     linked = []
     for event in events:
@@ -277,7 +331,7 @@ class Call:
             self.events.append({"unparsed": True})
             return
         self.events.append(value)
-        if value.get("event") == "turn-end" and value.get("input") == 0:
+        if value.get("event") == "turn-end" and value.get("input") == 0 and parent_event(value):
             self.send(proc, "close", "turn end of the message (readiness, not processing success)")
 
     def argv(self):
@@ -449,6 +503,19 @@ EXITS = {
 }
 
 
+def children_of(events):
+    """The owner's child admissions, refusals and results, as reported."""
+    pick = lambda name: [e for e in events if e.get("event") == name]
+    terminal = [e for e in events if isinstance(e.get("children"), dict) and "starts" in e["children"]]
+    return {
+        "accepted": pick("child-accepted"),
+        "refused": pick("child-refused"),
+        "setup_failed": pick("child-setup-failed"),
+        "results": pick("child-result"),
+        "owner_summary": terminal[-1]["children"] if terminal else None,
+    }
+
+
 def write_json(path, value):
     with open(path, "w", encoding="utf-8") as file:
         json.dump(value, file, indent=1, sort_keys=True)
@@ -477,6 +544,8 @@ def main_checked(argv):
         with open(os.path.join(args.out, "final.md"), "w", encoding="utf-8") as file:
             file.write(answer)
     of = lambda name: sum(1 for e in call.events if e.get("event") == name)
+    children = children_of(call.events)
+    write_json(os.path.join(args.out, "children.json"), children)
     write_json(os.path.join(args.out, "result.json"), {
         "class": cls,
         "front_door_exit": code,
@@ -488,8 +557,13 @@ def main_checked(argv):
             "lines": len(call.events),
             "bash_accepted": of("bash-accepted"),
             "bash_ended": of("bash-ended"),
-            "agent_messages": of("agent-message"),
+            "agent_messages": sum(1 for e in call.events if e.get("event") == "agent-message" and parent_event(e)),
+            "child_accepted": of("child-accepted"),
+            "child_refused": of("child-refused"),
+            "child_results": of("child-result"),
         },
+        "children": {"file": "children.json", "results": len(children["results"]),
+                     "meaning": "owner-reported child outcomes and lifecycles; not parent consumption"},
         "processing_completion": "not-observed",
         "correctness": "not-established",
         "retention": {

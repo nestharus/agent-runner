@@ -2843,6 +2843,10 @@ fn registered_child_answers_its_parent_with_lineage_and_is_stopped_after_its_tur
     assert_eq!(result["answer"], "wired via lib.rs");
     assert_eq!(result["turn_end"]["stop_reason"], "end_turn");
     assert_eq!(result["end"]["status"], "signal:9");
+    // Content and lifecycle are separate facts in the result.
+    assert_eq!(result["lifecycle"]["end"], "observed", "{result}");
+    assert_eq!(result["lifecycle"]["bash_runs_open"], 0);
+    assert_eq!(result["lifecycle"]["budget"], "released");
     // The parent got exactly that result on its own connection; its own
     // answer and turn end are the parent's, after the child's.
     let parent_answer = events(&seen, "parent", "agent-message")[0];
@@ -2861,10 +2865,7 @@ fn registered_child_answers_its_parent_with_lineage_and_is_stopped_after_its_tur
     assert_eq!(harness(&terminal, "parent")["exits"], json!(["signal:9"]));
     assert_eq!(terminal["children"]["starts"], 1);
     assert_eq!(terminal["children"]["children"][0]["outcome"], "answered");
-    assert_eq!(
-        terminal["children"]["children"][0]["requester"],
-        "delivered"
-    );
+    assert_eq!(terminal["children"]["children"][0]["requester"], "written");
     // Durable lineage: the child row names the exact parent work.
     let conn = db(&dir);
     let (parent, parent_work, route, outcome): (i64, i64, String, String) = conn
