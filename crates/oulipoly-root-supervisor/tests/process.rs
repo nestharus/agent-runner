@@ -2846,7 +2846,10 @@ fn registered_child_answers_its_parent_with_lineage_and_is_stopped_after_its_tur
     // Content and lifecycle are separate facts in the result.
     assert_eq!(result["lifecycle"]["end"], "observed", "{result}");
     assert_eq!(result["lifecycle"]["bash_runs_open"], 0);
-    assert_eq!(result["lifecycle"]["budget"], "released");
+    assert_eq!(
+        result["lifecycle"]["budget"],
+        "still charged (release pending)"
+    );
     // The parent got exactly that result on its own connection; its own
     // answer and turn end are the parent's, after the child's.
     let parent_answer = events(&seen, "parent", "agent-message")[0];
@@ -2892,6 +2895,42 @@ fn registered_child_answers_its_parent_with_lineage_and_is_stopped_after_its_tur
     let child = read_state(&dir.state("child"));
     assert_eq!(child["launches"].as_array().unwrap().len(), 1);
     assert_eq!(child["prompts"].as_array().unwrap().len(), 1);
+}
+
+/// An exec failure is not a no-process-start: the work was launched and
+/// waited even though the requested executable did not run.
+#[test]
+fn child_exec_failure_reports_started_work_separately_from_exec() {
+    let dir = Scratch::new("child-exec-fault");
+    let mut run = Run::start(
+        &dir,
+        &child_spec(
+            &dir,
+            json!([{ "id": "parent", "argv": peer(&dir.state("parent"), &[]),
+                 "messages": ["explore:broken:q"] }]),
+            json!({ "broken": { "harness": "fixed", "endpoint": "stdio",
+                            "argv": [dir.0.join("does-not-exist")] } }),
+            4,
+            2,
+        ),
+    );
+    run.until("parent received exec-fault result", |value| {
+        value["harness"] == "parent" && value["event"] == "turn-end"
+    });
+    run.control(r#"{"cmd":"close"}"#);
+    let (terminal, _, seen) = run.terminal();
+    let failed = events(&seen, "child-1", "launch-failed")[0];
+    assert_eq!(failed["not_started"], false, "{failed}");
+    assert!(failed["work"].is_number());
+    let result = child_result(&seen)[0];
+    assert_eq!(result["launch"]["not_started"], false);
+    assert_eq!(result["lifecycle"]["end"], "observed");
+    assert!(!result["end"].is_null());
+    let text = events(&seen, "parent", "agent-message")[0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains(r#""not_started":false"#), "{text}");
+    assert_eq!(terminal["children"]["children"][0]["record"]["launches"], 1);
 }
 
 /// G2/G5/G7: refusals record and start nothing: no child policy; a route

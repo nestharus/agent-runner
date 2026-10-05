@@ -113,11 +113,13 @@ def site(base_url):
         "v": 1, "allowed_users": ["nes"], "run_base": RUNS, "max_deadline_s": 600,
         "cancel_grace_s": 10, "credential_margin_s": 60, "allow_keep": False,
         "default_path": "/usr/local/bin:/usr/bin:/bin",
+        "child_limits": {"max_starts": 4, "max_concurrent": 2},
+        "child_routes": {"orientation": {"model": "fixture/scripted", "provider": provider, "credential": "required"}},
         "routes": {
             "fixture": {"model": "fixture/scripted", "provider": provider, "credential": "none"},
-            "fixture-auth": {"model": "fixture/scripted", "provider": provider, "credential": "required"},
+            "fixture-auth": {"model": "fixture/scripted", "provider": provider, "credential": "required", "children": ["orientation"]},
             "claude-fixture": {"harness": "claude", "model": "claude-opus-5-5", "effort": "medium",
-                               "config_dir": CLAUDE_STORE, "credential": "none"},
+                               "config_dir": CLAUDE_STORE, "credential": "none", "children": ["orientation"]},
         },
     }
     with open(SITE, "w") as file:
@@ -395,6 +397,61 @@ def scenarios(out, model):
           frontdoor_exit=fd.get("exit"))
     check("claude-exit: nothing left", clean(), left=leftovers())
 
+    # Registered child use on BOTH native parent kinds. Published OpenCode
+    # discovers the real explore.ts; Claude's executable is a fakepeer,
+    # while its receiver and Agent SDK are the published package assets.
+    for kind, parent, grant_options in (
+        ("sol", "fixture-auth", ["--credential-opencode-auth", source, "--credential-provider", "fixture"]),
+        ("claude", "claude-fixture", ["--child-credential-opencode-auth", source, "--child-credential-provider", "fixture"]),
+    ):
+        before = len(model.requests)
+        sdk_record = CLAUDE_RECORDS + "/child-" + kind + ".jsonl"
+        r = call(out, "child-" + kind, "EXPLORE where is child admission wired?",
+                 "--route", parent, "--trusted-task", "--deadline", "120",
+                 "--child-route", "orientation", "--child-max-starts", "4", "--child-max-concurrent", "2",
+                 "--env", "FAKE_CLAUDE_RECORD=" + sdk_record, *grant_options)
+        fd = frontdoor_terminal(r["events"])
+        children = of(r["events"], "child-result")
+        accepted = of(r["events"], "child-accepted")
+        check(kind + " child: admitted once, answered and observed end",
+              r["exit"] == 0 and len(accepted) == len(children) == 1
+              and children[0].get("outcome") == "answered"
+              and children[0].get("lifecycle", {}).get("end") == "observed"
+              and children[0].get("end", {}).get("namespace", {}).get("drained") is True,
+              cls=r["result"]["class"], accepted=accepted, results=children)
+        check(kind + " child: parent-only answer carries orientation and lifecycle",
+              r["answer"] is not None and "ORIENTATION:" in r["answer"]
+              and "Lifecycle status: end observed" in r["answer"]
+              and "root budget: still charged (release pending)" in r["answer"], answer=r["answer"])
+        if kind == "sol":
+            offered = [tool for q in model.requests[before:] for tool in (q.get("body", {}).get("tools") or [])
+                       if tool.get("function", {}).get("name") == "explore"]
+            check("sol child: real OpenCode discovered the explore custom tool",
+                  bool(offered) and "orientation question" in offered[0]["function"].get("description", ""),
+                  offered=offered)
+        else:
+            shutil.copyfile(sdk_record, os.path.join(r["out"], "sdk-peer.jsonl"))
+            with open(sdk_record) as file:
+                peer = [json.loads(line) for line in file if line.strip()]
+            listed = next((v["tools_list"] for v in peer if "tools_list" in v), {})
+            check("claude child: published SDK MCP list and callback result",
+                  any(tool.get("name") == "explore" for tool in listed.get("mcp_response", {}).get("result", {}).get("tools", []))
+                  and any("Lifecycle status: end observed" in str(v.get("tool_result", "")) for v in peer),
+                  tools_list=listed)
+        with open(os.path.join(r["out"], "children.json")) as file:
+            inventory = json.load(file)
+        check(kind + " child: site and owner ceilings are 4/2",
+              bool(accepted) and accepted[0].get("starts", {}).get("max") == 4
+              and accepted[0].get("concurrent", {}).get("max") == 2,
+              owner_summary=inventory["owner_summary"])
+        removed = fd.get("retire", {}).get("credentials", {}).get("files", [])
+        check(kind + " child: staged grant and derived copies normally retired",
+              fd.get("retire", {}).get("run_removed") is True
+              and any(x["path"].endswith("/private/child-auth.json") and x["result"] == "removed" for x in removed)
+              and any("/launch/children/c" in x["path"] and x["path"].endswith("/auth.json")
+                      and x["result"] == "removed" for x in removed), credential_cleanup=removed)
+        check(kind + " child: nothing left", clean(), left=leftovers())
+
     # 6. Refusals before any effect.
     good = {"v": 1, "route": "fixture", "message": "x", "cwd": PROJECT, "bash": {"authority": "trusted-task"}, "deadline_s": 60}
     for name, request in (
@@ -432,6 +489,8 @@ def main():
         model.close()
     summary = {"checks": checks, "passed": all(c["ok"] is not False for c in checks), "elapsed_s": round(time.monotonic() - started, 1),
                "model_requests": len(model.requests)}
+    with open(os.path.join(args.out, "scripted-model-requests.json"), "w") as file:
+        json.dump(model.requests, file, indent=1, sort_keys=True)
     with open(os.path.join(args.out, "summary.json"), "w") as file:
         json.dump(summary, file, indent=1, sort_keys=True)
     for c in checks:

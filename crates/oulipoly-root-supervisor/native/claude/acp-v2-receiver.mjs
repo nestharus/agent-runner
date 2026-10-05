@@ -475,12 +475,12 @@ function bashServer(cwd) {
   })
 }
 
-function exploreTool() {
-  return tool("explore", exploreDescription(config.explore), {
+export function exploreTool(explore = config.explore) {
+  return tool("explore", exploreDescription(explore), {
     question: z.string().describe("the orientation question for the explorer"),
     route: z.string().optional().describe("the explorer route (default: the only one)"),
   }, async (args, extra) => {
-    const result = await exploreRequest(pickRoute(config.explore, args.route), args.question, { signal: extra?.signal })
+    const result = await exploreRequest(pickRoute(explore, args.route), args.question, { signal: extra?.signal })
     return { content: [{ type: "text", text: result.text }], isError: result.isError }
   })
 }

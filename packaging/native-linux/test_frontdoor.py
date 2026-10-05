@@ -223,9 +223,16 @@ class Custody(Scratch):
             routes = frontdoor.load_site(path)["routes"]
         self.assertEqual(sorted(routes), ["opus-high", "opus-medium", "sol-high"])
         self.assertEqual(routes["sol-high"]["credential"], "required")
+        self.assertEqual(routes["sol-high"]["children"], ["luna-max"])
+        self.assertEqual(example["child_limits"], {"max_starts": 4, "max_concurrent": 2})
+        child = example["child_routes"]["luna-max"]
+        self.assertEqual(child["model"], "openai/gpt-6-luna")
+        self.assertEqual(child["credential"], "required")
+        self.assertEqual(child["provider"]["openai"]["npm"], "@ai-sdk/openai")
+        self.assertEqual(child["provider"]["openai"]["models"]["gpt-6-luna"]["options"]["reasoningEffort"], "max")
         for name, effort in (("opus-medium", "medium"), ("opus-high", "high")):
             self.assertEqual(routes[name], {"harness": "claude", "model": "claude-opus-5-5", "effort": effort,
-                                            "config_dir": ".claude5", "credential": "none"})
+                                            "config_dir": ".claude5", "credential": "none", "children": ["luna-max"]})
 
     def test_writable_and_escaping_entries_refused(self):
         owners = frozenset({os.getuid()})

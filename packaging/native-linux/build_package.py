@@ -65,7 +65,10 @@ def run(argv, log, **kwargs):
     with open(log, "ab") as out:
         out.write(("+ " + " ".join(argv) + "\n").encode())
         out.flush()
-        subprocess.run(argv, check=True, stdout=out, stderr=subprocess.STDOUT, **kwargs)
+        done = subprocess.run(argv, stdout=out, stderr=subprocess.STDOUT, **kwargs)
+        out.write(("status=" + str(done.returncode) + "\n").encode())
+        out.flush()
+        done.check_returncode()
 
 
 def output(argv, **kwargs):

@@ -761,7 +761,7 @@ impl Worker {
         // root closing) is not started; the stop holds this same lock.
         if let Some(reason) = self.child.as_ref().and_then(|link| link.stopped()) {
             drop(custody);
-            self.report(json!({ "event": "launch-failed", "reason": format!("stopped-before-launch: {reason}") }));
+            self.report(json!({ "event": "launch-failed", "reason": format!("stopped-before-launch: {reason}"), "not_started": true }));
             self.label_remaining(reason);
             return None;
         }
@@ -774,7 +774,9 @@ impl Worker {
             }
             Err(Err(reason)) => {
                 drop(custody);
-                self.report(json!({ "event": "launch-failed", "reason": reason }));
+                self.report(
+                    json!({ "event": "launch-failed", "reason": reason, "not_started": true }),
+                );
                 self.label_remaining("launch-failed");
                 return None;
             }
@@ -849,7 +851,7 @@ impl Worker {
             return None;
         }
         if let Some(error) = spawned.exec_error {
-            self.report(json!({ "event": "launch-failed", "reason": error }));
+            self.report(json!({ "event": "launch-failed", "reason": error, "not_started": false, "work": work }));
             self.label_remaining("launch-failed");
             self.finish_live(live, ConnEnd::Stop, "");
             return None;

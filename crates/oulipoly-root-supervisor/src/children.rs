@@ -434,10 +434,14 @@ impl Registry {
         }
     }
 
-    fn finish(&self, position: usize, summary: Value, unknown: bool) {
+    fn finish(&self, position: usize, mut summary: Value, unknown: bool) {
         let mut state = self.state.lock().expect("children");
+        // Decide the charge in the same critical section as release, not
+        // from a runs_of snapshot taken before a concurrent notification.
+        let run_unknown = state.runs_unknown.contains(&position);
+        summary["bash_run_end_unknown"] = json!(run_unknown);
         state.live.retain(|child| child.position != position);
-        if unknown {
+        if unknown || run_unknown {
             state.unknown += 1;
         }
         state.finished.push(summary);
@@ -577,7 +581,7 @@ impl ChildLink {
             "launch-failed" | "launch-unknown" => {
                 seen.launch = Some(report.clone());
                 Some(
-                    json!({ "event": event, "reason": report["reason"], "not_started": event == "launch-failed", "setup_effects": report.get("setup_effects") }),
+                    json!({ "event": event, "reason": report["reason"], "not_started": report.get("not_started").and_then(Value::as_bool), "setup_effects": report.get("setup_effects") }),
                 )
             }
             "ack" if report["index"] == 0 => {
@@ -795,6 +799,7 @@ pub(crate) fn serve(
                 "event": "launch-failed",
                 "reason": reason,
                 "setup_effects": setup_effects,
+                "not_started": true,
             }));
             let _ = ctx.tx.send(Event::Report(json!({
                 "event": "child-setup-failed",
@@ -827,7 +832,7 @@ pub(crate) fn serve(
         } else if open_runs > 0 {
             "still charged until its Bash runs end"
         } else {
-            "released"
+            "still charged (release pending)"
         },
         "outcome_recorded": recorded.is_ok(),
         "meaning": "outcome/answer are content; this says what is known of its end and drain. Neither is parent consumption.",
@@ -1049,9 +1054,10 @@ fn launch_argv(
                 .expect("opencode route");
             match provision_opencode(&setup, identity) {
                 Ok(launch) => Ok(launch.argv),
-                // The base itself may have been made just now: shared, empty.
+                // InputInvalid covers only provision writes: make_base has
+                // already run and may have created the shared directory.
                 Err(OpenCodeSetupError::InputInvalid(reason)) => {
-                    Err((format!("setup-refused: {reason}"), "none"))
+                    Err((format!("setup-refused: {reason}"), "possible"))
                 }
                 Err(OpenCodeSetupError::ConstructionFailed(reason)) => {
                     Err((format!("setup-failed: {reason}"), "possible"))
@@ -1331,6 +1337,98 @@ mod tests {
         let summary = f.registry.summary();
         assert_eq!(summary["end_unknown"], 1);
         assert_eq!(summary["starts"], 4);
+    }
+
+    /// Actual ingress spawn-fault path, with child finish scheduled at
+    /// custody release (the former late-notification window). A fake PID1
+    /// reports a refusal without positive no-start; it is not a real spawn.
+    #[test]
+    fn spawn_unknown_is_published_before_child_finish_can_release() {
+        let f = Arc::new(fixture("spawn-interleave", 4));
+        let child = admit(&ctx(&f), &who(0, f.parent), 7, &request()).unwrap();
+        admit(&ctx(&f), &who(0, f.parent), 7, &request()).unwrap();
+        let work = f
+            .store
+            .lock()
+            .unwrap()
+            .begin_work(child.position, 1)
+            .unwrap();
+        f.views.lock().unwrap()[child.position]
+            .works
+            .push((work, PidNs { dev: 1, ino: 1 }));
+        let ingress = crate::bash::Ingress::new(
+            "r".into(),
+            Arc::clone(&f.slot),
+            Arc::clone(&f.custody),
+            Arc::clone(&f.store),
+            Arc::clone(&f.views),
+            f.tx.clone(),
+            Arc::clone(&f.registry),
+            "/".into(),
+        );
+        // The child sampled no unknown before the fault; finish must not
+        // trust that stale boolean. Interleave on the actual failure path.
+        let sampled_unknown = f.registry.runs_of(child.position).1;
+        assert!(!sampled_unknown);
+        let finishing = Arc::clone(&f);
+        *ingress.after_spawn_error_unlock.lock().unwrap() = Some(Box::new(move || {
+            let custody = finishing.custody.lock().unwrap();
+            finishing
+                .registry
+                .finish(child.position, json!({}), sampled_unknown);
+            drop(custody);
+            let refused = admit(&ctx(&finishing), &who(0, finishing.parent), 7, &request())
+                .err()
+                .unwrap();
+            assert_eq!(refused, "budget-concurrent: 2 of 2 (1 unknown-end charged)");
+        }));
+        let replying = Arc::clone(&f);
+        let replier = thread::spawn(move || {
+            let (bytes, _) = crate::sys::recv(&replying._far).unwrap().unwrap();
+            let request: Value = serde_json::from_slice(&bytes).unwrap();
+            crate::sys::send(
+                &replying._far,
+                json!({
+                    "req": request["req"], "event": "refused",
+                    "reason": "after-possible-creation", "not_started": false,
+                })
+                .to_string()
+                .as_bytes(),
+                &[],
+            )
+            .unwrap();
+        });
+        ingress.run_fault_seam(&who(child.position, work), "/".into());
+        replier.join().unwrap();
+        assert_eq!(f.registry.summary()["end_unknown"], 1);
+        assert_eq!(
+            f.registry.summary()["children"][0]["bash_run_end_unknown"],
+            true
+        );
+    }
+
+    /// Fault after make_base: actual provision input rejection leaves a
+    /// shared base but no child launch tree and starts no process.
+    #[test]
+    fn setup_input_refusal_after_base_creation_reports_possible_files() {
+        let f = fixture("base-effects", 4);
+        let route = ChildRoute::Opencode {
+            deps: f._dir.0.join("missing-deps").display().to_string(),
+            agent_bash_tool: f._dir.0.join("missing-tool").display().to_string(),
+            agent_bash_bin: f._dir.0.join("missing-bin").display().to_string(),
+            bash_allow: vec!["pwd".into()],
+            bash_authority: None,
+            model: "openai/gpt-6-luna".into(),
+            provider: serde_json::from_value(json!({"openai": {}})).unwrap(),
+            auth: None,
+        };
+        let base = std::path::Path::new(&f.registry.policy.as_ref().unwrap().launch_base);
+        assert!(!base.exists());
+        let (reason, effects) = launch_argv(&ctx(&f), 1, &route).unwrap_err();
+        assert!(reason.starts_with("setup-refused:"), "{reason}");
+        assert!(base.is_dir());
+        assert!(!base.join("c1").exists());
+        assert_eq!(effects, "possible");
     }
 
     #[test]
