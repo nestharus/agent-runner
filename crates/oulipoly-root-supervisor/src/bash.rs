@@ -138,6 +138,8 @@ pub(crate) struct Ingress {
     children: Arc<Registry>,
     /// Every child harness starts here (the intent's `cwd`).
     cwd: String,
+    #[cfg(test)]
+    pub(crate) after_spawn_error_unlock: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// A Bash run an earlier owner accepted, as found at attach.
@@ -179,6 +181,8 @@ impl Ingress {
             gate: Arc::default(),
             children,
             cwd,
+            #[cfg(test)]
+            after_spawn_error_unlock: Mutex::new(None),
         })
     }
 
@@ -352,6 +356,19 @@ impl Ingress {
             .ok_or_else(|| "peer-unattributed: outside-every-harness-namespace".to_owned())
     }
 
+    #[cfg(test)]
+    pub(crate) fn run_fault_seam(&self, who: &Attributed, cwd: String) {
+        self.run(
+            who,
+            1,
+            &RunRequest {
+                argv: vec!["fixture".into()],
+                cwd,
+            },
+            &mut Sink::new(None),
+        );
+    }
+
     fn run(&self, who: &Attributed, requester: i32, request: &RunRequest, sink: &mut Sink) {
         let open: Vec<Value> = who
             .open
@@ -461,7 +478,6 @@ impl Ingress {
         let spawned = match spawned {
             Ok(spawned) => spawned,
             Err(reason) => {
-                drop(custody);
                 let not_started = matches!(reason, SpawnError::NotStarted(_));
                 let event = if not_started {
                     "launch-failed"
@@ -479,6 +495,13 @@ impl Ingress {
                 // A child's possible run keeps that child charged.
                 if !not_started {
                     self.children.note_run_unknown(who.position);
+                }
+                // Publish possible child-owned work before releasing the
+                // launch/admission lock. A finishing child must see it.
+                drop(custody);
+                #[cfg(test)]
+                if let Some(interleave) = self.after_spawn_error_unlock.lock().unwrap().take() {
+                    interleave();
                 }
                 sink.send(&json!({ "event": event, "reason": reason.reason(), "not_started": not_started }));
                 self.report(json!({ "event": format!("bash-{event}"), "work": work, "reason": reason.reason(), "not_started": not_started }));

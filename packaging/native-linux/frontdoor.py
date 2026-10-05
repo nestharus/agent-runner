@@ -20,9 +20,11 @@ routes may offer them and the ceilings; the requester picks among them.
 An OpenCode parent's children reuse its admitted grant; a Claude parent's
 take a separate access-only child-provider grant (never Claude's login).
 That grant is staged once per root (private/child-auth.json, each child's
-launch copies it) and every staged and derived copy, the children's
-included, is removed at retirement, keep or discard, after partial
-setup or failure too.
+launch copies it) and normal-path retirement removes staged and derived copies, including
+children's, under keep or discard when cleanup succeeds. Unknown entry
+stop skips retirement; abrupt loss can leave copies until the stale-run
+sweep. Access-only expiry bounds their intended use window, not a
+universal deletion or provider-validity guarantee.
 
 Access-only staging avoids intentional credential echo, but arbitrary
 native/task output is unredacted and can contain secrets. Requester env
@@ -1121,7 +1123,7 @@ def run_locked(argv, environ, stdin_fd=0):
                 "max_concurrent": children["max_concurrent"],
                 "depth": 1,
                 "credential": child_public,
-                "credential_copies": "private/child-auth.json once; each child's launch copies it; all removed at retirement",
+                "credential_copies": "private/child-auth.json once; each child's launch copies it; normal-path cleanup on known entry end; unknown stop or abrupt loss defers to sweep",
             },
             "deadline_s": checked["deadline"],
             "cancel_grace_s": site["cancel_grace_s"],
