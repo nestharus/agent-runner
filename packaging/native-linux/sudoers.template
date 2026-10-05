@@ -1,0 +1,7 @@
+# oulipoly-native: the one privileged entry of one installed package.
+# Rendered by install_package.py for exactly one package path and one
+# user; checked with `visudo -cf` before it is put in place (0440).
+# The argument `run` is pinned: no other argument (no --site-config) is
+# accepted through this rule. The front door reads its request on stdin.
+Defaults!@FRONTDOOR@ !use_pty, !log_input, !log_output, env_reset, !setenv, !requiretty
+@USER@ ALL=(root) NOPASSWD: @FRONTDOOR@ run

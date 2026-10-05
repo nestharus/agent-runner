@@ -1,0 +1,30 @@
+{
+ "v": 1,
+ "allowed_users": ["nes"],
+ "run_base": "/var/lib/oulipoly-native/runs",
+ "max_deadline_s": 7200,
+ "cancel_grace_s": 30,
+ "credential_margin_s": 300,
+ "allow_keep": false,
+ "default_path": "/usr/local/bin:/usr/bin:/bin",
+ "routes": {
+  "sol-high": {
+   "model": "openai/gpt-6.1-sol",
+   "credential": "required",
+   "provider": {
+    "openai": {
+     "npm": "@ai-sdk/openai",
+     "name": "OpenAI",
+     "models": {
+      "gpt-6.1-sol": {
+       "name": "GPT-6.1 Sol",
+       "tool_call": true,
+       "reasoning": true,
+       "options": {"reasoningEffort": "high"}
+      }
+     }
+    }
+   }
+  }
+ }
+}
