@@ -454,19 +454,8 @@ impl Root {
     /// with `env` added to root PID 1's environment. A `command` (a Bash
     /// run, not a harness) reads `/dev/null` and its stderr joins its
     /// stdout; a harness keeps its stdin pipe and root PID 1's stderr.
-    pub(crate) fn spawn(
-        &self,
-        work: i64,
-        argv: &[String],
-        env: &serde_json::Map<String, Value>,
-        cwd: &str,
-        command: bool,
-    ) -> Result<Spawned, String> {
-        self.spawn_observed(work, argv, env, cwd, command)
-            .map_err(|error| error.reason().to_owned())
-    }
-
-    /// Preserves possible creation when a request or its stdio reply is lost.
+    /// Preserves possible creation when a request or its stdio reply is
+    /// lost: only a positive no-start reply is [`SpawnError::NotStarted`].
     pub(crate) fn spawn_observed(
         &self,
         work: i64,

@@ -70,6 +70,13 @@
 //!     With the launch password, the
 //!     host's HTTP API refuses requests without it and its internal clients
 //!     (the endpoint plugin's included) send it. No argv carries the value.
+//! * **Explorer tool** (`explore`, only when the root allows registered
+//!   children): `tool/explore.ts` asks the root's owner for one child
+//!   through the shared `explore-client.mjs`, from inside the host process
+//!   (so the request is attributed to this host's work); `explore.json`
+//!   names its routes and limits, which the owner enforces. The native
+//!   permission config allows `explore` by name and nothing else besides
+//!   `bash`. A child's own launch never has this tool.
 //! * **Work identity.** Without one, everything is the caller's (`0700` /
 //!   `0600`), as for an unprivileged root. With a `host-root` work identity
 //!   (the caller is host root), the fresh tree is handed over before it is
@@ -92,13 +99,16 @@ use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::workload::Identity;
 
 const ENDPOINT: &str = include_str!("../native/opencode/acp-v2-endpoint.ts");
 const GATE: &str = include_str!("../native/opencode/bash-policy-tool.ts");
+const EXPLORE: &str = include_str!("../native/opencode/explore-tool.ts");
+/// The registered-children client shared with the native Claude receiver.
+pub(crate) const EXPLORE_CLIENT: &str = include_str!("../native/explore-client.mjs");
 const PACKAGE: &str = include_str!("../native/opencode/package.json");
 const LOCK: &str = include_str!("../native/opencode/package-lock.json");
 
@@ -157,10 +167,31 @@ pub struct OpenCodeSetup {
     /// (see the module docs); needs `model`.
     #[serde(default)]
     pub auth: Option<String>,
+    /// The `explore` tool, when the root allows registered children.
+    #[serde(default)]
+    pub explore: Option<ExploreTool>,
+}
+
+/// What a parent's `explore` tool describes (the owner enforces it).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExploreTool {
+    pub routes: Vec<String>,
+    pub max_starts: u32,
+    pub max_concurrent: u32,
+}
+
+impl ExploreTool {
+    pub(crate) fn check(&self) -> Result<(), String> {
+        if self.routes.is_empty() || self.routes.iter().any(String::is_empty) {
+            return Err("explore names no route".to_owned());
+        }
+        Ok(())
+    }
 }
 
 /// A `bash` authority wider than a named-command list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BashAuthority {
     /// Any command, for this task (see the module docs).
@@ -172,6 +203,8 @@ pub enum BashAuthority {
 pub struct Policy {
     /// `None`: `trusted-task`; else the named whole commands.
     pub bash_allow: Option<Vec<String>>,
+    /// The `explore` tool's routes, when it is offered.
+    pub explore: Option<Vec<String>>,
     /// The native permission config as written to `opencode.json`.
     pub native: String,
 }
@@ -179,30 +212,44 @@ pub struct Policy {
 impl Policy {
     /// The policy `setup` selects, refused unless exactly one form is given.
     pub fn of(setup: &OpenCodeSetup) -> Result<Self, String> {
-        match setup.bash_authority {
+        let mut policy = match setup.bash_authority {
             Some(BashAuthority::TrustedTask) if !setup.bash_allow.is_empty() => {
-                Err("bash_allow and bash_authority are exclusive".to_owned())
+                return Err("bash_allow and bash_authority are exclusive".to_owned());
             }
-            Some(BashAuthority::TrustedTask) => Ok(Self {
+            Some(BashAuthority::TrustedTask) => Self {
                 bash_allow: None,
+                explore: None,
                 native: TRUSTED_TASK_PERMISSION.to_owned(),
-            }),
-            None => Ok(Self {
+            },
+            None => Self {
                 native: permission(&setup.bash_allow)?,
                 bash_allow: Some(setup.bash_allow.clone()),
-            }),
+                explore: None,
+            },
+        };
+        if let Some(explore) = &setup.explore {
+            explore.check()?;
+            // Named after `*`: the last matching rule wins natively.
+            let native = policy.native.strip_suffix('}').expect("json object");
+            policy.native = format!(r#"{native},"explore":"allow"}}"#);
+            policy.explore = Some(explore.routes.clone());
         }
+        Ok(policy)
     }
 
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "bash": match &self.bash_allow {
                 None => json!("trusted-task"),
                 Some(commands) => json!({ "allow": commands }),
             },
             "other": "deny",
             "native": self.native,
-        })
+        });
+        if let Some(routes) = &self.explore {
+            value["explore"] = json!({ "routes": routes });
+        }
+        value
     }
 }
 
@@ -335,6 +382,12 @@ impl std::fmt::Display for OpenCodeSetupError {
 
 impl std::error::Error for OpenCodeSetupError {}
 
+/// The checks [`provision_opencode`] makes before any write, alone: what a
+/// caller can confirm before effects of its own (no write happens here).
+pub fn check_opencode(setup: &OpenCodeSetup) -> Result<(), String> {
+    setup_inputs(setup).map(drop)
+}
+
 /// Creates the launch directory for `setup` and returns its launch.
 /// [`OpenCodeSetupError::InputInvalid`] means no setup writes occurred.
 /// [`OpenCodeSetupError::ConstructionFailed`] may leave partial effects;
@@ -347,8 +400,13 @@ pub fn provision_opencode(
     let inputs = setup_inputs(setup).map_err(OpenCodeSetupError::InputInvalid)?;
     let launch = write_launch(setup, inputs).map_err(OpenCodeSetupError::ConstructionFailed)?;
     if let Some(identity) = identity {
-        hand_over(Path::new(&setup.dir), identity, launch.auth.is_some())
-            .map_err(OpenCodeSetupError::ConstructionFailed)?;
+        hand_over(
+            Path::new(&setup.dir),
+            identity,
+            launch.auth.is_some(),
+            setup.explore.is_some(),
+        )
+        .map_err(OpenCodeSetupError::ConstructionFailed)?;
     }
     Ok(launch)
 }
@@ -356,7 +414,7 @@ pub fn provision_opencode(
 /// Gives the fresh launch tree its `host-root` ownership (see the module
 /// docs). The launch directory stays `0700` and the caller's until last,
 /// so nothing here can be raced by another user.
-fn hand_over(dir: &Path, identity: &Identity, secrets: bool) -> Result<(), String> {
+fn hand_over(dir: &Path, identity: &Identity, secrets: bool, explore: bool) -> Result<(), String> {
     use std::os::unix::fs::{PermissionsExt, lchown};
     let set = |path: &Path, uid: Option<u32>, mode: Option<u32>| {
         lchown(path, uid, Some(identity.gid))
@@ -376,6 +434,11 @@ fn hand_over(dir: &Path, identity: &Identity, secrets: bool) -> Result<(), Strin
         "opencode.json",
     ] {
         set(&config.join(file), None, Some(0o640))?;
+    }
+    if explore {
+        for file in ["tool/explore.ts", "explore-client.mjs", "explore.json"] {
+            set(&config.join(file), None, Some(0o640))?;
+        }
     }
     set(&config.join("node_modules"), None, None)?;
     for sub in ["tool", "agent-bash"] {
@@ -587,6 +650,14 @@ fn write_launch(setup: &OpenCodeSetup, inputs: SetupInputs<'_>) -> Result<OpenCo
     write_new(&config_dir.join("tool/bash.ts"), GATE)?;
     write_new(&config_dir.join("agent-bash/bash.ts"), &tool_source)?;
     write_new(&config_dir.join("package.json"), PACKAGE)?;
+    if let Some(explore) = &setup.explore {
+        write_new(&config_dir.join("tool/explore.ts"), EXPLORE)?;
+        write_new(&config_dir.join("explore-client.mjs"), EXPLORE_CLIENT)?;
+        write_new(
+            &config_dir.join("explore.json"),
+            &serde_json::to_string(explore).expect("explore json"),
+        )?;
+    }
     write_new(&config_dir.join("package-lock.json"), LOCK)?;
     std::os::unix::fs::symlink(deps.join("node_modules"), config_dir.join("node_modules"))
         .map_err(|error| format!("node_modules: {error}"))?;
@@ -709,6 +780,7 @@ mod tests {
                 serde_json::from_str(r#"{"openai":{"models":{"m":{"name":"m"}}}}"#).unwrap()
             }),
             auth: auth.map(str::to_owned),
+            explore: None,
         }
     }
 
@@ -761,7 +833,7 @@ mod tests {
         write_launch(&setup(&dir, None), inputs(&dir, None)).unwrap();
         let identity = own_identity();
         let gid = identity.gid;
-        hand_over(&dir, &identity, false).unwrap();
+        hand_over(&dir, &identity, false, false).unwrap();
         let mode = |sub: &str| {
             let meta = std::fs::symlink_metadata(dir.join(sub)).unwrap();
             assert_eq!(meta.gid(), gid, "{sub}");
@@ -838,7 +910,7 @@ mod tests {
         )
         .unwrap();
         let identity = own_identity();
-        hand_over(&dir, &identity, true).unwrap();
+        hand_over(&dir, &identity, true, false).unwrap();
         let placed = launch.auth.as_ref().unwrap();
         assert_eq!(placed.auth_file, dir.join("xdg/data/opencode/auth.json"));
         assert_eq!(placed.password_file, dir.join("secret/server-password"));

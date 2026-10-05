@@ -2721,3 +2721,621 @@ fn host_root_declared_by_a_non_root_owner_is_refused_before_any_effect() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Registered children and namespace-wide stop. Deterministic peers stand in
+// for both parent and child harnesses; nothing here is a model, Luna,
+// OpenCode or Claude.
+
+const CHILD_CLIENT: &str = env!("CARGO_BIN_EXE_oulipoly-root-child");
+
+/// A create request whose intent allows children on `routes`.
+fn child_spec(
+    dir: &Scratch,
+    harnesses: Value,
+    routes: Value,
+    starts: u32,
+    concurrent: u32,
+) -> Value {
+    let mut spec = spec(dir, 1, harnesses);
+    spec["intent"]["children"] = json!({
+        "routes": routes,
+        "max_starts": starts,
+        "max_concurrent": concurrent,
+        "launch_base": dir.0.join("children"),
+    });
+    spec
+}
+
+/// A fixed child route running a deterministic peer.
+fn peer_route(dir: &Scratch, name: &str, extra: &[&str]) -> Value {
+    json!({ "harness": "fixed", "argv": peer(&dir.state(name), extra), "endpoint": "stdio" })
+}
+
+/// The pid (in this test's namespace) a fixture process wrote to `path`.
+fn wait_pid(path: &Path) -> i32 {
+    let deadline = std::time::Instant::now() + WATCHDOG;
+    loop {
+        if let Some(pid) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+        {
+            return pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "watchdog: pid file {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A shell line that writes its own pid (as this test's /proc names it) to
+/// `path`, ignores TERM, HUP and INT, leaves its session and outlives its
+/// starter: an adversarial descendant, not a harness or a Bash run.
+fn adversary(path: &Path) -> String {
+    format!(
+        "setsid /bin/sh -c 'trap \"\" TERM HUP INT; while read k v r; do [ \"$k\" = NSpid: ] && echo $v > {}; done < /proc/self/status; exec sleep 600' </dev/null >/dev/null 2>&1 &",
+        path.display()
+    )
+}
+
+fn child_result(seen: &[Value]) -> Vec<&Value> {
+    owner_event(seen, "child-result")
+}
+
+/// G1/G2/G3: a parent asks for a child; the child's answer comes back to the
+/// parent's own requester only, with lineage durable before `accepted`;
+/// the child's turn end, its stop and its waited end are distinct facts;
+/// the parent's own turn end and close remain the parent's.
+#[test]
+fn registered_child_answers_its_parent_with_lineage_and_is_stopped_after_its_turn() {
+    let dir = Scratch::new("child-answer");
+    let mut run = Run::start(
+        &dir,
+        &child_spec(
+            &dir,
+            json!([{ "id": "parent", "argv": peer(&dir.state("parent"), &[]), "messages": ["explore:echo:echo:wired via lib.rs"] }]),
+            json!({ "echo": peer_route(&dir, "child", &[]) }),
+            4,
+            2,
+        ),
+    );
+    let accepted = run.until("child accepted", |value| value["event"] == "child-accepted");
+    assert_eq!(accepted["durable"], true);
+    assert_eq!(accepted["parent"], "parent");
+    assert_eq!(accepted["route"], "echo");
+    assert_eq!(accepted["child"], "child-1");
+    assert_eq!(
+        accepted["input_attribution"], "single-open-input",
+        "{accepted}"
+    );
+    let parent_launch = run.event("parent", "launched");
+    assert_eq!(accepted["parent_work"], parent_launch["work"]);
+    let parent_turn = run.until("parent turn end", |value| {
+        value["harness"] == "parent" && value["event"] == "turn-end" && value["input"] == 0
+    });
+    assert_eq!(parent_turn["own_output"], true);
+    run.control(r#"{"cmd":"close"}"#);
+    let (terminal, status, seen) = run.terminal();
+    assert_eq!(status.code(), Some(7), "{terminal}");
+    assert_eq!(terminal["status"], "closed");
+    assert_eq!(terminal["records_complete"], true);
+    // Only the intent harness is a terminal harness record.
+    assert_eq!(terminal["harnesses"].as_array().unwrap().len(), 1);
+    // The child's own events are its own and marked as a child's.
+    let child_turns = events(&seen, "child-1", "turn-end");
+    assert_eq!(child_turns.len(), 1);
+    assert_eq!(child_turns[0]["child"]["parent"], "parent");
+    let child_message = events(&seen, "child-1", "agent-message")[0];
+    assert_eq!(child_message["text"], "wired via lib.rs");
+    // The child was stopped after its turn (a request), and its end and its
+    // namespace's drain were reported by its waiters (facts).
+    let stopping = events(&seen, "child-1", "close-stopping")[0];
+    assert_eq!(stopping["signalled"], true);
+    let exited = events(&seen, "child-1", "exited")[0];
+    assert_eq!(exited["status"], "signal:9");
+    assert_eq!(exited["stop_requested"], true);
+    assert_eq!(exited["namespace"]["drained"], true, "{exited}");
+    let result = child_result(&seen)[0];
+    assert_eq!(result["outcome"], "answered");
+    assert_eq!(result["answer"], "wired via lib.rs");
+    assert_eq!(result["turn_end"]["stop_reason"], "end_turn");
+    assert_eq!(result["end"]["status"], "signal:9");
+    // The parent got exactly that result on its own connection; its own
+    // answer and turn end are the parent's, after the child's.
+    let parent_answer = events(&seen, "parent", "agent-message")[0];
+    let text = parent_answer["text"].as_str().unwrap();
+    assert!(text.starts_with("exit=Some(0)"), "{text}");
+    assert!(
+        text.contains(r#""outcome":"answered""#) && text.contains("wired via lib.rs"),
+        "{text}"
+    );
+    let position = |pred: &dyn Fn(&Value) -> bool| seen.iter().position(pred).unwrap();
+    assert!(
+        position(&|v| v["harness"] == "child-1" && v["event"] == "turn-end")
+            < position(&|v| v["harness"] == "parent" && v["event"] == "turn-end")
+    );
+    // The parent was stopped by the caller's close, not by the child.
+    assert_eq!(harness(&terminal, "parent")["exits"], json!(["signal:9"]));
+    assert_eq!(terminal["children"]["starts"], 1);
+    assert_eq!(terminal["children"]["children"][0]["outcome"], "answered");
+    assert_eq!(
+        terminal["children"]["children"][0]["requester"],
+        "delivered"
+    );
+    // Durable lineage: the child row names the exact parent work.
+    let conn = db(&dir);
+    let (parent, parent_work, route, outcome): (i64, i64, String, String) = conn
+        .query_row(
+            "SELECT parent, parent_work, route, outcome FROM child",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (parent, route.as_str(), outcome.as_str()),
+        (0, "echo", "answered")
+    );
+    assert_eq!(Some(parent_work), parent_launch["work"].as_i64());
+    let text: String = conn
+        .query_row("SELECT m.text FROM message m JOIN harness h ON h.position = m.harness WHERE h.kind = 'child'", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        text.starts_with("You are a registered read-only orientation explorer"),
+        "{text}"
+    );
+    assert!(text.ends_with("\n\necho:wired via lib.rs"), "{text}");
+    // The child's peer saw one session and one prompt: never replayed.
+    let child = read_state(&dir.state("child"));
+    assert_eq!(child["launches"].as_array().unwrap().len(), 1);
+    assert_eq!(child["prompts"].as_array().unwrap().len(), 1);
+}
+
+/// G2/G5/G7: refusals record and start nothing: no child policy; a route
+/// the policy does not name; a child asking for a grandchild (depth 1);
+/// a request from a Bash run's namespace (not a harness's).
+#[test]
+fn child_requests_are_refused_without_policy_route_or_depth_and_from_bash() {
+    // No policy: refused.
+    let dir = Scratch::new("child-none");
+    let mut run = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            1,
+            json!([{ "id": "p", "argv": peer(&dir.state("p"), &[]), "messages": ["explore:echo:echo:x"] }]),
+        ),
+    );
+    let refused = run.until("refused", |value| value["event"] == "child-refused");
+    assert_eq!(refused["reason"], "children-not-enabled");
+    run.until("turn end", |value| value["event"] == "turn-end");
+    run.control(r#"{"cmd":"close"}"#);
+    let (terminal, _, seen) = run.terminal();
+    assert_eq!(terminal["status"], "closed", "{terminal}");
+    assert_eq!(terminal["children"]["refused"], 1);
+    assert_eq!(terminal["children"]["starts"], 0);
+    let text = events(&seen, "p", "agent-message")[0]["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        text.starts_with("exit=Some(65)") && text.contains("children-not-enabled"),
+        "{text}"
+    );
+    assert_eq!(
+        count(
+            &db(&dir),
+            "SELECT count(*) FROM harness WHERE kind = 'child'"
+        ),
+        0
+    );
+
+    // Route outside the policy, a grandchild, and a Bash-namespace request.
+    let dir = Scratch::new("child-refuse");
+    let mut run = Run::start(
+        &dir,
+        &child_spec(
+            &dir,
+            json!([{ "id": "p", "argv": peer(&dir.state("p"), &[]), "messages": ["explore:other:echo:x"] }]),
+            json!({ "echo": peer_route(&dir, "c", &[]) }),
+            4,
+            2,
+        ),
+    );
+    run.until("route refused", |value| {
+        value["event"] == "child-refused" && value["reason"] == "route-not-allowed"
+    });
+    run.until("turn end", |value| {
+        value["event"] == "turn-end" && value["input"] == 0
+    });
+    run.control(
+        &json!({ "cmd": "send", "text": "explore:echo:explore:echo:grandchild" }).to_string(),
+    );
+    let depth = run.until("depth refused", |value| {
+        value["event"] == "child-refused"
+            && value["reason"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("depth"))
+    });
+    assert_eq!(depth["harness"], "child-1", "{depth}");
+    assert!(
+        depth["reason"].as_str().unwrap().starts_with("depth"),
+        "{depth}"
+    );
+    run.until("turn end 1", |value| {
+        value["harness"] == "p" && value["event"] == "turn-end" && value["input"] == 1
+    });
+    // A Bash run gets no ingress variable; name the socket explicitly, as a
+    // shell could: its namespace is still not a harness's.
+    let socket = owner_event(run.drain_now(), "bash-ingress")[0]["path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    run.control(
+        &json!({ "cmd": "send", "text": format!("bash:OULIPOLY_ROOT_BASH_V1={socket} {CHILD_CLIENT} echo from-bash") })
+            .to_string(),
+    );
+    run.until("turn end 2", |value| {
+        value["harness"] == "p" && value["event"] == "turn-end" && value["input"] == 2
+    });
+    run.control(r#"{"cmd":"close"}"#);
+    let (terminal, _, seen) = run.terminal();
+    assert_eq!(terminal["status"], "closed", "{terminal}");
+    // One child (the one that asked for a grandchild); no grandchild row.
+    assert_eq!(terminal["children"]["starts"], 1);
+    assert_eq!(
+        count(
+            &db(&dir),
+            "SELECT count(*) FROM harness WHERE kind = 'child'"
+        ),
+        1
+    );
+    let grandchild = child_result(&seen)[0]["answer"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        grandchild.contains(r#""event":"refused""#) && grandchild.contains("depth"),
+        "{grandchild}"
+    );
+    // From a Bash run's namespace: the ingress refuses before reading.
+    let refused = owner_event(&seen, "bash-refused");
+    assert!(
+        refused
+            .iter()
+            .any(|value| value["reason"] == "peer-unattributed: outside-every-harness-namespace"),
+        "{refused:?}"
+    );
+    let bash = events(&seen, "p", "agent-message")[2]["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(bash.contains("peer-unattributed"), "{bash}");
+}
+
+/// G2 budget: at most `max_concurrent` children at once (a third request
+/// is refused, not queued) and at most `max_starts` over the root's life.
+/// Cancel then stops the live children; their ends and drains are waited.
+#[test]
+fn child_budget_refuses_over_concurrency_and_starts_and_cancel_stops_children() {
+    let dir = Scratch::new("child-budget");
+    let out = dir.0.join("out");
+    std::fs::create_dir(&out).unwrap();
+    let ask = |n: u32| format!("{CHILD_CLIENT} quiet q{n} > {}/r{n} 2>&1", out.display());
+    let mut run = Run::start(
+        &dir,
+        &child_spec(
+            &dir,
+            json!([{ "id": "p", "argv": peer(&dir.state("p"), &[]), "messages": [
+                format!("spawn:{} & {} & sleep 0.5; {}", ask(1), ask(2), ask(3))
+            ] }]),
+            json!({ "quiet": peer_route(&dir, "q", &["--mode", "silent"]) }),
+            3,
+            2,
+        ),
+    );
+    let refused = run.until("concurrency refusal", |value| {
+        value["event"] == "child-refused"
+    });
+    assert!(
+        refused["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("budget-concurrent: 2 of 2"),
+        "{refused}"
+    );
+    run.until("first child launched", |value| {
+        value["harness"] == "child-1" && value["event"] == "launched"
+    });
+    run.until("second child launched", |value| {
+        value["harness"] == "child-2" && value["event"] == "launched"
+    });
+    run.cancel();
+    let (terminal, status, seen) = run.terminal();
+    assert_eq!(status.code(), Some(2), "{terminal}");
+    assert_eq!(terminal["status"], "cancelled");
+    let children = &terminal["children"];
+    assert_eq!(children["starts"], 2, "{children}");
+    assert_eq!(children["refused"], 1);
+    for result in child_result(&seen) {
+        assert_eq!(result["outcome"], "stopped", "{result}");
+        assert_eq!(result["stopped"], "cancelled");
+        assert_eq!(result["end"]["status"], "signal:9");
+        assert_eq!(result["end"]["namespace"]["drained"], true);
+    }
+    assert_eq!(child_result(&seen).len(), 2);
+
+    // Starts: max_starts 2, sequential children; the third is refused.
+    let dir = Scratch::new("child-starts");
+    let mut run = Run::start(
+        &dir,
+        &child_spec(
+            &dir,
+            json!([{ "id": "p", "argv": peer(&dir.state("p"), &[]), "messages": ["explore:echo:echo:one"] }]),
+            json!({ "echo": peer_route(&dir, "c", &[]) }),
+            2,
+            2,
+        ),
+    );
+    for (input, text) in [(1, "explore:echo:echo:two"), (2, "explore:echo:echo:three")] {
+        run.until("turn end", |value| {
+            value["harness"] == "p" && value["event"] == "turn-end" && value["input"] == input - 1
+        });
+        run.control(&json!({ "cmd": "send", "text": text }).to_string());
+    }
+    let refused = run.until("starts refusal", |value| value["event"] == "child-refused");
+    assert!(
+        refused["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("budget-starts: 2 of 2"),
+        "{refused}"
+    );
+    run.until("turn end 2", |value| {
+        value["harness"] == "p" && value["event"] == "turn-end" && value["input"] == 2
+    });
+    run.control(r#"{"cmd":"close"}"#);
+    let (terminal, _, _) = run.terminal();
+    assert_eq!(terminal["status"], "closed", "{terminal}");
+    assert_eq!(terminal["children"]["starts"], 2);
+    assert_eq!(
+        count(
+            &db(&dir),
+            "SELECT count(*) FROM child WHERE outcome = 'answered'"
+        ),
+        2
+    );
+}
+
+/// G3: the requester going away (its process killed) stops its child and
+/// the child's own Bash, including a TERM-ignoring descendant that left
+/// its session; the child's Bash was attributed to the child, not the
+/// parent; nothing is retried and the parent's root closes normally.
+#[test]
+fn requester_loss_stops_the_child_and_its_attributed_bash_with_descendants() {
+    let dir = Scratch::new("child-loss");
+    let pid_file = dir.0.join("descendant.pid");
+    let child_question = format!("bash:{} sleep 300", adversary(&pid_file));
+    let mut run = Run::start(
+        &dir,
+        &child_spec(
+            &dir,
+            json!([{ "id": "p", "argv": peer(&dir.state("p"), &[]), "messages": [
+                format!("spawn:{CHILD_CLIENT} work '{}' > /dev/null 2>&1", child_question.replace('\'', "'\\''"))
+            ] }]),
+            json!({ "work": peer_route(&dir, "c", &[]) }),
+            4,
+            2,
+        ),
+    );
+    let accepted = run.until("child accepted", |value| value["event"] == "child-accepted");
+    let bash = run.until("child bash", |value| value["event"] == "bash-accepted");
+    assert_eq!(
+        bash["harness"], "child-1",
+        "the child's Bash is the child's: {bash}"
+    );
+    let child_launch = events(run.drain_now(), "child-1", "launched")[0].clone();
+    assert_eq!(bash["harness_work"], child_launch["work"]);
+    let descendant = wait_pid(&pid_file);
+    let descendant_fd = pidfd(descendant).expect("descendant pidfd");
+    run.until("parent turn end", |value| {
+        value["harness"] == "p" && value["event"] == "turn-end"
+    });
+    // The requester is this root's process: kill exactly it (pidfd).
+    let requester = i32::try_from(accepted["requester_pid"].as_i64().unwrap()).unwrap();
+    let requester_fd = pidfd(requester).expect("requester pidfd");
+    let started = std::time::Instant::now();
+    // SAFETY: pidfd_send_signal on a pidfd naming the verified requester.
+    assert_eq!(
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                requester_fd.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        },
+        0
+    );
+    let stopping = run.until("child stopping", |value| value["event"] == "child-stopping");
+    assert_eq!(stopping["reason"], "requester-gone");
+    let result = run.until("child result", |value| value["event"] == "child-result");
+    assert_eq!(result["outcome"], "stopped", "{result}");
+    assert_eq!(result["stopped"], "requester-gone");
+    assert_eq!(result["end"]["namespace"]["drained"], true);
+    let bash_end = run.until("child bash end", |value| value["event"] == "bash-ended");
+    assert_eq!(bash_end["work"], bash["work"]);
+    assert_eq!(bash_end["bash"], "end", "{bash_end}");
+    assert!(
+        exited(&descendant_fd, 10_000),
+        "the child's Bash descendant was not stopped"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+    run.control(r#"{"cmd":"close"}"#);
+    let (terminal, status, seen) = run.terminal();
+    assert_eq!(status.code(), Some(7), "{terminal}");
+    assert_eq!(terminal["children"]["children"][0]["outcome"], "stopped");
+    assert_eq!(terminal["children"]["children"][0]["requester"], "gone");
+    assert_eq!(terminal["bash"]["accepted"], 1);
+    assert_eq!(terminal["bash"]["ended"], 1);
+    assert!(owner_event(&seen, "relaunch").is_empty());
+    let conn = db(&dir);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM child WHERE outcome = 'stopped:requester-gone'"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM bash_run b JOIN work w ON w.id = b.work WHERE w.harness = 1 AND b.requester_work IS NOT NULL"
+        ),
+        1
+    );
+}
+
+/// G4 (no children): a stop ends the whole work, not only its leader. A
+/// harness's TERM-ignoring, session-leaving descendant used to hold the
+/// work (and so the run) after the harness was killed; a Bash run whose
+/// leader already exited used to ignore the stop. Both now drain promptly,
+/// and a process of the same user outside the root is never signalled.
+#[test]
+fn stop_drains_every_process_of_the_work_namespace_and_nothing_outside() {
+    // Close: harness descendant.
+    let dir = Scratch::new("ns-close");
+    let pid_file = dir.0.join("h.pid");
+    let mut bystander = Command::new("/bin/sh")
+        .args(["-c", "trap '' TERM HUP INT; exec sleep 600"])
+        .spawn()
+        .unwrap();
+    let mut run = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            1,
+            json!([{ "id": "a", "argv": peer(&dir.state("a"), &[]), "messages": [format!("spawn:{}", adversary(&pid_file))] }]),
+        ),
+    );
+    let descendant = wait_pid(&pid_file);
+    let descendant_fd = pidfd(descendant).expect("descendant pidfd");
+    run.until("turn end", |value| value["event"] == "turn-end");
+    let started = std::time::Instant::now();
+    run.control(r#"{"cmd":"close"}"#);
+    let (terminal, status, seen) = run.terminal();
+    assert_eq!(status.code(), Some(7), "{terminal}");
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
+    let exited_event = events(&seen, "a", "exited")[0];
+    assert_eq!(exited_event["status"], "signal:9");
+    assert_eq!(exited_event["namespace"]["drained"], true, "{exited_event}");
+    assert!(exited_event["namespace"]["others_reaped"].as_u64().unwrap() >= 1);
+    assert!(
+        exited(&descendant_fd, 5_000),
+        "descendant survived the close stop"
+    );
+    assert!(
+        alive(u64::from(bystander.id())),
+        "a process outside the root was signalled"
+    );
+
+    // Cancel: a Bash run whose leader exited while a descendant holds it.
+    let dir = Scratch::new("ns-cancel");
+    let pid_file = dir.0.join("b.pid");
+    let mut run = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            1,
+            json!([{ "id": "a", "argv": peer(&dir.state("a"), &[]), "messages": [format!("bash:{}", adversary(&pid_file))] }]),
+        ),
+    );
+    let descendant = wait_pid(&pid_file);
+    let descendant_fd = pidfd(descendant).expect("descendant pidfd");
+    run.until("bash started", |value| value["event"] == "bash-started");
+    // The leader has exited; the run is held only by the descendant.
+    assert!(!exited(&descendant_fd, 500));
+    run.cancel();
+    let (terminal, status, seen) = run.terminal();
+    assert_eq!(status.code(), Some(2), "{terminal}");
+    let cancel = owner_event(&seen, "cancel-requested")[0];
+    assert!(cancel["signalled"].as_u64().unwrap() >= 1, "{cancel}");
+    let ended = owner_event(&seen, "bash-ended")[0];
+    assert_eq!(ended["bash"], "end", "{ended}");
+    assert_eq!(ended["status"], "code:0", "the leader's own exit: {ended}");
+    assert!(exited(&descendant_fd, 5_000), "descendant survived cancel");
+    assert_eq!(terminal["bash"]["ended"], 1);
+    assert!(
+        alive(u64::from(bystander.id())),
+        "a process outside the root was signalled"
+    );
+    // Exact cleanup of this test's own bystander.
+    bystander.kill().unwrap();
+    bystander.wait().unwrap();
+}
+
+/// G3 recovery: an owner killed while its child runs; a recovering owner
+/// never continues, reconnects or redelivers the child. Its survivor is
+/// stopped and its end recorded as observed; the child is lost visibly.
+#[test]
+fn recovered_child_is_stopped_never_continued() {
+    let dir = Scratch::new("child-recover");
+    let mut run = Run::start(
+        &dir,
+        &child_spec(
+            &dir,
+            json!([{ "id": "p", "argv": peer(&dir.state("p"), &["--on-reinit", "normal"]), "messages": [
+                format!("spawn:{CHILD_CLIENT} quiet q > /dev/null 2>&1")
+            ] }]),
+            json!({ "quiet": peer_route(&dir, "q", &["--mode", "silent"]) }),
+            4,
+            2,
+        ),
+    );
+    run.until("child launched", |value| {
+        value["harness"] == "child-1" && value["event"] == "launched"
+    });
+    run.until("parent turn end", |value| {
+        value["harness"] == "p" && value["event"] == "turn-end"
+    });
+    // The child holds its one prompt (never acknowledged) when its owner dies.
+    wait_state(&dir.state("q"), |state| {
+        state["prompts"].as_array().is_some_and(|p| p.len() == 1)
+    });
+    let _ = run.kill();
+    let mut spec = recover(&dir);
+    spec["recover"] = json!("cancel");
+    let run = Run::start(&dir, &spec);
+    let (terminal, _, seen) = run.terminal();
+    let stopping = owner_event(&seen, "child-recovered-stopping");
+    assert_eq!(stopping.len(), 1, "{seen:#?}");
+    let prior = owner_event(&seen, "child-prior-end")[0];
+    assert_eq!(prior["status"], "signal:9", "{prior}");
+    assert_eq!(prior["observer"], "work-pid1-wait");
+    assert_eq!(
+        terminal["children"]["children"][0]["outcome"],
+        "lost-with-prior-owner"
+    );
+    // Never relaunched or delivered to again.
+    let child = read_state(&dir.state("q"));
+    assert_eq!(child["launches"].as_array().unwrap().len(), 1);
+    assert_eq!(child["prompts"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        count(
+            &db(&dir),
+            "SELECT count(*) FROM child WHERE outcome = 'lost-with-prior-owner'"
+        ),
+        1
+    );
+}

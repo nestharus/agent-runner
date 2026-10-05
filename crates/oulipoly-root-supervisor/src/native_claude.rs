@@ -37,6 +37,13 @@
 //!   This is constructed configuration, not a certificate of absence: a
 //!   trusted shell keeps the work user's normal host rights, and Claude
 //!   Code's managed settings (`/etc/claude-code`) still apply.
+//! * **Explorer tool** (`explore`, only when the root allows registered
+//!   children): a second tool of the receiver's in-process MCP server,
+//!   `mcp__oulipoly__explore`, asks the root's owner for one registered
+//!   child through the shared `explore-client.mjs` (written beside the
+//!   receiver), from inside the receiver process, so the request is
+//!   attributed to this harness's work. The owner enforces routes and
+//!   limits; nothing else is widened.
 //! * **Model.** `model` and `effort` are passed to Claude Code as given; the
 //!   receiver reports a different model in Claude Code's init as a warning
 //!   notice. No version gate: unsupported behavior is a visible outcome.
@@ -55,7 +62,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::native::BashAuthority;
+use crate::native::{BashAuthority, ExploreTool};
 use crate::workload::Identity;
 
 const RECEIVER: &str = include_str!("../native/claude/acp-v2-receiver.mjs");
@@ -127,6 +134,9 @@ pub struct ClaudeSetup {
     pub start_timeout_s: Option<u32>,
     #[serde(default)]
     pub ack_timeout_s: Option<u32>,
+    /// The `explore` tool, when the root allows registered children.
+    #[serde(default)]
+    pub explore: Option<ExploreTool>,
 }
 
 /// Claude Code's effort levels.
@@ -236,6 +246,7 @@ impl ClaudeLaunch {
             "effort": self.launch["effort"],
             "claude_executable": self.launch["claude_executable"],
             "config_dir": self.launch["claude_env"]["CLAUDE_CONFIG_DIR"],
+            "explore": self.launch["explore"],
             "claude_env_set": self.launch["claude_env"],
             "claude_env_withheld": "every inherited ANTHROPIC_* and CLAUDE* name, OULIPOLY_*, AGENT_BASH_*, NODE_*, OTEL_*",
             "credential": "none: Claude Code's own login in config_dir, never read by setup",
@@ -313,6 +324,9 @@ fn inputs(setup: &ClaudeSetup) -> Result<Inputs, String> {
     {
         return Err("model must be a Claude model id".to_owned());
     }
+    if let Some(explore) = &setup.explore {
+        explore.check()?;
+    }
     let start = timeout("start_timeout_s", setup.start_timeout_s, START_TIMEOUT_S)?;
     let ack = timeout("ack_timeout_s", setup.ack_timeout_s, ACK_TIMEOUT_S)?;
     match fs::read_to_string(deps.join("package-lock.json")) {
@@ -348,6 +362,7 @@ fn inputs(setup: &ClaudeSetup) -> Result<Inputs, String> {
         "tools": policy.tools,
         "start_timeout_s": start,
         "ack_timeout_s": ack,
+        "explore": setup.explore,
         "claude_env": {
             "CLAUDE_CONFIG_DIR": utf8(&config_dir)?,
             // The receiver's one MCP tool is loaded upfront, never deferred.
@@ -418,6 +433,10 @@ fn write_launch(inputs: Inputs) -> Result<ClaudeLaunch, String> {
     write_new(&receiver, RECEIVER)?;
     write_new(&claude.join("package.json"), PACKAGE)?;
     write_new(&claude.join("package-lock.json"), LOCK)?;
+    write_new(
+        &claude.join("explore-client.mjs"),
+        crate::native::EXPLORE_CLIENT,
+    )?;
     std::os::unix::fs::symlink(deps.join("node_modules"), claude.join("node_modules"))
         .map_err(|error| format!("node_modules: {error}"))?;
     let launch_file = claude.join("launch.json");
@@ -457,6 +476,7 @@ fn hand_over(dir: &Path, identity: &Identity) -> Result<(), String> {
     let claude = dir.join("claude");
     for file in [
         "acp-v2-receiver.mjs",
+        "explore-client.mjs",
         "package.json",
         "package-lock.json",
         "launch.json",
@@ -513,6 +533,7 @@ mod tests {
             config_dir: "/nonexistent-claude-store".to_owned(),
             start_timeout_s: None,
             ack_timeout_s: None,
+            explore: None,
         }
     }
 
@@ -604,6 +625,7 @@ mod tests {
             ("", 0o750),
             ("claude", 0o750),
             ("claude/acp-v2-receiver.mjs", 0o640),
+            ("claude/explore-client.mjs", 0o640),
             ("claude/launch.json", 0o640),
             ("claude/package.json", 0o640),
             ("claude/package-lock.json", 0o640),

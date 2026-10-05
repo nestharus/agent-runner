@@ -23,6 +23,12 @@
 //   root's own Bash ingress (`OULIPOLY_ROOT_BASH_V1`): attributed, durably
 //   recorded, killed on cancel. With an allow list, a command not named
 //   exactly is refused here and nothing runs.
+// - `explore` (`mcp__oulipoly__explore`), only when the launch names
+//   explorer routes: asks the root's owner for one registered read-only
+//   child through `explore-client.mjs` from inside this process (attributed
+//   to this harness's work), blocks until its result, and returns the
+//   child's answer and lifecycle. The owner enforces routes, budget and
+//   depth; closing the connection (an aborted call) stops the child.
 // - session/new starts Claude Code and answers once its control handshake
 //   completed (bounded). One session per process; session/resume is refused.
 // - session/prompt sends one user message with a fresh random uuid and a
@@ -60,6 +66,7 @@ import { Readable, Writable } from "node:stream"
 import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from "@agentclientprotocol/sdk/experimental/v2"
 import { createSdkMcpServer, query, tool } from "@anthropic-ai/claude-agent-sdk"
 import { z } from "zod"
+import { exploreDescription, exploreRequest, pickRoute } from "./explore-client.mjs"
 
 // Unit tests import this module's pure functions without a launch.
 const MAIN = process.env.OULIPOLY_CLAUDE_RECEIVER_NO_MAIN !== "1"
@@ -67,6 +74,9 @@ const config = MAIN ? JSON.parse(readFileSync(process.argv[2], "utf8")) : {}
 const START_MS = config.start_timeout_s * 1000
 const ACK_MS = config.ack_timeout_s * 1000
 const BASH_TOOL = "mcp__oulipoly__bash"
+const EXPLORE_TOOL = "mcp__oulipoly__explore"
+// The receiver's own tools this launch offers.
+const OWN_TOOLS = MAIN && config.explore?.routes?.length ? [BASH_TOOL, EXPLORE_TOOL] : [BASH_TOOL]
 // Never offered, whatever `tools` says: execution, delegation, background
 // and network tools of the built-in set.
 const DENIED_TOOLS = [
@@ -381,7 +391,7 @@ function onInit(init) {
   const bash = (init.mcp_servers ?? []).find((server) => server.name === "oulipoly")
   if (bash && bash.status !== "connected")
     void notice("error", "claude bash tool server not connected", String(bash.status))
-  const extra = (init.tools ?? []).filter((name) => name !== BASH_TOOL && !config.tools.includes(name))
+  const extra = (init.tools ?? []).filter((name) => !OWN_TOOLS.includes(name) && !config.tools.includes(name))
   if (extra.length) void notice("warning", "claude offers tools outside the launch policy", extra.join(", "))
 }
 
@@ -460,7 +470,18 @@ function bashServer(cwd) {
         const result = await runRootBash(args.command, workdir)
         return { content: [{ type: "text", text: result.text }], isError: result.error }
       }),
+      ...(config.explore?.routes?.length ? [exploreTool()] : []),
     ],
+  })
+}
+
+function exploreTool() {
+  return tool("explore", exploreDescription(config.explore), {
+    question: z.string().describe("the orientation question for the explorer"),
+    route: z.string().optional().describe("the explorer route (default: the only one)"),
+  }, async (args, extra) => {
+    const result = await exploreRequest(pickRoute(config.explore, args.route), args.question, { signal: extra?.signal })
+    return { content: [{ type: "text", text: result.text }], isError: result.isError }
   })
 }
 
@@ -478,7 +499,7 @@ function start(cwd) {
       mcpServers: { oulipoly: bashServer(cwd) },
       plugins: [],
       tools: config.tools,
-      allowedTools: [...config.tools, BASH_TOOL],
+      allowedTools: [...config.tools, ...OWN_TOOLS],
       disallowedTools: DENIED_TOOLS.filter((name) => !config.tools.includes(name)),
       // No permission callback: in `dontAsk` anything not pre-approved is
       // denied without asking; the result's permission_denials report it.

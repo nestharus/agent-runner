@@ -102,6 +102,7 @@ impl Fixture {
             config_dir: store_dir.to_str().unwrap().to_owned(),
             start_timeout_s: Some(30),
             ack_timeout_s,
+            explore: None,
         };
         let launch = provision_claude(&setup, None).unwrap();
         let record = dir.join("record.jsonl");

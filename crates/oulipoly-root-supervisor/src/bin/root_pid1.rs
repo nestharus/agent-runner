@@ -49,6 +49,11 @@ struct Work {
     /// PID 1 (that namespace's init) read it before starting the harness.
     pidns: Value,
     harness: Option<String>,
+    /// Whether this work's PID 1 was asked to stop its namespace, and its
+    /// report that nothing is left in it (`drained`): separate facts from
+    /// the harness's own wait status.
+    stop_requested: bool,
+    drained: Option<Value>,
 }
 
 /// The host identity work is started as (see the module docs).
@@ -552,6 +557,10 @@ impl Pid1 {
             "harness_observer": work.harness.as_ref().map(|_| "work-pid1-wait"),
             "work_pid1": sys::describe_status(status),
             "work_pid1_observer": "root-pid1-wait",
+            // Reported by the work's PID 1 before it exited: its namespace
+            // had no process left (`null`: no such report).
+            "namespace": work.drained,
+            "stop_requested": work.stop_requested,
         });
         self.broadcast(&receipt);
         self.receipts.push(receipt);
@@ -596,10 +605,22 @@ impl Pid1 {
 fn parse_lines(work: &mut Work) {
     while let Some(end) = work.pending.iter().position(|&byte| byte == b'\n') {
         let line: Vec<u8> = work.pending.drain(..=end).collect();
-        if let Ok(value) = serde_json::from_slice::<Value>(&line)
-            && let Some(status) = value["harness"].as_str()
-        {
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if let Some(status) = value["harness"].as_str() {
             work.harness = Some(status.to_owned());
+        }
+        if value["stop"] == "namespace-kill" {
+            work.stop_requested = true;
+        }
+        if value["drained"] == true {
+            work.drained = Some(json!({
+                "drained": true,
+                "others_reaped": value["others_reaped"],
+                "stop": value["stop"],
+                "stop_kills": value["stop_kills"],
+            }));
         }
     }
 }
@@ -671,6 +692,8 @@ fn start_work(launch: &Launch) -> io::Result<(Work, Value)> {
             harness_host_pid: None,
             pidns: Value::Null,
             harness: None,
+            stop_requested: false,
+            drained: None,
         },
         first,
     ))
@@ -700,6 +723,15 @@ fn write_line(fd: &OwnedFd, value: &Value) {
     line.push('\n');
     // SAFETY: write to a pipe we own; a short write only loses the report.
     unsafe { libc::write(fd.as_raw_fd(), line.as_ptr().cast(), line.len()) };
+}
+
+/// SIGKILL to every process in this PID namespace except this init (the
+/// caller is always a work's PID 1). Whether any process was signalled;
+/// `ESRCH` (none left) is not an error.
+fn kill_namespace() -> bool {
+    // SAFETY: kill(2) with pid -1 from a PID namespace's init signals the
+    // processes visible in that namespace (and those nested in it) only.
+    unsafe { libc::kill(-1, libc::SIGKILL) == 0 }
 }
 
 /// PID 1 of one work's PID namespace: the actual parent of its harness.
@@ -837,6 +869,13 @@ fn work_pid1(
     let mut harness_done = false;
     let mut others = 0u64;
     let mut control_open = true;
+    // A stop request ends the whole work, not only its leader: once asked,
+    // this PID 1 sends SIGKILL to every process of its own PID namespace
+    // (`kill(-1)` from a namespace's init reaches exactly the processes
+    // visible in that namespace, nested ones included, never itself or
+    // anything outside), and again after each reap until none is left.
+    let mut stopping = false;
+    let mut stop_kills = 0u64;
     loop {
         let mut polls = [
             libc::pollfd {
@@ -864,12 +903,18 @@ fn work_pid1(
             let read = unsafe { libc::read(control.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
             if read <= 0 {
                 control_open = false;
-            } else if byte[0] == b'k'
-                && !harness_done
-                && let Some(fd) = pidfd.as_ref()
-            {
-                // The harness is unreaped, so the pidfd still names it.
-                let _ = sys::pidfd_kill(fd);
+            } else if byte[0] == b'k' {
+                if !stopping {
+                    stopping = true;
+                    // Recorded before the signal: a stop was asked for,
+                    // which is not yet any process's end.
+                    write_line(&receipt, &json!({ "stop": "namespace-kill" }));
+                }
+                if !harness_done && let Some(fd) = pidfd.as_ref() {
+                    // The harness is unreaped, so the pidfd still names it.
+                    let _ = sys::pidfd_kill(fd);
+                }
+                stop_kills += u64::from(kill_namespace());
             }
         }
         if polls[0].revents != 0 {
@@ -890,12 +935,22 @@ fn work_pid1(
                     // ECHILD: nothing left in this namespace.
                     write_line(
                         &receipt,
-                        &json!({ "drained": true, "others_reaped": others }),
+                        &json!({
+                            "drained": true,
+                            "others_reaped": others,
+                            "stop": if stopping { "namespace-kill" } else { "none" },
+                            "stop_kills": stop_kills,
+                        }),
                     );
                     std::process::exit(0);
                 } else {
                     break;
                 }
+            }
+            if stopping {
+                // A process forked while the earlier signal was delivered,
+                // or reparented here since, is signalled too.
+                stop_kills += u64::from(kill_namespace());
             }
         }
     }

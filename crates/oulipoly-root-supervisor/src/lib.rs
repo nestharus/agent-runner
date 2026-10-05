@@ -467,6 +467,7 @@
 //!   survivor's stdout.
 
 pub mod bash;
+pub mod children;
 mod conversation;
 mod custody;
 mod harness;
@@ -583,6 +584,10 @@ pub struct Intent {
     /// Who the root's work runs as and where it meets this owner; declared,
     /// never chosen from the owner's euid (see [`workload`]).
     pub workload: Workload,
+    /// Registered children the intent's harnesses may ask for (see
+    /// [`children`]). Absent: every child request is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub children: Option<children::ChildPolicy>,
 }
 
 /// One owned harness: how to launch it and what to deliver to it, in order.
@@ -694,6 +699,9 @@ impl Intent {
             return Err("at least one harness is required".to_owned());
         }
         self.workload.validate()?;
+        if let Some(children) = &self.children {
+            children.validate()?;
+        }
         let mut ids = HashSet::new();
         for harness in &self.harnesses {
             if harness.argv.is_empty() {
@@ -704,6 +712,12 @@ impl Intent {
             }
             if harness.session.as_deref().is_some_and(str::is_empty) {
                 return Err(format!("harness {}: session is empty", harness.id));
+            }
+            if harness.id.starts_with("child-") {
+                return Err(format!(
+                    "harness {}: child- ids are the owner's",
+                    harness.id
+                ));
             }
         }
         Ok(())
@@ -829,6 +843,7 @@ where
         claimed.live_incarnation.as_ref(),
         &claimed.harnesses,
         &claimed.open_bash,
+        &claimed.open_children,
         &mut store,
         &stop,
     );
@@ -848,6 +863,12 @@ where
         recovery.root,
     ));
     let custody = Arc::new(Mutex::new(live::Custody::new(Arc::clone(&stop))));
+    let registry = children::Registry::new(
+        claimed.children.clone(),
+        claimed.harnesses.len(),
+        claimed.child_starts,
+        Arc::clone(&custody),
+    );
     let inboxes = match (0..expected.len())
         .map(|_| conversation::Inbox::new().map(Arc::new))
         .collect::<std::io::Result<Vec<_>>>()
@@ -899,10 +920,10 @@ where
     }
     let store = Arc::new(Mutex::new(store));
     let (tx, rx) = mpsc::channel();
+    // One view per harness row, intent and child (children keep theirs
+    // for Bash attribution by position).
     let views: bash::Views = Arc::new(Mutex::new(
-        claimed
-            .harnesses
-            .iter()
+        (0..claimed.positions.max(claimed.harnesses.len()))
             .map(|_| bash::View::default())
             .collect(),
     ));
@@ -913,6 +934,8 @@ where
         Arc::clone(&store),
         Arc::clone(&views),
         tx.clone(),
+        Arc::clone(&registry),
+        claimed.cwd.clone(),
     );
     match ingress.listen() {
         Ok(path) => emit(
@@ -926,6 +949,15 @@ where
     }
     for prior in recovery.bash.drain(..) {
         ingress.recover(prior);
+    }
+    if claimed.children_lost > 0 {
+        emit(
+            &mut out,
+            &json!({ "event": "children-lost", "count": claimed.children_lost, "meaning": "admitted by an earlier owner, never launched or resolved; not relaunched or delivered" }),
+        );
+    }
+    for prior in recovery.children.drain(..) {
+        recover_child(prior, &slot, &custody, &store, &registry, &mut out);
     }
 
     let control_tx = tx.clone();
@@ -947,6 +979,12 @@ where
             "root_id": claimed.root_id,
             "isolation": isolation.label(),
             "harnesses": expected.len(),
+            "children": claimed.children.as_ref().map(|policy| json!({
+                "routes": policy.routes.keys().collect::<Vec<_>>(),
+                "max_starts": policy.max_starts,
+                "max_concurrent": policy.max_concurrent,
+                "starts_used": claimed.child_starts,
+            })),
             "outage_closure_cap": claimed.outage_closure_cap,
             "delivery_attempt_cap": claimed.delivery_attempt_cap,
         }),
@@ -966,6 +1004,7 @@ where
             views: Arc::clone(&views),
             inbox: Arc::clone(&inboxes[position]),
             closing: Arc::clone(&closing),
+            children: Arc::clone(&registry),
         };
         thread::spawn(move || harness::run(assignment));
     }
@@ -998,6 +1037,9 @@ where
                         if !cancel_requested {
                             cancel_requested = true;
                             let signalled = custody.lock().expect("custody lock").cancel();
+                            // Already killed with every registered work;
+                            // marked so admission and results say why.
+                            registry.stop_all("cancelled");
                             emit(
                                 &mut out,
                                 &json!({ "event": "cancel-requested", "signalled": signalled }),
@@ -1032,6 +1074,16 @@ where
                                 &json!({ "event": "control-refused", "control": controls, "cmd": "close", "reason": reason }),
                             ),
                             None => {
+                                // Close ends input for the whole root: no
+                                // child is admitted after it, and children
+                                // still running are stopped.
+                                let stopped = registry.stop_all("root-closing");
+                                if stopped > 0 {
+                                    emit(
+                                        &mut out,
+                                        &json!({ "event": "children-stopping", "reason": "root-closing", "signalled": stopped }),
+                                    );
+                                }
                                 emit(
                                     &mut out,
                                     &json!({
@@ -1099,7 +1151,13 @@ where
         report["status"] = json!("incomplete");
         code = EXIT_INCOMPLETE;
     }
+    if registry.ends_unproven() && matches!(code, EXIT_ENDED | EXIT_ENDED_OWED | EXIT_CLOSED) {
+        // A child may have run and its end is not known.
+        report["status"] = json!("incomplete");
+        code = EXIT_INCOMPLETE;
+    }
     report["bash"] = ingress.summary();
+    report["children"] = registry.summary();
     report["root_pid1"] = root_pid1;
     emit(&mut out, &report);
     code
@@ -1110,6 +1168,7 @@ struct Recovery {
     root: Option<Arc<custody::Root>>,
     priors: HashMap<usize, harness::Prior>,
     bash: Vec<bash::Prior>,
+    children: Vec<ChildPrior>,
     unattached: Option<String>,
     outcome: &'static str,
     incarnation: Option<i64>,
@@ -1142,6 +1201,7 @@ fn recover_custody(
     recorded: Option<&store::IncarnationRow>,
     harnesses: &[store::DurableHarness],
     open_bash: &[store::OpenBash],
+    open_children: &[store::OpenChild],
     store: &mut store::Store,
     stop: &Arc<transport::StopSignal>,
 ) -> Recovery {
@@ -1149,6 +1209,7 @@ fn recover_custody(
         root: None,
         priors: HashMap::new(),
         bash: Vec::new(),
+        children: Vec::new(),
         unattached: None,
         outcome: "fresh",
         incarnation: None,
@@ -1247,7 +1308,119 @@ fn recover_custody(
         };
         recovery.bash.push(prior);
     }
+    for child in open_children
+        .iter()
+        .filter(|child| child.incarnation == recorded.id)
+    {
+        let name = custody::work_name(child.work);
+        let found = if let Some(index) = live.iter().position(|adopted| adopted.work == child.work)
+        {
+            ChildFound::Live(live.swap_remove(index))
+        } else if let Some(receipt) = receipts
+            .iter()
+            .find(|receipt| receipt["work"] == name.as_str())
+        {
+            ChildFound::Exited(receipt.clone())
+        } else {
+            // Absent from an attached root's lists is not a positive
+            // no-start either (a first report can be lost after creation).
+            ChildFound::Unknown
+        };
+        recovery.children.push(ChildPrior {
+            child: child.clone(),
+            found,
+        });
+    }
     recovery
+}
+
+/// A registered child an earlier owner left with an open launch.
+struct ChildPrior {
+    child: store::OpenChild,
+    found: ChildFound,
+}
+
+enum ChildFound {
+    Live(custody::Adopted),
+    Exited(Value),
+    Unknown,
+}
+
+/// A recovered child is never continued, reconnected or delivered to: its
+/// requester's connection died with the earlier owner. A survivor is
+/// stopped (unless authority is lost) and its end recorded as observed.
+fn recover_child<W: Write>(
+    prior: ChildPrior,
+    slot: &custody::RootSlot,
+    custody: &Mutex<live::Custody>,
+    store: &Mutex<store::Store>,
+    registry: &children::Registry,
+    out: &mut W,
+) {
+    let ChildPrior { child, found } = prior;
+    let (status, observer, unknown) = match found {
+        ChildFound::Live(adopted) => {
+            let Some(root) = slot.current() else {
+                return;
+            };
+            let mut guard = custody.lock().expect("custody lock");
+            let token = guard.register(Arc::clone(&root), adopted.work);
+            let stopped = guard.reason();
+            drop(guard);
+            let signalled = stopped != Some("authority-lost") && root.kill(adopted.work);
+            emit(
+                out,
+                &json!({ "event": "child-recovered-stopping", "harness": child.id, "work": child.work, "signalled": signalled }),
+            );
+            // Its output is not read: nothing collects it any more.
+            transport::drain(adopted.stdio.stdout, Arc::clone(&slot.stop));
+            let waited = root.wait_receipt(adopted.work);
+            custody.lock().expect("custody lock").release(token);
+            match waited {
+                custody::ReceiptWait::Receipt(receipt) => match receipt["harness"].as_str() {
+                    Some(status) => (status.to_owned(), Some("work-pid1-wait"), false),
+                    None => (
+                        "ended-with-work-namespace-status-unknown".to_owned(),
+                        None,
+                        true,
+                    ),
+                },
+                _ => ("end-unknown".to_owned(), None, true),
+            }
+        }
+        ChildFound::Exited(receipt) => match receipt["harness"].as_str() {
+            Some(status) => (status.to_owned(), Some("work-pid1-wait"), false),
+            None => (
+                "ended-with-work-namespace-status-unknown".to_owned(),
+                None,
+                true,
+            ),
+        },
+        ChildFound::Unknown => (
+            "ended-with-root-namespace-status-unknown".to_owned(),
+            None,
+            true,
+        ),
+    };
+    {
+        let mut store = store.lock().expect("store lock");
+        if status != "end-unknown" {
+            let _ = store.resolve_work(child.work, &status, observer);
+        }
+        let _ = store.resolve_child(child.position, "lost-with-prior-owner");
+    }
+    let summary = json!({
+        "id": child.id,
+        "position": child.position,
+        "outcome": "lost-with-prior-owner",
+        "end": { "status": status, "observer": observer },
+        "recovered": true,
+    });
+    emit(
+        out,
+        &json!({ "event": "child-prior-end", "harness": child.id, "work": child.work, "status": status, "observer": observer }),
+    );
+    registry.note_recovered(summary, unknown);
 }
 
 /// Releases this owner's root PID 1 at the end of its run and reports how
@@ -1643,6 +1816,7 @@ mod tests {
                 messages: vec![],
             }],
             workload: Workload::UnprivilegedUserns {},
+            children: None,
         };
         let mut store = store::Store::claim(&dir, Some(&intent)).unwrap().store;
         assert_eq!(store.begin_incarnation("t", "test").unwrap(), 1);

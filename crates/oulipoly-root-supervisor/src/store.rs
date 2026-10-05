@@ -33,6 +33,13 @@
 //!   it is owed like any intent message, and a recovery resubmits it the
 //!   same way. Version 5 added this; a version 4 store is refused like any
 //!   other version (no migration).
+//! * A `harness` of kind `child` is a registered child an intent harness
+//!   asked for through the ingress; `child` keeps the durable lineage: the
+//!   requesting (parent) harness and the exact parent **work** it was
+//!   current under at commit, the site route, the requester and the parent
+//!   inputs open then, and how the child ended (`outcome`). Its prompt is
+//!   its one message. A `bash_run` also keeps the requesting harness work.
+//!   Version 7 added both (no migration: no legacy data is kept).
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -50,7 +57,7 @@ pub(crate) const LOCK_FILE: &str = "owner.lock";
 pub(crate) const DB_FILE: &str = "intent.sqlite3";
 /// Version of this new per-root lineage. There is no migration chain: a
 /// store of any other version is refused.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 /// How long a write waits for a foreign SQLite lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -76,6 +83,7 @@ CREATE TABLE intent (
     delivery_attempt_cap INTEGER NOT NULL,
     cwd TEXT NOT NULL,
     workload TEXT NOT NULL,
+    children TEXT,
     generation INTEGER NOT NULL
 );
 CREATE TABLE harness (
@@ -83,7 +91,19 @@ CREATE TABLE harness (
     id TEXT NOT NULL UNIQUE,
     argv TEXT NOT NULL,
     endpoint TEXT NOT NULL,
-    session TEXT
+    session TEXT,
+    kind TEXT NOT NULL DEFAULT 'intent' CHECK (kind IN ('intent', 'child'))
+);
+CREATE TABLE child (
+    harness INTEGER PRIMARY KEY REFERENCES harness(position),
+    parent INTEGER NOT NULL REFERENCES harness(position),
+    parent_work INTEGER NOT NULL REFERENCES work(id),
+    route TEXT NOT NULL,
+    requester_pid INTEGER NOT NULL,
+    inputs_open TEXT NOT NULL,
+    admitted_generation INTEGER NOT NULL,
+    outcome TEXT,
+    resolved_generation INTEGER
 );
 CREATE TABLE message (
     harness INTEGER NOT NULL REFERENCES harness(position),
@@ -131,6 +151,7 @@ CREATE TABLE work (
 );
 CREATE TABLE bash_run (
     work INTEGER PRIMARY KEY REFERENCES work(id),
+    requester_work INTEGER REFERENCES work(id),
     requester_pid INTEGER NOT NULL,
     inputs_open TEXT NOT NULL,
     argv TEXT NOT NULL,
@@ -252,6 +273,15 @@ pub(crate) struct OpenBash {
     pub(crate) harness: usize,
 }
 
+/// A registered child with a launch whose end is not recorded.
+#[derive(Debug, Clone)]
+pub(crate) struct OpenChild {
+    pub(crate) position: usize,
+    pub(crate) id: String,
+    pub(crate) work: i64,
+    pub(crate) incarnation: i64,
+}
+
 /// A root PID 1 incarnation not yet recorded as ended.
 #[derive(Debug, Clone)]
 pub(crate) struct IncarnationRow {
@@ -277,6 +307,16 @@ pub(crate) struct Claimed {
     /// The latest root PID 1 incarnation not recorded as ended, if any.
     pub(crate) live_incarnation: Option<IncarnationRow>,
     pub(crate) open_bash: Vec<OpenBash>,
+    /// The intent's child policy, as committed.
+    pub(crate) children: Option<crate::children::ChildPolicy>,
+    /// Every harness row, intent and child: the next position is this.
+    pub(crate) positions: usize,
+    /// Children admitted by every generation (the start budget's use).
+    pub(crate) child_starts: u32,
+    pub(crate) open_children: Vec<OpenChild>,
+    /// Children an earlier owner admitted whose end it never recorded and
+    /// which have no open launch: this claim labelled them lost.
+    pub(crate) children_lost: u32,
 }
 
 /// The current owner's handle on its root's store.
@@ -350,53 +390,86 @@ impl Store {
              WHERE outcome IS NULL AND generation < ?2",
             params![UNKNOWN_PRIOR_OWNER, generation],
         )?;
-        let existing: Option<(u32, u32, String, String)> = tx
+        let existing: Option<(u32, u32, String, String, Option<String>)> = tx
             .query_row(
-                "SELECT outage_closure_cap, delivery_attempt_cap, cwd, workload FROM intent",
+                "SELECT outage_closure_cap, delivery_attempt_cap, cwd, workload, children FROM intent",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()?;
-        let (created, cap, attempt_cap, cwd, workload, harnesses) = match (intent, existing) {
-            (Some(_), Some(_)) => return Err(ClaimError::IntentExists),
-            (None, None) => return Err(ClaimError::NoIntent),
-            (Some(intent), None) => {
-                tx.execute(
-                    "INSERT INTO root (singleton, root_id) VALUES (1, ?1)",
-                    params![crate::sys::random_hex()?],
-                )?;
-                let harnesses = create_intent(&tx, intent, generation)?;
-                (
-                    true,
-                    intent.outage_closure_cap,
-                    intent.delivery_attempt_cap,
-                    intent.cwd.clone(),
-                    intent.workload.clone(),
-                    harnesses,
-                )
-            }
-            (None, Some((cap, attempt_cap, cwd, workload))) => {
-                let workload: crate::Workload = serde_json::from_str(&workload)
-                    .map_err(|error| ClaimError::Store(format!("stored workload: {error}")))?;
-                // Persisted attempts from every generation count: a restart
-                // loop cannot buy more attempts than the intent allows.
-                tx.execute(
-                    "UPDATE message SET stop = ?1
+        let (created, cap, attempt_cap, cwd, workload, children, harnesses) =
+            match (intent, existing) {
+                (Some(_), Some(_)) => return Err(ClaimError::IntentExists),
+                (None, None) => return Err(ClaimError::NoIntent),
+                (Some(intent), None) => {
+                    tx.execute(
+                        "INSERT INTO root (singleton, root_id) VALUES (1, ?1)",
+                        params![crate::sys::random_hex()?],
+                    )?;
+                    let harnesses = create_intent(&tx, intent, generation)?;
+                    (
+                        true,
+                        intent.outage_closure_cap,
+                        intent.delivery_attempt_cap,
+                        intent.cwd.clone(),
+                        intent.workload.clone(),
+                        intent.children.clone(),
+                        harnesses,
+                    )
+                }
+                (None, Some((cap, attempt_cap, cwd, workload, children))) => {
+                    let workload: crate::Workload = serde_json::from_str(&workload)
+                        .map_err(|error| ClaimError::Store(format!("stored workload: {error}")))?;
+                    let children = children
+                        .map(|text| serde_json::from_str(&text))
+                        .transpose()
+                        .map_err(|error| ClaimError::Store(format!("stored children: {error}")))?;
+                    // Persisted attempts from every generation count: a restart
+                    // loop cannot buy more attempts than the intent allows.
+                    tx.execute(
+                        "UPDATE message SET stop = ?1
                      WHERE stop IS NULL AND ack_label IS NULL
                        AND (SELECT count(*) FROM attempt a
                             WHERE a.harness = message.harness AND a.idx = message.idx) >= ?2",
-                    params![ATTEMPTS_EXHAUSTED, attempt_cap],
-                )?;
-                (
-                    false,
-                    cap,
-                    attempt_cap,
-                    cwd,
-                    workload,
-                    load_intent(&tx, generation)?,
-                )
-            }
-        };
+                        params![ATTEMPTS_EXHAUSTED, attempt_cap],
+                    )?;
+                    (
+                        false,
+                        cap,
+                        attempt_cap,
+                        cwd,
+                        workload,
+                        children,
+                        load_intent(&tx, generation)?,
+                    )
+                }
+            };
+        // A child an earlier owner admitted and never resolved, with no
+        // launch left open, is lost with that owner: it is never relaunched
+        // or delivered to again (its requester's connection died too).
+        let children_lost = tx.execute(
+            "UPDATE child SET outcome = 'lost-with-prior-owner', resolved_generation = ?1
+             WHERE outcome IS NULL AND NOT EXISTS (
+                 SELECT 1 FROM work w WHERE w.harness = child.harness AND w.outcome IS NULL)",
+            params![generation],
+        )?;
+        let positions: i64 = tx.query_row("SELECT count(*) FROM harness", [], |row| row.get(0))?;
+        let child_starts: i64 = tx.query_row("SELECT count(*) FROM child", [], |row| row.get(0))?;
+        let open_children = tx
+            .prepare(
+                "SELECT w.id, w.incarnation, w.harness, h.id FROM work w
+                 JOIN harness h ON h.position = w.harness
+                 WHERE h.kind = 'child' AND w.kind = 'harness' AND w.outcome IS NULL ORDER BY w.id",
+            )?
+            .query_map([], |row| {
+                Ok(OpenChild {
+                    work: row.get(0)?,
+                    incarnation: row.get(1)?,
+                    position: usize::try_from(row.get::<_, i64>(2)?).unwrap_or(usize::MAX),
+                    id: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         let root_id: String = tx.query_row("SELECT root_id FROM root", [], |row| row.get(0))?;
         let live_incarnation = tx
             .query_row(
@@ -452,6 +525,11 @@ impl Store {
             root_id,
             live_incarnation,
             open_bash,
+            children,
+            positions: usize::try_from(positions).unwrap_or(usize::MAX),
+            child_starts: u32::try_from(child_starts).unwrap_or(u32::MAX),
+            open_children,
+            children_lost: u32::try_from(children_lost).unwrap_or(u32::MAX),
         })
     }
 
@@ -657,6 +735,7 @@ impl Store {
     pub(crate) fn begin_bash(
         &mut self,
         harness: usize,
+        requester_work: i64,
         incarnation: i64,
         requester_pid: i32,
         inputs_open: &str,
@@ -673,11 +752,88 @@ impl Store {
             )?;
             let work = tx.last_insert_rowid();
             tx.execute(
-                "INSERT INTO bash_run (work, requester_pid, inputs_open, argv, cwd)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![work, requester_pid, inputs_open, argv, cwd],
+                "INSERT INTO bash_run (work, requester_work, requester_pid, inputs_open, argv, cwd)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![work, requester_work, requester_pid, inputs_open, argv, cwd],
             )?;
             Ok(work)
+        })
+    }
+
+    /// Commits a registered child in one transaction: its harness row (the
+    /// next position), its one owed message (`text`, a freshly minted key)
+    /// and its lineage to the exact parent work. Returns the position and
+    /// the message. Nothing is reported admitted before this commits.
+    pub(crate) fn admit_child(
+        &mut self,
+        child: &ChildAdmission<'_>,
+    ) -> Result<(usize, OutboundMessage), StoreError> {
+        let generation = self.generation;
+        self.write(|tx| {
+            let position: i64 =
+                tx.query_row("SELECT count(*) FROM harness", [], |row| row.get(0))?;
+            tx.execute(
+                "INSERT INTO harness (position, id, argv, endpoint, session, kind)
+                 VALUES (?1, ?2, '[]', ?3, NULL, 'child')",
+                params![position, child.id, child.endpoint.label()],
+            )?;
+            tx.execute(
+                "INSERT INTO child (harness, parent, parent_work, route, requester_pid, inputs_open,
+                                    admitted_generation)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    position,
+                    int(child.parent),
+                    child.parent_work,
+                    child.route,
+                    child.requester_pid,
+                    child.inputs_open,
+                    generation
+                ],
+            )?;
+            let message = OutboundMessage::fresh_recorded(child.text, |key: &MessageKey| {
+                tx.execute(
+                    "INSERT INTO message (harness, idx, key, text) VALUES (?1, 0, ?2, ?3)",
+                    params![position, key.as_str(), child.text],
+                )
+                .map(drop)
+                .map_err(|error| io::Error::other(error.to_string()))
+            })
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            Ok((usize::try_from(position).unwrap_or(usize::MAX), message))
+        })
+    }
+
+    /// Records the argv a child's launch was provisioned with.
+    pub(crate) fn set_harness_argv(
+        &mut self,
+        harness: usize,
+        argv: &[String],
+    ) -> Result<(), StoreError> {
+        let argv = serde_json::to_string(argv).expect("argv serializes");
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE harness SET argv = ?2 WHERE position = ?1",
+                params![int(harness), argv],
+            )
+            .map(drop)
+        })
+    }
+
+    /// Records how a child ended for its parent (never more than observed).
+    pub(crate) fn resolve_child(
+        &mut self,
+        harness: usize,
+        outcome: &str,
+    ) -> Result<(), StoreError> {
+        let generation = self.generation;
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE child SET outcome = ?2, resolved_generation = ?3
+                 WHERE harness = ?1 AND outcome IS NULL",
+                params![int(harness), outcome, generation],
+            )
+            .map(drop)
         })
     }
 
@@ -756,6 +912,18 @@ impl Store {
     }
 }
 
+/// What [`Store::admit_child`] commits.
+pub(crate) struct ChildAdmission<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) endpoint: crate::Endpoint,
+    pub(crate) parent: usize,
+    pub(crate) parent_work: i64,
+    pub(crate) route: &'a str,
+    pub(crate) requester_pid: i32,
+    pub(crate) inputs_open: &'a str,
+    pub(crate) text: &'a str,
+}
+
 /// SQLite integers are `i64`; positions, indexes and times fit.
 fn int<N: TryInto<i64>>(value: N) -> i64 {
     value.try_into().unwrap_or(i64::MAX)
@@ -797,13 +965,20 @@ fn create_intent(
     generation: i64,
 ) -> Result<Vec<DurableHarness>, ClaimError> {
     tx.execute(
-        "INSERT INTO intent (singleton, outage_closure_cap, delivery_attempt_cap, cwd, workload, generation)
-         VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO intent (singleton, outage_closure_cap, delivery_attempt_cap, cwd, workload,
+                             children, generation)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             intent.outage_closure_cap,
             intent.delivery_attempt_cap,
             intent.cwd,
             serde_json::to_string(&intent.workload)
+                .map_err(|error| ClaimError::Store(error.to_string()))?,
+            intent
+                .children
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
                 .map_err(|error| ClaimError::Store(error.to_string()))?,
             generation
         ],
@@ -856,8 +1031,10 @@ fn create_intent(
 }
 
 fn load_intent(tx: &Transaction<'_>, generation: i64) -> Result<Vec<DurableHarness>, ClaimError> {
-    let mut harness_rows =
-        tx.prepare("SELECT position, id, argv, endpoint, session FROM harness ORDER BY position")?;
+    let mut harness_rows = tx.prepare(
+        "SELECT position, id, argv, endpoint, session FROM harness
+             WHERE kind = 'intent' ORDER BY position",
+    )?;
     let rows = harness_rows
         .query_map([], |row| {
             Ok((
@@ -971,6 +1148,7 @@ mod tests {
                 messages: vec!["one".into()],
             }],
             workload: crate::Workload::UnprivilegedUserns {},
+            children: None,
         }
     }
 

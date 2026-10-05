@@ -25,6 +25,12 @@ test = false
 name = "oulipoly-root-bash"
 path = "src/bin/root_bash.rs"
 
+# Prototype requester of a root's registered children (see `children`
+# module docs): what a parent's explore tool does, for process tests.
+[[bin]]
+name = "oulipoly-root-child"
+path = "src/bin/root_child.rs"
+
 # Owner-side setup of one native OpenCode host's launch directory, policy
 # and harness argv (see the `native` module docs).
 [[bin]]

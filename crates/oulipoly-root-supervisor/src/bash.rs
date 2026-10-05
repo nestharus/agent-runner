@@ -27,6 +27,12 @@
 //!   `launch-unknown` (possible effects) or `left-to-successor`.
 //!   Uncertain launches are never retried. A requester that goes away does not stop the run;
 //!   the owner still waits for its end and records it.
+//! * The parent attributed before the request was read must still be that
+//!   exact live harness work when the run is committed (`parent-not-current`
+//!   otherwise), and the durable record keeps that requesting work.
+//! * The same socket admits registered children (`op` `child`, the
+//!   [`crate::children`] module). A child's own Bash runs are attributed to
+//!   the child, refused once it is stopped, and killed when it stops or ends.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -41,6 +47,7 @@ use std::thread;
 use serde_json::{Value, json};
 
 use crate::Event;
+use crate::children::Registry;
 use crate::custody::{Adopted, PidNs, ReceiptWait, Root, RootSlot, SpawnError};
 use crate::live::Custody;
 use crate::store::Store;
@@ -79,10 +86,12 @@ pub(crate) struct View {
 pub(crate) type Views = Arc<Mutex<Vec<View>>>;
 
 #[derive(Default)]
-struct Gate {
+pub(crate) struct Gate {
     closed: bool,
     /// Runs admitted and not yet finished, including taken-over ones.
     open: usize,
+    /// Children admitted and not yet finished.
+    children_open: usize,
     accepted: u64,
     refused: u64,
     not_run: u64,
@@ -101,6 +110,22 @@ enum Outcome {
     NotRun,
 }
 
+/// Admits one child into the count the owning loop waits on, unless the
+/// ingress is closed.
+pub(crate) fn enter_child(gate: &Arc<(Mutex<Gate>, Condvar)>) -> bool {
+    let mut gate = gate.0.lock().expect("bash gate");
+    if gate.closed {
+        return false;
+    }
+    gate.children_open += 1;
+    true
+}
+
+pub(crate) fn leave_child(gate: &Arc<(Mutex<Gate>, Condvar)>, tx: &Sender<Event>) {
+    gate.0.lock().expect("bash gate").children_open -= 1;
+    let _ = tx.send(Event::BashDone);
+}
+
 /// One owner run's Bash ingress.
 pub(crate) struct Ingress {
     root_id: String,
@@ -110,6 +135,9 @@ pub(crate) struct Ingress {
     views: Views,
     tx: Sender<Event>,
     gate: Arc<(Mutex<Gate>, Condvar)>,
+    children: Arc<Registry>,
+    /// Every child harness starts here (the intent's `cwd`).
+    cwd: String,
 }
 
 /// A Bash run an earlier owner accepted, as found at attach.
@@ -130,6 +158,7 @@ pub(crate) enum Prior {
 }
 
 impl Ingress {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         root_id: String,
         slot: Arc<RootSlot>,
@@ -137,6 +166,8 @@ impl Ingress {
         store: Arc<Mutex<Store>>,
         views: Views,
         tx: Sender<Event>,
+        children: Arc<Registry>,
+        cwd: String,
     ) -> Arc<Self> {
         Arc::new(Self {
             root_id,
@@ -146,6 +177,8 @@ impl Ingress {
             views,
             tx,
             gate: Arc::default(),
+            children,
+            cwd,
         })
     }
 
@@ -199,7 +232,7 @@ impl Ingress {
     /// harness's end is reported.
     pub(crate) fn close_if_idle(&self) -> bool {
         let mut gate = self.gate.0.lock().expect("bash gate");
-        if gate.open > 0 {
+        if gate.open > 0 || gate.children_open > 0 {
             return false;
         }
         if !gate.closed {
@@ -276,8 +309,26 @@ impl Ingress {
             Ok(request) => request,
             Err(reason) => return self.refused(&stream, peer, &reason),
         };
-        let mut sink = Sink(Some(stream));
-        self.run(&attributed, cred.pid, &request, &mut sink);
+        match request {
+            Request::Run(request) => {
+                let mut sink = Sink(Some(stream));
+                self.run(&attributed, cred.pid, &request, &mut sink);
+            }
+            Request::Child(request) => {
+                let ctx = crate::children::Context {
+                    root_id: &self.root_id,
+                    registry: &self.children,
+                    slot: &self.slot,
+                    custody: &self.custody,
+                    store: &self.store,
+                    views: &self.views,
+                    gate: &self.gate,
+                    tx: &self.tx,
+                    cwd: &self.cwd,
+                };
+                crate::children::serve(&ctx, &attributed, cred.pid, request, stream);
+            }
+        }
     }
 
     /// The harness whose live work's own PID namespace the peer is in.
@@ -325,6 +376,32 @@ impl Ingress {
             );
             return;
         }
+        if let Some(reason) = self.children.refuses_bash(who.position) {
+            drop(custody);
+            self.refused(
+                sink.stream(),
+                json!({ "pid": requester }),
+                &format!("requester-stopped: {reason}"),
+            );
+            return;
+        }
+        // The attribution was taken before the request was read: the same
+        // live work must still be current at commit.
+        let current = self
+            .views
+            .lock()
+            .expect("views")
+            .get(who.position)
+            .is_some_and(|view| view.works.iter().any(|(work, _)| *work == who.harness_work));
+        if !current {
+            drop(custody);
+            self.refused(
+                sink.stream(),
+                json!({ "pid": requester }),
+                "parent-not-current",
+            );
+            return;
+        }
         if !self.enter() {
             drop(custody);
             self.refused(sink.stream(), json!({ "pid": requester }), "ingress-closed");
@@ -339,6 +416,7 @@ impl Ingress {
         let inputs_open = Value::Array(open.clone()).to_string();
         let begun = self.store.lock().expect("store lock").begin_bash(
             who.position,
+            who.harness_work,
             root.incarnation,
             requester,
             &inputs_open,
@@ -409,6 +487,7 @@ impl Ingress {
             }
         };
         let token = custody.register(Arc::clone(&root), work);
+        self.children.add_run(who.position, &root, work);
         drop(custody);
         let _ = self
             .store
@@ -478,6 +557,7 @@ impl Ingress {
         };
         event["output"] = output;
         self.custody.lock().expect("custody lock").release(token);
+        self.children.remove_run(work);
         let caller = match sink {
             Some(sink) => {
                 sink.send(&event);
@@ -516,7 +596,12 @@ impl Ingress {
                 let token = custody.register(Arc::clone(&root), adopted.work);
                 let stopped = custody.reason();
                 drop(custody);
-                if stopped.is_some_and(|reason| reason != "authority-lost") {
+                // A recovered child's Bash is stopped with that child: no
+                // child is continued by a successor.
+                let child = ingress.children.is_child(harness);
+                if stopped.is_some_and(|reason| reason != "authority-lost")
+                    || (child && stopped.is_none())
+                {
                     root.kill(adopted.work);
                 }
                 ingress.report(json!({
@@ -609,12 +694,12 @@ fn relay_output(
     (bytes, output)
 }
 
-struct Attributed {
-    position: usize,
-    harness: String,
-    harness_work: i64,
-    session: Option<String>,
-    open: Vec<OpenInput>,
+pub(crate) struct Attributed {
+    pub(crate) position: usize,
+    pub(crate) harness: String,
+    pub(crate) harness_work: i64,
+    pub(crate) session: Option<String>,
+    pub(crate) open: Vec<OpenInput>,
 }
 
 struct RunRequest {
@@ -622,11 +707,24 @@ struct RunRequest {
     cwd: String,
 }
 
+enum Request {
+    Run(RunRequest),
+    Child(crate::children::ChildRequest),
+}
+
 /// The requester's connection; writes stop being attempted once it fails.
-struct Sink(Option<UnixStream>);
+pub(crate) struct Sink(Option<UnixStream>);
 
 impl Sink {
-    fn send(&mut self, value: &Value) {
+    pub(crate) fn new(stream: Option<UnixStream>) -> Self {
+        Self(stream)
+    }
+
+    pub(crate) fn connected(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub(crate) fn send(&mut self, value: &Value) {
         if let Some(stream) = self.0.as_mut()
             && writeln!(stream, "{value}")
                 .and_then(|()| stream.flush())
@@ -691,7 +789,7 @@ fn peer_cred(stream: &UnixStream) -> std::io::Result<libc::ucred> {
     sys::peer_cred(&fd)
 }
 
-fn read_request(stream: &UnixStream) -> Result<RunRequest, String> {
+fn read_request(stream: &UnixStream) -> Result<Request, String> {
     let mut line = String::new();
     BufReader::new(stream.take(MAX_REQUEST))
         .read_line(&mut line)
@@ -699,6 +797,9 @@ fn read_request(stream: &UnixStream) -> Result<RunRequest, String> {
     let value: Value = serde_json::from_str(line.trim()).map_err(|_| "malformed".to_owned())?;
     if value["v"].as_u64() != Some(PROTOCOL) {
         return Err("unsupported-version".to_owned());
+    }
+    if value["op"] == "child" {
+        return crate::children::parse_request(&value).map(Request::Child);
     }
     if value["op"] != "run" {
         return Err("unknown-op".to_owned());
@@ -718,7 +819,7 @@ fn read_request(stream: &UnixStream) -> Result<RunRequest, String> {
         .filter(|cwd| cwd.starts_with('/') && !cwd.contains('\0'))
         .ok_or("bad-cwd")?
         .to_owned();
-    Ok(RunRequest { argv, cwd })
+    Ok(Request::Run(RunRequest { argv, cwd }))
 }
 
 /// Standard base64 with padding.
@@ -803,7 +904,9 @@ mod tests {
         }
     }
 
-    fn fixture(dir: &Path) -> (Arc<Ingress>, Arc<Root>, OwnedFd) {
+    /// The ingress, the seam's root, its far end, and the requesting
+    /// harness's (recorded, current) work.
+    fn fixture(dir: &Path) -> (Arc<Ingress>, Arc<Root>, OwnedFd, i64) {
         let intent = Intent {
             outage_closure_cap: 1,
             delivery_attempt_cap: 1,
@@ -816,12 +919,20 @@ mod tests {
                 messages: vec!["one".into()],
             }],
             workload: crate::Workload::UnprivilegedUserns {},
+            children: None,
         };
         let mut claimed = Store::claim(&dir.join("store"), Some(&intent)).unwrap();
         claimed
             .store
             .begin_incarnation("fixture", "fixture")
             .unwrap();
+        let parent = claimed.store.begin_work(0, 1).unwrap();
+        let views: Views = Arc::new(Mutex::new(vec![View {
+            id: "h".into(),
+            session: None,
+            works: vec![(parent, PidNs { dev: 0, ino: 0 })],
+            open: vec![],
+        }]));
         let stop = Arc::new(StopSignal::new().unwrap());
         let (root, far) = Root::seam(false, i32::try_from(std::process::id()).unwrap(), &stop);
         let slot = Arc::new(RootSlot::new(
@@ -832,22 +943,26 @@ mod tests {
             Some(Arc::clone(&root)),
         ));
         let (tx, _rx) = channel();
+        let custody = Arc::new(Mutex::new(Custody::new(stop)));
+        let children = Registry::new(None, 1, 0, Arc::clone(&custody));
         let ingress = Ingress::new(
             claimed.root_id,
             slot,
-            Arc::new(Mutex::new(Custody::new(stop))),
+            custody,
             Arc::new(Mutex::new(claimed.store)),
-            Arc::default(),
+            views,
             tx,
+            children,
+            dir.display().to_string(),
         );
-        (ingress, root, far)
+        (ingress, root, far, parent)
     }
 
     #[test]
     fn spawn_reply_faults_keep_possible_effects_unknown_and_intent_open() {
         for mode in ["lost-reply", "missing-stdio", "unproven-refusal", "refused"] {
             let dir = Fixture::new();
-            let (ingress, _root, far) = fixture(&dir.0);
+            let (ingress, _root, far, parent) = fixture(&dir.0);
             let marker = dir.0.join("effects");
             let replier = thread::spawn(move || {
                 let (bytes, _) = sys::recv(&far).unwrap().unwrap();
@@ -876,7 +991,7 @@ mod tests {
             let who = Attributed {
                 position: 0,
                 harness: "h".into(),
-                harness_work: 0,
+                harness_work: parent,
                 session: None,
                 open: vec![],
             };
@@ -918,15 +1033,53 @@ mod tests {
         }
     }
 
+    /// The requesting work attributed before the request was read must
+    /// still be current at commit: otherwise refused, nothing recorded or
+    /// run, and nothing is asked of root PID 1.
+    #[test]
+    fn stale_requesting_work_at_commit_is_refused_and_nothing_runs() {
+        let dir = Fixture::new();
+        let (ingress, _root, _far, parent) = fixture(&dir.0);
+        ingress.views.lock().unwrap()[0].works.clear();
+        let (near, far) = UnixStream::pair().unwrap();
+        far.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let who = Attributed {
+            position: 0,
+            harness: "h".into(),
+            harness_work: parent,
+            session: None,
+            open: vec![],
+        };
+        let request = RunRequest {
+            argv: vec!["fixture".into()],
+            cwd: "/".into(),
+        };
+        ingress.run(&who, 1, &request, &mut Sink(Some(near)));
+        let mut reply = String::new();
+        BufReader::new(far).read_line(&mut reply).unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["event"], "refused");
+        assert_eq!(reply["reason"], "parent-not-current");
+        let conn =
+            rusqlite::Connection::open(dir.0.join("store").join(crate::store::DB_FILE)).unwrap();
+        let runs: i64 = conn
+            .query_row("SELECT count(*) FROM work WHERE kind = 'bash'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(runs, 0);
+        assert_eq!(ingress.summary()["accepted"], 0);
+    }
+
     #[test]
     fn output_read_failure_preserves_wait_but_never_claims_eof() {
         let dir = Fixture::new();
-        let (ingress, root, far) = fixture(&dir.0);
+        let (ingress, root, far, parent) = fixture(&dir.0);
         let work = ingress
             .store
             .lock()
             .unwrap()
-            .begin_bash(0, 1, 1, "[]", &["fixture".into()], "/")
+            .begin_bash(0, parent, 1, 1, "[]", &["fixture".into()], "/")
             .unwrap();
         assert!(ingress.enter());
         let token = ingress
