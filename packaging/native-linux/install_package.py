@@ -7,7 +7,8 @@
         [--sudoers /etc/sudoers.d/oulipoly-native]
     install_package.py uninstall --record <prefix>/<id>.install.json [--purge-site]
 
-`install` checks the archive digest, extracts it member by member (regular
+`install` copies the archive into a root-private temporary file, checks
+the digest of that copy and uses only it, extracts it member by member (regular
 files, directories and in-package relative symlinks only) into a fresh
 `<prefix>/.<id>.partial`, root-owned with the archive's normalized modes,
 checks every file against `MANIFEST.json`, and renames it to
@@ -39,6 +40,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 
 OLD_CANONICAL = "/usr/local/libexec/oulipoly"
 VISUDO = "/usr/sbin/visudo"
@@ -214,14 +216,38 @@ def plan(args, paths, package_id):
 
 def install(args, paths):
     unprivileged = args.unprivileged_test
-    if sha256_file(args.archive) != args.sha256:
-        raise Stop("archive digest differs from --sha256")
-    package_id = package_id_of(args.archive)
-    if args.command == "plan":
-        print(json.dumps(plan(args, paths, package_id), indent=1))
-        return 0
-    if not unprivileged and os.geteuid() != 0:
+    if args.command == "install" and not unprivileged and os.geteuid() != 0:
         raise Stop("install runs as root")
+    # The archive may sit where its owner can still change it: everything
+    # below reads only this private copy, hashed as it is made.
+    private = tempfile.mkdtemp(prefix="oulipoly-native-install-")
+    try:
+        archive = os.path.join(private, "package.tar.gz")
+        if private_copy(args.archive, archive) != args.sha256:
+            raise Stop("archive digest differs from --sha256")
+        package_id = package_id_of(archive)
+        if args.command == "plan":
+            print(json.dumps(plan(args, paths, package_id), indent=1))
+            return 0
+        return install_from(args, paths, archive, package_id)
+    finally:
+        shutil.rmtree(private, ignore_errors=True)
+
+
+def private_copy(source, target):
+    """Copies `source` to the new file `target` (`0600`) and returns the
+    sha256 of exactly the bytes written."""
+    digest = hashlib.sha256()
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with open(source, "rb") as src, os.fdopen(fd, "wb") as out:
+        for chunk in iter(lambda: src.read(1 << 20), b""):
+            digest.update(chunk)
+            out.write(chunk)
+    return digest.hexdigest()
+
+
+def install_from(args, paths, archive, package_id):
+    unprivileged = args.unprivileged_test
     sudoers = paths.host(paths.sudoers)
     if not os.path.isdir(os.path.dirname(sudoers)):
         raise Stop(f"{os.path.dirname(paths.sudoers)} is not a directory")
@@ -237,7 +263,7 @@ def install(args, paths):
     partial = os.path.join(prefix, "." + package_id + ".partial")
     if os.path.lexists(partial):
         raise Stop(f"{partial} is left from an earlier attempt; inspect and remove it")
-    extract(args.archive, package_id, partial, unprivileged)
+    extract(archive, package_id, partial, unprivileged)
     manifest = verify(partial)
     os.rename(partial, final)
     created.append(final)

@@ -59,15 +59,16 @@ dependencies. The runner is built with default features (never
 ## Install (as root, reviewed)
 
 ```
-python3 -I <reviewed checkout>/packaging/native-linux/install_package.py plan \
+python3 -I <root-owned copy of the reviewed install_package.py> plan \
   --archive B/dist/<id>.tar.gz --sha256 <hex> --user nes
-python3 -I <reviewed checkout>/packaging/native-linux/install_package.py install \
+python3 -I <root-owned copy of the reviewed install_package.py> install \
   --archive B/dist/<id>.tar.gz --sha256 <hex> --user nes
 ```
 
 `install` takes these steps:
 
-1. Checks the digest.
+1. Copies the archive into a root-private temporary file, checks the
+   digest of that copy, and reads only the copy from then on.
 2. Extracts the archive member by member into a fresh root-owned
    directory. Only regular files, directories and in-package relative
    symlinks are accepted.
