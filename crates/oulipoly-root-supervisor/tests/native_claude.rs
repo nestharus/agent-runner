@@ -11,8 +11,11 @@
 //! --ignore-scripts` of `native/claude/package.json` beside its lockfile),
 //! `OULIPOLY_NATIVE_NODE` (the Node runtime) and `AGENT_BASH_BIN` (an
 //! agent-bash binary with root v1). Nothing here needs the network; run it
-//! inside `unshare --user --map-current-user --net --pid --fork` so the
-//! fixture has none and everything ends with it.
+//! inside `unshare --user --map-current-user --net --mount --pid --fork
+//! --mount-proc` so the fixture has none and everything ends with it. The
+//! private `/proc` is needed: the owner reads its work's PID namespace
+//! there; with the host's `/proc` launches fail or Bash is refused as
+//! unattributed.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
