@@ -542,4 +542,33 @@ mod tests {
             .is_ok()
         );
     }
+
+    #[test]
+    fn buffered_stdout_flush_loss_returns_failure_without_changing_caller_records() {
+        // Small writes fit in the real buffer; /dev/full fails only when flush
+        // sends the bytes to the OS. No synthetic always-error writer.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("final.md"), "retained answer").unwrap();
+        let result = b"{\"class\":\"answered\",\"front_door_exit\":87}";
+        std::fs::write(dir.path().join("result.json"), result).unwrap();
+        let status = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .status()
+            .unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let mut stdout = std::io::BufWriter::with_capacity(4096, file);
+        assert_eq!(report_to(dir.path(), status, &mut stdout).unwrap(), 6);
+        assert_eq!(stdout.buffer(), b"retained answer\n");
+        assert_eq!(
+            std::fs::read(dir.path().join("result.json")).unwrap(),
+            result
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("final.md")).unwrap(),
+            "retained answer"
+        );
+    }
 }

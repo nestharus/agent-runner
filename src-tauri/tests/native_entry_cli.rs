@@ -51,7 +51,18 @@ if [ "$route" = "no-answer-route" ]; then
   printf '{"class":"no-answer","front_door_exit":87}\n' > "$out/result.json"
   exit 1
 fi
-printf 'stand-in answer via %s' "$route" > "$out/final.md"
+case "$route" in
+  missing-final) ;;
+  invalid-final) printf '\377' > "$out/final.md" ;;
+  unreadable-final|cancelled-bad-final) mkdir "$out/final.md" ;;
+  large-answer) awk 'BEGIN { for (i=0; i<1048576; i++) printf "x" }' > "$out/final.md" ;;
+  *) printf 'stand-in answer via %s' "$route" > "$out/final.md" ;;
+esac
+case "$route" in
+  cancelled-*)
+    printf '{"class":"cancelled","front_door_exit":87}\n' > "$out/result.json"
+    exit 5 ;;
+esac
 printf '{"class":"answered","front_door_exit":87}\n' > "$out/result.json"
 exit 0
 "#;
@@ -84,9 +95,9 @@ impl Fixture {
         fixture
     }
 
-    fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"))
-            .args(args)
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        command
             .current_dir(self.root.join("work"))
             .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env_remove("OULIPOLY_CONFIG_HOME")
@@ -95,9 +106,12 @@ impl Fixture {
             .env("HOME", &self.root)
             .env("FAKE_RECORD", &self.record)
             .env_remove("OULIPOLY_PARENT_INVOCATION")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .unwrap()
+            .stdin(std::process::Stdio::null());
+        command
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        self.command().args(args).output().unwrap()
     }
 
     fn argv(&self) -> Option<Vec<String>> {
@@ -259,4 +273,209 @@ fn unsupported_forms_and_malformed_config_are_refused() {
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
     assert!(fixture.argv().is_none() && broken.argv().is_none());
     assert!(fixture.legacy_untouched() && broken.legacy_untouched());
+}
+
+#[test]
+fn unresolved_config_root_is_refused_before_legacy_scheduling() {
+    let fixture = Fixture::new(CONFIG);
+    // Even a regressed selector cannot spawn a legacy maintenance worker:
+    // its data root is an ordinary file, so scheduling must fail before spawn.
+    fs::create_dir_all(fixture.data_dir.parent().unwrap()).unwrap();
+    fs::write(&fixture.data_dir, "data-root blocker").unwrap();
+    let output = fixture
+        .command()
+        .env_remove("XDG_CONFIG_HOME")
+        .args(["-m", "codex~high", "hi"])
+        .output()
+        .unwrap();
+    eprintln!(
+        "config-root control: entry {:?}; {}",
+        output.status.code(),
+        stderr(&output)
+    );
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(stderr(&output).contains("cannot determine native configuration selection"));
+    assert!(stderr(&output).contains("OULIPOLY_CONFIG_HOME is not set"));
+    assert!(!stderr(&output).contains("OULIPOLY_MAINTENANCE_GAP"));
+    assert!(fixture.argv().is_none());
+    assert!(!fixture.root.join("runs").exists());
+    assert_eq!(
+        fs::read_to_string(&fixture.data_dir).unwrap(),
+        "data-root blocker"
+    );
+
+    // A malformed executable-adjacent paths file has priority over a valid
+    // environment config root. Refuse its actual resolver error too.
+    let image = fixture.root.join("image");
+    fs::create_dir(&image).unwrap();
+    let executable = image.join("oulipoly-agent-runner");
+    fs::copy(env!("CARGO_BIN_EXE_oulipoly-agent-runner"), &executable).unwrap();
+    fs::write(image.join("config.toml"), "not valid TOML").unwrap();
+    let command = fixture.command();
+    // Reuse the isolated environment, changing just the executable.
+    let output = Command::new(&executable)
+        .envs(
+            command
+                .get_envs()
+                .filter_map(|(name, value)| value.map(|value| (name, value))),
+        )
+        .env_remove("OULIPOLY_CONFIG_HOME")
+        .env_remove("OULIPOLY_PARENT_INVOCATION")
+        .current_dir(fixture.root.join("work"))
+        .stdin(std::process::Stdio::null())
+        .args(["-m", "codex~high", "hi"])
+        .output()
+        .unwrap();
+    eprintln!(
+        "config-root control: entry {:?}; {}",
+        output.status.code(),
+        stderr(&output)
+    );
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(stderr(&output).contains("cannot determine native configuration selection"));
+    assert!(stderr(&output).contains("Could not parse runtime paths file"));
+    assert!(stderr(&output).contains(image.join("config.toml").to_str().unwrap()));
+    assert!(!stderr(&output).contains("OULIPOLY_MAINTENANCE_GAP"));
+    assert!(fixture.argv().is_none());
+    assert!(!fixture.root.join("runs").exists());
+}
+
+fn outcome_records(fixture: &Fixture, output: &Output, class: &str, code: i32) -> PathBuf {
+    let text = stderr(output);
+    eprintln!(
+        "presentation control: entry {:?}; stdout {} bytes; {text}",
+        output.status.code(),
+        output.stdout.len()
+    );
+    assert!(
+        text.contains(&format!(
+            "class {class}; caller exit {code}; front door exit 87; records "
+        )),
+        "{text}"
+    );
+    let runs: Vec<_> = fs::read_dir(fixture.root.join("runs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .collect();
+    assert_eq!(runs.len(), 1);
+    let out = &runs[0];
+    assert!(text.contains(out.to_str().unwrap()), "{text}");
+    let result: serde_json::Value =
+        serde_json::from_slice(&fs::read(out.join("result.json")).unwrap()).unwrap();
+    assert_eq!(result["class"], class);
+    assert_eq!(result["front_door_exit"], 87);
+    assert_eq!(fixture.prompt(), "hi");
+    assert!(fixture.legacy_untouched());
+    out.clone()
+}
+
+#[test]
+fn answer_read_failures_are_visible_with_caller_outcome_and_records() {
+    for route in ["missing-final", "invalid-final", "unreadable-final"] {
+        let fixture = Fixture::new(&CONFIG.replace("sol-high", route));
+        let output = fixture.run(&["-m", "codex~high", "hi"]);
+        assert_eq!(
+            output.status.code(),
+            Some(6),
+            "{route}: {}",
+            stderr(&output)
+        );
+        assert!(output.stdout.is_empty());
+        let text = stderr(&output);
+        assert!(
+            text.contains("answer presentation failed: cannot read"),
+            "{text}"
+        );
+        assert!(text.contains("entry exit 6"), "{text}");
+        let out = outcome_records(&fixture, &output, "answered", 0);
+        assert!(text.contains(out.join("final.md").to_str().unwrap()));
+    }
+}
+
+#[test]
+fn stdout_loss_is_visible_with_caller_outcome_and_retained_answer() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+
+    for broken_socket in [false, true] {
+        let fixture = Fixture::new(&CONFIG.replace("sol-high", "large-answer"));
+        let sink = if broken_socket {
+            let (writer, reader) = UnixStream::pair().unwrap();
+            drop(reader);
+            Stdio::from(OwnedFd::from(writer))
+        } else {
+            Stdio::from(
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open("/dev/full")
+                    .unwrap(),
+            )
+        };
+        let output = fixture
+            .command()
+            .args(["-m", "codex~high", "hi"])
+            .stdout(sink)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(6), "{}", stderr(&output));
+        let text = stderr(&output);
+        assert!(
+            text.contains("answer presentation failed: cannot write answer to stdout"),
+            "{text}"
+        );
+        assert!(
+            text.contains(if broken_socket {
+                "Broken pipe"
+            } else {
+                "No space left"
+            }),
+            "{text}"
+        );
+        let out = outcome_records(&fixture, &output, "answered", 0);
+        assert_eq!(fs::metadata(out.join("final.md")).unwrap().len(), 1048576);
+    }
+}
+
+#[test]
+fn nonanswered_diagnostic_text_and_read_loss_never_upgrade_caller_code() {
+    for route in ["cancelled-text", "cancelled-bad-final"] {
+        let fixture = Fixture::new(&CONFIG.replace("sol-high", route));
+        let output = fixture.run(&["-m", "codex~high", "hi"]);
+        assert_eq!(output.status.code(), Some(5), "{}", stderr(&output));
+        outcome_records(&fixture, &output, "cancelled", 5);
+        if route == "cancelled-text" {
+            assert_eq!(stdout(&output), "stand-in answer via cancelled-text\n");
+            assert!(!stderr(&output).contains("answer presentation failed"));
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(stderr(&output).contains("answer presentation failed: cannot read"));
+            assert!(stderr(&output).contains("entry exit 5"));
+        }
+    }
+}
+
+#[test]
+fn nonanswered_stdout_loss_preserves_nonzero_caller_code() {
+    let fixture = Fixture::new(&CONFIG.replace("sol-high", "cancelled-text"));
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let output = fixture
+        .command()
+        .args(["-m", "codex~high", "hi"])
+        .stdout(file)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(5), "{}", stderr(&output));
+    assert!(stderr(&output).contains("answer presentation failed"));
+    assert!(stderr(&output).contains("No space left"));
+    assert!(stderr(&output).contains("entry exit 5"));
+    let out = outcome_records(&fixture, &output, "cancelled", 5);
+    assert_eq!(
+        fs::read_to_string(out.join("final.md")).unwrap(),
+        "stand-in answer via cancelled-text"
+    );
 }

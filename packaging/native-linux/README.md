@@ -250,12 +250,16 @@ bash = "trusted-task"
 ```
 
 The final answer goes to stdout; a status line (class, caller and front-door
-exits, record directory) goes to stderr; the exit code is the caller's own
-(0 answered, which is not correctness). Unmapped models, an invalid file,
-`--resume`, `repl`, `resume`, `--new`, provider pinning/rotation and `-i`
+exits, record directory) goes to stderr. Answer read/write/flush failures are
+also reported there; after caller success they return entry exit 6, while a
+nonzero caller exit is preserved. Caller 0/answered is not correctness.
+Unmapped models, an invalid file, `--resume`, `repl`, `resume`, `--new`,
+provider pinning/rotation and `-i`
 with `-m` are refused with exit 3 and nothing launched: no legacy launch and
-no substitute model. Without the file, nothing changes. The credential is
-the explicitly named profile only: no rotation, lease or renewal (the caller
+no substitute model. An unresolved config root is also refused with exit 3;
+only a resolved root with an absent file leaves the entry unselected.
+The credential is the explicitly named profile only: no rotation, lease or
+renewal (the caller
 refuses a stale one). One attempt, synchronous, no streaming or resume yet.
 
 ## Native Claude routes
