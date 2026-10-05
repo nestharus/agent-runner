@@ -131,19 +131,34 @@ export function renderRootV1(exitCode, stdout, stderr) {
   if (value?.result_surface !== ROOT_V1_SURFACE || value.version !== 1 || value.delivery_mode !== "sync" ||
       !ROOT_V1_OUTCOMES.includes(value.outcome) || typeof value.effects_possible !== "boolean" ||
       !Array.isArray(value.stages) || !Array.isArray(value.faults) || !output ||
-      typeof output.base64 !== "string" || !Number.isSafeInteger(output.bytes)) {
+      typeof output.base64 !== "string" || !Number.isSafeInteger(output.bytes) || output.bytes < 0) {
     return { text: unresolved("result surface invalid"), error: true }
   }
   const bytes = Buffer.from(output.base64, "base64")
-  if (bytes.length !== output.bytes || bytes.toString("base64") !== output.base64)
+  // The requester counts the drained stream but carries only a prefix.
+  // Empty refusal/no-start results have no presentation fields.
+  const hasPresentation = ["presented_bytes", "omitted_bytes", "remainder"].some((key) => key in output)
+  const presented = hasPresentation ? output.presented_bytes : output.bytes
+  const omitted = hasPresentation ? output.omitted_bytes : 0
+  if (!Number.isSafeInteger(presented) || presented < 0 ||
+      !Number.isSafeInteger(omitted) || omitted < 0 || presented > output.bytes ||
+      omitted !== output.bytes - presented || bytes.length !== presented ||
+      bytes.toString("base64") !== output.base64 ||
+      (hasPresentation && output.remainder !== (omitted ? "discarded" : "none")))
     return { text: unresolved("output length or encoding mismatch"), error: true }
   const ended = value.outcome === "ended" || value.outcome === "ended-output-unproven"
   if (ended !== (value.wait !== null && typeof value.wait === "object") ||
       value.effects_possible !== !["refused", "not-started"].includes(value.outcome))
     return { text: unresolved("result outcome inconsistent"), error: true }
+  const delivery = value.outcome === "ended" ? (omitted ? "partial" : "complete")
+    : ["refused", "not-started"].includes(value.outcome) ? "none" : "unproven"
+  if (output.delivery !== delivery ||
+      (delivery === "none" && output.bytes !== 0))
+    return { text: unresolved("output delivery inconsistent"), error: true }
   const stage = (s) => {
     const name = String(s?.event)
     if (name === "accepted") return `accepted(work=${s.work}, durable=${s.durable})`
+    if (name === "output" && s.chunks !== undefined) return `output(chunks=${s.chunks}, bytes=${s.bytes})`
     if (name === "output-closed") return `output-closed(bytes=${s.bytes})`
     if (name === "end") return `end(${s.status}, observer=${s.observer}, output=${s.output?.state})`
     return s?.reason === undefined ? name : `${name}(${s.reason})`
@@ -152,7 +167,9 @@ export function renderRootV1(exitCode, stdout, stderr) {
   const faults = value.faults.length ? `\nfaults: ${value.faults.join("; ")}` : ""
   const text = bytes.toString("utf8")
   const utf8 = !bytes.includes(0) && Buffer.from(text, "utf8").equals(bytes)
-  const body = `\n--- output (stderr joined; ${bytes.length} bytes, ${utf8 ? "utf8" : "hex"}) ---\n` +
+  const presentation = `\nOutput: ${presented} shown bytes of ${output.bytes} received; ${omitted} omitted; ` +
+    (omitted ? "remainder discarded, not retained." : "remainder none.")
+  const body = `\n--- output (stderr joined; ${bytes.length} shown bytes, ${utf8 ? "utf8" : "hex"}) ---\n` +
     (utf8 ? text : bytes.toString("hex"))
   switch (value.outcome) {
     case "refused":
@@ -162,16 +179,16 @@ export function renderRootV1(exitCode, stdout, stderr) {
       return { text: `Root v1 accepted the command, then reported a positive no-start; nothing was run.\n${stages}${faults}`, error: true }
     case "unknown":
       return { text: `Root v1 outcome unknown (${value.meaning}): the command may have run. Do not replay.\n` +
-        `${stages}${faults}${bytes.length ? `${body}\n(output above is partial and unproven)` : ""}`, error: true }
+        `${stages}${faults}${presentation}${bytes.length ? `${body}\n(output above is partial and unproven)` : ""}`, error: true }
     default: {
       const wait = value.wait.exit?.code !== undefined
         ? `exited with code ${value.wait.exit.code}`
         : `signaled with signal ${value.wait.exit?.signal}`
-      const delivery = value.outcome === "ended"
-        ? "output complete (counted, closed, matched by the end)"
+      const status = value.outcome === "ended"
+        ? `output ${delivery} (full stream counted, closed, matched by the end)`
         : "output delivery unproven: the output below may be incomplete; do not replay"
       return { text: `Root v1 work ended: ${wait} (${value.wait.status}, observer ${value.wait.observer}); ` +
-        `${delivery}.\n${stages}${faults}${body}`, error: false }
+        `${status}.\n${stages}${faults}${presentation}${body}`, error: false }
     }
   }
 }
