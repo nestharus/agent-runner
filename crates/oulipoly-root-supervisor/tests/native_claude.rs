@@ -588,6 +588,183 @@ fn retained_output_is_acquired_and_locally_accepted_through_the_supported_mcp_to
     std::fs::remove_dir_all(&fixture.dir).unwrap();
 }
 
+/// Background Bash through the supported MCP tool. The command waits on a
+/// gate this test creates only after the first turn has ended, so its end
+/// cannot precede the tool's answer or that turn's end. `close` is sent at
+/// that turn end (as the public caller does); the harness must stay live
+/// until the owner's completion input is acknowledged and its tagged turn
+/// ends. In that later turn the stand-in reads every retained byte the
+/// completion names and accepts it; nothing polls before it.
+#[test]
+#[ignore = "needs OULIPOLY_NATIVE_CLAUDE_DEPS, OULIPOLY_NATIVE_NODE and AGENT_BASH_BIN"]
+fn background_bash_completion_reaches_the_live_session_as_a_later_turn() {
+    let fixture = Fixture::new("normal", None, None);
+    let gate = fixture.dir.join("gate");
+    let command = format!(
+        "while [ ! -e {} ]; do sleep 0.05; done; python3 -c 'import sys; sys.stdout.write(\"\".join(chr(97 + i % 26) for i in range(3000)))'; exit 7",
+        gate.display()
+    );
+    let mut run = Run::start(
+        &fixture,
+        &fixture.spec("root", &format!("BACKGROUND {command}")),
+    );
+    let started = run.until("started answer", |v| {
+        v["event"] == "agent-message" && v["text"].as_str().unwrap_or("").starts_with("STARTED ")
+    });
+    assert!(
+        started["text"]
+            .as_str()
+            .unwrap()
+            .contains("background work accepted and started (reference=rv1w:"),
+        "{started}"
+    );
+    let first = run.until("first turn end", |v| {
+        v["event"] == "turn-end" && v["input"] == 0
+    });
+    assert_eq!(first["stop_reason"], "end_turn");
+    assert!(!gate.exists());
+    assert!(
+        !has(&run.seen, "bash-ended"),
+        "the command cannot have ended before its gate"
+    );
+    run.control(json!({ "cmd": "close" }));
+    run.event("close-requested");
+    std::fs::write(&gate, b"").unwrap();
+    let (terminal, code, seen) = run.end();
+    let at =
+        |pred: &dyn Fn(&Value) -> bool| seen.iter().position(|v| pred(v)).expect("event present");
+    let bash_end = seen
+        .iter()
+        .find(|v| v["event"] == "bash-ended")
+        .unwrap()
+        .clone();
+    let work = bash_end["work"].as_i64().unwrap();
+    assert_eq!(bash_end["status"], "code:7");
+    assert_eq!(bash_end["observer"], "work-pid1-wait");
+    assert_eq!(bash_end["requester"], "detached-async");
+    assert_eq!(bash_end["retained"]["state"], "complete");
+    assert_eq!(bash_end["retained"]["bytes"], 3000);
+    let identity = bash_end["retained"]["identity"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let admitted = at(&|v| v["event"] == "bash-async-completion-admitted" && v["work"] == work);
+    assert_eq!(seen[admitted]["input"], 1);
+    let ack = at(&|v| v["event"] == "ack" && v["index"] == 1);
+    let answer = at(&|v| v["event"] == "agent-message" && v["input"] == 1);
+    let completed = seen[answer]["text"].as_str().unwrap();
+    assert_eq!(
+        completed,
+        format!("COMPLETED work={work} status=code:7 bytes=3000 pages=3 accepted={identity}")
+    );
+    let second = at(&|v| v["event"] == "turn-end" && v["input"] == 1);
+    let settled =
+        at(&|v| v["event"] == "async-owed" && v["change"] == "turn-ended" && v["work"] == work);
+    assert_eq!(seen[settled]["owed_async"], 0);
+    let close = at(&|v| v["event"] == "close-requested");
+    let stopping = at(&|v| v["event"] == "close-stopping");
+    let ended = at(&|v| v["event"] == "bash-ended");
+    let accepted = at(&|v| v["event"] == "bash-output-accepted");
+    assert!(
+        close < ended
+            && ended < admitted
+            && admitted < ack
+            && ack < accepted
+            && accepted < second
+            && second <= settled
+            && settled < stopping,
+        "order: close {close} ended {ended} admitted {admitted} ack {ack} accepted {accepted} turn {second} settled {settled} stop {stopping}"
+    );
+    assert_eq!(code, Some(7));
+    assert_eq!(terminal["status"], "closed");
+    assert_eq!(terminal["async"]["accepted"], 1);
+    assert_eq!(terminal["async"]["turn_ended"], 1);
+    assert_eq!(terminal["async"]["undelivered"], json!([]));
+    assert_eq!(terminal["async"]["owed"], 0);
+    assert_eq!(
+        terminal["bash"]["output_requests"], 4,
+        "3 pages + 1 acceptance, all after delivery"
+    );
+    let records = fixture.records();
+    let acquired = records
+        .iter()
+        .find(|v| v.get("completion_facts").is_some())
+        .unwrap();
+    let expected: String = (0..3000)
+        .map(|i| char::from(b'a' + (i % 26) as u8))
+        .collect();
+    use std::io::Read as _;
+    let mut decoded = Vec::new();
+    std::process::Command::new("base64")
+        .arg("-d")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map(|mut child| {
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(acquired["acquired_b64"].as_str().unwrap().as_bytes())
+                .unwrap();
+            child
+                .stdout
+                .take()
+                .unwrap()
+                .read_to_end(&mut decoded)
+                .unwrap();
+            child.wait().unwrap()
+        })
+        .unwrap();
+    assert_eq!(String::from_utf8(decoded).unwrap(), expected);
+    assert_eq!(acquired["completion_facts"]["accepted_locally"], false);
+    assert_eq!(acquired["completion_facts"]["end"]["status"], "code:7");
+    if let Ok(path) = std::env::var("OULIPOLY_NATIVE_ASYNC_EVIDENCE") {
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(
+                &json!({ "records": records, "events": seen, "terminal": terminal }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    std::fs::remove_dir_all(&fixture.dir).unwrap();
+}
+
+/// Cancel while a background completion is owed: the run is killed, its
+/// true wait is a signal, and its completion is settled undelivered with
+/// the cancel as reason. Nothing claims a delivered or processed turn.
+#[test]
+#[ignore = "needs OULIPOLY_NATIVE_CLAUDE_DEPS, OULIPOLY_NATIVE_NODE and AGENT_BASH_BIN"]
+fn cancel_with_an_owed_background_completion_settles_it_undelivered() {
+    let fixture = Fixture::new("normal", None, None);
+    let mut run = Run::start(&fixture, &fixture.spec("root", "BACKGROUND sleep 600"));
+    run.until("first turn end", |v| {
+        v["event"] == "turn-end" && v["input"] == 0
+    });
+    run.control(json!({ "cmd": "close" }));
+    run.event("close-requested");
+    run.control(json!({ "cmd": "cancel" }));
+    let (terminal, _code, seen) = run.end();
+    let bash_end = seen.iter().find(|v| v["event"] == "bash-ended").unwrap();
+    let work = bash_end["work"].clone();
+    assert!(
+        bash_end["status"].as_str().unwrap().starts_with("signal:"),
+        "{bash_end}"
+    );
+    assert_eq!(terminal["status"], "cancelled");
+    assert_eq!(terminal["async"]["accepted"], 1);
+    assert_eq!(terminal["async"]["turn_ended"], 0);
+    assert_eq!(
+        terminal["async"]["undelivered"],
+        json!([{ "harness": "claude", "work": work, "reason": "cancelled" }])
+    );
+    assert!(!has(&seen, "bash-async-completion-admitted"));
+    assert!(!seen.iter().any(|v| v["event"] == "ack" && v["index"] == 1));
+    std::fs::remove_dir_all(&fixture.dir).unwrap();
+}
+
 /// An allow list: a command it does not name is refused by the tool and
 /// never reaches the root's Bash ingress; the turn still ends normally.
 #[test]

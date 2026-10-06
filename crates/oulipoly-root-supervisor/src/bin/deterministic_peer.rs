@@ -26,6 +26,9 @@
 //! `--turn-before-ack` sends an echo reply and idle before the insertion
 //! response, exercising the ordering allowed by the native endpoint.
 //!
+//! `--reject-completion-once` conclusively rejects the first background
+//! completion with -32001 before insertion, then stays alive for later inputs.
+//!
 //! `--no-dedup` disables the local dedup contract. `--exit-after-acks N`
 //! exits normally after the Nth acknowledgement and its idle update;
 //! otherwise the peer stays alive until stdin ends.
@@ -54,7 +57,11 @@
 //! through `oulipoly-root-bash` (next to this binary), i.e. through the
 //! root's Bash ingress, after acknowledging it; its exit code and output
 //! come back as one `agent_message` tagged with [`PARENT_MESSAGE_META`],
-//! then the idle. `--untagged` sends neither tag.
+//! then the idle. `--untagged` sends neither tag. A prompt starting
+//! `[Background Bash completion]` (an owner's background-run completion)
+//! is handled the same way with the command `@completion <its last line>`,
+//! for a test's requester to interpret; the prototype requester runs it as
+//! a shell command, which fails visibly.
 //!
 //! The peer sets no parent-death signal: whether it outlives its owner is
 //! decided by its custody, not by the peer.
@@ -80,6 +87,7 @@ struct Args {
     idle: bool,
     silent_after_acks: Option<u64>,
     turn_before_ack: bool,
+    reject_completion_once: bool,
 }
 
 fn parse_args() -> Args {
@@ -95,6 +103,7 @@ fn parse_args() -> Args {
         idle: true,
         silent_after_acks: None,
         turn_before_ack: false,
+        reject_completion_once: false,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -103,6 +112,7 @@ fn parse_args() -> Args {
             "--mode" => args.mode = iter.next().expect("--mode value"),
             "--launch-modes" => args.launch_modes = iter.next().expect("--launch-modes value"),
             "--no-dedup" => args.dedup = false,
+            "--reject-completion-once" => args.reject_completion_once = true,
             "--untagged" => args.tagged = false,
             "--no-idle" => args.idle = false,
             "--turn-before-ack" => args.turn_before_ack = true,
@@ -296,6 +306,20 @@ impl Peer {
                         "exit-before-ack-always" => std::process::exit(1),
                         _ => {}
                     }
+                    let text = params["prompt"][0]["text"].as_str().unwrap_or_default();
+                    if args.reject_completion_once
+                        && text.starts_with("[Background Bash completion]")
+                        && state["fault_used"] == false
+                    {
+                        state["fault_used"] = Value::Bool(true);
+                        save(&args.state, state);
+                        send(
+                            out,
+                            &json!({ "jsonrpc": "2.0", "id": id,
+                            "error": { "code": -32001, "message": "fixture completion rejected" } }),
+                        );
+                        continue;
+                    }
                     let earlier = args
                         .dedup
                         .then(|| {
@@ -341,7 +365,6 @@ impl Peer {
                             &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
                         );
                     }
-                    let text = params["prompt"][0]["text"].as_str().unwrap_or_default();
                     if args.turn_before_ack {
                         let mut update = json!({
                             "sessionUpdate": "agent_message",
@@ -385,7 +408,15 @@ impl Peer {
                             }),
                         );
                     }
-                    if let Some(command) = command.strip_prefix("bash:") {
+                    // An owner completion of background Bash: its facts line
+                    // goes to the Bash requester as `@completion <facts>`.
+                    let completion = text.starts_with("[Background Bash completion]").then(|| {
+                        format!(
+                            "@completion {}",
+                            text.trim_end().rsplit('\n').next().unwrap_or("")
+                        )
+                    });
+                    if let Some(command) = command.strip_prefix("bash:").or(completion.as_deref()) {
                         let result = run_bash(command);
                         // Kept too, in case no owner is attached to read it.
                         state["bash"]

@@ -289,6 +289,102 @@ def answer_of(events):
     return None, None, len(linked)
 
 
+def async_of(events):
+    """Reconcile reports with the owner's terminal account. Missing trailing
+    reports are not unsettled debt when the owner supplies its actual end
+    account; contradictory or missing terminal evidence remains explicit."""
+    parent = [e for e in events if parent_event(e)]
+    reports = [e for e in parent if e.get("event") == "async-owed"]
+    completions = [e for e in parent if e.get("event") == "bash-async-completion-admitted"]
+    accepted = [e.get("work") for e in reports if e.get("change") == "owed"]
+    ended = [e.get("work") for e in reports if e.get("change") == "turn-ended"]
+    lost = [{"work": e.get("work"), "reason": e.get("reason")}
+            for e in reports if e.get("change") == "undelivered"]
+    observed = {"accepted": len(accepted), "turn_ended": len(ended),
+                "undelivered": lost, "unsettled": len(accepted) - len(ended) - len(lost)}
+    terminals = [e for e in parent if e.get("event") == "terminal"]
+    owner = terminals[-1].get("async") if terminals else None
+    account = dict(observed)
+    errors, gaps = [], []
+    active = bool(reports or completions)
+    for completion in completions:
+        work = completion.get("work")
+        if type(work) is not int or work not in accepted:
+            errors.append(f"async-completion-work-not-in-owed-reports: {work!r}")
+    if owner is None:
+        if active:
+            errors.append("owner-terminal-async-account-missing")
+    elif not isinstance(owner, dict) or not all(
+            type(owner.get(k)) is int and owner[k] >= 0 for k in ("accepted", "turn_ended", "owed")) \
+            or not isinstance(owner.get("undelivered"), list) \
+            or not all(isinstance(v, dict) and type(v.get("work")) is int
+                       and isinstance(v.get("reason"), str) and v["reason"]
+                       for v in owner["undelivered"]):
+        errors.append("owner-terminal-async-account-invalid")
+    else:
+        account = {"accepted": owner["accepted"], "turn_ended": owner["turn_ended"],
+                   "undelivered": owner["undelivered"], "unsettled": owner["owed"]}
+        for loss in owner["undelivered"]:
+            if loss["work"] not in accepted:
+                errors.append(f"owner-terminal-undelivered-work-not-in-owed-reports: {loss['work']!r}")
+        if owner["accepted"] != owner["turn_ended"] + len(owner["undelivered"]) + owner["owed"]:
+            errors.append("owner-terminal-async-totals-inconsistent")
+        if len(accepted) != len(set(accepted)) or len(ended) != len(set(ended)) \
+                or len(lost) != len({v["work"] for v in lost}) \
+                or set(ended) & {v["work"] for v in lost} \
+                or set(ended) & {v["work"] for v in owner["undelivered"]} \
+                or not (set(ended) | {v["work"] for v in lost}) <= set(accepted) \
+                or len(accepted) > owner["accepted"] or len(ended) > owner["turn_ended"] \
+                or any(v not in [{"work": u["work"], "reason": u["reason"]}
+                                 for u in owner["undelivered"]] for v in lost) \
+                or len(owner["undelivered"]) != len({v["work"] for v in owner["undelivered"]}):
+            errors.append("async-reports-contradict-owner-terminal")
+        if observed != {**account, "undelivered": [{"work": u["work"], "reason": u["reason"]}
+                                                 for u in owner["undelivered"]]}:
+            gaps.append("async-reports-differ-from-owner-terminal; see both accounts")
+    return {
+        **account, "active": active or bool(account["accepted"]), "reports": observed, "owner_summary": owner,
+        "errors": errors, "evidence_gaps": gaps,
+        "meaning": "turn_ended: the completion input was acknowledged and a tagged turn end covered it; not proof the agent used or accepted the output",
+    }
+
+
+def turns_of(events):
+    """Every linked turn of the parent: its input, kind, last linked text
+    and turn end, in turn-end order."""
+    events = [e for e in events if parent_event(e)]
+    acks = {}
+    completions = {e.get("input"): e.get("work") for e in events if e.get("event") == "bash-async-completion-admitted"}
+    texts = {}
+    turns = []
+    for event in events:
+        name = event.get("event")
+        if name == "ack" and event.get("message_id"):
+            acks[event.get("index")] = event["message_id"]
+        elif name == "agent-message" and event.get("input") is not None \
+                and event.get("parent_message_id") == acks.get(event.get("input")) \
+                and str(event.get("text", "")).strip():
+            texts[event["input"]] = event["text"]
+        elif name == "turn-end" and event.get("input") is not None:
+            index = event["input"]
+            turns.append({
+                "input": index,
+                "kind": "initial" if index == 0 else "background-completion" if index in completions else "follow-up",
+                "work": completions.get(index),
+                "text": texts.get(index),
+                "stop_reason": event.get("stop_reason"),
+                "acknowledged": index in acks,
+                "ended": True,
+            })
+    # Preserve linked diagnostic text even when its carrying turn never ends.
+    covered = {t["input"] for t in turns}
+    turns += [{"input": index, "kind": "initial" if index == 0 else "background-completion" if index in completions else "follow-up",
+               "work": completions.get(index), "text": text, "stop_reason": None,
+               "acknowledged": True, "ended": False}
+              for index, text in texts.items() if index not in covered]
+    return turns
+
+
 class Call:
     def __init__(self, args, out):
         self.args = args
@@ -299,6 +395,7 @@ class Call:
         self.signals = []
         self.pending = b""
         self.stop_at = None
+        self.owed_async = 0
         self.actions = open(os.path.join(out, "caller.jsonl"), "w", encoding="utf-8")
         self.capture = open(os.path.join(out, "events.jsonl"), "wb")
 
@@ -310,7 +407,12 @@ class Call:
         if cmd in self.sends or "cancel" in self.sends or proc.stdin.closed:
             return
         self.sends[cmd] = {"why": why, "t": round(time.monotonic() - self.start, 3)}
-        self.stop_at = min(self.stop_at or float("inf"), time.monotonic() + STOP_GRACE_S)
+        if cmd == "close" and self.owed_async > 0:
+            # The owner keeps its harness for owed background completions;
+            # the stop bound starts once none is owed (or at the deadline).
+            self.sends[cmd]["stop_bound"] = "after-owed-background-completions"
+        else:
+            self.stop_at = min(self.stop_at or float("inf"), time.monotonic() + STOP_GRACE_S)
         if self.pending:
             # Admission is still blocked; close stdin rather than completing
             # a cancelled request. The privileged side bounds admission too.
@@ -331,8 +433,12 @@ class Call:
             self.events.append({"unparsed": True})
             return
         self.events.append(value)
+        if value.get("event") == "async-owed" and parent_event(value) and type(value.get("owed_async")) is int:
+            self.owed_async = value["owed_async"]
+            if self.owed_async == 0 and "close" in self.sends and "stop_bound" in self.sends["close"]:
+                self.stop_at = min(self.stop_at or float("inf"), time.monotonic() + STOP_GRACE_S)
         if value.get("event") == "turn-end" and value.get("input") == 0 and parent_event(value):
-            self.send(proc, "close", "turn end of the message (readiness, not processing success)")
+            self.send(proc, "close", "turn end of the message (readiness, not processing success); owed background completions still get their own turns")
 
     def argv(self):
         frontdoor = self.args.frontdoor or os.path.join(
@@ -475,6 +581,11 @@ def classify(code, collection, events, sends):
     terminals = [e for e in events if e.get("frontdoor") == "terminal"]
     terminal = terminals[-1] if terminals else None
     answer, turn_end, linked = answer_of(events)
+    background = async_of(events)
+    turns = turns_of(events)
+    if background["active"]:
+        texts = [t["text"] for t in turns if t["text"] is not None]
+        answer = texts[-1] if texts else None
     complete = bool(terminal) and collection["stdout_eof"] and not collection["errors"] and code is not None
     entries = [e for e in events if e.get("entry") == "terminal"]
     relay_complete = bool(entries) and entries[-1].get("relay") == "complete"
@@ -484,11 +595,25 @@ def classify(code, collection, events, sends):
         cls = "front-door-refused"
     elif code == 94 or (terminal and terminal.get("retire", {}).get("ok") is False and terminal.get("retire", {}).get("stop") != "unknown"):
         cls = "cleanup-failed"
-    elif not complete or code == 93 or (code in (0, 87) and not relay_complete):
+    elif not complete or code == 93 or (code in (0, 83, 87) and not relay_complete):
         cls = "incomplete"
     elif "cancel" in sends or code == 92:
         cls = "cancelled"
-    elif code in (0, 87) and answer is not None and turn_end and turn_end.get("stop_reason") == "end_turn":
+    elif code in (0, 83, 87) and background["errors"]:
+        cls = "incomplete"
+    elif code in (0, 83, 87) and background["undelivered"]:
+        cls = "async-undelivered"
+    elif code in (0, 87) and background["unsettled"] != 0:
+        cls = "incomplete"
+    elif code in (0, 87) and background["accepted"] and (
+            turn_end is None or len({t["work"] for t in turns if t["kind"] == "background-completion"
+                 and t["acknowledged"] and t["ended"]}) != background["accepted"]
+            or any(not t["acknowledged"] or not t["ended"]
+                   for t in turns if t["kind"] == "background-completion")):
+        cls = "incomplete"
+    elif code in (0, 87) and answer is not None and turn_end and turn_end.get("stop_reason") == "end_turn" \
+            and all(t["stop_reason"] == "end_turn"
+                    for t in turns if background["accepted"] and t["kind"] == "background-completion"):
         cls = "answered"
     elif code in (0, 87):
         cls = "no-answer"
@@ -500,6 +625,7 @@ def classify(code, collection, events, sends):
 EXITS = {
     "answered": 0, "no-answer": 1, "refused-locally": 3, "front-door-refused": 4,
     "cancelled": 5, "incomplete": 6, "cleanup-failed": 7, "launch-failed": 8, "ended-otherwise": 9,
+    "async-undelivered": 10,
 }
 
 
@@ -540,9 +666,20 @@ def main_checked(argv):
     code, collection = call.run(request)
     request = None
     cls, answer, turn_end, linked, terminal = classify(code, collection, call.events, call.sends)
-    if answer is not None:
+    background = async_of(call.events)
+    turns = turns_of(call.events)
+    final = answer
+    if background["active"] and any(t["text"] is not None for t in turns):
+        # Every linked turn's answer, in order: the first turn alone is not
+        # a complete background task.
+        final = "\n\n".join(
+            f"## Turn {n} (input {t['input']}, {t['kind']}{'' if t['work'] is None else ', work ' + str(t['work'])})\n\n"
+            + (t["text"] if t["text"] is not None else "(no linked answer text)")
+            + ("" if t["ended"] else "\n\n(carrying turn end not observed; diagnostic text)")
+            for n, t in enumerate(turns, 1))
+    if final is not None:
         with open(os.path.join(args.out, "final.md"), "w", encoding="utf-8") as file:
-            file.write(answer)
+            file.write(final)
     of = lambda name: sum(1 for e in call.events if e.get("event") == name)
     children = children_of(call.events)
     write_json(os.path.join(args.out, "children.json"), children)
@@ -553,6 +690,8 @@ def main_checked(argv):
         "collection": collection,
         "sends": call.sends,
         "answer": {"present": answer is not None, "linked_messages": linked, "turn_end": turn_end},
+        "async": background,
+        "turns": [{k: v for k, v in t.items() if k != "text"} | {"answered": t["text"] is not None} for t in turns],
         "counts": {
             "lines": len(call.events),
             "bash_accepted": of("bash-accepted"),

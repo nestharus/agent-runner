@@ -816,6 +816,11 @@ class Relay:
         self.cancel_at = None
         self.kill_at = None
         self.killed = False
+        # Background Bash completions the owner still owes its live harness
+        # (its `async-owed` events). A requester close arms the kill grace
+        # only once none is owed; the deadline bounds the wait regardless.
+        self.owed_async = 0
+        self.close_waiting = False
         self.why = None
         self.stdout_gone = False
         self.stdin_open = True
@@ -887,8 +892,25 @@ class Relay:
             self.killed = True
             self.say({"frontdoor": "killed", "why": self.why})
 
+    def arm_close(self):
+        if self.cancel_at is None:
+            self.cancel_at = self.clock()
+            self.kill_at = self.cancel_at + self.grace
+            self.why = "requester close"
+
     def entry_line(self, line):
         self.queue_output(line)
+        if b'"async-owed"' in line:
+            try:
+                value = json.loads(line)
+            except ValueError:
+                value = None
+            if isinstance(value, dict) and value.get("event") == "async-owed" and "child" not in value \
+                    and type(value.get("owed_async")) is int:
+                self.owed_async = value["owed_async"]
+                if self.owed_async == 0 and self.close_waiting:
+                    self.close_waiting = False
+                    self.arm_close()
         if self.staged_removed is None and b'"setup-completed"' in line:
             try:
                 value = json.loads(line)
@@ -913,7 +935,11 @@ class Relay:
         if value is None:
             self.say({"frontdoor": "control-refused", "reason": "not cancel, close or send"})
         else:
-            if value["cmd"] in ("cancel", "close"):
+            if value["cmd"] == "close" and self.owed_async > 0:
+                # The owner keeps the harness for owed background
+                # completions (bounded by the deadline); arm once none is.
+                self.close_waiting = True
+            elif value["cmd"] in ("cancel", "close"):
                 # Native close/cancel may never complete. Arm before I/O.
                 if self.cancel_at is None:
                     self.cancel_at = self.clock()

@@ -14,7 +14,11 @@
 // Prompt text: `EXPLORE <question>` invokes the published SDK explore
 // callback and returns its complete text; `RUN <command>` calls the MCP
 // `bash` tool with that command
-// and answers `DONE <first output line>`; anything else is answered
+// and answers `DONE <first output line>`; `BACKGROUND <command>` calls it
+// with `background: true` and answers `STARTED <first line>`; an owner
+// completion input (`[Background Bash completion]`) reads every retained
+// byte it names, accepts that identity and answers `COMPLETED ...`;
+// anything else is answered
 // `ECHO <text>` in two assistant messages (the first carries the
 // attribution, as Claude Code's first reply does).
 
@@ -54,6 +58,35 @@ function mcp(message) {
   return new Promise((resolve) => pending.set(request_id, resolve))
 }
 
+async function callBash(args) {
+  const called = await mcp({ jsonrpc: "2.0", id: ++requests + 10, method: "tools/call", params: { name: "bash", arguments: args } })
+  record({ retained_call: args, retained_result: called })
+  const reply = called?.mcp_response?.result
+  if (!reply) throw new Error("missing retained result")
+  return reply
+}
+
+// Every retained byte of `identity`, page by page through the Bash tool.
+async function retrieve(identity) {
+  let offset = 0
+  let pages = 0
+  const chunks = []
+  while (true) {
+    const reply = await callBash({ output_identity: identity, output_offset: offset, output_length: 1024 })
+    if (reply.isError) throw new Error(JSON.stringify(reply))
+    const text = reply.content[0].text
+    const mode = text.match(/--- retained bytes \((utf8|hex);/)[1]
+    chunks.push(Buffer.from(text.split(" ---\n")[1], mode === "utf8" ? "utf8" : "hex"))
+    const next = Number(text.match(/next_offset=(\d+)/)[1])
+    if (next !== offset + chunks.at(-1).length) throw new Error("range progress mismatch")
+    offset = next
+    pages++
+    if (text.includes("eof=true")) break
+    if (pages > 1024) throw new Error("finite page bound")
+  }
+  return { acquired: Buffer.concat(chunks), pages }
+}
+
 let initSent = false
 let mcpReady = false
 async function turn(user) {
@@ -90,10 +123,7 @@ async function turn(user) {
     result({ is_error: true, result: "model not available", api_error_status: 404 })
     return
   }
-  if (text.startsWith("RUN ") || text.startsWith("EXPLORE ") || text.startsWith("RETAIN ")) {
-    const exploring = text.startsWith("EXPLORE ")
-    const name = exploring ? "explore" : "bash"
-    const arguments_ = exploring ? { question: text.slice(8) } : { command: text.slice(text.startsWith("RETAIN ") ? 7 : 4) }
+  const ready = async () => {
     if (!mcpReady) {
       mcpReady = true
       await mcp({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "fake-claude", version: "0" } } })
@@ -101,6 +131,41 @@ async function turn(user) {
       const listed = await mcp({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} })
       record({ tools_list: listed })
     }
+  }
+  // An owner completion of background work: reads every retained byte it
+  // names through the Bash tool and explicitly accepts that exact identity.
+  if (text.startsWith("[Background Bash completion]")) {
+    await ready()
+    const facts = JSON.parse(text.trim().split("\n").at(-1))
+    const identity = facts.retained?.identity
+    if (!identity) throw new Error("completion names no retained identity")
+    const { acquired, pages } = await retrieve(identity)
+    record({ completion_facts: facts, acquired_b64: acquired.toString("base64"), identity, pages })
+    const accepted = await callBash({ output_identity: identity, accept_output: true })
+    if (accepted.isError || !accepted.content[0].text.includes("repeat=false")) throw new Error("completion acceptance failed")
+    const answer = `COMPLETED work=${facts.work} status=${facts.end.status} bytes=${acquired.length} pages=${pages} accepted=${identity}`
+    assistant([{ type: "text", text: answer }], attribution)
+    result({ result: answer })
+    return
+  }
+  if (text.startsWith("BACKGROUND ")) {
+    await ready()
+    const arguments_ = { command: text.slice(11), background: true }
+    assistant([{ type: "tool_use", id: "toolu_1", name: "mcp__oulipoly__bash", input: arguments_ }], attribution)
+    const called = await mcp({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "bash", arguments: arguments_ } })
+    record({ tool_result: called })
+    const body = called?.mcp_response?.result?.content?.[0]?.text ?? ""
+    send({ type: "user", uuid: randomUUID(), session_id: session, parent_tool_use_id: null,
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: body }] } })
+    assistant([{ type: "text", text: `STARTED ${body.split("\n")[0]}` }])
+    result({ result: `STARTED ${body.split("\n")[0]}` })
+    return
+  }
+  if (text.startsWith("RUN ") || text.startsWith("EXPLORE ") || text.startsWith("RETAIN ")) {
+    const exploring = text.startsWith("EXPLORE ")
+    const name = exploring ? "explore" : "bash"
+    const arguments_ = exploring ? { question: text.slice(8) } : { command: text.slice(text.startsWith("RETAIN ") ? 7 : 4) }
+    await ready()
     assistant([{ type: "tool_use", id: "toolu_1", name: `mcp__oulipoly__${name}`, input: arguments_ }], attribution)
     const called = await mcp({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name, arguments: arguments_ } })
     record({ tool_result: called })

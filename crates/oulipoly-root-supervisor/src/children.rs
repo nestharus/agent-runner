@@ -1177,6 +1177,7 @@ mod tests {
                 index: 0,
                 message_id: Some("msg-1".into()),
             }],
+            ..View::default()
         }]));
         let (tx, _rx) = channel();
         Fixture {

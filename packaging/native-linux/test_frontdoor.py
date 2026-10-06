@@ -411,6 +411,27 @@ class RelayTest(Scratch):
         self.assertEqual([l["frontdoor"] for l in lines if "frontdoor" in l], ["staged-credential", "cancel", "killed"])
         self.assertEqual(relay.why, "deadline")
 
+    def test_close_with_owed_background_completions_arms_kill_only_once_none_is_owed(self):
+        relay, entry, run, (out_r, out_w), (in_r, in_w) = self.relay("ignore", 60, 5)
+        clock = [100.0]
+        relay.clock = lambda: clock[0]
+        with mock.patch.object(frontdoor, "OUT_FD", out_w):
+            relay.entry_line(b'{"event":"async-owed","change":"owed","work":2,"owed_async":1}')
+            relay.requester_line(b'{"cmd":"close"}')
+            self.assertIsNone(relay.kill_at, "no kill grace while a completion is owed")
+            self.assertTrue(relay.close_waiting)
+            # A registered child's events never move the parent's count.
+            relay.entry_line(b'{"event":"async-owed","change":"turn-ended","owed_async":0,"child":{"id":"c"}}')
+            self.assertIsNone(relay.kill_at)
+            clock[0] = 500.0
+            relay.entry_line(b'{"event":"async-owed","change":"turn-ended","work":2,"owed_async":0}')
+            self.assertEqual(relay.kill_at, 505.0)
+            self.assertEqual(relay.why, "requester close")
+        # Without owed work, close arms at once as before.
+        plain = frontdoor.Relay(entry, run, 60, 5, clock=lambda: 7.0)
+        plain.requester_line(b'{"cmd":"close"}')
+        self.assertEqual(plain.kill_at, 12.0)
+
     def test_signal_is_abandonment(self):
         relay, entry, run, (out_r, out_w), (in_r, in_w) = self.relay("obey", 60, 5)
         relay.signals.append(15)
