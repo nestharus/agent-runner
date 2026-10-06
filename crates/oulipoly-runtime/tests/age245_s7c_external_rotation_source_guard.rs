@@ -1391,7 +1391,9 @@ impl RuntimeFixture {
         }
     }
 
-    fn identity(&self) -> oulipoly_runtime::rotation_external_provider::ExternalRotationIdentity {
+    fn identity(
+        &self,
+    ) -> oulipoly_runtime::rotation_external_provider::ExternalRotationProviderOperation {
         let registry = self.registry.current();
         resolve_rotation_external_provider_identity(
             registry.as_ref(),
@@ -1956,4 +1958,68 @@ fn workspace_root() -> PathBuf {
         .parent()
         .expect("repo root")
         .to_path_buf()
+}
+
+#[test]
+fn refresh_migration_plan_and_effect_use_one_generation_then_next_operation_refreshes() {
+    let fixture = RuntimeFixture::new("s7c-migration-plan-success");
+    let path = PathBuf::from(
+        fixture
+            .model
+            .provider
+            .as_ref()
+            .unwrap()
+            .path
+            .as_ref()
+            .unwrap(),
+    );
+    let log = fixture.workspace.join("generations.log");
+    let body = |generation: &str| {
+        format!(
+            r#"#!/usr/bin/env python3
+import json, sys
+r=json.load(sys.stdin)
+sub=sys.argv[1]
+with open({log},'a') as f: f.write('{generation} '+sub+'\n')
+if sub=='describe':
+    result={{'provider_id':'fake-provider','display_name':'Fixture','contract_versions':[r['contract']],'preferred_contract':r['contract'],'capabilities':{{'launch':False,'policy':False,'quota':False,'session':False,'terminal':False,'rotation':True,'discovery':False,'settings':False,'setup_brain':False,'setup':False,'migration':True}}}}
+elif sub=='migration.plan':
+    result={{'actions':[{{'kind':'noop'}}],'warnings':[],'requires_backup':False}}
+else:
+    assert sub=='migration.apply'
+    result={{'applied_actions':[{{'kind':'noop'}}],'artifacts':[],'warnings':[],'outcome':{{'changed':False}}}}
+print(json.dumps({{'contract':r['contract'],'request_id':r['request_id'],'ok':True,'result':result}}))
+"#,
+            log = serde_json::to_string(&log).unwrap()
+        )
+    };
+    std::fs::write(&path, body("A")).unwrap();
+    let operation = fixture.identity();
+    plan_migration(
+        &fixture.registry,
+        operation.clone(),
+        &fixture.request(&mut Vec::new()),
+    )
+    .unwrap();
+    let staged = path.with_extension("replacement");
+    std::fs::write(&staged, body("B")).unwrap();
+    make_executable(&staged);
+    std::fs::rename(staged, &path).unwrap();
+    apply_migration(
+        &fixture.registry,
+        operation,
+        &fixture.request(&mut Vec::new()),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "A describe\nA migration.plan\nA migration.apply\n"
+    );
+    let next = fixture.identity();
+    apply_migration(&fixture.registry, next, &fixture.request(&mut Vec::new())).unwrap();
+    assert!(
+        std::fs::read_to_string(log)
+            .unwrap()
+            .ends_with("B describe\nB migration.apply\n")
+    );
 }

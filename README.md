@@ -1191,14 +1191,36 @@ The new operation then uses the newly advertised capabilities, for example
 `launch_output_v1` after an upgrade. Compatibility is decided by that describe
 result, not by matching any earlier binary.
 
-An operation that already holds an endpoint keeps the executable it was admitted
-with, and nothing is replayed. If the artifact is missing, or `describe` fails
-while it is being rewritten, the lookup returns the error. Nothing is cached, so
-a later lookup retries once the file is usable. A non-atomic in-place rewrite
-can still be executed partially written by an operation that was already
-admitted. Use an atomic rename to avoid that. Each account or family refreshes
-on its own: concurrent lookups for one account wait for a single `describe`,
-and other accounts are not blocked.
+On Linux an unavailable metadata stamp cannot confirm freshness: the lookup
+re-negotiates instead of keeping cached agreement. If resolution or `describe`
+fails while an artifact is missing or being rewritten, the lookup returns the
+error and a later lookup retries. Each account or family refreshes on its own:
+concurrent lookups for one account wait for one `describe`, and other accounts
+are not blocked.
+
+Dispatch, live report capture, quota sequences, a bounded receipt visit,
+rotation/migration steps and lifecycle authentication/capture each hold one
+endpoint for their operation. Atomic pathname replacement does not switch their
+reader or actor midway; later operations acquire the compatible replacement.
+Nothing is automatically replayed after an uncertain effect. A held file
+handle does not freeze same-inode bytes: an admitted execution can still run a
+partially or completely rewritten file. Use atomic replacement. Explicit
+`script` artifacts also retain their existing visible-path spawn race.
+
+Receipt checkpoints label the retained reader used for that visit. Metadata
+checks before/after reads and before checkpoint publication/confirmation refuse
+a detectable retained-file rewrite without advancing page evidence. A later
+visit under the new compatible reader rescans from the immutable submission
+anchor, discarding old matches and cursors. These checks do not prove immutable
+bytes against arbitrary concurrent writers, changes after the final check, or
+changes to dependencies behind an unchanged wrapper; no binary copy or permanent
+anchor-time binary hash is required for admission.
+
+Registry-backed outbound paging acquires the current compatible provider per
+page, retaining its cursor while validating account/instance, projection,
+position and snapshot. Cross-generation cursor continuity remains unqualified;
+a provider must clearly refuse a foreign cursor. This refresh establishes no
+supervisor or live-session handoff and advertises no future contract version.
 
 ### Prompt Acceptance Attestation
 
@@ -1318,11 +1340,13 @@ Repeated reads of the published result do not acknowledge it. This preserves
 matching counts across incomplete and empty completion pages, including duplicate
 matches on separate pages, without growing a pending-page queue.
 
-Observer recovery does not replace the cached, pinned provider executable. A live
-observer pinned to a paging-paused containment provider can stop again even after
-an installed pathname is replaced. Neither explicit rearming nor these local
-queue semantics establishes an in-process provider-replacement handoff or deployed
-restoration; deployment authority and evidence remain separate.
+Registry-backed outbound observation adopts a compatible executable replacement
+on its next page acquisition. Explicit rearming clears the exact observation
+stop; a still-refusing current provider can stop again. Held-endpoint paths keep
+their acquisition for that operation, subject to the in-place rewrite limits
+above. Neither rearming nor local queue semantics establishes supervisor or
+live-session handoff, deployed restoration, or cross-generation cursor
+continuity; deployment authority and evidence remain separate.
 
 ### Active headless native notification receipt
 

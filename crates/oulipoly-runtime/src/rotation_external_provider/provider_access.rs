@@ -8,17 +8,47 @@ mod registry_artifact_access;
 mod registry_error_mapper;
 
 use super::{ExternalRotationError, ExternalRotationIdentity};
-use crate::provider_registry::{PinnedProviderEndpoint, ProviderRegistry, ProviderRegistryHandle};
+use crate::provider_registry::{DescribeHostOptions, PinnedProviderEndpoint, ProviderRegistry};
 use oulipoly_config::ModelConfig;
 use oulipoly_state::ResolvedResume;
 use std::sync::Arc;
+
+/// One acquisition shared by identity discovery and all steps of a rotation / migration.
+/// It is neither serialized into recovery journals nor retained across operations.
+#[derive(Debug, Clone)]
+pub struct ExternalRotationProviderOperation {
+    identity: Box<ExternalRotationIdentity>,
+    endpoint: Arc<PinnedProviderEndpoint>,
+    pub(super) host_options: DescribeHostOptions,
+    pub(super) source_settings_id: String,
+}
+
+impl std::ops::Deref for ExternalRotationProviderOperation {
+    type Target = ExternalRotationIdentity;
+    fn deref(&self) -> &Self::Target {
+        &self.identity
+    }
+}
+
+impl ExternalRotationProviderOperation {
+    pub(super) fn endpoint(
+        &self,
+        operation: &'static str,
+    ) -> Result<&PinnedProviderEndpoint, ExternalRotationError> {
+        capability_predicates::supports_rotation_or_migration(
+            self.endpoint.capabilities(),
+            operation,
+        )?;
+        Ok(self.endpoint.as_ref())
+    }
+}
 
 pub fn resolve_rotation_external_provider_identity(
     registry: &ProviderRegistry,
     model: &ModelConfig,
     resolved: &ResolvedResume,
     target_provider: &str,
-) -> Result<ExternalRotationIdentity, ExternalRotationError> {
+) -> Result<ExternalRotationProviderOperation, ExternalRotationError> {
     identity_validation::validate_external_model_identity(model, resolved, target_provider)?;
     let endpoint = registry_artifact_access::preflight_external_model_provider(
         registry,
@@ -28,25 +58,20 @@ pub fn resolve_rotation_external_provider_identity(
     let settings_id = endpoint
         .settings_id()
         .map_err(registry_error_mapper::map_registry_identity_error)?;
-    Ok(identity_mapper::map_external_rotation_identity(
+    let identity = identity_mapper::map_external_rotation_identity(
         model,
         resolved,
         target_provider,
         endpoint.capabilities().clone(),
         settings_id,
-    ))
-}
-
-pub(super) fn load_provider_artifact_and_capabilities(
-    registry_handle: &ProviderRegistryHandle,
-    account_name: &str,
-    operation: &'static str,
-) -> Result<Arc<PinnedProviderEndpoint>, ExternalRotationError> {
-    let registry = registry_handle.current();
-    let registry = registry.as_ref();
-    let endpoint = registry
-        .preflight_account(account_name)
-        .map_err(registry_error_mapper::map_registry_dispatch_error)?;
-    capability_predicates::supports_rotation_or_migration(endpoint.capabilities(), operation)?;
-    Ok(endpoint)
+    );
+    Ok(ExternalRotationProviderOperation {
+        identity: Box::new(identity),
+        endpoint,
+        host_options: registry.host_options().clone(),
+        source_settings_id: registry
+            .account_settings_id(&resolved.active_provider)
+            .map_err(registry_error_mapper::map_registry_identity_error)?
+            .to_string(),
+    })
 }

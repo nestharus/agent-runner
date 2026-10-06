@@ -284,6 +284,14 @@ impl ProviderClient {
         self.identity_cache.digest(&resolved.pinned_executable())
     }
 
+    /// Validate the revision that supplied the last retained-file identity.
+    /// This checks metadata, not byte immutability across arbitrary writers.
+    pub fn pinned_executable_identity_unchanged(&self, identity: &str) -> Result<bool, String> {
+        let resolved = self.resolved.get().ok_or("endpoint_not_pinned")?;
+        self.identity_cache
+            .unchanged_for_identity(&resolved.pinned_executable(), identity)
+    }
+
     /// Receipt-only cache validation. Re-resolve the configured artifact to
     /// notice namespace/PATH replacement, then compare retained handle stamps.
     /// False/error requires a fresh registry and describe, not cached capability
@@ -309,13 +317,13 @@ impl ProviderClient {
     /// metadata stamps (device, inode, length, mtime, ctime); no provider bytes
     /// are read. Atomic replacement, symlink retargeting and completed in-place
     /// writes all report `false`, as does an artifact that no longer resolves.
-    /// Where stamps are unsupported the pinned revision is treated as current.
+    /// A missing stamp cannot establish freshness on supported platforms.
     pub fn configured_artifact_unchanged(&self) -> bool {
         let Some(resolved) = self.resolved.get() else {
             return false;
         };
         let Some(revision) = resolved.revision() else {
-            return true;
+            return cfg!(not(any(unix, windows)));
         };
         ProviderResolver::new(self.options.resolver.clone())
             .resolve(&self.artifact, self.options.provider_config_dir.as_deref())
@@ -1200,3 +1208,42 @@ pub use crate::process::enter_receipt_inspection_group;
 
 #[cfg(target_os = "linux")]
 pub use crate::process::settle_receipt_inspection_group;
+
+#[cfg(all(test, target_os = "linux"))]
+mod refresh_stamp_tests {
+    use super::*;
+    #[test]
+    fn unknown_initial_linux_stamp_cannot_confirm_cached_freshness() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("u93-correction-stamp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let path = root.join("provider");
+        std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let client = ProviderClient::new(
+            ProviderArtifactRef::Path { path: path.clone() },
+            ProviderClientOptions::default(),
+        );
+        let mut resolved = ProviderResolver::new(client.options.resolver.clone())
+            .resolve(&client.artifact, None)
+            .unwrap();
+        resolved.forget_revision_for_test();
+        client.resolved.set(resolved).unwrap();
+        assert!(
+            !client.configured_artifact_unchanged(),
+            "a stamp error on Linux cannot attest cache freshness"
+        );
+        std::fs::write(&path, b"#!/bin/sh\nexit 1\n").unwrap();
+        assert!(!client.configured_artifact_unchanged());
+        drop(client);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

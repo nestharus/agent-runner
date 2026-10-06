@@ -1287,3 +1287,62 @@ print(json.dumps(response))
         record_path = serde_json::to_string(&record_path.display().to_string()).unwrap(),
     )
 }
+
+#[test]
+fn refresh_lifecycle_authentication_and_capture_use_the_same_acquisition() {
+    let provider = ProviderAFixture::new("capture_success");
+    let path = &provider.provider_path;
+    let staged = path.with_extension("replacement");
+    let original = std::fs::read_to_string(path).unwrap();
+    std::fs::write(
+        &staged,
+        original.replace(
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let replacing = original.replace(
+        "def describe():\n",
+        &format!(
+            "def describe():\n    import os\n    os.replace({}, {})\n",
+            serde_json::to_string(&staged).unwrap(),
+            serde_json::to_string(path).unwrap()
+        ),
+    );
+    std::fs::write(path, replacing).unwrap();
+    let registry = provider.registry_handle();
+    let service = ProductionSessionLifecycleService::with_registry_handle(registry);
+    for (invocation_uuid, expected) in [
+        (
+            "11111111-1111-4111-8111-111111111111",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        ),
+        (
+            "22222222-2222-4222-8222-222222222222",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        ),
+    ] {
+        let invocation_row_id = provider
+            .fixture
+            .start_and_finalize_provider_a_invocation(invocation_uuid);
+        let output = service
+            .ingest_session(SessionLifecycleRequest {
+                state: &provider.fixture.state,
+                sessions_cfg: &SessionsConfig::default(),
+                providers_cfg: None,
+                provider_name: PROVIDER_A_ACCOUNT,
+                external_provider: Some(external_provider_identity()),
+                invocation_row_id,
+                invocation_uuid,
+                effective_cwd: None,
+                mode: SessionLifecycleIngestMode::Unpinned {
+                    capture_method: "provider_session_capture".into(),
+                },
+                stderr: &mut Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(output.session_id.as_deref(), Some(expected));
+    }
+}
