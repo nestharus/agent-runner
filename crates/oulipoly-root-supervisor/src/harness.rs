@@ -1379,7 +1379,12 @@ impl Worker {
                     self.stop_for_close(live);
                 }
                 observed.wake_armed.set(true);
-                let idle = client.await_session_idle(&session);
+                // Publish on event arrival while the turn is still open.
+                // The reporting cursor preserves order and prevents repeats;
+                // submit's ACK is already durable before this wait begins.
+                let idle = client.await_session_idle_with_events(&session, |client| {
+                    self.report_turn(client, &mut seen);
+                });
                 observed.wake_armed.set(false);
                 self.report_turn(client, &mut seen);
                 match idle {
