@@ -38,7 +38,7 @@ pub fn assess_rotation(
         request,
         &identity.host_options,
         "rotation.assess",
-        &identity.source_settings_id,
+        identity.source_settings_id()?,
     )?;
     provider_dispatch::invoke_provider_contract(endpoint.client(), "rotation.assess", payload)
 }
@@ -67,6 +67,7 @@ pub(crate) fn materialize_rotation_with_fence(
     request: &MigrationServiceRequest<'_>,
     migration_fence: &oulipoly_state::CompletedTurnMigrationFence,
 ) -> Result<MigrationServiceOutput, ExternalRotationError> {
+    identity.source_settings_id()?;
     source_ingest::settle_source_ingestion(registry_handle, &identity, request)?;
     let result = invoke_rotation_materialize(&identity, request)?;
     if !result.changed {
@@ -141,7 +142,7 @@ fn invoke_rotation_materialize(
         request,
         &identity.host_options,
         "rotation.materialize",
-        &identity.source_settings_id,
+        identity.source_settings_id()?,
     )?;
     provider_dispatch::invoke_provider_contract(endpoint.client(), "rotation.materialize", payload)
 }

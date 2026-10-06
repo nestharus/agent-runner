@@ -1961,8 +1961,8 @@ fn workspace_root() -> PathBuf {
 }
 
 #[test]
-fn refresh_migration_plan_and_effect_use_one_generation_then_next_operation_refreshes() {
-    let fixture = RuntimeFixture::new("s7c-migration-plan-success");
+fn refresh_target_only_migration_keeps_actor_and_rotation_requires_source_settings() {
+    let mut fixture = RuntimeFixture::new("s7c-migration-plan-success");
     let path = PathBuf::from(
         fixture
             .model
@@ -1972,6 +1972,31 @@ fn refresh_migration_plan_and_effect_use_one_generation_then_next_operation_refr
             .path
             .as_ref()
             .unwrap(),
+    );
+    let mut config = providers(&path);
+    config.entries.get_mut(SOURCE_PROVIDER).unwrap().settings_id = None;
+    fixture.registry = ProviderRegistryHandle::new(Arc::new(
+        ProviderRegistry::from_configs(
+            std::slice::from_ref(&fixture.model),
+            &config,
+            ProviderRegistryOptions::default(),
+        )
+        .unwrap(),
+    ));
+    assert!(
+        fixture
+            .registry
+            .current()
+            .account_settings_id(SOURCE_PROVIDER)
+            .is_err()
+    );
+    assert_eq!(
+        fixture
+            .registry
+            .current()
+            .account_settings_id(TARGET_PROVIDER)
+            .unwrap(),
+        TARGET_SETTINGS_ID
     );
     let log = fixture.workspace.join("generations.log");
     let body = |generation: &str| {
@@ -1995,6 +2020,9 @@ print(json.dumps({{'contract':r['contract'],'request_id':r['request_id'],'ok':Tr
     };
     std::fs::write(&path, body("A")).unwrap();
     let operation = fixture.identity();
+    assert_eq!(operation.source_provider, SOURCE_PROVIDER);
+    assert_eq!(operation.source_session_id, SOURCE_SESSION);
+    assert_eq!(operation.settings_id, TARGET_SETTINGS_ID);
     plan_migration(
         &fixture.registry,
         operation.clone(),
@@ -2007,7 +2035,7 @@ print(json.dumps({{'contract':r['contract'],'request_id':r['request_id'],'ok':Tr
     std::fs::rename(staged, &path).unwrap();
     apply_migration(
         &fixture.registry,
-        operation,
+        operation.clone(),
         &fixture.request(&mut Vec::new()),
     )
     .unwrap();
@@ -2015,11 +2043,48 @@ print(json.dumps({{'contract':r['contract'],'request_id':r['request_id'],'ok':Tr
         std::fs::read_to_string(&log).unwrap(),
         "A describe\nA migration.plan\nA migration.apply\n"
     );
-    let next = fixture.identity();
-    apply_migration(&fixture.registry, next, &fixture.request(&mut Vec::new())).unwrap();
-    assert!(
-        std::fs::read_to_string(log)
-            .unwrap()
-            .ends_with("B describe\nB migration.apply\n")
+    let before = fixture.snapshot();
+    let assessment = assess_rotation(
+        &fixture.registry,
+        operation.clone(),
+        &fixture.request(&mut Vec::new()),
+    )
+    .unwrap_err();
+    let materialization = materialize_rotation(
+        &fixture.registry,
+        operation,
+        &fixture.request(&mut Vec::new()),
+    )
+    .unwrap_err();
+    for error in [assessment, materialization] {
+        let ExternalRotationError::MalformedExternalIdentity { reason } = error else {
+            panic!("expected a clear missing-source-settings refusal: {error:?}");
+        };
+        assert_eq!(
+            reason,
+            format!("provider account has no explicit settings identity: {SOURCE_PROVIDER}")
+        );
+        println!("source-consuming rotation refused: {reason}");
+    }
+    assert_eq!(fixture.snapshot(), before);
+    assert!(!fixture.artifact_path.exists());
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "A describe\nA migration.plan\nA migration.apply\n",
+        "missing settings must refuse rotation before dispatching a provider step"
     );
+    let next = fixture.identity();
+    plan_migration(
+        &fixture.registry,
+        next.clone(),
+        &fixture.request(&mut Vec::new()),
+    )
+    .unwrap();
+    apply_migration(&fixture.registry, next, &fixture.request(&mut Vec::new())).unwrap();
+    let generations = std::fs::read_to_string(log).unwrap();
+    assert_eq!(
+        generations,
+        "A describe\nA migration.plan\nA migration.apply\nB describe\nB migration.plan\nB migration.apply\n"
+    );
+    println!("target-only migration generations:\n{generations}");
 }

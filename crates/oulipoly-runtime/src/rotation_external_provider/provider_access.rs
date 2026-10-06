@@ -20,7 +20,7 @@ pub struct ExternalRotationProviderOperation {
     identity: Box<ExternalRotationIdentity>,
     endpoint: Arc<PinnedProviderEndpoint>,
     pub(super) host_options: DescribeHostOptions,
-    pub(super) source_settings_id: String,
+    source_settings_id: Option<String>,
 }
 
 impl std::ops::Deref for ExternalRotationProviderOperation {
@@ -31,6 +31,16 @@ impl std::ops::Deref for ExternalRotationProviderOperation {
 }
 
 impl ExternalRotationProviderOperation {
+    pub(super) fn source_settings_id(&self) -> Result<&str, ExternalRotationError> {
+        self.source_settings_id.as_deref().ok_or_else(|| {
+            registry_error_mapper::map_registry_identity_error(
+                crate::provider_registry::ProviderRegistryError::AccountSettingsNotConfigured {
+                    account_name: self.source_provider.clone(),
+                },
+            )
+        })
+    }
+
     pub(super) fn endpoint(
         &self,
         operation: &'static str,
@@ -71,7 +81,7 @@ pub fn resolve_rotation_external_provider_identity(
         host_options: registry.host_options().clone(),
         source_settings_id: registry
             .account_settings_id(&resolved.active_provider)
-            .map_err(registry_error_mapper::map_registry_identity_error)?
-            .to_string(),
+            .ok()
+            .map(str::to_string),
     })
 }
