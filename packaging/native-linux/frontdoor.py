@@ -42,7 +42,9 @@ import secrets
 import select
 import shutil
 import signal
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -61,6 +63,15 @@ EXIT_RUN_FAILED = 91
 EXIT_KILLED = 92
 EXIT_UNKNOWN = 93
 EXIT_CLEANUP_FAILED = 94
+
+# Live roots (request `live: true`): this front door detaches from its
+# opening caller and stays the root's one owning supervisor until close,
+# cancel or its deadline. Later callers of the same requester address it
+# through its socket in the run directory.
+LIVE_SOCKET = "live.sock"
+MAX_LIVE_ROOTS = 4
+HELLO_S = 5
+HELLO_LIMIT = 4096
 
 RUNNER = "bin/oulipoly-agent-runner"
 SUPERVISOR = "bin/oulipoly-root-supervisor"
@@ -338,7 +349,7 @@ def check_request(request, site, now):
     if not isinstance(request, dict):
         raise Refused("request is not an object")
     known = {"v", "route", "message", "cwd", "bash", "env", "deadline_s", "credential", "retention",
-             "children", "child_credential"}
+             "children", "child_credential", "live"}
     if request.get("v") != 1:
         raise Refused("request: v must be 1")
     unknown = set(request) - known
@@ -377,6 +388,9 @@ def check_request(request, site, now):
     retention = request.get("retention", "discard")
     if retention not in ("discard", "keep") or (retention == "keep" and not site["allow_keep"]):
         raise Refused("request: retention")
+    live = request.get("live", False)
+    if type(live) is not bool:
+        raise Refused("request: live must be true or false")
     credential = check_credential(route, request.get("credential"), deadline, site, now)
     children = check_children(route, request, credential, deadline, site, now)
     return {
@@ -390,6 +404,7 @@ def check_request(request, site, now):
         "retention": retention,
         "credential": credential,
         "children": children,
+        "live": live,
     }
 
 
@@ -832,8 +847,11 @@ class Relay:
         self.output = b""
         self.controls = b""
         self.collection_errors = []
-        os.set_blocking(OUT_FD, False)
+        self.client_setup()
         os.set_blocking(self.entry.stdin.fileno(), False)
+
+    def client_setup(self):
+        os.set_blocking(OUT_FD, False)
 
     def queue_output(self, line):
         if self.stdout_gone:
@@ -972,21 +990,7 @@ class Relay:
         except InterruptedError:
             return
         if self.entry.stdout.fileno() in ready:
-            chunk = os.read(self.entry.stdout.fileno(), 65536)
-            if not chunk:
-                self.out_eof = True
-                if self.out_buffer:
-                    self.entry_line(self.out_buffer)
-                    self.out_buffer = b""
-            else:
-                self.out_buffer += chunk
-                if len(self.out_buffer) > OUTPUT_LIMIT:
-                    self.out_buffer = b""
-                    self.collection_errors.append("entry-line-too-long")
-                    self.abandon("unterminated entry output")
-                while b"\n" in self.out_buffer:
-                    line, self.out_buffer = self.out_buffer.split(b"\n", 1)
-                    self.entry_line(line)
+            self.read_entry()
         if stdin_fd in ready:
             chunk = os.read(stdin_fd, 65536)
             if not chunk:
@@ -1001,6 +1005,23 @@ class Relay:
                 if len(self.stdin_buffer) > CONTROL_LIMIT:
                     self.stdin_buffer = b""
                     self.say({"frontdoor": "control-refused", "reason": "control line too long"})
+
+    def read_entry(self):
+        chunk = os.read(self.entry.stdout.fileno(), 65536)
+        if not chunk:
+            self.out_eof = True
+            if self.out_buffer:
+                self.entry_line(self.out_buffer)
+                self.out_buffer = b""
+            return
+        self.out_buffer += chunk
+        if len(self.out_buffer) > OUTPUT_LIMIT:
+            self.out_buffer = b""
+            self.collection_errors.append("entry-line-too-long")
+            self.abandon("unterminated entry output")
+        while b"\n" in self.out_buffer:
+            line, self.out_buffer = self.out_buffer.split(b"\n", 1)
+            self.entry_line(line)
 
     def run_to_end(self, stdin_fd):
         ended_at = None
@@ -1028,6 +1049,392 @@ class Relay:
             self.flush()
             time.sleep(0.01)
         return not self.output and not self.stdout_gone
+
+
+def peer_uid(conn):
+    _pid, uid, _gid = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+    return uid
+
+
+def listen_live(run, uid):
+    """The live root's address: a socket in the root-owned run directory,
+    owned by the requester and mode 0600; every connection's peer is
+    still checked (SO_PEERCRED) against the requester's uid."""
+    path = os.path.join(run, LIVE_SOCKET)
+    if len(os.fsencode(path)) >= 108:
+        raise RunFailed("live socket path too long")
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)
+    try:
+        listener.bind(path)
+        os.chmod(path, 0o600)
+        if os.geteuid() == 0:
+            os.chown(path, uid, -1, follow_symlinks=False)
+        listener.listen(4)
+    except BaseException:
+        listener.close()
+        raise
+    return listener, path
+
+
+def live_roots(user_dir):
+    """This requester's runs with a live socket whose supervisor still
+    holds the run lock (a dead one's lock is free: not counted)."""
+    try:
+        names = os.listdir(user_dir)
+    except FileNotFoundError:
+        return 0
+    count = 0
+    for name in names:
+        run = os.path.join(user_dir, name)
+        if not os.path.lexists(os.path.join(run, LIVE_SOCKET)):
+            continue
+        try:
+            fd = os.open(os.path.join(run, "private", "lock"), os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            count += 1
+        finally:
+            os.close(fd)
+    return count
+
+
+class LiveRelay(Relay):
+    """The live root's relay. No requester stdin: callers attach through
+    the root's socket one at a time; a caller leaving (EOF or `detach`)
+    is not abandonment. While no caller is attached, records wait in a
+    bounded backlog (overflow is dropped and counted, never silently).
+    Close, cancel and the deadline keep the per-call relay's meaning."""
+
+    def __init__(self, entry, run, deadline_s, grace_s, listener, uid, run_id, token, clock=time.monotonic):
+        self.listener = listener
+        self.uid = uid
+        self.run_id = run_id
+        self.token = token
+        self.client = None
+        self.client_in = b""
+        self.waiting = None
+        self.dropped = 0
+        self.dropped_total = 0
+        self.attaches = 0
+        self.refusals = []
+        super().__init__(entry, run, deadline_s, grace_s, clock)
+
+    def client_setup(self):
+        self.listener.setblocking(False)
+
+    def queue_output(self, line, force=False):
+        data = encoded(line)
+        if not force and len(self.output) + len(data) > OUTPUT_LIMIT:
+            self.dropped += 1
+            self.dropped_total += 1
+            return
+        self.output += data
+
+    def say(self, fields):
+        self.queue_output(fields, force=True)
+
+    def flush(self):
+        if self.controls:
+            try:
+                count = os.write(self.entry.stdin.fileno(), self.controls)
+                self.controls = self.controls[count:]
+            except BlockingIOError:
+                pass
+            except OSError:
+                self.controls = b""
+        if self.client is not None and self.output:
+            try:
+                count = self.client.send(self.output)
+                self.output = self.output[count:]
+            except BlockingIOError:
+                pass
+            except OSError:
+                self.detach("caller-gone")
+
+    def refuse_conn(self, conn, reason):
+        self.refusals.append(reason)
+        try:
+            conn.send(encoded({"frontdoor": "attach-refused", "reason": reason, "retry": "do-not-replay"}))
+        except OSError:
+            pass
+        conn.close()
+
+    def accept(self):
+        try:
+            conn, _ = self.listener.accept()
+        except (BlockingIOError, InterruptedError):
+            return
+        conn.setblocking(False)
+        try:
+            uid = peer_uid(conn)
+        except OSError:
+            return self.refuse_conn(conn, "peer-unknown")
+        if uid != self.uid:
+            return self.refuse_conn(conn, "foreign-requester")
+        if self.client is not None or self.waiting is not None:
+            return self.refuse_conn(conn, "busy")
+        self.waiting = (conn, b"", self.clock())
+
+    def hello(self, data):
+        conn, buffer, at = self.waiting
+        if data == b"":
+            self.waiting = None
+            conn.close()
+            return
+        buffer += data
+        if b"\n" not in buffer:
+            if len(buffer) > HELLO_LIMIT:
+                self.waiting = None
+                self.refuse_conn(conn, "hello-too-long")
+            else:
+                self.waiting = (conn, buffer, at)
+            return
+        line, rest = buffer.split(b"\n", 1)
+        self.waiting = None
+        try:
+            value = json.loads(line)
+        except ValueError:
+            value = None
+        attach = value.get("attach") if isinstance(value, dict) and value.get("v") == 1 and set(value) == {"v", "attach"} else None
+        if not isinstance(attach, dict) or set(attach) != {"run", "token"} \
+                or not all(isinstance(attach[k], str) for k in ("run", "token")):
+            return self.refuse_conn(conn, "hello-malformed")
+        if attach["run"] != self.run_id:
+            return self.refuse_conn(conn, "not-this-root")
+        if not secrets.compare_digest(attach["token"].encode(), self.token.encode()):
+            return self.refuse_conn(conn, "handle-token")
+        self.attaches += 1
+        record = {
+            "frontdoor": "attached", "run": self.run_id, "attach": self.attaches,
+            "backlog_bytes": len(self.output), "backlog_dropped": self.dropped,
+            "backlog_dropped_total": self.dropped_total,
+            "closing": self.cancel_at is not None or self.close_waiting,
+            "meaning": "attached to the one live owner; records since the previous caller left follow, then live records",
+        }
+        self.dropped = 0
+        self.output = encoded(record) + self.output
+        self.client = conn
+        self.client_in = rest
+
+    def detach(self, why):
+        if self.client is None:
+            return
+        try:
+            self.client.close()
+        except OSError:
+            pass
+        self.client = None
+        self.client_in = b""
+        # Unsent records stay for the next caller; this one reads as gone.
+        self.say({"frontdoor": "detached", "why": why, "root": "live" if self.entry.poll() is None else "ending"})
+
+    def client_lines(self):
+        while self.client is not None and b"\n" in self.client_in:
+            line, self.client_in = self.client_in.split(b"\n", 1)
+            try:
+                value = json.loads(line)
+            except ValueError:
+                value = None
+            if value == {"cmd": "detach"}:
+                self.detach("caller detach")
+            else:
+                self.requester_line(line)
+        if self.client is not None and len(self.client_in) > CONTROL_LIMIT:
+            self.client_in = b""
+            self.say({"frontdoor": "control-refused", "reason": "control line too long"})
+
+    def step(self, stdin_fd=None, timeout=0.2):
+        self.flush()
+        now = self.clock()
+        if self.signals:
+            self.abandon(f"signal {self.signals[0]}")
+        if self.cancel_at is None and now >= self.deadline:
+            self.cancel("deadline")
+        if self.kill_at is not None and now >= self.kill_at:
+            self.kill()
+        if self.waiting is not None and now >= self.waiting[2] + HELLO_S:
+            conn = self.waiting[0]
+            self.waiting = None
+            self.refuse_conn(conn, "hello-timeout")
+        readers = [] if self.out_eof else [self.entry.stdout.fileno()]
+        if self.listener is not None:
+            readers.append(self.listener.fileno())
+        if self.client is not None:
+            readers.append(self.client.fileno())
+        if self.waiting is not None:
+            readers.append(self.waiting[0].fileno())
+        writers = [self.client.fileno()] if self.client is not None and self.output else []
+        try:
+            ready = select.select(readers, writers, [], timeout)[0]
+        except InterruptedError:
+            return
+        if not self.out_eof and self.entry.stdout.fileno() in ready:
+            self.read_entry()
+        if self.listener is not None and self.listener.fileno() in ready:
+            self.accept()
+        if self.waiting is not None and self.waiting[0].fileno() in ready:
+            try:
+                self.hello(self.waiting[0].recv(HELLO_LIMIT))
+            except BlockingIOError:
+                pass
+            except OSError:
+                conn = self.waiting[0]
+                self.waiting = None
+                conn.close()
+        if self.client is not None and self.client.fileno() in ready:
+            try:
+                chunk = self.client.recv(65536)
+            except BlockingIOError:
+                chunk = None
+            except OSError:
+                chunk = b""
+            if chunk == b"":
+                self.detach("caller-eof")
+            elif chunk:
+                self.client_in += chunk
+        self.client_lines()
+
+    def stop_listening(self, path):
+        """No new caller once the entry ended; a later address is absent."""
+        if self.listener is not None:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            self.listener.close()
+            self.listener = None
+        if self.waiting is not None:
+            conn = self.waiting[0]
+            self.waiting = None
+            self.refuse_conn(conn, "root-ending")
+
+    def finish_output(self):
+        end = self.clock() + COLLECTION_S
+        while self.output and self.client is not None and self.clock() < end:
+            self.flush()
+            time.sleep(0.01)
+        delivered = not self.output
+        if self.client is not None:
+            try:
+                self.client.close()
+            except OSError:
+                pass
+            self.client = None
+        return delivered
+
+
+def live_daemon(package, site, checked, run_id, run_dir, request_path, user, listener, socket_path, token, ready_w):
+    """The detached owning supervisor of one live root. Returns its exit."""
+    for number in (signal.SIGHUP, signal.SIGINT):
+        signal.signal(number, signal.SIG_IGN)
+    try:
+        entry, alive = start_entry(package, request_path)
+    except (OSError, subprocess.SubprocessError) as error:
+        os.write(ready_w, b"failed " + type(error).__name__.encode() + b"\n")
+        listener.close()
+        retire(run_dir, checked["retention"])
+        return EXIT_RUN_FAILED
+    relay = LiveRelay(entry, run_dir, checked["deadline"] + site["cancel_grace_s"], site["cancel_grace_s"],
+                      listener, user.pw_uid, run_id, token)
+    signal.signal(signal.SIGTERM, lambda number, frame: relay.signals.append(number))
+    os.write(ready_w, b"live\n")
+    os.close(ready_w)
+    try:
+        status = relay.run_to_end(None)
+    except BaseException as failure:
+        relay.collection_errors.append("live-relay-failed:" + type(failure).__name__)
+        if entry.poll() is None:
+            os.kill(entry.pid, signal.SIGKILL)
+            relay.killed = True
+        end = time.monotonic() + COLLECTION_S
+        while entry.poll() is None and time.monotonic() < end:
+            time.sleep(0.01)
+        status = entry.poll()
+    relay.stop_listening(socket_path)
+    os.close(alive)
+    code = entry_exit(status, relay.killed)
+    retired = retire(run_dir, checked["retention"]) if status is not None else {"ok": False, "stop": "unknown", "run_removed": False}
+    if relay.collection_errors:
+        code = EXIT_UNKNOWN
+    if status is not None and not retired["ok"]:
+        code = EXIT_CLEANUP_FAILED
+    relay.say({
+        "frontdoor": "terminal",
+        "stage": "ended",
+        "run": run_id,
+        "live": {"attaches": relay.attaches, "backlog_dropped_total": relay.dropped_total,
+                 "refusals": relay.refusals},
+        "entry_status": status,
+        "killed": relay.killed,
+        "cancel": relay.why,
+        "staged_credential": relay.staged_removed,
+        "retire": retired,
+        "collection_errors": relay.collection_errors,
+        "exit": code,
+        "retry": "do-not-replay",
+    })
+    relay.finish_output()
+    return code
+
+
+def open_live(package, site, checked, run_id, run_dir, request_path, user):
+    """Forks the detached owning supervisor (its own session, no caller
+    stdio), waits for its readiness and answers the opening caller with
+    the root's handle. This process then ends; the root does not."""
+    token = secrets.token_hex(16)
+    listener, socket_path = listen_live(run_dir, user.pw_uid)
+    ready_r, ready_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        code = EXIT_UNKNOWN
+        try:
+            os.close(ready_r)
+            os.setsid()
+            null = os.open(os.devnull, os.O_RDWR)
+            for fd in (0, 1, 2):
+                os.dup2(null, fd)
+            os.close(null)
+            if OUT_FD > 2:
+                # The opening caller's channel must end with this call.
+                os.close(OUT_FD)
+            code = live_daemon(package, site, checked, run_id, run_dir, request_path, user, listener,
+                               socket_path, token, ready_w)
+        except BaseException:
+            pass
+        finally:
+            os._exit(code & 0xFF)
+    os.close(ready_w)
+    listener.close()
+    data = b""
+    end = time.monotonic() + ADMISSION_S
+    while b"\n" not in data and time.monotonic() < end:
+        if not select.select([ready_r], [], [], max(0.0, end - time.monotonic()))[0]:
+            break
+        chunk = os.read(ready_r, 256)
+        if not chunk:
+            break
+        data += chunk
+    os.close(ready_r)
+    if data != b"live\n":
+        emit({"frontdoor": "terminal", "stage": "run-failed", "run": run_id,
+              "reason": "live root not started: " + (data.decode(errors="replace").strip() or "no readiness"),
+              "effects": "possible", "retry": "do-not-replay"})
+        return EXIT_UNKNOWN if not data else EXIT_RUN_FAILED
+    emit({
+        "frontdoor": "terminal",
+        "stage": "live-opened",
+        "run": run_id,
+        "supervisor_pid": pid,
+        "handle": {"v": 1, "run": run_id, "socket": socket_path, "token": token, "uid": user.pw_uid},
+        "deadline_s": checked["deadline"],
+        "meaning": "the root's owning supervisor runs detached from this call; this exit is not the root's end; close, cancel or the deadline ends it",
+        "exit": 0,
+        "retry": "do-not-replay",
+    })
+    return 0
 
 
 def entry_exit(status, killed):
@@ -1108,6 +1515,9 @@ def run_locked(argv, environ, stdin_fd=0):
     child_grant, child_public = (children or {}).get("grant") or (None, None)
     if children is not None:
         children["grant"] = (None, child_public) if child_grant is not None else None
+    if checked["live"] and live_roots(os.path.join(site["run_base"], str(user.pw_uid))) >= MAX_LIVE_ROOTS:
+        emit({"frontdoor": "terminal", "stage": "refused", "reason": f"live roots: {MAX_LIVE_ROOTS} already held by this requester", "effects": "none"})
+        return EXIT_REFUSED
     try:
         run_id, run_dir, lock, swept = make_run(site, user)
     except (Refused, OSError) as error:
@@ -1154,7 +1564,9 @@ def run_locked(argv, environ, stdin_fd=0):
             "deadline_s": checked["deadline"],
             "cancel_grace_s": site["cancel_grace_s"],
             "retention": checked["retention"],
-            "containment": "entry is PID 1 of a new PID and mount namespace and dies with this process",
+            "containment": "entry is PID 1 of a new PID and mount namespace and dies with this process"
+                           + ("; live: this process detaches as the root's owning supervisor" if checked["live"] else ""),
+            "live": checked["live"],
         })
         if credential_public is not None:
             # Setup elapsed since admission; recheck just before native launch.
@@ -1164,6 +1576,8 @@ def run_locked(argv, environ, stdin_fd=0):
             with open(os.path.join(run_dir, "private", "child-auth.json")) as file:
                 staged = json.load(file)
             check_credential({"model": child_public["provider"] + "/child", "credential": "required"}, staged, checked["deadline"], site, time.time())
+        if checked["live"]:
+            return open_live(package, site, checked, run_id, run_dir, request_path, user)
         try:
             entry, alive = start_entry(package, request_path)
         except (OSError, subprocess.SubprocessError) as error:

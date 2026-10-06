@@ -235,6 +235,81 @@ non-background tasks keep their first-turn answer contract.
 `answered` **does not prove task completion or correctness**. A denial
 or tool echo can be answered/0; entry 87 means close followed through.
 
+### Live roots (explicit, bounded)
+
+The fresh per-call behavior above is unchanged and remains the default. A live
+root is only opened on explicit request. In that case one front door process
+stays the root's owning supervisor after the call that opened it has exited.
+Later, independent calls by the same requester can then address that root.
+
+- **Open.** Run `oulipoly-native-call ... --live-handle FILE` with the ordinary
+  options. This sends request `live: true` through the same sudoers `run` rule.
+  - Admission, routes, credentials, children and the namespace entry are the
+    same as for a fresh call.
+  - After admission the front door forks its supervisor into a new session.
+    The supervisor closes the caller's stdio, unshares, starts the entry and
+    reports readiness.
+  - The front door then answers with terminal stage `live-opened`, which
+    carries a handle (`run`, socket, random token, uid), and exits 0. This exit
+    is **not** the root's end.
+  - The caller writes the handle to a new file (mode 0600), attaches, waits for
+    input 0's own tagged turn, writes `final.md` and detaches. It never sends
+    the automatic close.
+- **Address.** Run `oulipoly-native-call --root FILE --prompt-file P --out DIR
+  [--wait S]`.
+  - The caller connects to the root's `live.sock` in the root-owned run
+    directory. The socket is owned by the requester, mode 0600, and the
+    supervisor checks every peer's uid with `SO_PEERCRED`.
+  - The caller proves the run and token, then sends `send` with a fresh `ref`.
+    It correlates its own input in this order: `follow-up-admitted` (same
+    `ref`, giving the input index), then `ack`, then linked `agent-message`,
+    then that input's `turn-end`.
+  - The caller then detaches. `--wait` bounds this call only; the root is
+    unaffected by it.
+  - One caller is attached at a time; a concurrent one is refused with `busy`.
+    While nobody is attached, records wait in a bounded backlog (8 MiB).
+    Overflow is dropped and counted (`backlog_dropped`), never silently.
+- **Close or cancel.** Run `--root FILE --close` (or `--cancel`). This has the
+  per-call close/cancel meaning, including deferral for owed background
+  completions and the kill grace.
+  - The supervisor stops listening and unlinks the socket. It retires the run
+    as for a fresh call, sends the terminal record (`live` attaches,
+    refusals, drops) to the attached closer, and exits with the entry's code.
+  - `closed`/0 means the front door exited 0 or 87 with clean retirement. It
+    is not processing success.
+- **Bounds.**
+  - `deadline_s` (site maximum) bounds the whole live root, not one call.
+    When it expires the root is cancelled, then killed, even if nobody is
+    attached.
+  - At most 4 live roots per requester are allowed; dead ones (lock free) are
+    not counted and are swept by the next run.
+  - The supervisor holds the package's shared lock and the run lock for the
+    root's life.
+- **Outcomes (caller exits).**
+
+  | Exit | Class | Meaning |
+  |---|---|---|
+  | 11 | `root-absent` | No address: the root ended and was retired, or never existed. |
+  | 12 | `root-dead` | The address is present but nothing is listening; the supervisor died, and the lock is free for the sweep. |
+  | 13 | `root-foreign` | The address is not accessible, or the peer is another uid. |
+  | 14 | `root-refused` | The token or run is wrong (`handle-token`, `not-this-root`), or the reason is `busy` or `hello-timeout`. |
+  | 15 | `follow-up-refused` | The owner refused the input (for example `input-closed`). |
+  | 16 | `root-ended` | The root ended before this input's turn did. |
+  | 3 | `refused-locally` | A handle naming another uid is refused locally. |
+
+  There is no automatic fallback, replay or restart.
+- **Not provided.**
+  - Stopped-root delivery, restart, recovery and resume.
+  - Dedup across owners.
+  - Cross-supervisor messaging.
+  - A global daemon.
+  - Generic descendants.
+  - The ordinary `agents` entry and the temporary dispatcher do not open live
+    roots.
+
+`test_live.py` contains the offline controls. Only the namespace entry is a
+stand-in in them.
+
 ## Ordinary `agents` entry (`native.toml`)
 
 Ordinary Linux CLI launch requires `<runner config root>/native.toml`

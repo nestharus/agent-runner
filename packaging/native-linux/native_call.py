@@ -9,6 +9,12 @@
         [--child-route NAME ... [--child-max-starts N] [--child-max-concurrent N]
          [--child-credential-codex-profile DIR
           | --child-credential-opencode-auth FILE --child-credential-provider ID]]
+        [--live-handle NEWFILE]
+    oulipoly-native-call --root HANDLE --out DIR
+        (--prompt-file FILE | --close | --cancel) [--wait SECONDS]
+
+--live-handle opens a live root: its supervisor outlives this call; --root
+addresses it later (same requester), see share/README.md "Live roots".
 
 Explicit caller-selected access-only source; no search/refresh/copyback.
 Nonblocking admission/control and bounded terminal/EOF/exit collection;
@@ -26,10 +32,12 @@ Exit classes and runtime/credential bounds: share/README.md.
 
 import argparse
 import base64
+import errno
 import json
 import os
 import selectors
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -168,6 +176,8 @@ def parse_args(argv):
     child.add_argument("--child-credential-opencode-auth")
     child.add_argument("--child-credential-codex-profile")
     parser.add_argument("--child-credential-provider")
+    parser.add_argument("--live-handle",
+                        help="open a live root: no automatic close; its handle is written to this new file")
     parser.add_argument("--frontdoor")
     parser.add_argument("--sudo", default="/usr/bin/sudo")
     # Test seam only: run the front door directly (the caller is root in a
@@ -437,7 +447,8 @@ class Call:
             self.owed_async = value["owed_async"]
             if self.owed_async == 0 and "close" in self.sends and "stop_bound" in self.sends["close"]:
                 self.stop_at = min(self.stop_at or float("inf"), time.monotonic() + STOP_GRACE_S)
-        if value.get("event") == "turn-end" and value.get("input") == 0 and parent_event(value):
+        if value.get("event") == "turn-end" and value.get("input") == 0 and parent_event(value) \
+                and not getattr(getattr(self, "args", None), "live_handle", None):
             self.send(proc, "close", "turn end of the message (readiness, not processing success); owed background completions still get their own turns")
 
     def argv(self):
@@ -661,10 +672,20 @@ def main_checked(argv):
     except (LocalRefusal, OSError, ValueError, TypeError, OverflowError) as refusal:
         write_json(os.path.join(args.out, "result.json"), {"class": "refused-locally", "reason": str(refusal) if isinstance(refusal, LocalRefusal) else type(refusal).__name__, "started": False})
         return EXITS["refused-locally"]
+    if args.live_handle:
+        if os.path.lexists(args.live_handle):
+            write_json(os.path.join(args.out, "result.json"), {"class": "refused-locally", "reason": "live handle file exists", "started": False})
+            return EXITS["refused-locally"]
+        request["live"] = True
+        public["live"] = True
     write_json(os.path.join(args.out, "request.public.json"), public)
     call = Call(args, args.out)
     code, collection = call.run(request)
     request = None
+    terminals = [e for e in call.events if e.get("frontdoor") == "terminal"]
+    if args.live_handle and terminals and terminals[-1].get("stage") == "live-opened" and code == 0 \
+            and not collection["errors"]:
+        return opened_live(args, call, terminals[-1], collection)
     cls, answer, turn_end, linked, terminal = classify(code, collection, call.events, call.sends)
     background = async_of(call.events)
     turns = turns_of(call.events)
@@ -718,7 +739,335 @@ def main_checked(argv):
     return EXITS[cls]
 
 
+# Live roots: one owning supervisor that outlives the call that opened it.
+
+LIVE_EXITS = {
+    "answered": 0, "closed": 0, "no-answer": 1, "refused-locally": 3, "cancelled": 5, "incomplete": 6,
+    "cleanup-failed": 7, "ended-otherwise": 9, "root-absent": 11, "root-dead": 12, "root-foreign": 13,
+    "root-refused": 14, "follow-up-refused": 15, "root-ended": 16,
+}
+
+
+def read_handle(path):
+    try:
+        handle = json.loads(read_private(path))
+    except LocalRefusal:
+        raise
+    except (OSError, ValueError) as error:
+        raise LocalRefusal(f"live handle: {type(error).__name__}") from None
+    if not isinstance(handle, dict) or handle.get("v") != 1 \
+            or not all(isinstance(handle.get(k), str) and handle[k] for k in ("run", "socket", "token")) \
+            or not handle["socket"].startswith("/") or type(handle.get("uid")) is not int:
+        raise LocalRefusal("live handle: shape")
+    if handle["uid"] != os.getuid():
+        # Another requester's root: the front door would refuse it too.
+        raise LocalRefusal("live handle names another requester")
+    return handle
+
+
+def write_handle(path, handle):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as file:
+        json.dump(handle, file, sort_keys=True)
+        file.write("\n")
+
+
+class Attached:
+    """One caller attachment to a live root: connect, prove the handle,
+    then exchange JSON lines until the caller's own goal or bound."""
+
+    def __init__(self, handle, out, actions=None, capture=None):
+        self.handle = handle
+        self.start = time.monotonic()
+        self.events = []
+        self.actions = actions or open(os.path.join(out, "caller.jsonl"), "a", encoding="utf-8")
+        self.capture = capture or open(os.path.join(out, "events.jsonl"), "ab")
+        self.sock = None
+        self.buffer = b""
+        self.eof = False
+        self.signals = []
+
+    def log(self, **fields):
+        self.actions.write(json.dumps({**fields, "t": round(time.monotonic() - self.start, 3)}, sort_keys=True) + "\n")
+        self.actions.flush()
+
+    def connect(self):
+        """None when attached, else the refusal class and its reason."""
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)
+        sock.settimeout(5)
+        try:
+            sock.connect(self.handle["socket"])
+        except FileNotFoundError:
+            sock.close()
+            return "root-absent", "no live address: the root ended and was retired, or never existed (stale handle)"
+        except ConnectionRefusedError:
+            sock.close()
+            return "root-dead", "address present but no supervisor listening: owner died without retirement"
+        except PermissionError:
+            sock.close()
+            return "root-foreign", "address not accessible to this requester"
+        except OSError as error:
+            sock.close()
+            return "root-absent" if error.errno == errno.ENOTDIR else "root-unavailable", type(error).__name__
+        self.sock = sock
+        self.write({"v": 1, "attach": {"run": self.handle["run"], "token": self.handle["token"]}})
+        first = self.next_event(time.monotonic() + 5)
+        if first is None:
+            return "root-refused", "no attach answer"
+        if first.get("frontdoor") == "attach-refused":
+            reason = first.get("reason")
+            return ("root-foreign" if reason == "foreign-requester" else "root-refused"), reason
+        if first.get("frontdoor") != "attached":
+            return "root-refused", "unexpected attach answer"
+        self.log(action="attached", attach=first.get("attach"), backlog_dropped=first.get("backlog_dropped"))
+        return None
+
+    def write(self, value):
+        self.sock.settimeout(5)
+        self.sock.sendall(json.dumps(value).encode() + b"\n")
+
+    def next_event(self, until):
+        while b"\n" not in self.buffer:
+            if self.eof:
+                return None
+            remaining = until - time.monotonic()
+            if remaining <= 0 or self.signals:
+                return None
+            self.sock.settimeout(min(remaining, 0.2))
+            try:
+                chunk = self.sock.recv(65536)
+            except socket.timeout:
+                continue
+            except OSError:
+                chunk = b""
+            if not chunk:
+                self.eof = True
+                continue
+            self.capture.write(chunk)
+            self.buffer += chunk
+            if len(self.buffer) > LINE_LIMIT:
+                self.eof = True
+                return None
+        raw, self.buffer = self.buffer.split(b"\n", 1)
+        try:
+            value = json.loads(raw)
+            if not isinstance(value, dict):
+                raise ValueError
+        except ValueError:
+            value = {"unparsed": True}
+        self.events.append(value)
+        return value
+
+    def detach(self):
+        try:
+            self.write({"cmd": "detach"})
+        except OSError:
+            pass
+        self.close()
+
+    def close(self):
+        if self.sock is not None:
+            self.sock.close()
+            self.sock = None
+        self.capture.flush()
+
+    def turn(self, index, ref, until):
+        """Waits for the caller's own input: admitted (by ref), ACK, its
+        linked agent text and tagged turn end. Returns the account."""
+        account = {"input": index, "ref": ref, "admitted": index is not None, "ack": None,
+                   "linked_messages": 0, "turn_end": None, "refused": None, "root_ended": None}
+        text = None
+        while True:
+            event = self.next_event(until)
+            if event is None:
+                account["stop"] = "eof" if self.eof else "signal" if self.signals else "wait-bound"
+                break
+            if event.get("frontdoor") == "terminal":
+                account["root_ended"] = event
+                break
+            if not parent_event(event):
+                continue
+            name = event.get("event")
+            if ref is not None and event.get("ref") == ref:
+                if name == "follow-up-admitted" and type(event.get("input")) is int:
+                    account["input"], account["admitted"] = event["input"], True
+                elif name == "follow-up-refused":
+                    account["refused"] = event.get("reason")
+                    break
+            if account["input"] is None:
+                continue
+            if name == "ack" and event.get("index") == account["input"] and event.get("message_id"):
+                account["ack"] = {k: event.get(k) for k in ("message_id", "label", "durable")}
+            elif name == "agent-message" and event.get("input") == account["input"] and account["ack"] \
+                    and event.get("parent_message_id") == account["ack"]["message_id"]:
+                account["linked_messages"] += 1
+                if str(event.get("text", "")).strip():
+                    text = event["text"]
+            elif name == "turn-end" and event.get("input") == account["input"]:
+                account["turn_end"] = event
+                break
+        account["answer_present"] = text is not None
+        return account, text
+
+
+def turn_class(account, text):
+    if account["refused"] is not None:
+        return "follow-up-refused"
+    if account["turn_end"] is None:
+        return "root-ended" if account["root_ended"] is not None else "incomplete"
+    if text is not None and account["ack"] and account["turn_end"].get("stop_reason") == "end_turn":
+        return "answered"
+    return "no-answer"
+
+
+def end_class(terminal):
+    if terminal is None:
+        return "incomplete"
+    code = terminal.get("exit")
+    if code == 94 or terminal.get("retire", {}).get("ok") is False:
+        return "cleanup-failed"
+    if code == 92 or (terminal.get("cancel") or "").startswith(("abandoned", "deadline")):
+        return "cancelled"
+    if code in (90, 91, 93) or code is None or terminal.get("collection_errors"):
+        return "incomplete"
+    if code in (0, 87):
+        return "closed"
+    return "ended-otherwise"
+
+
+def live_result(out, cls, fields):
+    write_json(os.path.join(out, "result.json"), {
+        "class": cls, **fields,
+        "processing_completion": "not-observed", "correctness": "not-established", "retry": "do-not-replay",
+    })
+    return LIVE_EXITS[cls]
+
+
+def caller_signals(attached):
+    return {sig: signal.signal(sig, lambda sig, frame: attached.signals.append(sig)) for sig in (signal.SIGINT, signal.SIGTERM)}
+
+
+def opened_live(args, call, terminal, collection):
+    """The opening caller: the root is live; write its handle, attach and
+    wait for input 0's own turn, then leave the root running."""
+    handle = terminal.get("handle")
+    base = {"front_door_terminal": {k: v for k, v in terminal.items() if k != "handle"}, "collection": collection}
+    try:
+        write_handle(args.live_handle, handle)
+    except (OSError, TypeError, ValueError) as error:
+        # Nobody else could address it: close it rather than leave it.
+        attached = Attached(handle, args.out, call.actions, call.capture)
+        refused = attached.connect()
+        if refused is None:
+            attached.write({"cmd": "close"})
+        attached.close()
+        return live_result(args.out, "incomplete", {**base, "reason": "live handle not written: " + type(error).__name__,
+                                                   "close": "requested" if refused is None else refused[0]})
+    attached = Attached(handle, args.out, call.actions, call.capture)
+    old = caller_signals(attached)
+    try:
+        refused = attached.connect()
+        if refused is not None:
+            return live_result(args.out, refused[0], {**base, "reason": refused[1], "handle": args.live_handle})
+        account, text = attached.turn(0, None, call.start + args.deadline)
+        attached.detach()
+    finally:
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+    if text is not None:
+        with open(os.path.join(args.out, "final.md"), "w", encoding="utf-8") as file:
+            file.write(text)
+    cls = turn_class(account, text)
+    return live_result(args.out, cls, {
+        **base, "handle": args.live_handle, "run": handle.get("run"), "turn": account,
+        "root": "ended" if account["root_ended"] else "live (detached; this exit is not the root's end)",
+    })
+
+
+def parse_live_args(argv):
+    parser = argparse.ArgumentParser(prog="oulipoly-native-call --root",
+                                     description="Address a live root opened with --live-handle.")
+    parser.add_argument("--root", required=True, help="the live handle file")
+    parser.add_argument("--out", required=True)
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("--prompt-file", help="deliver one more input and wait for its own turn")
+    action.add_argument("--close", action="store_true", help="close the root: drain and end its tree")
+    action.add_argument("--cancel", action="store_true", help="cancel the root")
+    parser.add_argument("--wait", type=int, default=1800, help="this call's own bound; the root is unaffected by it")
+    args = parser.parse_args(argv)
+    if not 1 <= args.wait <= MAX_DEADLINE_S:
+        parser.error(f"--wait must be 1..{MAX_DEADLINE_S}")
+    return args
+
+
+def main_live(argv):
+    args = parse_live_args(argv)
+    try:
+        os.mkdir(args.out, 0o700)
+    except OSError as error:
+        print(json.dumps({"class": "refused-locally", "reason": type(error).__name__, "started": False}), file=sys.stderr)
+        return 2
+    try:
+        handle = read_handle(args.root)
+        message = None
+        if args.prompt_file:
+            with open(args.prompt_file, encoding="utf-8") as file:
+                message = file.read()
+            if not message.strip():
+                raise LocalRefusal("prompt file is empty")
+    except (LocalRefusal, OSError, UnicodeError) as refusal:
+        return live_result(args.out, "refused-locally", {"reason": str(refusal) if isinstance(refusal, LocalRefusal) else type(refusal).__name__, "started": False})
+    attached = Attached(handle, args.out)
+    base = {"handle": args.root, "run": handle["run"]}
+    old = caller_signals(attached)
+    try:
+        refused = attached.connect()
+        if refused is not None:
+            attached.close()
+            return live_result(args.out, refused[0], {**base, "reason": refused[1]})
+        until = attached.start + args.wait
+        if message is not None:
+            ref = "c" + os.urandom(8).hex()
+            attached.write({"cmd": "send", "text": message, "ref": ref})
+            attached.log(action="send", ref=ref)
+            account, text = attached.turn(None, ref, until)
+            attached.detach()
+            if text is not None:
+                with open(os.path.join(args.out, "final.md"), "w", encoding="utf-8") as file:
+                    file.write(text)
+            return live_result(args.out, turn_class(account, text), {
+                **base, "turn": account,
+                "root": "ended" if account["root_ended"] else "live (detached; this exit is not the root's end)"})
+        cmd = "close" if args.close else "cancel"
+        attached.write({"cmd": cmd})
+        attached.log(action="send", cmd=cmd)
+        terminal = None
+        while True:
+            event = attached.next_event(until + STOP_GRACE_S)
+            if event is None:
+                break
+            if event.get("frontdoor") == "terminal":
+                terminal = event
+        attached.close()
+        cls = end_class(terminal)
+        if cmd == "cancel" and cls == "closed":
+            cls = "cancelled"
+        owner_terminals = [e for e in attached.events if e.get("event") == "terminal" and parent_event(e)]
+        return live_result(args.out, cls, {
+            **base, "front_door_terminal": terminal, "eof": attached.eof,
+            "owner_terminal": owner_terminals[-1] if owner_terminals else None,
+            "root": "ended" if terminal else "unknown (no terminal record; stop not observed)"})
+    except OSError as error:
+        attached.close()
+        return live_result(args.out, "incomplete", {**base, "reason": type(error).__name__})
+    finally:
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+
+
 def main(argv):
+    if "--root" in argv:
+        return main_live(argv)
     try:
         return main_checked(argv)
     except (OSError, ValueError, TypeError, OverflowError) as error:
