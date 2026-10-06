@@ -192,7 +192,9 @@ Front-door codes: native entry status when observed, 90 admission refused,
 The caller selects `sudo -n <realpath frontdoor> run`; no profile search or
 fallback. It nonblockingly sends request/control, captures stdout and
 stderr, sends close on input 0's turn end, and cancel at deadline/signals.
-It collects at most N+65 s overall, or 65 s from an early close/cancel,
+It collects at most N+65 s overall. Close waits for owed background
+completion turns within that same deadline; its 65 s stop allowance starts
+when that debt settles. Cancel retains its 65 s allowance,
 with 30 s from terminal/partial EOF, plus a 0.2 s child exit attempt.
 Lines are limited to 8 MiB and capture to 64 MiB; exceeding them gives
 incomplete/unknown. Closing pipes requests abandonment; terminating its
@@ -217,9 +219,20 @@ result file that cannot be written.
 
 Caller codes: 0 answered, 1 no-answer, 2 usage, 3 local refusal,
 4 front-door refusal, 5 cancelled, 6 incomplete/stop unknown,
-7 cleanup failed, 8 launch failed, 9 ended otherwise.
-`answered` requires linked text, its end_turn, complete transport and clean
-retirement; it **does not prove task completion or correctness**. A denial
+7 cleanup failed, 8 launch failed, 9 ended otherwise, 10 async-undelivered.
+For tasks with accepted background work, `final.md` preserves ordered linked
+turn text (including diagnostic text on failure); `result.json` retains the
+report and owner-terminal async accounts and any gaps or inconsistencies.
+`answer.present` covers task-linked text on async calls; `answer.linked_messages`
+and `answer.turn_end` retain the initial-turn diagnostics. `turns` carries the
+wider per-turn account, including silent or unfinished turns.
+`answered` requires an eventual linked answer, the initial end_turn and every
+owed completion's acknowledged tagged end_turn, a fully settled valid owner
+account, complete transport and clean retirement. A silent completion turn
+alone is not a failure, but no linked text anywhere remains no-answer;
+undelivered or unknown debt cannot become success from text alone. Ordinary
+non-background tasks keep their first-turn answer contract.
+`answered` **does not prove task completion or correctness**. A denial
 or tool echo can be answered/0; entry 87 means close followed through.
 
 ## Ordinary `agents` entry (`native.toml`)

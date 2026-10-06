@@ -23,6 +23,11 @@ pub(crate) struct FollowUp {
     /// The caller's own correlation string, echoed, never interpreted.
     pub(crate) caller_ref: Option<String>,
     pub(crate) text: String,
+    /// Set when this input is the owner's own completion of a background
+    /// Bash run of this harness (its work id), not caller input: it is
+    /// owed to the harness even after `close`, and is held (not refused)
+    /// while an earlier input is open.
+    pub(crate) completion: Option<i64>,
 }
 
 struct State {
@@ -74,6 +79,11 @@ impl Inbox {
         drop(state);
         self.ring();
         Ok(())
+    }
+
+    /// Whether the worker is now in a conversation that can take input.
+    pub(crate) fn accepting(&self) -> bool {
+        self.state.lock().expect("inbox").accepting
     }
 
     /// Wakes a worker waiting between turns (also used for `close`).

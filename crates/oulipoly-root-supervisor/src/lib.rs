@@ -481,9 +481,9 @@ mod conversation;
 mod custody;
 mod harness;
 mod live;
-mod retention;
 pub mod native;
 pub mod native_claude;
+mod retention;
 mod store;
 #[doc(hidden)]
 pub mod sys;
@@ -947,6 +947,7 @@ where
         Arc::clone(&registry),
         claimed.cwd.clone(),
     );
+    ingress.deliver_to(inboxes.clone());
     match ingress.listen() {
         Ok(path) => emit(
             &mut out,
@@ -1167,6 +1168,7 @@ where
         code = EXIT_INCOMPLETE;
     }
     report["bash"] = ingress.summary();
+    report["async"] = bash::async_summary(&views);
     report["children"] = registry.summary();
     report["root_pid1"] = root_pid1;
     emit(&mut out, &report);
@@ -1631,6 +1633,7 @@ impl Control<'_> {
             control: self.number,
             caller_ref: caller_ref.map(str::to_owned),
             text: text.to_owned(),
+            completion: None,
         };
         match self.inboxes[position].offer(follow_up) {
             Ok(()) => json!({

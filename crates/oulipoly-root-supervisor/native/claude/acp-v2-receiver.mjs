@@ -19,10 +19,12 @@
 //   `CLAUDE*` name (API keys, tokens, provider and endpoint redirects), plus
 //   the launch's own settings; its login stays the store's own.
 // - `bash` is one in-process MCP tool (`mcp__oulipoly__bash`). It runs a
-//   command only through `agent-bash run --delivery sync` and so through the
-//   root's own Bash ingress (`OULIPOLY_ROOT_BASH_V1`): attributed, durably
-//   recorded, killed on cancel. With an allow list, a command not named
-//   exactly is refused here and nothing runs.
+//   command only through `agent-bash run --delivery sync` (or `async` with
+//   `background: true`) and so through the root's own Bash ingress
+//   (`OULIPOLY_ROOT_BASH_V1`): attributed, durably recorded, killed on
+//   cancel. A background run's end reaches this session later as an owner
+//   prompt (a new turn), never inside a busy turn and never polled. With an
+//   allow list, a command not named exactly is refused here and nothing runs.
 // - `explore` (`mcp__oulipoly__explore`), only when the launch names
 //   explorer routes: asks the root's owner for one registered read-only
 //   child through `explore-client.mjs` from inside this process (attributed
@@ -213,6 +215,38 @@ export function renderRootV1(exitCode, stdout, stderr) {
   }
 }
 
+// A background run's result: `running` is durable acceptance and start
+// only; no wait, exit or output is known until its completion arrives as a
+// later message in this conversation.
+export function renderRootV1Async(exitCode, stdout, stderr) {
+  const unresolved = (reason) => ({ text:
+    `Root v1 background result unresolved (${reason}); the command may be running; do not replay.\n` +
+    `exit: ${exitCode}\nstdout: ${stdout.slice(0, 2048)}\nstderr: ${stderr.slice(0, 2048)}`, error: true })
+  if (exitCode !== 0) return unresolved("agent-bash did not complete its result")
+  let value
+  try { value = JSON.parse(stdout) } catch { return unresolved("result is not one JSON object") }
+  if (value?.result_surface !== ROOT_V1_SURFACE || value.version !== 1 || value.delivery_mode !== "async" ||
+      !Array.isArray(value.stages)) return unresolved("result surface invalid")
+  const stages = `stages: ${value.stages.map(s => String(s?.event) + (s?.reason ? `(${s.reason})` : "")).join(" -> ") || "none"}`
+  const reference = typeof value.output?.reference === "string" ? value.output.reference : undefined
+  switch (value.outcome) {
+    case "running":
+      if (value.wait !== null || value.effects_possible !== true || !reference) return unresolved("async result inconsistent")
+      return { text: `Root v1 background work accepted and started (reference=${reference}); it is still running. ` +
+        "Its end (wait status, output facts and retained output identity) will arrive later in this conversation as a " +
+        "separate message; do not poll for it. Nothing about its exit or output is known yet.\n" + stages, error: false }
+    case "refused":
+      return { text: `Root v1 refused background work (${value.refusal?.reason}). Nothing was run; not converted to synchronous.\n${stages}`, error: true }
+    case "not-started":
+      return { text: `Root v1 accepted the background command, then reported a positive no-start; nothing was run.\n${stages}`, error: true }
+    case "unknown":
+      return { text: `Root v1 background outcome unknown (${value.meaning}): the command may be running or may have run. ` +
+        `Do not replay; a completion may or may not arrive.${reference ? ` reference=${reference}` : ""}\n${stages}`, error: true }
+    default:
+      return unresolved("async result outcome invalid")
+  }
+}
+
 function renderRetention(record, reference) {
   if (!record) return reference ? `\nOwner output reference=${reference}; seal not observed. ` +
     `Use {output_identity: "${reference}"} to request retained bytes from the current owner; availability/loss may remain unknown.` : ""
@@ -252,7 +286,7 @@ export function renderRootOutput(exitCode, stdout) {
 }
 
 // One command through agent-bash and so through the root's Bash ingress.
-function runRootBash(command, cwd, outputRequest) {
+function runRootBash(command, cwd, outputRequest, background = false) {
   return new Promise((done) => {
     let stdout = ""
     let stderr = ""
@@ -261,7 +295,8 @@ function runRootBash(command, cwd, outputRequest) {
     try {
       const argv = outputRequest ? (outputRequest.accept_output ? ["native-accept", outputRequest.output_identity]
         : ["native-output", outputRequest.output_identity, "--offset", String(outputRequest.output_offset ?? 0),
-           "--length", String(outputRequest.output_length ?? 1024)]) : ["run", "--delivery", "sync", "--", "bash", "-lc", command]
+           "--length", String(outputRequest.output_length ?? 1024)])
+        : ["run", "--delivery", background ? "async" : "sync", "--", "bash", "-lc", command]
       child = spawn(config.agent_bash_bin, argv, {
         cwd, env: process.env, stdio: ["ignore", "pipe", "pipe"],
       })
@@ -290,7 +325,8 @@ function runRootBash(command, cwd, outputRequest) {
           : "Root v1 result unresolved (result larger than this tool's bound); the command may have run; do not replay.", error: true })
         return
       }
-      done(outputRequest ? renderRootOutput(code, stdout.trim()) : renderRootV1(code, stdout.trim(), stderr))
+      done(outputRequest ? renderRootOutput(code, stdout.trim())
+        : background ? renderRootV1Async(code, stdout.trim(), stderr) : renderRootV1(code, stdout.trim(), stderr))
     })
   })
 }
@@ -532,8 +568,8 @@ async function pump() {
 
 function bashServer(cwd) {
   const description = config.bash.authority === "trusted-task"
-    ? "Run a shell command (bash -lc) synchronously through this root's own attributed Bash ingress. Returns the root's record, wait status and combined output. There is no background mode."
-    : `Run one of these exact shell commands (bash -lc) synchronously through this root's own attributed Bash ingress; any other command is refused: ${JSON.stringify(config.bash.allow)}`
+    ? "Run a shell command (bash -lc) through this root's own attributed Bash ingress. By default synchronous: returns the root's record, wait status and combined output. With background: true it returns once started, and its end arrives later in this conversation as a separate message."
+    : `Run one of these exact shell commands (bash -lc) through this root's own attributed Bash ingress (synchronously, or with background: true as background work whose end arrives later as a separate message); any other command is refused: ${JSON.stringify(config.bash.allow)}`
   return createSdkMcpServer({
     name: "oulipoly",
     version: "1",
@@ -546,10 +582,12 @@ function bashServer(cwd) {
         accept_output: z.boolean().optional().describe("explicit local acceptance of precisely output_identity; no ACK/processing/drain"),
         command: z.string().optional().describe("the shell command to run"),
         workdir: z.string().optional().describe("absolute working directory (default: the session's)"),
+        background: z.boolean().optional().describe("run as background work: returns once started; its end arrives later in this conversation as a separate message (do not poll)"),
       }, async (args) => {
         const retained = ["output_identity", "output_offset", "output_length", "accept_output"].some(key => args[key] !== undefined)
         if (retained) {
           if (typeof args.output_identity !== "string" || args.command !== undefined || args.workdir !== undefined ||
+              args.background !== undefined ||
               (args.accept_output && (args.output_offset !== undefined || args.output_length !== undefined))) {
             return { content: [{ type: "text", text: "Native output request conflicts with command/workdir or acceptance range. Nothing sent." }], isError: true }
           }
@@ -562,7 +600,7 @@ function bashServer(cwd) {
         const workdir = args.workdir ?? cwd
         if (!workdir.startsWith("/"))
           return { content: [{ type: "text", text: "workdir must be absolute. Nothing was run." }], isError: true }
-        const result = await runRootBash(args.command, workdir)
+        const result = await runRootBash(args.command, workdir, undefined, args.background === true)
         return { content: [{ type: "text", text: result.text }], isError: result.error }
       }),
       ...(config.explore?.routes?.length ? [exploreTool()] : []),

@@ -104,10 +104,104 @@ pub(crate) struct View {
     /// Live works of this harness and each one's own PID namespace.
     pub(crate) works: Vec<(i64, PidNs)>,
     pub(crate) open: Vec<OpenInput>,
+    /// Background (`delivery` `async`) Bash runs of this harness whose
+    /// completion is still owed to it: not yet carried by an input whose
+    /// linked turn ended, and not yet ended as undelivered.
+    pub(crate) owed_async: Vec<i64>,
+    /// Background runs accepted, completions whose linked turn ended, and
+    /// completions ended undelivered (each with its reason), on this view.
+    pub(crate) async_accepted: u64,
+    pub(crate) async_turn_ended: u64,
+    pub(crate) async_undelivered: Vec<(i64, String)>,
 }
 
 /// Every harness's view, by position.
 pub(crate) type Views = Arc<Mutex<Vec<View>>>;
+
+/// Completions still owed across this root (every view).
+fn owed_total(views: &[View]) -> usize {
+    views.iter().map(|view| view.owed_async.len()).sum()
+}
+
+/// Records a background run's completion as owed to the harness at
+/// `position`, and reports the root's new owed count. Reported while the
+/// views are held, so every `async-owed` report is in owed order.
+pub(crate) fn owe_async(views: &Views, tx: &Sender<Event>, position: usize, work: i64) {
+    let mut views = views.lock().expect("views");
+    let Some(view) = views.get_mut(position) else {
+        return;
+    };
+    view.owed_async.push(work);
+    view.async_accepted += 1;
+    let harness = view.id.clone();
+    let owed = owed_total(&views);
+    let _ = tx.send(Event::Report(json!({
+        "event": "async-owed",
+        "change": "owed",
+        "work": work,
+        "harness": harness,
+        "owed_async": owed,
+        "meaning": "a background Bash run's completion is owed to this live harness; the task stays open for it within its deadline",
+    })));
+}
+
+/// Ends one owed completion: `turn-ended` (an input carrying it was
+/// acknowledged and the agent's tagged turn end covered it) or
+/// `undelivered` with its reason. False if it was not owed (already ended).
+pub(crate) fn settle_async(
+    views: &Views,
+    tx: &Sender<Event>,
+    position: usize,
+    work: i64,
+    resolution: &str,
+    reason: Option<&str>,
+) -> bool {
+    let mut views = views.lock().expect("views");
+    let Some(view) = views.get_mut(position) else {
+        return false;
+    };
+    let Some(at) = view.owed_async.iter().position(|owed| *owed == work) else {
+        return false;
+    };
+    view.owed_async.remove(at);
+    if resolution == "turn-ended" {
+        view.async_turn_ended += 1;
+    } else {
+        view.async_undelivered
+            .push((work, reason.unwrap_or("unknown").to_owned()));
+    }
+    let harness = view.id.clone();
+    let owed = owed_total(&views);
+    let _ = tx.send(Event::Report(json!({
+        "event": "async-owed",
+        "change": resolution,
+        "work": work,
+        "harness": harness,
+        "reason": reason,
+        "owed_async": owed,
+    })));
+    true
+}
+
+/// The root's background-completion account for the terminal report.
+pub(crate) fn async_summary(views: &Views) -> Value {
+    let views = views.lock().expect("views");
+    let undelivered: Vec<Value> = views
+        .iter()
+        .flat_map(|view| {
+            view.async_undelivered
+                .iter()
+                .map(|(work, reason)| json!({ "harness": view.id, "work": work, "reason": reason }))
+        })
+        .collect();
+    json!({
+        "accepted": views.iter().map(|view| view.async_accepted).sum::<u64>(),
+        "turn_ended": views.iter().map(|view| view.async_turn_ended).sum::<u64>(),
+        "undelivered": undelivered,
+        "owed": owed_total(&views),
+        "meaning": "turn_ended: a completion input was acknowledged and a tagged turn end covered it; not proof the agent read, used or accepted the output",
+    })
+}
 
 #[derive(Default)]
 pub(crate) struct Gate {
@@ -167,6 +261,10 @@ pub(crate) struct Ingress {
     /// Retained output of this root, against its bound.
     pub(crate) budget: Budget,
     budget_unknown: bool,
+    /// Each top-level harness's inbox, by position: where a background
+    /// run's completion is offered. Unset (no background runs) in tests
+    /// that build an ingress alone.
+    inboxes: std::sync::OnceLock<Vec<Arc<crate::conversation::Inbox>>>,
     #[cfg(test)]
     pub(crate) after_spawn_error_unlock: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
@@ -221,6 +319,7 @@ impl Ingress {
             gate: Arc::default(),
             children,
             cwd,
+            inboxes: std::sync::OnceLock::new(),
             #[cfg(test)]
             after_spawn_error_unlock: Mutex::new(None),
         });
@@ -238,6 +337,26 @@ impl Ingress {
             ),
         }
         ingress
+    }
+
+    /// Names where background completions go (top-level harnesses only).
+    pub(crate) fn deliver_to(&self, inboxes: Vec<Arc<crate::conversation::Inbox>>) {
+        let _ = self.inboxes.set(inboxes);
+    }
+
+    /// Why the harness at `position` cannot be owed a background
+    /// completion now, if it cannot. Checked before anything is recorded.
+    fn async_refusal(&self, position: usize) -> Option<&'static str> {
+        if self.children.is_child(position) {
+            return Some("async-unavailable: registered child");
+        }
+        match self.inboxes.get().and_then(|inboxes| inboxes.get(position)) {
+            None => Some("async-unavailable: no completion recipient"),
+            Some(inbox) if !inbox.accepting() => {
+                Some("async-unavailable: requester not in a live conversation")
+            }
+            Some(_) => None,
+        }
     }
 
     pub(crate) fn socket_path(store: &Path) -> PathBuf {
@@ -403,8 +522,12 @@ impl Ingress {
 
     fn enter_retained(&self) -> Result<(), &'static str> {
         let mut gate = self.gate.0.lock().expect("bash gate");
-        if gate.closed { return Err("ingress-closed"); }
-        if gate.output_open >= MAX_OUTPUT_REQUESTS { return Err("output-request-bound"); }
+        if gate.closed {
+            return Err("ingress-closed");
+        }
+        if gate.output_open >= MAX_OUTPUT_REQUESTS {
+            return Err("output-request-bound");
+        }
         gate.output_open += 1;
         gate.output_requests += 1;
         Ok(())
@@ -444,6 +567,7 @@ impl Ingress {
             &RunRequest {
                 argv: vec!["fixture".into()],
                 cwd,
+                background: false,
             },
             &mut Sink::new(None),
         );
@@ -499,6 +623,13 @@ impl Ingress {
             );
             return;
         }
+        if request.background
+            && let Some(reason) = self.async_refusal(who.position)
+        {
+            drop(custody);
+            self.refused(sink.stream(), json!({ "pid": requester }), reason);
+            return;
+        }
         if !self.enter() {
             drop(custody);
             self.refused(sink.stream(), json!({ "pid": requester }), "ingress-closed");
@@ -543,9 +674,15 @@ impl Ingress {
             "input_attribution": input_attribution,
         });
         let mut accepted = json!({ "event": "accepted", "work": work, "durable": true });
+        if request.background {
+            accepted["delivery"] = json!("async");
+        }
         merge(&mut accepted, &attribution);
         sink.send(&accepted);
         let mut owner = json!({ "event": "bash-accepted", "work": work, "argv": request.argv });
+        if request.background {
+            owner["delivery"] = json!("async");
+        }
         merge(&mut owner, &attribution);
         self.report(owner);
         let spawned = root.spawn_observed(
@@ -614,6 +751,23 @@ impl Ingress {
             // At this moment only; a short run may already be gone (null).
             "identity": spawned.harness_host_pid.map(crate::workload::observe),
         }));
+        let completion = request.background.then(|| {
+            // Owed before the requester hears `detached`, so the owner's
+            // `async-owed` report precedes any turn end that follows it.
+            owe_async(&self.views, &self.tx, who.position, work);
+            sink.send(&json!({
+                "event": "detached",
+                "work": work,
+                "completion": "owed-to-requesting-harness",
+                "meaning": "the run continues; its end will be offered to this harness as a later input referencing its retained output; this reply is not its end",
+            }));
+            // The requester's connection ends here; the run does not.
+            sink.0 = None;
+            Completion {
+                position: who.position,
+                argv: request.argv.clone(),
+            }
+        });
         let mut retainer = Retainer::start(&self.slot.store_dir, work, &self.budget);
         if self.budget_unknown {
             retainer.deny_unknown_budget();
@@ -625,6 +779,7 @@ impl Ingress {
             spawned.stdio.stdout,
             Some(sink),
             retainer,
+            completion,
         );
     }
 
@@ -639,6 +794,7 @@ impl Ingress {
         stdout: File,
         sink: Option<&mut Sink>,
         mut retainer: Retainer<'_>,
+        completion: Option<Completion>,
     ) {
         let mut sink = sink;
         let (bytes, output) = relay_output(&self.slot.stop, stdout, &mut sink, &mut retainer);
@@ -689,6 +845,7 @@ impl Ingress {
         self.children
             .remove_run(work, matches!(outcome, Outcome::Ended));
         let caller = match sink {
+            _ if completion.is_some() => "detached-async",
             Some(sink) => {
                 sink.send(&event);
                 if sink.0.is_some() {
@@ -699,6 +856,7 @@ impl Ingress {
             }
             None => "lost-with-prior-owner",
         };
+        let end = event.clone();
         let mut owner = event;
         owner["bash"] = owner["event"].take();
         owner["event"] = json!("bash-ended");
@@ -706,7 +864,56 @@ impl Ingress {
         owner["output_bytes"] = json!(bytes);
         owner["requester"] = json!(caller);
         self.report(owner);
+        if let Some(completion) = completion {
+            self.offer_completion(work, &completion, &end);
+        }
+        // Left only after the completion is offered or settled, so the
+        // owning loop cannot end between this run's end and its offer.
         self.leave(outcome);
+    }
+
+    /// Offers a background run's end to its requesting harness as one
+    /// later input: a reference to its retained output plus its wait and
+    /// output facts, never the output itself and never an acceptance.
+    fn offer_completion(&self, work: i64, completion: &Completion, end: &Value) {
+        let position = completion.position;
+        let text = completion_text(&self.root_id, work, &completion.argv, end);
+        let undelivered = |reason: &str| {
+            settle_async(
+                &self.views,
+                &self.tx,
+                position,
+                work,
+                "undelivered",
+                Some(reason),
+            );
+            // A worker held open for this completion re-checks its close.
+            if let Some(inbox) = self.inboxes.get().and_then(|inboxes| inboxes.get(position)) {
+                inbox.ring();
+            }
+        };
+        if let Some(reason) = self.custody.lock().expect("custody lock").reason() {
+            return undelivered(reason);
+        }
+        let Some(inbox) = self.inboxes.get().and_then(|inboxes| inboxes.get(position)) else {
+            return undelivered("no-completion-recipient");
+        };
+        let follow_up = crate::conversation::FollowUp {
+            control: 0,
+            caller_ref: Some(format!("bash-completion:{work}")),
+            text,
+            completion: Some(work),
+        };
+        match inbox.offer(follow_up) {
+            Ok(()) => self.report(json!({
+                "event": "bash-async-completion-offered",
+                "work": work,
+                "harness_position": position,
+                "stage": "queued-not-admitted",
+                "durable": false,
+            })),
+            Err(_) => undelivered("recipient-not-in-conversation"),
+        }
     }
 
     /// Takes over a Bash run an earlier owner accepted. Its requester's
@@ -741,6 +948,9 @@ impl Ingress {
                     "pid": adopted.harness_host_pid,
                 }));
                 let retainer = ingress.resume_retainer(adopted.work);
+                // A background run's completion was owed to a harness of
+                // the earlier owner's live conversation; it is not carried
+                // across owners (no durable async record, no resume).
                 ingress.finish(
                     &root,
                     adopted.work,
@@ -748,6 +958,7 @@ impl Ingress {
                     adopted.stdio.stdout,
                     None,
                     retainer,
+                    None,
                 );
             }
             Prior::Exited {
@@ -1000,6 +1211,85 @@ impl Ingress {
     }
 }
 
+/// Where a background run's completion goes, and what names it.
+pub(crate) struct Completion {
+    position: usize,
+    argv: Vec<String>,
+}
+
+/// Longest command text quoted back in a completion input.
+const COMPLETION_COMMAND_CHARS: usize = 400;
+
+/// The completion input's text: what the agent reads. A human summary,
+/// then one JSON line with the exact facts. Output is referenced by its
+/// retained identity, never inlined; wait, output state and retention are
+/// kept separate, and delivery is said not to be acceptance.
+pub(crate) fn completion_text(root_id: &str, work: i64, argv: &[String], end: &Value) -> String {
+    let command = argv.last().map_or(String::new(), |last| {
+        let mut text: String = last.chars().take(COMPLETION_COMMAND_CHARS).collect();
+        if last.chars().count() > COMPLETION_COMMAND_CHARS {
+            text.push_str("…[truncated]");
+        }
+        text
+    });
+    let ended = match end["event"].as_str() {
+        Some("end") => format!(
+            "ended {} (observer {})",
+            end["status"].as_str().unwrap_or("?"),
+            end["observer"].as_str().unwrap_or("?")
+        ),
+        Some(other) => format!(
+            "{other}: how it ended is not known ({})",
+            end["reason"].as_str().unwrap_or("no reason given")
+        ),
+        None => "end not reported".to_owned(),
+    };
+    let output = &end["output"];
+    let stream = match output["state"].as_str() {
+        Some("closed") => format!("output stream closed after {} bytes", output["bytes"]),
+        Some(state) => format!(
+            "output stream {state} ({})",
+            output["reason"].as_str().unwrap_or("")
+        ),
+        None => "output stream state unknown".to_owned(),
+    };
+    let retained = &end["retained"];
+    let retention = match retained["identity"].as_str() {
+        Some(identity) => format!(
+            "retained {} of {} received bytes, state {}: {identity}. Read it with the Bash tool's output_identity (and offset/length); accept exact bytes only with output_identity plus accept_output. This message is a delivery, not an acceptance.",
+            retained["bytes"],
+            retained["received"],
+            retained["state"].as_str().unwrap_or("?"),
+        ),
+        None => format!(
+            "no retained identity ({}); try output_identity rv1w:{root_id}:{work} for what the owner kept.",
+            retained["reason"]
+                .as_str()
+                .or(retained["state"].as_str())
+                .unwrap_or("unknown")
+        ),
+    };
+    let facts = json!({
+        "completion": "agent-bash-root-v1-async",
+        "version": 1,
+        "root_id": root_id,
+        "work": work,
+        "reference": format!("rv1w:{root_id}:{work}"),
+        "end": {
+            "event": end["event"],
+            "status": end["status"],
+            "observer": end["observer"],
+            "reason": end["reason"],
+        },
+        "output": output,
+        "retained": retained,
+        "accepted_locally": false,
+    });
+    format!(
+        "[Background Bash completion] Your background command (work {work}) {ended}; {stream}; {retention}\nCommand: {command}\n{facts}"
+    )
+}
+
 /// EOF, read failure and detach are different observations; none is a wait.
 fn relay_output(
     stop: &transport::StopSignal,
@@ -1054,6 +1344,9 @@ pub(crate) struct Attributed {
 struct RunRequest {
     argv: Vec<String>,
     cwd: String,
+    /// `delivery` `async`: answer after `started` with `detached`, then
+    /// deliver the completion to the requesting harness as a later input.
+    background: bool,
 }
 
 /// A read (`op` `output`) or local acceptance (`op` `accept`) of one run's
@@ -1227,7 +1520,17 @@ fn read_request(stream: &UnixStream) -> Result<Request, String> {
         .filter(|cwd| cwd.starts_with('/') && !cwd.contains('\0'))
         .ok_or("bad-cwd")?
         .to_owned();
-    Ok(Request::Run(RunRequest { argv, cwd }))
+    let background = match &value["delivery"] {
+        Value::Null => false,
+        Value::String(mode) if mode == "sync" => false,
+        Value::String(mode) if mode == "async" => true,
+        _ => return Err("bad-delivery".to_owned()),
+    };
+    Ok(Request::Run(RunRequest {
+        argv,
+        cwd,
+        background,
+    }))
 }
 
 /// Standard base64 with padding.
@@ -1351,6 +1654,7 @@ mod tests {
             session: None,
             works: vec![(parent, PidNs { dev: 0, ino: 0 })],
             open: vec![],
+            ..View::default()
         }]));
         let stop = Arc::new(StopSignal::new().unwrap());
         let (root, far) = Root::seam(false, i32::try_from(std::process::id()).unwrap(), &stop);
@@ -1417,6 +1721,7 @@ mod tests {
             let request = RunRequest {
                 argv: vec!["fixture".into()],
                 cwd: dir.0.display().to_string(),
+                background: false,
             };
             ingress.run(&who, 1, &request, &mut Sink(Some(near)));
             replier.join().unwrap();
@@ -1472,6 +1777,7 @@ mod tests {
         let request = RunRequest {
             argv: vec!["fixture".into()],
             cwd: "/".into(),
+            background: false,
         };
         ingress.run(&who, 1, &request, &mut Sink(Some(near)));
         let mut reply = String::new();
@@ -1520,6 +1826,7 @@ mod tests {
             File::open(&dir.0).unwrap(),
             Some(&mut sink),
             retainer,
+            None,
         );
         drop(sink);
         let events: Vec<Value> = BufReader::new(far)
@@ -1605,6 +1912,7 @@ mod tests {
             File::open(&source).unwrap(),
             Some(&mut sink),
             retainer,
+            None,
         );
         drop(sink);
         let events = reader.join().unwrap();
@@ -2125,12 +2433,19 @@ mod tests {
     fn retained_request_budget_is_bounded_and_reply_work_prevents_idle_close() {
         let dir = Fixture::new();
         let (ingress, _root, _far, _parent) = fixture(&dir.0);
-        for _ in 0..MAX_OUTPUT_REQUESTS { ingress.enter_retained().unwrap(); }
-        assert_eq!(ingress.enter_retained().unwrap_err(), "output-request-bound");
+        for _ in 0..MAX_OUTPUT_REQUESTS {
+            ingress.enter_retained().unwrap();
+        }
+        assert_eq!(
+            ingress.enter_retained().unwrap_err(),
+            "output-request-bound"
+        );
         assert_eq!(ingress.summary()["output_open"], MAX_OUTPUT_REQUESTS);
         assert_eq!(ingress.summary()["accepted"], 0); // retrieval is not a Bash launch
         assert!(!ingress.close_if_idle());
-        for _ in 0..MAX_OUTPUT_REQUESTS { ingress.leave_retained(); }
+        for _ in 0..MAX_OUTPUT_REQUESTS {
+            ingress.leave_retained();
+        }
         assert!(ingress.close_if_idle());
         assert_eq!(ingress.summary()["output_open"], 0);
         assert_eq!(ingress.summary()["output_requests"], MAX_OUTPUT_REQUESTS);

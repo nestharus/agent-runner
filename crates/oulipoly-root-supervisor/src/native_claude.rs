@@ -214,7 +214,7 @@ impl ClaudePolicy {
                 None => json!("trusted-task"),
                 Some(commands) => json!({ "allow": commands }),
             },
-            "bash_route": "agent-bash run --delivery sync -> root Bash ingress",
+            "bash_route": "agent-bash run --delivery sync|async -> root Bash ingress",
             "builtin_tools": self.tools,
             "other": "deny",
             "permission_mode": "dontAsk",
