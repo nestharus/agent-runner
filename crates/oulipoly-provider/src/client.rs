@@ -304,6 +304,26 @@ impl ProviderClient {
             == crate::executable_identity::stamp(&current.pinned_executable())?)
     }
 
+    /// Whether the configured artifact still resolves to the same file revision
+    /// this client pinned. Re-resolves the configured path/name and compares
+    /// metadata stamps (device, inode, length, mtime, ctime); no provider bytes
+    /// are read. Atomic replacement, symlink retargeting and completed in-place
+    /// writes all report `false`, as does an artifact that no longer resolves.
+    /// Where stamps are unsupported the pinned revision is treated as current.
+    pub fn configured_artifact_unchanged(&self) -> bool {
+        let Some(resolved) = self.resolved.get() else {
+            return false;
+        };
+        let Some(revision) = resolved.revision() else {
+            return true;
+        };
+        ProviderResolver::new(self.options.resolver.clone())
+            .resolve(&self.artifact, self.options.provider_config_dir.as_deref())
+            .ok()
+            .and_then(|current| current.revision().map(|current| current == revision))
+            .unwrap_or(false)
+    }
+
     /// Build another client for the exact executable already resolved and
     /// pinned by this client. This changes operation-local options without
     /// re-resolving a pathname or opening a replacement executable.

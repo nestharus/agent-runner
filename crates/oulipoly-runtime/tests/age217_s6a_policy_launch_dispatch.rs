@@ -1362,6 +1362,68 @@ fn external_provider_missing_launch_output_capability_requires_provider_upgrade(
 }
 
 #[test]
+fn external_provider_compatible_upgrade_is_admitted_by_the_same_registry() {
+    if isolated_case() {
+        return;
+    }
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+    disable_launch_output_capability(&fixture);
+    let model = external_model(&fixture);
+    let service = executor::RuntimeExecutorService::new(Arc::new(dispatch_registry_for_models(
+        std::slice::from_ref(&model),
+    )));
+    let request = || ExecutorServiceRequest::Facade {
+        model: model.clone(),
+        provider_index: 0,
+        prompt: "prompt-value".to_string(),
+        working_dir: None,
+        models_dir: None,
+        extra_inputs: HashMap::new(),
+        parent_invocation_env: None,
+    };
+
+    let Err(error) = service.execute(request()) else {
+        panic!("the cached agreement lacks launch_output_v1");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("complete_launch_output_unsupported")
+    );
+    assert!(!fixture.launch_record_path.exists());
+
+    // Rebuild elsewhere and rename over the configured path; no registry restart.
+    let staged = fixture.provider_path.with_extension("staged");
+    let upgraded = fs::read_to_string(&fixture.provider_path)
+        .unwrap()
+        .replacen(
+            "\"launch_output_v1\": False",
+            "\"launch_output_v1\": True",
+            1,
+        );
+    write_executable(&staged, &upgraded);
+    fs::rename(&staged, &fixture.provider_path).unwrap();
+
+    let result = service
+        .execute(request())
+        .expect("the compatible upgrade must be described and admitted")
+        .result;
+    assert_eq!(result.stdout, vec![0, 1, 255]);
+    assert_eq!(
+        order_lines(&fixture.order_path),
+        ["policy.evaluate", "launch"]
+    );
+    assert!(!fixture.legacy_record_path.exists());
+}
+
+#[test]
 fn external_provider_policy_evaluate_runs_before_launch_and_uses_selected_provider_settings() {
     if isolated_case() {
         return;

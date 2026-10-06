@@ -1179,6 +1179,27 @@ does not make every older provider launch-compatible with a newer host. The
 host may require a selected extension before dispatch when that extension is
 necessary to preserve execution correctness.
 
+### Replacing a Provider Executable
+
+A running registry picks up a rebuilt or upgraded provider at its configured
+path without a restart. Before reusing a cached describe result, the account,
+family and per-artifact lookups re-resolve the configured artifact and compare
+its file metadata (device, inode, size, modification and change times) with the
+file that was described. They do not hash the file. An atomic rename, a
+retargeted symlink or a completed in-place rewrite causes a fresh `describe`.
+The new operation then uses the newly advertised capabilities, for example
+`launch_output_v1` after an upgrade. Compatibility is decided by that describe
+result, not by matching any earlier binary.
+
+An operation that already holds an endpoint keeps the executable it was admitted
+with, and nothing is replayed. If the artifact is missing, or `describe` fails
+while it is being rewritten, the lookup returns the error. Nothing is cached, so
+a later lookup retries once the file is usable. A non-atomic in-place rewrite
+can still be executed partially written by an operation that was already
+admitted. Use an atomic rename to avoid that. Each account or family refreshes
+on its own: concurrent lookups for one account wait for a single `describe`,
+and other accounts are not blocked.
+
 ### Prompt Acceptance Attestation
 
 External provider binaries advertise `capabilities.prompt_acceptance_v1: true` only when they implement the `oulipoly.prompt_acceptance/v1` launch extension and the describe request explicitly selects it with `host.env.OULIPOLY_HOST_PROMPT_ACCEPTANCE_V1=1`. The provider crate exposes `host_requested_prompt_acceptance_v1` for this check. A provider must omit the capability property for a host that does not select it, preserving the closed legacy `oulipoly.provider/v1` describe shape for older hosts; older providers can ignore the already-open host environment map and return their existing shape to a new host. For an advertised provider, the host adds `params.prompt_acceptance` with the protocol id, the SHA-256 of the exact launch prompt, and the mailbox delivery nonce when that prompt contains one. This contract data lets the provider correlate delivery without parsing an application-local prompt envelope. If provider policy changes the `argv`, `stdin`, or canonical `prompt` bytes, the host omits the extension for that launch and ignores any acceptance marker; byte-identical policy results retain eligibility.

@@ -10,8 +10,7 @@ mod handle;
 mod options;
 
 use artifact_key::{ArtifactKey, artifact_key};
-use cache::DescribeCache;
-use describe::describe_provider;
+use cache::{DescribeCache, EndpointSlots};
 pub(crate) use describe::{DescribeHostOptions, describe_provider_client};
 use oulipoly_config::{
     ModelConfig, ProvidersConfig, provider_implementation_ref::ProviderImplementationRef,
@@ -21,7 +20,7 @@ use oulipoly_provider::generated::DescribeResult;
 use oulipoly_provider::resolver::ProviderArtifactRef;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 pub use client_factory::ProviderClientFactory;
 pub use conversion::{ArtifactKind, RuntimeProviderArtifact};
@@ -47,7 +46,7 @@ pub use options::ProviderRegistryOptions;
 //     Owns:
 //       - account/family endpoint construction
 //       - artifact keying and deduplication
-//       - in-process describe cache
+//       - in-process describe cache, refreshed when the configured artifact revision changes
 //       - describe request orchestration and error mapping
 //       - registry root to internal helper module coordination
 
@@ -63,8 +62,8 @@ pub struct ProviderRegistry {
     model_artifacts: HashMap<String, ArtifactKey>,
     model_provider_artifacts: HashMap<ModelProviderKey, ArtifactKey>,
     cache: DescribeCache,
-    endpoint_cache: Mutex<HashMap<String, Arc<PinnedProviderEndpoint>>>,
-    family_endpoint_cache: Mutex<HashMap<String, Arc<PinnedFamilyEndpoint>>>,
+    endpoint_cache: EndpointSlots<PinnedProviderEndpoint>,
+    family_endpoint_cache: EndpointSlots<PinnedFamilyEndpoint>,
     client_factory: ProviderClientFactory,
     host_options: DescribeHostOptions,
 }
@@ -206,8 +205,8 @@ impl ProviderRegistry {
             model_artifacts: inventory.model_artifacts,
             model_provider_artifacts: inventory.model_provider_artifacts,
             cache: DescribeCache::default(),
-            endpoint_cache: Mutex::new(HashMap::new()),
-            family_endpoint_cache: Mutex::new(HashMap::new()),
+            endpoint_cache: EndpointSlots::default(),
+            family_endpoint_cache: EndpointSlots::default(),
             client_factory: ProviderClientFactory::new(options.client),
             host_options: DescribeHostOptions {
                 config_root: options.config_root,
@@ -228,8 +227,8 @@ impl ProviderRegistry {
             model_artifacts: HashMap::new(),
             model_provider_artifacts: HashMap::new(),
             cache: DescribeCache::default(),
-            endpoint_cache: Mutex::new(HashMap::new()),
-            family_endpoint_cache: Mutex::new(HashMap::new()),
+            endpoint_cache: EndpointSlots::default(),
+            family_endpoint_cache: EndpointSlots::default(),
             client_factory: ProviderClientFactory::new(options.client),
             host_options: DescribeHostOptions {
                 config_root: options.config_root,
@@ -365,16 +364,12 @@ impl ProviderRegistry {
     /// Used only by the receipt helper's retained registry cache. All populated
     /// endpoints must retain both executable revision and configured resolution.
     pub fn receipt_endpoints_unchanged(&self) -> bool {
-        self.endpoint_cache
-            .lock()
-            .expect("endpoint cache mutex")
-            .values()
-            .all(|endpoint| {
-                endpoint
-                    .client()
-                    .receipt_endpoint_unchanged()
-                    .unwrap_or(false)
-            })
+        self.endpoint_cache.populated().iter().all(|endpoint| {
+            endpoint
+                .client()
+                .receipt_endpoint_unchanged()
+                .unwrap_or(false)
+        })
     }
 
     pub fn preflight_account(
@@ -391,28 +386,35 @@ impl ProviderRegistry {
     ) -> Result<Arc<PinnedProviderEndpoint>, ProviderRegistryError> {
         #[cfg(all(feature = "age360-fault-fixtures", target_os = "linux"))]
         cancellation_fixture::before(self, account_name, custody.is_some());
-        let mut endpoints = self
-            .endpoint_cache
+        let key = self.lookup_account_artifact_key(account_name)?;
+        let slot = self.endpoint_cache.slot(account_name);
+        let mut cached = slot
             .lock()
-            .expect("provider endpoint cache mutex should not be poisoned");
+            .expect("provider endpoint slot mutex should not be poisoned");
+        // A cached agreement is reused only while the configured artifact still
+        // resolves to the revision that was described. Replacement, completed
+        // in-place writes and removal all fall through to a fresh describe;
+        // endpoints already handed out keep their own pinned client.
+        if cached
+            .as_ref()
+            .is_some_and(|endpoint| !endpoint.client.configured_artifact_unchanged())
+        {
+            *cached = None;
+        }
+        let current = cached.clone();
         #[cfg(all(feature = "age360-fault-fixtures", target_os = "linux"))]
         cancellation_fixture::observe(
             self,
             account_name,
             custody.is_some(),
-            if endpoints.contains_key(account_name) {
-                "hit"
-            } else {
-                "miss"
-            },
+            if current.is_some() { "hit" } else { "miss" },
         );
-        if let Some(endpoint) = endpoints.get(account_name) {
+        if let Some(endpoint) = current {
             if let Some(custody) = &custody {
                 custody.record_not_invoked("describe");
             }
-            return Ok(endpoint.clone());
+            return Ok(endpoint);
         }
-        let key = self.lookup_account_artifact_key(account_name)?;
         let artifact = match self.lookup_artifact(account_name, &key)? {
             RuntimeProviderArtifact::Enabled(artifact) => artifact,
             RuntimeProviderArtifact::RuntimeDisabled(artifact) => {
@@ -426,7 +428,6 @@ impl ProviderRegistry {
         let attributed = custody.is_some();
         let client = Arc::new(self.client_factory.client_for_attempt(artifact, custody));
         let capabilities = describe_provider_client(client.as_ref(), &self.host_options)?;
-        self.store_describe(&key, capabilities.clone());
         let client = Arc::new(
             client
                 .fork_from_pinned(self.client_factory.base_options())
@@ -435,6 +436,7 @@ impl ProviderRegistry {
                     source: Box::new(source),
                 })?,
         );
+        self.store_describe(&key, capabilities.clone(), client.clone());
         let endpoint = Arc::new(PinnedProviderEndpoint {
             account_name: account_name.to_string(),
             family: self
@@ -446,7 +448,7 @@ impl ProviderRegistry {
             client,
             capabilities,
         });
-        endpoints.insert(account_name.to_string(), endpoint.clone());
+        *cached = Some(endpoint.clone());
         #[cfg(all(feature = "age360-fault-fixtures", target_os = "linux"))]
         cancellation_fixture::observe(self, account_name, attributed, "stored");
         Ok(endpoint)
@@ -456,13 +458,6 @@ impl ProviderRegistry {
         &self,
         family: &str,
     ) -> Result<Arc<PinnedFamilyEndpoint>, ProviderRegistryError> {
-        let mut endpoints = self
-            .family_endpoint_cache
-            .lock()
-            .expect("provider family endpoint cache mutex should not be poisoned");
-        if let Some(endpoint) = endpoints.get(family) {
-            return Ok(endpoint.clone());
-        }
         let key = self
             .family_artifacts
             .get(family)
@@ -472,14 +467,28 @@ impl ProviderRegistry {
                     family: family.to_string(),
                 },
             )?;
+        let slot = self.family_endpoint_cache.slot(family);
+        let mut cached = slot
+            .lock()
+            .expect("provider family endpoint slot mutex should not be poisoned");
+        if let Some(endpoint) = cached.as_ref() {
+            if endpoint.client.configured_artifact_unchanged() {
+                return Ok(endpoint.clone());
+            }
+            *cached = None;
+        }
         let artifact = enabled_artifact(
             self.lookup_artifact(family, &key)?,
             "family bootstrap endpoint",
         )?;
         let endpoint =
             preflight_family_endpoint(family, artifact, &self.client_factory, &self.host_options)?;
-        self.store_describe(&key, endpoint.capabilities().clone());
-        endpoints.insert(family.to_string(), endpoint.clone());
+        self.store_describe(
+            &key,
+            endpoint.capabilities().clone(),
+            endpoint.client.clone(),
+        );
+        *cached = Some(endpoint.clone());
         Ok(endpoint)
     }
 
@@ -554,8 +563,9 @@ impl ProviderRegistry {
     ) -> Result<DescribeResult, ProviderRegistryError> {
         match self.lookup_artifact(model_name, key)? {
             RuntimeProviderArtifact::Enabled(artifact) => {
-                let result = describe_provider(&self.client_factory, artifact, &self.host_options)?;
-                self.store_describe(key, result.clone());
+                let client = Arc::new(self.client_factory.client_for(artifact));
+                let result = describe_provider_client(client.as_ref(), &self.host_options)?;
+                self.store_describe(key, result.clone(), client);
                 Ok(result)
             }
             RuntimeProviderArtifact::RuntimeDisabled(artifact) => {
@@ -579,8 +589,13 @@ impl ProviderRegistry {
         })
     }
 
-    fn store_describe(&self, key: &ArtifactKey, result: DescribeResult) {
-        self.cache.insert(key.clone(), result);
+    fn store_describe(
+        &self,
+        key: &ArtifactKey,
+        result: DescribeResult,
+        client: Arc<ProviderClient>,
+    ) {
+        self.cache.insert(key.clone(), result, client);
     }
 }
 
