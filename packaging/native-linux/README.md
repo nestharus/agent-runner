@@ -269,20 +269,48 @@ Later, independent calls by the same requester can then address that root.
   - One caller is attached at a time; a concurrent one is refused with `busy`.
     While nobody is attached, records wait in a bounded backlog (8 MiB).
     Overflow is dropped and counted (`backlog_dropped`), never silently.
+    Each attachment begins on a whole JSON record. If a caller leaves during
+    a partial send, that entire interrupted record is discarded and counted;
+    whole unsent records remain queued. Attach and terminal records expose
+    cumulative dropped records/bytes, interrupted records and prefix bytes
+    sent to departed callers. Counts describe transport loss, not processing.
+  - `answered`/0 covers only this input's correlated ACK, linked text and
+    tagged `end_turn`; it establishes neither semantic processing nor
+    settlement of the whole root or its background obligations.
 - **Close or cancel.** Run `--root FILE --close` (or `--cancel`). This has the
   per-call close/cancel meaning, including deferral for owed background
   completions and the kill grace.
   - The supervisor stops listening and unlinks the socket. It retires the run
     as for a fresh call, sends the terminal record (`live` attaches,
     refusals, drops) to the attached closer, and exits with the entry's code.
-  - `closed`/0 means the front door exited 0 or 87 with clean retirement. It
-    is not processing success.
+  - Physical close and the caller's outcome are separate. `closed`/0 requires
+    clean retirement, collected EOF, a complete entry relay terminal and a
+    consistent owner terminal async account, with all accepted completion
+    inputs covered by ACK/tagged turn ends and no counted transport loss.
+    It establishes no semantic processing or task correctness.
+  - The live supervisor keeps a runtime-only accounting witness across
+    attachments (parent async reports/admissions, ACKs, turn ends and owner/
+    entry terminals, without answer bodies). It is bounded at 8 MiB and
+    exported in the final front-door terminal as `account_events`;
+    `account_errors`, the reconciled `async`, and raw terminals remain visible.
+    Missing, contradictory or limit-truncated evidence is `incomplete`/6.
+    Known undelivered completions are `async-undelivered`/10, even after clean
+    physical retirement. Counted transport loss also precludes `closed`/0.
+  - Precedence: observed cleanup failure/7, then incomplete transport/stop
+    collection/6, then explicit cancellation or owner kill/deadline/5, then
+    accounting incompleteness/6, known async loss/10, and transport loss/6.
+    Other owner exits remain `ended-otherwise`/9.
 - **Bounds.**
   - `deadline_s` (site maximum) bounds the whole live root, not one call.
     When it expires the root is cancelled, then killed, even if nobody is
     attached.
-  - At most 4 live roots per requester are allowed; dead ones (lock free) are
-    not counted and are swept by the next run.
+  - At most 4 live roots per requester are allowed, including admissions
+    still in progress before socket creation. A per-requester nonblocking
+    admission guard covers count/allocation; the allocated run's locked
+    reservation holds its slot until retirement. A competing guard holder
+    is refused explicitly (`requester admission busy`); the cap refusal is
+    `4 already held`. Dead ones (lock free) are not counted and are swept by
+    the next run.
   - The supervisor holds the package's shared lock and the run lock for the
     root's life.
 - **Outcomes (caller exits).**
@@ -295,9 +323,15 @@ Later, independent calls by the same requester can then address that root.
   | 14 | `root-refused` | The token or run is wrong (`handle-token`, `not-this-root`), or the reason is `busy` or `hello-timeout`. |
   | 15 | `follow-up-refused` | The owner refused the input (for example `input-closed`). |
   | 16 | `root-ended` | The root ended before this input's turn did. |
-  | 3 | `refused-locally` | A handle naming another uid is refused locally. |
+  | 17 | `root-unavailable` | Address/transport could not be used; no root state is inferred. |
+  | 3 | `refused-locally` | Malformed/unusable handle (including overlong AF_UNIX address), or another uid. |
 
-  There is no automatic fallback, replay or restart.
+  `root-absent` after an unattended deadline or retirement is deliberately
+  ambiguous: no terminal outcome can be inferred, including success or
+  failure. There is no terminal history, automatic fallback, replay or restart.
+  Failure before attachment uses the declared class and stores `result.json`
+  in the caller output directory; an unwritable/uncreatable output directory
+  can only expose its machine-readable refusal on stderr.
 - **Not provided.**
   - Stopped-root delivery, restart, recovery and resume.
   - Dedup across owners.
@@ -307,8 +341,13 @@ Later, independent calls by the same requester can then address that root.
   - The ordinary `agents` entry and the temporary dispatcher do not open live
     roots.
 
-`test_live.py` contains the offline controls. Only the namespace entry is a
-stand-in in them.
+`test_live.py` contains unprivileged stand-in controls for separate callers,
+constructor-initialized record framing/loss, the actual concurrent admission
+boundary and in-progress reservations, malformed public handles, and honest
+async close outcomes. The killed-supervisor stand-in did not itself die from
+PDEATHSIG and is explicitly killed by the control: it supplies no containment
+proof. Real owner/provider, privileged namespace/sudo/session policy and
+package replacement while a live root holds its lock remain ROOT qualification.
 
 ## Ordinary `agents` entry (`native.toml`)
 

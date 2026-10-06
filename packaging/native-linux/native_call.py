@@ -745,6 +745,7 @@ LIVE_EXITS = {
     "answered": 0, "closed": 0, "no-answer": 1, "refused-locally": 3, "cancelled": 5, "incomplete": 6,
     "cleanup-failed": 7, "ended-otherwise": 9, "root-absent": 11, "root-dead": 12, "root-foreign": 13,
     "root-refused": 14, "follow-up-refused": 15, "root-ended": 16,
+    "root-unavailable": 17, "async-undelivered": 10,
 }
 
 
@@ -755,12 +756,22 @@ def read_handle(path):
         raise
     except (OSError, ValueError) as error:
         raise LocalRefusal(f"live handle: {type(error).__name__}") from None
+    return check_handle(handle)
+
+
+def check_handle(handle):
     if not isinstance(handle, dict) or handle.get("v") != 1 \
             or not all(isinstance(handle.get(k), str) and handle[k] for k in ("run", "socket", "token")) \
             or not handle["socket"].startswith("/") or type(handle.get("uid")) is not int:
         raise LocalRefusal("live handle: shape")
+    try:
+        address = os.fsencode(handle["socket"])
+        json.dumps(handle, ensure_ascii=False).encode("utf-8")
+    except UnicodeError:
+        raise LocalRefusal("live handle: invalid Unicode") from None
+    if b"\0" in address or len(address) >= 108:
+        raise LocalRefusal("live handle: unusable AF_UNIX address")
     if handle["uid"] != os.getuid():
-        # Another requester's root: the front door would refuse it too.
         raise LocalRefusal("live handle names another requester")
     return handle
 
@@ -786,6 +797,7 @@ class Attached:
         self.buffer = b""
         self.eof = False
         self.signals = []
+        self.errors = []
 
     def log(self, **fields):
         self.actions.write(json.dumps({**fields, "t": round(time.monotonic() - self.start, 3)}, sort_keys=True) + "\n")
@@ -793,25 +805,28 @@ class Attached:
 
     def connect(self):
         """None when attached, else the refusal class and its reason."""
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)
-        sock.settimeout(5)
+        sock = None
         try:
+            check_handle(self.handle)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)
+            sock.settimeout(5)
             sock.connect(self.handle["socket"])
-        except FileNotFoundError:
-            sock.close()
-            return "root-absent", "no live address: the root ended and was retired, or never existed (stale handle)"
-        except ConnectionRefusedError:
-            sock.close()
-            return "root-dead", "address present but no supervisor listening: owner died without retirement"
-        except PermissionError:
-            sock.close()
-            return "root-foreign", "address not accessible to this requester"
+            self.sock = sock
+            self.write({"v": 1, "attach": {"run": self.handle["run"], "token": self.handle["token"]}})
+            first = self.next_event(time.monotonic() + 5)
+        except LocalRefusal as error:
+            return "refused-locally", str(error)
         except OSError as error:
-            sock.close()
-            return "root-absent" if error.errno == errno.ENOTDIR else "root-unavailable", type(error).__name__
-        self.sock = sock
-        self.write({"v": 1, "attach": {"run": self.handle["run"], "token": self.handle["token"]}})
-        first = self.next_event(time.monotonic() + 5)
+            if sock is not None:
+                sock.close()
+            self.sock = None
+            if isinstance(error, FileNotFoundError) or error.errno == errno.ENOTDIR:
+                return "root-absent", "no live address: ended and retired, or never existed; terminal outcome unknown"
+            if isinstance(error, ConnectionRefusedError):
+                return "root-dead", "address present but no supervisor listening: owner died without retirement"
+            if isinstance(error, PermissionError):
+                return "root-foreign", "address not accessible to this requester"
+            return "root-unavailable", type(error).__name__
         if first is None:
             return "root-refused", "no attach answer"
         if first.get("frontdoor") == "attach-refused":
@@ -838,14 +853,18 @@ class Attached:
                 chunk = self.sock.recv(65536)
             except socket.timeout:
                 continue
-            except OSError:
+            except OSError as error:
+                self.errors.append("transport-read:" + type(error).__name__)
                 chunk = b""
             if not chunk:
+                if self.buffer:
+                    self.errors.append("interrupted-transport-record")
                 self.eof = True
                 continue
             self.capture.write(chunk)
             self.buffer += chunk
             if len(self.buffer) > LINE_LIMIT:
+                self.errors.append("transport-line-limit")
                 self.eof = True
                 return None
         raw, self.buffer = self.buffer.split(b"\n", 1)
@@ -854,6 +873,7 @@ class Attached:
             if not isinstance(value, dict):
                 raise ValueError
         except ValueError:
+            self.errors.append("invalid-transport-record")
             value = {"unparsed": True}
         self.events.append(value)
         return value
@@ -920,22 +940,68 @@ def turn_class(account, text):
     return "no-answer"
 
 
-def end_class(terminal):
+def live_close_account(terminal, events):
+    """Use the live supervisor's runtime-only witness across attachments.
+    Caller-local records alone may omit earlier turns/reports. Never infer
+    whole-root settlement from the closer's own turn or physical retirement."""
+    witness = terminal.get("account_events") if terminal else None
+    errors = list(terminal.get("account_errors", [])) if terminal else []
+    if not isinstance(witness, list) or not all(isinstance(e, dict) for e in witness):
+        witness = [e for e in events if parent_event(e)]
+        errors.append("live-account-witness-missing-or-invalid")
+    owners = [e for e in witness if e.get("event") == "terminal" and parent_event(e)]
+    entries = [e for e in witness if e.get("entry") == "terminal"]
+    owner = owners[-1] if owners else None
+    if owner is None or owner.get("async") is None:
+        errors.append("owner-terminal-async-account-missing")
+    if len(owners) != 1:
+        errors.append("owner-terminal-missing-or-multiple")
+    if len(entries) != 1 or entries[-1].get("relay") != "complete":
+        errors.append("entry-relay-completion-missing-or-contradictory")
+    background = async_of(witness)
+    errors.extend(background["errors"])
+    if terminal and terminal.get("exit") in (0, 87):
+        if owner and owner.get("status") != "closed":
+            errors.append("owner-terminal-contradicts-close")
+        if terminal.get("entry_status") not in (0, 87) or terminal.get("killed"):
+            errors.append("entry-status-contradicts-close")
+    turns = turns_of(witness)
+    completed = {t["work"] for t in turns if t["kind"] == "background-completion"
+                 and t["acknowledged"] and t["ended"] and t["stop_reason"] == "end_turn"}
+    if not background["undelivered"] and (background["unsettled"] != 0
+            or len(completed) != background["accepted"]):
+        errors.append("async-carrying-turns-incomplete")
+    return {"async": background, "owner_terminal": owner, "errors": errors,
+            "meaning": "owner reports, ACK and tagged carrying turn ends; not semantic processing"}
+
+
+def end_class(terminal, account, collection, cmd):
     if terminal is None:
         return "incomplete"
     code = terminal.get("exit")
-    if code == 94 or terminal.get("retire", {}).get("ok") is False:
+    retired = terminal.get("retire", {})
+    if code == 94 or (retired.get("ok") is False and retired.get("stop") != "unknown"):
         return "cleanup-failed"
-    if code == 92 or (terminal.get("cancel") or "").startswith(("abandoned", "deadline")):
-        return "cancelled"
-    if code in (90, 91, 93) or code is None or terminal.get("collection_errors"):
+    if code in (90, 91, 93) or code is None or terminal.get("collection_errors") \
+            or not collection["eof"] or collection["errors"] or retired.get("stop") == "unknown":
         return "incomplete"
-    if code in (0, 87):
-        return "closed"
+    if cmd == "cancel" or code == 92 or (terminal.get("cancel") or "").startswith(("abandoned", "deadline", "requester cancel")):
+        return "cancelled"
+    if code in (0, 83, 87):
+        if retired.get("ok") is not True or account["errors"]:
+            return "incomplete"
+        if account["async"]["undelivered"]:
+            return "async-undelivered"
+        if terminal.get("live", {}).get("backlog_dropped_total", 0):
+            return "incomplete"
+        return "closed" if code in (0, 87) else "ended-otherwise"
     return "ended-otherwise"
 
 
 def live_result(out, cls, fields):
+    if cls not in LIVE_EXITS:
+        fields = {**fields, "classification_error": "undeclared live outcome: " + str(cls)}
+        cls = "incomplete"
     write_json(os.path.join(out, "result.json"), {
         "class": cls, **fields,
         "processing_completion": "not-observed", "correctness": "not-established", "retry": "do-not-replay",
@@ -952,6 +1018,10 @@ def opened_live(args, call, terminal, collection):
     wait for input 0's own turn, then leave the root running."""
     handle = terminal.get("handle")
     base = {"front_door_terminal": {k: v for k, v in terminal.items() if k != "handle"}, "collection": collection}
+    try:
+        check_handle(handle)
+    except LocalRefusal as error:
+        return live_result(args.out, "refused-locally", {**base, "reason": str(error)})
     try:
         write_handle(args.live_handle, handle)
     except (OSError, TypeError, ValueError) as error:
@@ -977,9 +1047,10 @@ def opened_live(args, call, terminal, collection):
     if text is not None:
         with open(os.path.join(args.out, "final.md"), "w", encoding="utf-8") as file:
             file.write(text)
-    cls = turn_class(account, text)
+    cls = "incomplete" if attached.errors else turn_class(account, text)
     return live_result(args.out, cls, {
         **base, "handle": args.live_handle, "run": handle.get("run"), "turn": account,
+        "transport": {"errors": attached.errors, "attached": attached.events[0] if attached.events else None},
         "root": "ended" if account["root_ended"] else "live (detached; this exit is not the root's end)",
     })
 
@@ -1006,7 +1077,7 @@ def main_live(argv):
         os.mkdir(args.out, 0o700)
     except OSError as error:
         print(json.dumps({"class": "refused-locally", "reason": type(error).__name__, "started": False}), file=sys.stderr)
-        return 2
+        return LIVE_EXITS["refused-locally"]
     try:
         handle = read_handle(args.root)
         message = None
@@ -1035,8 +1106,9 @@ def main_live(argv):
             if text is not None:
                 with open(os.path.join(args.out, "final.md"), "w", encoding="utf-8") as file:
                     file.write(text)
-            return live_result(args.out, turn_class(account, text), {
+            return live_result(args.out, "incomplete" if attached.errors else turn_class(account, text), {
                 **base, "turn": account,
+                "transport": {"errors": attached.errors, "attached": attached.events[0] if attached.events else None},
                 "root": "ended" if account["root_ended"] else "live (detached; this exit is not the root's end)"})
         cmd = "close" if args.close else "cancel"
         attached.write({"cmd": cmd})
@@ -1049,13 +1121,16 @@ def main_live(argv):
             if event.get("frontdoor") == "terminal":
                 terminal = event
         attached.close()
-        cls = end_class(terminal)
-        if cmd == "cancel" and cls == "closed":
-            cls = "cancelled"
-        owner_terminals = [e for e in attached.events if e.get("event") == "terminal" and parent_event(e)]
+        collection = {"eof": attached.eof, "errors": attached.errors}
+        account = live_close_account(terminal, attached.events)
+        cls = end_class(terminal, account, collection, cmd)
         return live_result(args.out, cls, {
-            **base, "front_door_terminal": terminal, "eof": attached.eof,
-            "owner_terminal": owner_terminals[-1] if owner_terminals else None,
+            **base, "front_door_terminal": terminal, "collection": collection,
+            "owner_terminal": account["owner_terminal"], "async": account["async"],
+            "account_errors": account["errors"],
+            "transport": {"attached": attached.events[0] if attached.events else None,
+                          "loss": terminal.get("live") if terminal else None},
+            "physical_close": bool(terminal and terminal.get("entry_status") is not None),
             "root": "ended" if terminal else "unknown (no terminal record; stop not observed)"})
     except OSError as error:
         attached.close()
@@ -1066,18 +1141,17 @@ def main_live(argv):
 
 
 def main(argv):
-    if "--root" in argv:
-        return main_live(argv)
+    live = any(arg == "--root" or arg.startswith("--root=") for arg in argv)
     try:
-        return main_checked(argv)
-    except (OSError, ValueError, TypeError, OverflowError) as error:
+        return main_live(argv) if live else main_checked(argv)
+    except (OSError, ValueError, TypeError, OverflowError, KeyError, AttributeError, RecursionError) as error:
         # result.json itself may be unwritable. Always expose a type-only
         # machine-readable failure on stderr, without echoing inputs.
         result = {"class": "incomplete", "reason": type(error).__name__, "stop": "unknown", "retry": "do-not-replay"}
         try:
-            args = parse_args(argv)
+            args = parse_live_args(argv) if live else parse_args(argv)
             write_json(os.path.join(args.out, "result.json"), result)
-        except (OSError, ValueError, TypeError, OverflowError):
+        except (OSError, ValueError, TypeError, OverflowError, KeyError, AttributeError, RecursionError):
             pass
         print(json.dumps(result), file=sys.stderr)
         return EXITS["incomplete"]

@@ -33,6 +33,7 @@ contract, limits and prepared ROOT operations: share/README.md.
 """
 
 import ctypes
+from collections import deque
 import fcntl
 import json
 import os
@@ -70,6 +71,7 @@ EXIT_CLEANUP_FAILED = 94
 # through its socket in the run directory.
 LIVE_SOCKET = "live.sock"
 MAX_LIVE_ROOTS = 4
+LIVE_RESERVATION = "live-reservation"
 HELLO_S = 5
 HELLO_LIMIT = 4096
 
@@ -1077,8 +1079,8 @@ def listen_live(run, uid):
 
 
 def live_roots(user_dir):
-    """This requester's runs with a live socket whose supervisor still
-    holds the run lock (a dead one's lock is free: not counted)."""
+    """Live sockets or in-progress reservations with a held run lock.
+    A dead owner's lock is free and no longer counts."""
     try:
         names = os.listdir(user_dir)
     except FileNotFoundError:
@@ -1086,7 +1088,8 @@ def live_roots(user_dir):
     count = 0
     for name in names:
         run = os.path.join(user_dir, name)
-        if not os.path.lexists(os.path.join(run, LIVE_SOCKET)):
+        if not (os.path.lexists(os.path.join(run, LIVE_SOCKET))
+                or os.path.lexists(os.path.join(run, "private", LIVE_RESERVATION))):
             continue
         try:
             fd = os.open(os.path.join(run, "private", "lock"), os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -1099,6 +1102,39 @@ def live_roots(user_dir):
         finally:
             os.close(fd)
     return count
+
+
+def make_live_run(site, user):
+    """Serialize check/allocation per requester, and reserve the slot before
+    releasing the guard. A locked reservation counts even before listen/fork.
+    Dead reservations are lock-free and swept like dead live sockets."""
+    base = site["run_base"]
+    check_owned(base)
+    user_dir = os.path.join(base, str(user.pw_uid))
+    try:
+        os.mkdir(user_dir, 0o711)
+    except FileExistsError:
+        pass
+    check_owned(user_dir)
+    guard = os.open(user_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        try:
+            fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Refused("live roots: requester admission busy") from None
+        if live_roots(user_dir) >= MAX_LIVE_ROOTS:
+            raise Refused(f"live roots: {MAX_LIVE_ROOTS} already held by this requester")
+        allocated = make_run(site, user)
+        _, run, lock, _ = allocated
+        try:
+            write_private(os.path.join(run, "private", LIVE_RESERVATION), "reserved")
+        except OSError:
+            retire(run, "discard")
+            os.close(lock)
+            raise
+        return allocated
+    finally:
+        os.close(guard)
 
 
 class LiveRelay(Relay):
@@ -1121,17 +1157,59 @@ class LiveRelay(Relay):
         self.attaches = 0
         self.refusals = []
         super().__init__(entry, run, deadline_s, grace_s, clock)
+        self.output = deque()
+        self.output_bytes = 0
+        self.send_offset = 0
+        self.interrupted_total = 0
+        self.interrupted_prefix_bytes = 0
+        self.dropped_bytes_total = 0
+        # Runtime-only accounting witness across attachments; no answer bodies.
+        self.account_events = []
+        self.account_bytes = 0
+        self.account_errors = []
+
+    def entry_line(self, line):
+        try:
+            value = json.loads(line)
+        except ValueError:
+            value = None
+        if isinstance(value, dict) and "child" not in value and (
+                value.get("event") in ("async-owed", "bash-async-completion-admitted", "ack", "turn-end", "terminal")
+                or value.get("entry") == "terminal"):
+            size = len(encoded(value))
+            if self.account_bytes + size <= OUTPUT_LIMIT:
+                self.account_events.append(value)
+                self.account_bytes += size
+            elif not self.account_errors:
+                self.account_errors.append("live-account-limit")
+        super().entry_line(line)
 
     def client_setup(self):
         self.listener.setblocking(False)
 
+    def drop_record(self, data, interrupted=False):
+        self.dropped += 1
+        self.dropped_total += 1
+        self.dropped_bytes_total += len(data)
+        if interrupted:
+            self.interrupted_total += 1
+            self.interrupted_prefix_bytes += self.send_offset
+
     def queue_output(self, line, force=False):
         data = encoded(line)
-        if not force and len(self.output) + len(data) > OUTPUT_LIMIT:
-            self.dropped += 1
-            self.dropped_total += 1
+        try:
+            value = json.loads(data)
+            if not isinstance(value, dict):
+                raise ValueError
+        except ValueError:
+            self.drop_record(data)
+            self.collection_errors.append("invalid-entry-record")
             return
-        self.output += data
+        if not force and self.output_bytes + len(data) > OUTPUT_LIMIT:
+            self.drop_record(data)
+            return
+        self.output.append(data)
+        self.output_bytes += len(data)
 
     def say(self, fields):
         self.queue_output(fields, force=True)
@@ -1147,8 +1225,16 @@ class LiveRelay(Relay):
                 self.controls = b""
         if self.client is not None and self.output:
             try:
-                count = self.client.send(self.output)
-                self.output = self.output[count:]
+                record = self.output[0]
+                count = self.client.send(record[self.send_offset:])
+                if count == 0:
+                    self.detach("caller-gone")
+                    return
+                self.send_offset += count
+                if self.send_offset == len(record):
+                    self.output.popleft()
+                    self.output_bytes -= len(record)
+                    self.send_offset = 0
             except BlockingIOError:
                 pass
             except OSError:
@@ -1209,13 +1295,18 @@ class LiveRelay(Relay):
         self.attaches += 1
         record = {
             "frontdoor": "attached", "run": self.run_id, "attach": self.attaches,
-            "backlog_bytes": len(self.output), "backlog_dropped": self.dropped,
+            "backlog_bytes": self.output_bytes, "backlog_dropped": self.dropped,
             "backlog_dropped_total": self.dropped_total,
+            "interrupted_records_total": self.interrupted_total,
+            "interrupted_prefix_bytes": self.interrupted_prefix_bytes,
+            "dropped_record_bytes_total": self.dropped_bytes_total,
             "closing": self.cancel_at is not None or self.close_waiting,
             "meaning": "attached to the one live owner; records since the previous caller left follow, then live records",
         }
         self.dropped = 0
-        self.output = encoded(record) + self.output
+        data = encoded(record)
+        self.output.appendleft(data)
+        self.output_bytes += len(data)
         self.client = conn
         self.client_in = rest
 
@@ -1228,7 +1319,14 @@ class LiveRelay(Relay):
             pass
         self.client = None
         self.client_in = b""
-        # Unsent records stay for the next caller; this one reads as gone.
+        # Discard the entire interrupted record, including its old prefix.
+        # A new attachment must never start with a previous caller's byte tail.
+        if self.send_offset:
+            data = self.output.popleft()
+            self.drop_record(data, interrupted=True)
+            self.output_bytes -= len(data)
+            self.send_offset = 0
+        # Whole unsent records stay for the next caller.
         self.say({"frontdoor": "detached", "why": why, "root": "live" if self.entry.poll() is None else "ending"})
 
     def client_lines(self):
@@ -1366,7 +1464,12 @@ def live_daemon(package, site, checked, run_id, run_dir, request_path, user, lis
         "stage": "ended",
         "run": run_id,
         "live": {"attaches": relay.attaches, "backlog_dropped_total": relay.dropped_total,
-                 "refusals": relay.refusals},
+                 "refusals": relay.refusals,
+                 "interrupted_records_total": relay.interrupted_total,
+                 "interrupted_prefix_bytes": relay.interrupted_prefix_bytes,
+                 "dropped_record_bytes_total": relay.dropped_bytes_total},
+        "account_events": relay.account_events,
+        "account_errors": relay.account_errors,
         "entry_status": status,
         "killed": relay.killed,
         "cancel": relay.why,
@@ -1515,12 +1618,16 @@ def run_locked(argv, environ, stdin_fd=0):
     child_grant, child_public = (children or {}).get("grant") or (None, None)
     if children is not None:
         children["grant"] = (None, child_public) if child_grant is not None else None
-    if checked["live"] and live_roots(os.path.join(site["run_base"], str(user.pw_uid))) >= MAX_LIVE_ROOTS:
-        emit({"frontdoor": "terminal", "stage": "refused", "reason": f"live roots: {MAX_LIVE_ROOTS} already held by this requester", "effects": "none"})
-        return EXIT_REFUSED
     try:
-        run_id, run_dir, lock, swept = make_run(site, user)
-    except (Refused, OSError) as error:
+        allocate = make_live_run if checked["live"] else make_run
+        run_id, run_dir, lock, swept = allocate(site, user)
+    except Refused as refusal:
+        if checked["live"]:
+            emit({"frontdoor": "terminal", "stage": "refused", "reason": str(refusal), "effects": "none"})
+            return EXIT_REFUSED
+        emit({"frontdoor": "terminal", "stage": "run-failed", "reason": type(refusal).__name__, "effects": "possible"})
+        return EXIT_RUN_FAILED
+    except OSError as error:
         emit({"frontdoor": "terminal", "stage": "run-failed", "reason": type(error).__name__, "effects": "possible"})
         return EXIT_RUN_FAILED
     for record in swept:
