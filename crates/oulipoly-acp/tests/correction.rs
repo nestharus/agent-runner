@@ -352,3 +352,93 @@ fn idle_after_attempt_label_requires_a_tracked_attempt() {
         Err(oulipoly_acp::IdleWaitFailure::NoAttempt)
     );
 }
+
+#[test]
+fn open_wait_exposes_events_before_receiving_more_without_consuming_idle() {
+    use oulipoly_acp::{Incoming, PeerClosed, SessionEvent, Transport};
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
+    struct Gated {
+        incoming: VecDeque<(usize, Value)>,
+        published: Rc<Cell<usize>>,
+    }
+    impl Transport for Gated {
+        fn send(&mut self, _: &Value) -> Result<(), PeerClosed> {
+            Ok(())
+        }
+        fn recv(&mut self) -> Incoming {
+            let Some((expected, message)) = self.incoming.pop_front() else {
+                assert_eq!(self.published.get(), 3);
+                return Incoming::Closed;
+            };
+            assert_eq!(
+                self.published.get(),
+                expected,
+                "collected events must be exposed before another blocking receive"
+            );
+            Incoming::Message(message)
+        }
+    }
+    let published = Rc::new(Cell::new(0));
+    let mut client = AcpClient::new(
+        Gated {
+            incoming: VecDeque::from([
+                (0, init()),
+                (
+                    0,
+                    json!({"jsonrpc":"2.0","id":2,"result":{"messageId":"m"}}),
+                ),
+                (
+                    0,
+                    json!({"jsonrpc":"2.0","method":"session/update","params":{
+                        "sessionId":"s","update":{"sessionUpdate":"notice","severity":"warning","title":"unresolved"}
+                    }}),
+                ),
+                (
+                    1,
+                    json!({"jsonrpc":"2.0","method":"session/update","params":{
+                        "sessionId":"s","update":{"sessionUpdate":"agent_message","messageId":"a",
+                            "content":[{"type":"text","text":"current"}],"_meta":{"oulipoly.ai/parentMessageId":"m"}}
+                    }}),
+                ),
+                (2, idle("s")),
+            ]),
+            published: published.clone(),
+        },
+        info(),
+    );
+    client.initialize().unwrap();
+    assert!(matches!(
+        client.submit("s", &mut OutboundMessage::fresh("hello").unwrap()),
+        DeliveryOutcome::Accepted(_)
+    ));
+    let mut reported = Vec::new();
+    let mut observe = |client: &AcpClient<Gated>| {
+        reported.extend_from_slice(&client.events()[published.get()..]);
+        published.set(client.events().len());
+    };
+    assert_eq!(
+        client
+            .await_session_idle_with_events("s", &mut observe)
+            .unwrap()
+            .stop_reason,
+        Some("end_turn".to_owned())
+    );
+    assert!(matches!(
+        client.await_session_idle_with_events("s", &mut observe),
+        Err(oulipoly_acp::IdleWaitFailure::PeerGone)
+    ));
+    assert_eq!(
+        reported.len(),
+        3,
+        "no duplicate publication on a later wait"
+    );
+    assert!(matches!(&reported[0], SessionEvent::Notice { title, .. } if title == "unresolved"));
+    assert!(
+        matches!(&reported[1], SessionEvent::AgentMessage { parent_message_id, .. }
+        if parent_message_id.as_deref() == Some("m"))
+    );
+    assert!(matches!(&reported[2], SessionEvent::Idle { .. }));
+}

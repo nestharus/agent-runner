@@ -9,7 +9,29 @@
 // FAKE_CLAUDE_RECORD names a file it appends JSON lines to: its argv, the
 // environment it got, the MCP tool list and tool results.
 // FAKE_CLAUDE_SCENARIO selects a behavior: normal (default), no-echo,
-// crash, error-result, unattributed, model-mismatch, denial.
+// crash, error-result, unattributed, model-mismatch, denial, and for
+// session continuation: receiver-stops-on-second (at a new session's second
+// input, before any echo, this stand-in SIGKILLs its parent, the receiver,
+// and exits: a receiver stop with that input owed; a resumed process
+// behaves normally), forget-session (the same, but its session is never
+// recorded), resume-forks (the same, and a resumed process silently runs
+// under a different session id).
+//
+// Sessions: `--session-id=<uuid>` names a new session, `--resume=<id>`
+// continues a recorded one, as the Agent SDK passes them. FAKE_CLAUDE_SESSIONS
+// names this stand-in's own session record (JSON lines; not a Claude store).
+// A resume of an unrecorded id writes Claude Code 2.1.289's message ("No
+// conversation found with session ID: <id>") to stderr and exits 1 before
+// reading any input. A resumed process first emits that session's earlier
+// history at its first input: the earlier input's replay echo, an assistant
+// reply and a result, all attributed to that earlier input. The
+// prior-blocks-{named,unnamed}-{before,after} controls instead emit two
+// blocks (only the first stamped) and a named/unnamed prior result, before
+// or after the current reply establishes its parent. unknown-result echoes
+// current input then emits only a result naming a fresh unknown UUID;
+// sessionless-attribution omits positive session identity on echo/replies.
+// prior-blocks-named-{before-ack,after-long} pause 2.6 s (past the
+// test receipt interval), then finish a positively attributed current turn.
 //
 // Prompt text: `EXPLORE <question>` invokes the published SDK explore
 // callback and returns its complete text; `RUN <command>` calls the MCP
@@ -22,18 +44,22 @@
 // `ECHO <text>` in two assistant messages (the first carries the
 // attribution, as Claude Code's first reply does).
 
-import { appendFileSync } from "node:fs"
+import { appendFileSync, readFileSync } from "node:fs"
 import { createInterface } from "node:readline"
 import { randomUUID } from "node:crypto"
 
 const scenario = process.env.FAKE_CLAUDE_SCENARIO || "normal"
 const recordFile = process.env.FAKE_CLAUDE_RECORD
-const session = randomUUID()
+const sessionsFile = process.env.FAKE_CLAUDE_SESSIONS
 const args = process.argv.slice(2)
 const flag = (name) => {
   const at = args.indexOf(name)
   return at >= 0 ? args[at + 1] : undefined
 }
+const valueOf = (name) => args.find((arg) => arg.startsWith(`${name}=`))?.slice(name.length + 1)
+const resuming = valueOf("--resume")
+const multiBlockHistory = scenario.startsWith("prior-blocks-")
+const stopsReceiverOnSecond = (["receiver-stops-on-second", "forget-session", "resume-forks"].includes(scenario) || multiBlockHistory) && !resuming
 
 function record(value) {
   if (recordFile) appendFileSync(recordFile, JSON.stringify(value) + "\n")
@@ -43,12 +69,33 @@ function send(value) {
   process.stdout.write(JSON.stringify(value) + "\n")
 }
 
+function recorded() {
+  try {
+    return readFileSync(sessionsFile, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line))
+  } catch {
+    return []
+  }
+}
+
+function remember(value) {
+  if (sessionsFile && scenario !== "forget-session") appendFileSync(sessionsFile, JSON.stringify(value) + "\n")
+}
+
 record({
   argv: args,
   env: Object.fromEntries(Object.entries(process.env).filter(([name]) =>
     /^(ANTHROPIC_|CLAUDE|ENABLE_TOOL_SEARCH|DISABLE_|OULIPOLY_|AGENT_BASH_|HOME$|NODE_OPTIONS)/.test(name))),
   cwd: process.cwd(),
 })
+
+const history = resuming ? recorded().filter((entry) => entry.session === resuming) : []
+if (resuming && !history.length) {
+  process.stderr.write(`No conversation found with session ID: ${resuming}\n`)
+  process.exit(1)
+}
+const session = resuming ? (scenario === "resume-forks" ? randomUUID() : resuming) : (valueOf("--session-id") ?? randomUUID())
+const earlier = history.filter((entry) => entry.user).at(-1)?.user
+if (!resuming) remember({ session })
 
 let requests = 0
 const pending = new Map()
@@ -87,6 +134,23 @@ async function retrieve(identity) {
   return { acquired: Buffer.concat(chunks), pages }
 }
 
+// Documented SDK shape: several content blocks can share message.id,
+// and only the first top-level block carries user_message_uuid(s).
+function priorBlocks() {
+  const id = randomUUID()
+  const named = { user_message_uuid: earlier, user_message_uuids: [earlier] }
+  for (const [text, attribution] of [["PRIOR first block", named], ["PRIOR unstamped block", {}]]) {
+    send({ type: "assistant", uuid: randomUUID(), session_id: session, parent_tool_use_id: null,
+      ...attribution, message: { id, role: "assistant", model: flag("--model"),
+        content: [{ type: "text", text }], stop_reason: null } })
+  }
+  send({ type: "result", subtype: "success", uuid: randomUUID(), session_id: session,
+    duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1, result: "PRIOR",
+    stop_reason: "max_tokens", total_cost_usd: 0, usage: {}, modelUsage: {}, permission_denials: [],
+    ...(scenario.includes("unnamed") ? {} : named) })
+  record({ emitted_history_of: earlier })
+}
+
 let initSent = false
 let mcpReady = false
 async function turn(user) {
@@ -108,12 +172,19 @@ async function turn(user) {
   const assistant = (content, extra = {}) => send({
     type: "assistant", uuid: randomUUID(), session_id: session, parent_tool_use_id: null,
     message: { id: randomUUID(), role: "assistant", model: flag("--model"), content, stop_reason: null }, ...extra,
+    ...(scenario === "sessionless-attribution" ? { session_id: "" } : {}),
   })
   const result = (fields) => send({
     type: "result", subtype: "success", uuid: randomUUID(), session_id: session, duration_ms: 1,
     duration_api_ms: 1, is_error: false, num_turns: 1, result: "", stop_reason: "end_turn",
     total_cost_usd: 0, usage: {}, modelUsage: {}, permission_denials: [], ...attribution, ...fields,
+    ...(scenario === "sessionless-attribution" ? { session_id: "" } : {}),
   })
+  if (scenario === "unknown-result") {
+    const unknown = randomUUID()
+    result({ user_message_uuid: unknown, user_message_uuids: [unknown], stop_reason: "max_tokens" })
+    return // remain live, without any assistant attribution or later terminal
+  }
   if (scenario === "crash") {
     assistant([{ type: "text", text: "about to fail" }], attribution)
     process.exit(1)
@@ -215,13 +286,20 @@ async function turn(user) {
     result({ result: `DONE ${exploring ? body : body.split("\n")[0]}` })
     return
   }
+  if (resuming && multiBlockHistory && scenario.endsWith("before")) priorBlocks()
   assistant([{ type: "text", text: "thinking about it" }], attribution)
+  if (resuming && multiBlockHistory && scenario.includes("-after")) priorBlocks()
+  if (resuming && ["prior-blocks-named-before-ack", "prior-blocks-named-after-long"].includes(scenario)) {
+    await new Promise((resolve) => setTimeout(resolve, 2600))
+    assistant([{ type: "text", text: "current progress after quiet work" }], attribution)
+  }
   assistant([{ type: "text", text: `ECHO ${text}` }])
   const denials = scenario === "denial" ? [{ tool_name: "Write", tool_use_id: "toolu_9", tool_input: {} }] : []
   result({ result: `ECHO ${text}`, permission_denials: denials })
 }
 
 let chain = Promise.resolve()
+let users = 0
 const lines = createInterface({ input: process.stdin })
 lines.on("line", (line) => {
   let message
@@ -244,9 +322,29 @@ lines.on("line", (line) => {
     return
   }
   if (message.type === "user") {
-    record({ user: { uuid: message.uuid, client_composed: message.client_composed ?? null } })
+    users++
+    record({ user: { uuid: message.uuid, client_composed: message.client_composed ?? null, session_id: message.session_id ?? null } })
+    if (stopsReceiverOnSecond && users === 2) {
+      record({ stopped_receiver_at_input: users, receiver_pid: process.ppid })
+      process.kill(process.ppid, "SIGKILL")
+      process.exit(1)
+    }
+    if (!resuming) remember({ session, user: message.uuid })
     if (scenario === "no-echo") return
-    if (args.includes("--replay-user-messages")) send({ ...message, session_id: session, isReplay: true })
+    if (resuming && users === 1 && earlier && !multiBlockHistory) {
+      // The resumed session's earlier history, before the new input's echo.
+      const earlierAttribution = { user_message_uuid: earlier, user_message_uuids: [earlier] }
+      send({ type: "user", uuid: earlier, session_id: session, parent_tool_use_id: null, isReplay: true,
+        message: { role: "user", content: [{ type: "text", text: "earlier input" }] } })
+      send({ type: "assistant", uuid: randomUUID(), session_id: session, parent_tool_use_id: null, ...earlierAttribution,
+        message: { id: randomUUID(), role: "assistant", model: flag("--model"), content: [{ type: "text", text: "PRIOR answer" }], stop_reason: null } })
+      send({ type: "result", subtype: "success", uuid: randomUUID(), session_id: session, duration_ms: 1, duration_api_ms: 1,
+        is_error: false, num_turns: 1, result: "PRIOR answer", stop_reason: "end_turn", total_cost_usd: 0, usage: {},
+        modelUsage: {}, permission_denials: [], ...earlierAttribution })
+      record({ emitted_history_of: earlier })
+    }
+    if (resuming && multiBlockHistory && scenario.endsWith("before-ack")) priorBlocks()
+    if (args.includes("--replay-user-messages")) send({ ...message, session_id: scenario === "sessionless-attribution" ? "" : session, isReplay: true })
     chain = chain.then(() => turn(message))
   }
 })

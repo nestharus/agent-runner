@@ -31,8 +31,25 @@
 //   to this harness's work), blocks until its result, and returns the
 //   child's answer and lifecycle. The owner enforces routes, budget and
 //   depth; closing the connection (an aborted call) stops the child.
-// - session/new starts Claude Code and answers once its control handshake
-//   completed (bounded). One session per process; session/resume is refused.
+// - session/new starts a new Claude Code session under a fresh UUID this
+//   receiver chooses (the SDK's `sessionId`, persisted in the work user's
+//   store as Claude Code does by default) and answers that UUID as the ACP
+//   session id once the control handshake completed (bounded).
+// - session/resume continues that same recorded Claude Code session in a
+//   new receiver (the SDK's `resume`, never `forkSession`, never a new
+//   session id): it accepts only a session id of that UUID form (no
+//   transcript path or other value reaches `--resume`) and answers `{}` once
+//   the handshake completed (readiness only). Failure to find or load a
+//   session may precede the handshake (rejecting resume) or follow it
+//   (ending the receiver and any pending/open input visibly). It replays
+//   nothing; Claude Code loads the history itself. Answering is neither
+//   proof the history loaded as before nor any understanding of it.
+// - Session identity, either way: every Claude Code frame naming another
+//   session id ends this receiver (`_claude_session_mismatch`); it cannot
+//   retract an earlier ACK. A consumption echo counts only if it names this
+//   session. A known current UUID on a reply can ACK without a session id;
+//   that is UUID attribution, not positive session identity. One session
+//   per process.
 // - session/prompt sends one user message with a fresh random uuid and a
 //   minted, ascending `messageId`. It answers `{ messageId }` only once
 //   Claude Code consumed that message: its replay echo
@@ -48,10 +65,18 @@
 //   ends the turn: one `state_update` idle tagged
 //   "oulipoly.ai/lastUserMessageId" with the latest input it answered, and
 //   a stop reason: `end_turn` (success without error), `max_tokens`,
-//   `refusal`, or `_claude_<reason>`. A result answering no known input
-//   while an acknowledged input is open ends that input visibly as
-//   `_claude_unattributed` with an error notice; otherwise an untagged idle
-//   is readiness only.
+//   `refusal`, or `_claude_<reason>`. A result with no explicit UUID and no
+//   carried foreign origin while an acknowledged input is open ends that
+//   input visibly as `_claude_unattributed` with an error notice; otherwise
+//   an untagged idle is readiness only. Output before any input was sent, or
+//   naming only inputs it never sent (e.g. a resumed session's earlier
+//   history), is a visible notice, never forwarded, attributed or taken
+//   as a turn end of a current input. This classification carries across
+//   unattributed blocks until a result or a known current UUID. Discarded
+//   results visibly identify ended-local or unresolved provenance and open
+//   input ids, without ending current work or starting a completion clock.
+//   Ambiguous quiet work awaits attributable completion or explicit cancel;
+//   ack_timeout_s bounds consumption receipt only.
 // - Visible outcomes as notices: the CLI's init (version, model,
 //   capabilities, tools, MCP status; warning on a model other than the one
 //   asked for), assistant errors (e.g. `model_not_found`,
@@ -337,15 +362,41 @@ export function bashDecision(command, policy) {
   return { run: false, text: `Denied by this root's bash policy: ${JSON.stringify(command)} is not a command it names. Nothing was run.` }
 }
 
+// The only session ids this receiver opens or continues: the lowercase
+// UUID form `randomUUID()` mints for session/new. Anything else (a
+// transcript path, a title, another receiver's prefixed id) is refused
+// before Claude Code starts, so `--resume` never gets a value Claude Code
+// would read as a file or search.
+const SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+export function resumableSessionId(value) {
+  if (typeof value !== "string" || !SESSION_UUID.test(value))
+    throw new Error(`session ${JSON.stringify(value)} is not a Claude Code session this receiver opened; nothing started`)
+  return value
+}
+
+// Whether one Claude Code frame belongs to `expected`: `mismatch` when it
+// names another session id, `same` when it names this one, `absent` when it
+// names none.
+export function sessionOf(message, expected) {
+  const id = message?.session_id
+  if (typeof id !== "string" || id === "") return "absent"
+  return id === expected ? "same" : "mismatch"
+}
+
 // --- ACP side -------------------------------------------------------------
 
-let acp // the owner's connection, from session/new
+let acp // the owner's connection, from session/new or session/resume
 let session // { id, cwd }
+let claudeSession // the Claude Code session id this receiver opened or resumes
 let claude // the Query
 let fatalReason
 const inputs = new Map() // uuid -> input
 const byId = new Map() // messageId -> input
 let turn // the current turn: { parent, answered: Set, buffered: [] }
+// SDKAssistantMessage stamps only the first block of a top-level reply.
+// Keep its origin through subsequent unstamped blocks, independently of a
+// current turn which may already have a parent.
+let foreignTurn = false // false, "prior" (ended local UUID), or "unresolved"
 
 class Pushed {
   constructor() {
@@ -394,7 +445,7 @@ function consumed(uuids) {
   const known = []
   for (const uuid of uuids) {
     const input = inputs.get(uuid)
-    if (!input) continue
+    if (!input || input.ended) continue
     known.push(input)
     if (!input.acked) {
       input.acked = true
@@ -462,7 +513,40 @@ function endInputs(ids, stopReason) {
   })
 }
 
+// A named first block establishes origin for following unstamped blocks.
+// Ended local UUIDs are prior inputs too. An old result closes only that
+// foreign segment: it must not flush or end the saved current turn.
+function foreign(message, what) {
+  const named = attribution(message)
+  if (named.length) {
+    foreignTurn = named.some((uuid) => {
+      const input = inputs.get(uuid)
+      return input && !input.ended
+    }) ? false : named.every((uuid) => inputs.get(uuid)?.ended) ? "prior" : "unresolved"
+  }
+  const rejected = foreignTurn || (inputs.size === 0 ? "unresolved" : false)
+  if (rejected) {
+    if (turn && !turn.parent) turn = undefined // unclassified buffered text is not a current reply
+    void notice("warning", `claude ${what} not forwarded`,
+      "prior or unknown input turn; not attributed to any current input")
+  }
+  if (message.type === "result") foreignTurn = false
+  return rejected
+}
+
+// Discarded results provide no failure evidence about current work. Name
+// the unresolved inputs visibly, without borrowing the receipt clock or
+// treating an unknown UUID as proof of old history or current completion.
 function onResult(result) {
+  const origin = foreign(result, "result")
+  if (origin) {
+    const pending = [...byId.values()].filter((input) => !input.ended)
+    void notice("warning", origin === "prior" ? "claude prior result discarded" : "claude result attribution unresolved",
+      `${origin === "prior" ? "ended local input" : "prior or unknown input; current provenance unresolved"}; ` +
+      `result does not end current inputs: ${pending.map((input) => input.messageId).join(", ") || "none"}; ` +
+      "waiting for attributable completion or explicit cancellation, without a completion deadline")
+    return
+  }
   attribute(result)
   const current = startTurn()
   for (const text of current.buffered.splice(0)) emitText(text, current.parent)
@@ -513,18 +597,30 @@ function onInit(init) {
 }
 
 function onMessage(message) {
+  if (fatalReason) return
+  const identity = sessionOf(message, claudeSession)
+  if (identity === "mismatch") {
+    void fatal(`Claude Code reports session ${message.session_id}, not ${claudeSession}; ` +
+      "nothing from another conversation is acknowledged or forwarded", "_claude_session_mismatch")
+    return
+  }
   if (message.type === "user" && message.isReplay === true && typeof message.uuid === "string") {
-    consumed([message.uuid])
+    // Consumption only if the echo names this session.
+    if (identity === "same") consumed([message.uuid])
+    else if (inputs.has(message.uuid))
+      void notice("warning", "claude consumption echo names no session", `echo of ${message.uuid} not counted as consumption`)
     return
   }
   if (message.type === "system" && message.subtype === "init") return onInit(message)
   if (message.type === "result") return onResult(message)
   if (message.parent_tool_use_id) return // subagent frames carry no attribution
   if (message.type === "stream_event" || message.type === "thinking_tokens") {
+    if (foreign(message, "reply attribution")) return
     attribute(message)
     return
   }
   if (message.type === "assistant") {
+    if (foreign(message, "assistant output")) return
     startTurn()
     attribute(message)
     if (message.error) void notice("error", `claude assistant error: ${message.error}`)
@@ -538,7 +634,7 @@ function onMessage(message) {
   }
 }
 
-async function fatal(reason) {
+async function fatal(reason, stopReason = "_claude_exited") {
   if (fatalReason) return
   fatalReason = reason
   await notice("error", "claude receiver ending", reason)
@@ -549,7 +645,7 @@ async function fatal(reason) {
     }
   }
   const open = openAcked()
-  if (open.length) await endInputs(open.map((input) => input.messageId), "_claude_exited")
+  if (open.length) await endInputs(open.map((input) => input.messageId), stopReason)
   try {
     claude?.close()
   } catch {}
@@ -618,11 +714,17 @@ export function exploreTool(explore = config.explore) {
   })
 }
 
-function start(cwd) {
+// `continuation` is `{ sessionId }` (a new session under that UUID) or
+// `{ resume }` (that same recorded session; no fork, so no new id).
+function start(cwd, continuation) {
   return query({
     prompt: stdinOfClaude,
     options: {
       cwd,
+      ...continuation,
+      forkSession: false,
+      // Default, stated: resume needs the session persisted in the store.
+      persistSession: true,
       model: config.model,
       effort: config.effort,
       pathToClaudeCodeExecutable: config.claude_executable,
@@ -653,6 +755,32 @@ function withTimeout(promise, ms, what) {
   ])
 }
 
+// Starts Claude Code for `id` (new or resumed) and returns once its control
+// handshake completed. Claude Code ending first (e.g. it cannot find or
+// load a resumed session) fails at once with that end, not at the bound.
+async function open(cwd, client, id, continuation, how) {
+  if (typeof cwd !== "string" || !cwd.startsWith("/")) throw new Error("cwd must be absolute")
+  claudeSession = id
+  claude = start(cwd, continuation)
+  const ended = pump().then(() => {
+    throw new Error(`Claude Code ended before its control handshake: ${fatalReason}`)
+  })
+  // A later end (after the handshake) is the pump's own fatal, not this race's.
+  ended.catch(() => {})
+  try {
+    await withTimeout(Promise.race([claude.initializationResult(), ended]), START_MS, "Claude Code control handshake")
+  } catch (error) {
+    const reason = how === "resume"
+      ? `session ${id} not continued (unavailable or not loadable here): ${error?.message ?? error}`
+      : `start failed: ${error?.message ?? error}`
+    void fatal(reason)
+    throw new Error(reason)
+  }
+  acp = client
+  session = { id, cwd }
+  log(`session/${how} ${id} cwd=${cwd} model=${config.model} effort=${config.effort}`)
+}
+
 function app() {
   return agent({ name: "oulipoly-claude-acp-v2" })
     .onRequest(methods.agent.initialize, () => ({
@@ -660,24 +788,17 @@ function app() {
       info: { name: "claude-code+oulipoly-acp-v2", version: "0" },
       capabilities: { session: {} },
     }))
-    .onRequest(methods.agent.session.resume, () => {
-      throw new Error("session/resume is not served: each harness starts a new Claude Code session")
+    .onRequest(methods.agent.session.resume, async ({ params, client }) => {
+      if (session || claude) throw new Error("one session per receiver")
+      const id = resumableSessionId(params.sessionId)
+      await open(params.cwd, client, id, { resume: id }, "resume")
+      return {}
     })
     .onRequest(methods.agent.session.new, async ({ params, client }) => {
       if (session || claude) throw new Error("one session per receiver")
-      if (typeof params.cwd !== "string" || !params.cwd.startsWith("/")) throw new Error("cwd must be absolute")
-      claude = start(params.cwd)
-      void pump()
-      try {
-        await withTimeout(claude.initializationResult(), START_MS, "Claude Code control handshake")
-      } catch (error) {
-        void fatal(`start failed: ${error?.message ?? error}`)
-        throw error
-      }
-      acp = client
-      session = { id: `claude-${randomUUID()}`, cwd: params.cwd }
-      log(`session/new ${session.id} cwd=${params.cwd} model=${config.model} effort=${config.effort}`)
-      return { sessionId: session.id }
+      const id = randomUUID()
+      await open(params.cwd, client, id, { sessionId: id }, "new")
+      return { sessionId: id }
     })
     .onRequest(methods.agent.session.prompt, async ({ params }) => {
       if (!session || params.sessionId !== session.id) throw new Error(`session ${params.sessionId} is not open here`)
@@ -699,7 +820,7 @@ function app() {
       stdinOfClaude.push({
         type: "user",
         uuid: input.uuid,
-        session_id: "",
+        session_id: claudeSession,
         message: { role: "user", content: texts.map((text) => ({ type: "text", text })) },
         parent_tool_use_id: null,
         client_composed: true,

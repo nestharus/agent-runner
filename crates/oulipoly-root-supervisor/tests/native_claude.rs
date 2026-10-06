@@ -115,6 +115,11 @@ impl Fixture {
                 "FAKE_CLAUDE_RECORD".to_owned(),
                 record.to_str().unwrap().to_owned(),
             ),
+            // The stand-in's own session record (not a Claude store).
+            (
+                "FAKE_CLAUDE_SESSIONS".to_owned(),
+                dir.join("fake-sessions.jsonl").to_str().unwrap().to_owned(),
+            ),
             // Ambient credentials and redirects that must not reach Claude Code.
             (
                 "ANTHROPIC_API_KEY".to_owned(),
@@ -142,11 +147,18 @@ impl Fixture {
     }
 
     fn spec(&self, store: &str, message: &str) -> Value {
+        self.spec_with_caps(store, message, 1)
+    }
+
+    /// The owner's existing relaunch-after-observed-exit path needs caps
+    /// above 1 to relaunch at all; this fixture setting does not change the
+    /// installed front door's caps.
+    fn spec_with_caps(&self, store: &str, message: &str, caps: u32) -> Value {
         json!({
             "store": self.dir.join(store),
             "intent": {
-                "outage_closure_cap": 1,
-                "delivery_attempt_cap": 1,
+                "outage_closure_cap": caps,
+                "delivery_attempt_cap": caps,
                 "cwd": self.project,
                 "workload": { "isolation": "unprivileged-userns" },
                 "harnesses": [{
@@ -173,6 +185,27 @@ impl Fixture {
             .find(|value| value.get("argv").is_some())
             .expect("stand-in started")
     }
+
+    /// Every stand-in start's argv, in order.
+    fn launches(&self) -> Vec<Vec<String>> {
+        self.records()
+            .iter()
+            .filter_map(|value| value.get("argv"))
+            .map(|argv| {
+                argv.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|arg| arg.as_str().unwrap().to_owned())
+                    .collect()
+            })
+            .collect()
+    }
+}
+
+/// The value of an SDK `--name=value` argument, if present.
+fn eq_flag<'a>(argv: &'a [String], name: &str) -> Option<&'a str> {
+    let prefix = format!("{name}=");
+    argv.iter().find_map(|arg| arg.strip_prefix(&prefix))
 }
 
 /// `real`'s `node_modules` seen through symlinks, except the SDK's Linux
@@ -319,7 +352,7 @@ fn trusted_task_turn_runs_attributed_bash_and_links_answers_to_inputs() {
     let fixture = Fixture::new("normal", None, None);
     println!("receipt: {}", fixture.receipt);
     let mut run = Run::start(&fixture, &fixture.spec("root", &format!("RUN {COMMAND}")));
-    run.event("session-opened");
+    let opened = run.event("session-opened");
     let ack = run.event("ack");
     assert_eq!(ack["label"], "accepted", "{ack}");
     let first = ack["message_id"].as_str().unwrap().to_owned();
@@ -406,6 +439,19 @@ fn trusted_task_turn_runs_attributed_bash_and_links_answers_to_inputs() {
         "--input-format",
     ] {
         assert!(argv.contains(&flag), "{flag}: {argv:?}");
+    }
+    // A fresh session: Claude Code is asked for a new session under exactly
+    // the id the owner recorded, never to resume or continue one.
+    let launches = fixture.launches();
+    assert_eq!(launches.len(), 1, "{launches:?}");
+    assert_eq!(
+        eq_flag(&launches[0], "--session-id"),
+        opened["session"].as_str(),
+        "{opened} {argv:?}"
+    );
+    assert_eq!(eq_flag(&launches[0], "--resume"), None, "{argv:?}");
+    for flag in ["--continue", "--fork-session", "--no-session-persistence"] {
+        assert!(!argv.contains(&flag), "{flag}: {argv:?}");
     }
     // No external MCP configuration: the one server is the receiver's own,
     // named in the SDK's initialize request; no hooks are registered.
@@ -877,6 +923,12 @@ fn error_unattributed_model_and_denial_outcomes_are_visible() {
             "claude model differs",
         ),
         ("denial", "end_turn", "warning", "claude permission denials"),
+        (
+            "sessionless-attribution",
+            "end_turn",
+            "warning",
+            "claude consumption echo names no session",
+        ),
     ] {
         let fixture = Fixture::new(scenario, None, None);
         let mut run = Run::start(&fixture, &fixture.spec("root", "hello"));
@@ -909,5 +961,371 @@ fn error_unattributed_model_and_denial_outcomes_are_visible() {
                 && value["input"] == 0
                 && value["text"] == "ECHO hello"));
         }
+    }
+}
+
+/// Runs a session's first input to its turn end, then a follow-up at whose
+/// receipt the stand-in stops the receiver (SIGKILL) before any echo, so
+/// the follow-up is owed when the receiver stops. Returns the run, the
+/// recorded session and the first input's ACK id.
+fn first_turn_then_receiver_stop(fixture: &Fixture) -> (Run, String, String) {
+    let mut run = Run::start(fixture, &fixture.spec_with_caps("root", "first input", 2));
+    let opened = run.event("session-opened");
+    let session = opened["session"].as_str().unwrap().to_owned();
+    let ack = run.until("ack 0", |value| {
+        value["event"] == "ack" && value["index"] == 0
+    });
+    let first = ack["message_id"].as_str().unwrap().to_owned();
+    run.until("turn end 0", |value| {
+        value["event"] == "turn-end" && value["input"] == 0
+    });
+    run.control(json!({ "cmd": "send", "text": "second input", "ref": "f1" }));
+    run.event("follow-up-admitted");
+    run.event("relaunch");
+    (run, session, first)
+}
+
+/// After the receiver stops, a new receiver continues the same recorded
+/// Claude Code session: Claude Code is asked to resume exactly that id
+/// (no new id, no fork), the owner reports the same session resumed, and
+/// only the follow-up's own consumption is acknowledged and linked. The
+/// session's earlier history that Claude Code emits is neither forwarded
+/// nor taken as the follow-up's ACK, answer or turn end.
+#[test]
+#[ignore = "needs OULIPOLY_NATIVE_CLAUDE_DEPS, OULIPOLY_NATIVE_NODE and AGENT_BASH_BIN"]
+fn stopped_receiver_continues_the_same_recorded_session() {
+    let fixture = Fixture::new("receiver-stops-on-second", None, None);
+    let (mut run, session, first) = first_turn_then_receiver_stop(&fixture);
+    let resumed = run.event("session-resumed");
+    assert_eq!(resumed["session"], session.as_str(), "{resumed}");
+    let ack = run.until("ack 1", |value| {
+        value["event"] == "ack" && value["index"] == 1
+    });
+    // An earlier attempt reached a receiver that stopped without an ACK:
+    // its insertion is unknown, so this ACK cannot claim at-most-once.
+    assert_eq!(ack["label"], "duplicate-unknown", "{ack}");
+    let second = ack["message_id"].as_str().unwrap().to_owned();
+    assert!(second > first, "{first} < {second}");
+    let answer = run.until("answer 1", |value| {
+        value["event"] == "agent-message"
+            && value["input"] == 1
+            && value["text"] == "ECHO second input"
+    });
+    assert_eq!(answer["parent_message_id"], second.as_str(), "{answer}");
+    let end = run.until("turn end 1", |value| {
+        value["event"] == "turn-end" && value["input"] == 1
+    });
+    assert_eq!(end["stop_reason"], "end_turn", "{end}");
+    run.control(json!({ "cmd": "close" }));
+    let (terminal, code, seen) = run.end();
+    println!("terminal: {terminal}");
+    assert_eq!(terminal["status"], "closed", "{terminal}");
+    assert_eq!(code, Some(7), "{terminal}");
+    assert_eq!(
+        seen.iter()
+            .filter(|value| value["event"] == "session-opened")
+            .count(),
+        1,
+        "no second, fresh session: {seen:#?}"
+    );
+    assert!(
+        !seen.iter().any(|value| value["event"] == "agent-message"
+            && value["text"].as_str().unwrap_or("").contains("PRIOR")),
+        "earlier history forwarded: {seen:#?}"
+    );
+    let warned = |title: &str| {
+        seen.iter().any(|value| {
+            value["event"] == "notice" && value["severity"] == "warning" && value["title"] == title
+        })
+    };
+    assert!(warned("claude assistant output not forwarded"), "{seen:#?}");
+    assert!(warned("claude result not forwarded"), "{seen:#?}");
+    assert_eq!(
+        seen.iter()
+            .filter(|value| value["event"] == "ack" && value["index"] == 0)
+            .count(),
+        1,
+        "{seen:#?}"
+    );
+
+    let launches = fixture.launches();
+    assert_eq!(launches.len(), 2, "{launches:?}");
+    assert_eq!(
+        eq_flag(&launches[0], "--session-id"),
+        Some(session.as_str())
+    );
+    assert_eq!(eq_flag(&launches[0], "--resume"), None);
+    assert_eq!(eq_flag(&launches[1], "--resume"), Some(session.as_str()));
+    assert_eq!(
+        eq_flag(&launches[1], "--session-id"),
+        None,
+        "{:?}",
+        launches[1]
+    );
+    for flag in ["--fork-session", "--continue", "--no-session-persistence"] {
+        assert!(!launches[1].iter().any(|arg| arg == flag), "{flag}");
+    }
+    let records = fixture.records();
+    let users: Vec<&Value> = records
+        .iter()
+        .filter_map(|value| value.get("user"))
+        .collect();
+    // Input 0 and the follow-up's stopped attempt, then its one resend.
+    assert_eq!(users.len(), 3, "{users:?}");
+    assert!(
+        users
+            .iter()
+            .all(|user| user["session_id"] == session.as_str()),
+        "{users:?}"
+    );
+    let history = records
+        .iter()
+        .find_map(|value| value.get("emitted_history_of"))
+        .expect("the resumed stand-in emitted earlier history");
+    assert_eq!(history, &users[0]["uuid"], "{records:?}");
+}
+
+/// A recorded session Claude Code cannot find: the resume fails visibly,
+/// nothing is acknowledged and no new session takes its place.
+#[test]
+#[ignore = "needs OULIPOLY_NATIVE_CLAUDE_DEPS, OULIPOLY_NATIVE_NODE and AGENT_BASH_BIN"]
+fn unavailable_recorded_session_fails_without_a_fresh_substitute() {
+    let fixture = Fixture::new("forget-session", None, None);
+    let (run, session, _) = first_turn_then_receiver_stop(&fixture);
+    let (terminal, code, seen) = run.end();
+    println!("terminal: {terminal}");
+    assert!(code.is_some(), "{terminal}");
+    let failed = seen
+        .iter()
+        .find(|value| value["event"] == "session-failed")
+        .unwrap_or_else(|| panic!("no session-failed: {seen:#?}"));
+    assert!(
+        failed["label"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("session-rejected-"),
+        "{failed}"
+    );
+    assert!(!has(&seen, "session-resumed"), "{seen:#?}");
+    assert_eq!(
+        seen.iter()
+            .filter(|value| value["event"] == "session-opened")
+            .count(),
+        1,
+        "{seen:#?}"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|value| value["event"] == "ack" && value["index"] == 1),
+        "{seen:#?}"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|value| value["event"] == "agent-message" && value["input"] == 1),
+        "{seen:#?}"
+    );
+    let launches = fixture.launches();
+    assert_eq!(launches.len(), 2, "{launches:?}");
+    assert_eq!(eq_flag(&launches[1], "--resume"), Some(session.as_str()));
+    assert_eq!(eq_flag(&launches[1], "--session-id"), None);
+    // The follow-up was never sent to the process that could not resume.
+    let users = fixture
+        .records()
+        .iter()
+        .filter(|value| value.get("user").is_some())
+        .count();
+    assert_eq!(users, 2, "input 0 and the stopped attempt only");
+}
+
+/// Claude Code continuing under another session id than the one resumed
+/// (a silently fresh or forked conversation): the receiver acknowledges
+/// nothing, forwards nothing and ends visibly; the follow-up is refused.
+#[test]
+#[ignore = "needs OULIPOLY_NATIVE_CLAUDE_DEPS, OULIPOLY_NATIVE_NODE and AGENT_BASH_BIN"]
+fn mismatched_resumed_session_acknowledges_nothing() {
+    let fixture = Fixture::new("resume-forks", None, None);
+    let (mut run, session, _) = first_turn_then_receiver_stop(&fixture);
+    let resumed = run.event("session-resumed");
+    assert_eq!(resumed["session"], session.as_str(), "{resumed}");
+    let rejected = run.until("follow-up refused", |value| {
+        value["event"] == "rejected" && value["index"] == 1
+    });
+    println!("rejected: {rejected}");
+    let (terminal, code, seen) = run.end();
+    println!("terminal: {terminal}");
+    assert!(code.is_some(), "{terminal}");
+    assert!(
+        !seen
+            .iter()
+            .any(|value| value["event"] == "ack" && value["index"] == 1),
+        "{seen:#?}"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|value| value["event"] == "agent-message" && value["input"] == 1),
+        "{seen:#?}"
+    );
+    assert!(
+        seen.iter().any(|value| value["event"] == "notice"
+            && value["title"] == "claude receiver ending"
+            && value["description"]
+                .as_str()
+                .unwrap_or("")
+                .contains(&format!("not {session}"))),
+        "{seen:#?}"
+    );
+}
+
+/// The SDK stamps only the first top-level block. Prior blocks and their
+/// named/unnamed result cannot leak into, or supply the stop reason for,
+/// a current reply, even once that reply already has a parent.
+#[test]
+#[ignore = "needs OULIPOLY_NATIVE_CLAUDE_DEPS, OULIPOLY_NATIVE_NODE and AGENT_BASH_BIN"]
+fn prior_multiblock_turns_do_not_supply_current_output_or_turn_end() {
+    for scenario in [
+        "prior-blocks-named-before",
+        "prior-blocks-unnamed-before",
+        "prior-blocks-named-after",
+        "prior-blocks-unnamed-after",
+    ] {
+        let fixture = Fixture::new(scenario, None, Some(2));
+        let (mut run, session, _) = first_turn_then_receiver_stop(&fixture);
+        let resumed = run.event("session-resumed");
+        assert_eq!(resumed["session"], session.as_str());
+        let ack = run.until("ack 1", |v| v["event"] == "ack" && v["index"] == 1);
+        let end = run.until("current turn end", |v| {
+            v["event"] == "turn-end" && v["input"] == 1
+        });
+        assert_eq!(end["stop_reason"], "end_turn", "{scenario}: {end}");
+        run.control(json!({ "cmd": "close" }));
+        let (terminal, code, seen) = run.end();
+        assert_eq!(terminal["status"], "closed", "{scenario}: {terminal}");
+        assert_eq!(code, Some(7));
+        assert!(
+            !seen.iter().any(|v| v["event"] == "agent-message"
+                && v["text"].as_str().unwrap_or("").contains("PRIOR")),
+            "{scenario}: prior blocks leaked: {seen:#?}"
+        );
+        assert!(
+            seen.iter().any(|v| v["event"] == "agent-message"
+                && v["text"] == "ECHO second input"
+                && v["parent_message_id"] == ack["message_id"]),
+            "{scenario}: current continuation lost: {seen:#?}"
+        );
+        assert_eq!(
+            seen.iter()
+                .filter(|v| v["event"] == "turn-end" && v["input"] == 1)
+                .count(),
+            1
+        );
+        assert_eq!(
+            seen.iter()
+                .filter(|v| v["event"] == "ack" && v["index"] == 1)
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(&fixture.dir).unwrap();
+    }
+}
+
+/// An unknown-UUID result is visibly unresolved, not a current terminal.
+/// Quiet acknowledged work stays open past its receipt interval until the
+/// caller explicitly cancels. This replaces the superseded O4 bounded-end
+/// oracle; the test's observation window is not a receiver completion clock.
+#[test]
+#[ignore = "needs OULIPOLY_NATIVE_CLAUDE_DEPS, OULIPOLY_NATIVE_NODE and AGENT_BASH_BIN"]
+fn fresh_unknown_uuid_result_is_visible_and_waits_for_explicit_cancellation() {
+    let fixture = Fixture::new("unknown-result", None, Some(2));
+    let mut run = Run::start(&fixture, &fixture.spec("root", "hello"));
+    run.event("ack");
+    let notice = run.until("unresolved result notice", |v| {
+        v["event"] == "notice" && v["title"] == "claude result attribution unresolved"
+    });
+    assert!(
+        notice["description"]
+            .as_str()
+            .unwrap()
+            .contains("explicit cancellation")
+    );
+    let until = std::time::Instant::now() + Duration::from_millis(2600);
+    while let Some(left) = until.checked_duration_since(std::time::Instant::now()) {
+        match run.lines.recv_timeout(left) {
+            Ok(value) => {
+                assert_ne!(
+                    value["event"], "turn-end",
+                    "unknown result falsely ended current input: {value}"
+                );
+                assert_ne!(
+                    value["event"], "terminal",
+                    "quiet current work was stopped: {value}"
+                );
+                run.seen.push(value);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            Err(error) => panic!("receiver disappeared during quiet work: {error}"),
+        }
+    }
+    assert!(!has(&run.seen, "turn-end"), "{:#?}", run.seen);
+    run.control(json!({ "cmd": "cancel" }));
+    let (terminal, code, seen) = run.end();
+    assert_eq!(terminal["status"], "cancelled", "{terminal}");
+    assert!(code.is_some());
+    assert_eq!(seen.iter().filter(|v| v["event"] == "ack").count(), 1);
+    assert!(!has(&seen, "agent-message"), "{seen:#?}");
+    assert!(!has(&seen, "relaunch"), "{seen:#?}");
+    std::fs::remove_dir_all(&fixture.dir).unwrap();
+}
+
+/// Prior results before receipt and during an attributed current reply are
+/// not failure evidence. The same resumed input completes after quiet work
+/// longer than ack_timeout_s, with its own parent and its own stop reason.
+#[test]
+#[ignore = "needs OULIPOLY_NATIVE_CLAUDE_DEPS, OULIPOLY_NATIVE_NODE and AGENT_BASH_BIN"]
+fn prior_results_do_not_limit_long_current_continuation() {
+    for scenario in [
+        "prior-blocks-named-before-ack",
+        "prior-blocks-named-after-long",
+    ] {
+        let fixture = Fixture::new(scenario, None, Some(2));
+        let (mut run, session, _) = first_turn_then_receiver_stop(&fixture);
+        let resumed = run.event("session-resumed");
+        assert_eq!(resumed["session"], session.as_str());
+        let ack = run.until("ack 1", |v| v["event"] == "ack" && v["index"] == 1);
+        let started = std::time::Instant::now();
+        let end = run.until("long current turn end", |v| {
+            v["event"] == "turn-end" && v["input"] == 1
+        });
+        assert_eq!(end["stop_reason"], "end_turn", "{scenario}: {end}");
+        assert!(
+            started.elapsed() > Duration::from_secs(2),
+            "{scenario}: no long work encountered"
+        );
+        run.control(json!({ "cmd": "close" }));
+        let (terminal, code, seen) = run.end();
+        assert_eq!(terminal["status"], "closed", "{terminal}");
+        assert_eq!(code, Some(7));
+        assert!(
+            !seen.iter().any(|v| v["event"] == "agent-message"
+                && v["text"].as_str().unwrap_or("").contains("PRIOR")),
+            "{scenario}: {seen:#?}"
+        );
+        for text in ["current progress after quiet work", "ECHO second input"] {
+            assert!(
+                seen.iter().any(|v| v["event"] == "agent-message"
+                    && v["text"] == text
+                    && v["parent_message_id"] == ack["message_id"]),
+                "{scenario}: {seen:#?}"
+            );
+        }
+        assert_eq!(
+            seen.iter()
+                .filter(|v| v["event"] == "turn-end" && v["input"] == 1)
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(&fixture.dir).unwrap();
     }
 }

@@ -543,11 +543,25 @@ impl<T: Transport> AcpClient<T> {
     /// attempt. Later attempts do not reset the cursor; already-observed idle
     /// may precede the latest message. This is readiness, never its completion.
     pub fn await_session_idle(&mut self, session_id: &str) -> Result<SessionIdle, IdleWaitFailure> {
+        self.await_session_idle_with_events(session_id, |_| {})
+    }
+
+    /// Wait with the same idle cursor and readiness semantics as
+    /// [`Self::await_session_idle`], exposing collected events before the next
+    /// blocking receive. Called once for the existing event history and after
+    /// each inbound method; consumers keep their own reporting cursor.
+    /// Observation does not consume events or imply idle or completion.
+    pub fn await_session_idle_with_events(
+        &mut self,
+        session_id: &str,
+        mut observe: impl FnMut(&Self),
+    ) -> Result<SessionIdle, IdleWaitFailure> {
         let Some(&start) = self.idle_cursor.get(session_id) else {
             return Err(IdleWaitFailure::NoAttempt);
         };
         let mut scanned = start;
         loop {
+            observe(self);
             if let Some((next, idle)) =
                 self.events[scanned..]
                     .iter()
