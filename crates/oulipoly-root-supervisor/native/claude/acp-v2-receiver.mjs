@@ -148,7 +148,7 @@ export function renderRootV1(exitCode, stdout, stderr) {
       !Number.isSafeInteger(omitted) || omitted < 0 || presented > output.bytes ||
       omitted !== output.bytes - presented || bytes.length !== presented ||
       bytes.toString("base64") !== output.base64 ||
-      (hasPresentation && output.remainder !== (omitted ? "discarded" : "none")))
+      (hasPresentation && (omitted ? !["discarded", "retained-by-owner", "partial-owner-retention"].includes(output.remainder) : output.remainder !== "none")))
     return { text: unresolved("output length or encoding mismatch"), error: true }
   const ended = value.outcome === "ended" || value.outcome === "ended-output-unproven"
   if (ended !== (value.wait !== null && typeof value.wait === "object") ||
@@ -179,14 +179,15 @@ export function renderRootV1(exitCode, stdout, stderr) {
   }
   const consumerOmitted = presented - shown
   const totalOmitted = output.bytes - shown
+  const retention = renderRetention(output.retained, output.reference)
   const presentation = consumerOmitted
     ? `\nProducer output: ${presented} carried bytes of ${output.bytes} received; ${omitted} omitted; ` +
-      (omitted ? "remainder discarded, not retained." : "remainder none.") +
+      (retention ? "owner retention described below." : omitted ? "remainder discarded, not retained." : "remainder none.") +
       `\nClaude presentation: ${shown} shown bytes of ${presented} producer-carried; ` +
       `${consumerOmitted} additionally omitted; ${totalOmitted} total omitted of ${output.bytes} received; ` +
-      "additional remainder not presented, not retained by this receiver."
+      (retention ? "additional remainder not presented; see owner retention below." : "additional remainder not presented, not retained by this receiver.")
     : `\nOutput: ${presented} shown bytes of ${output.bytes} received; ${omitted} omitted; ` +
-      (omitted ? "remainder discarded, not retained." : "remainder none.")
+      (retention ? "owner retention described below." : omitted ? "remainder discarded, not retained." : "remainder none.")
   const prefix = bytes.subarray(0, shown)
   const body = `\n--- output (stderr joined; ${shown} shown bytes, ${utf8 ? "utf8" : "hex"}) ---\n` +
     (utf8 ? prefix.toString("utf8") : prefix.toString("hex"))
@@ -198,7 +199,7 @@ export function renderRootV1(exitCode, stdout, stderr) {
       return { text: `Root v1 accepted the command, then reported a positive no-start; nothing was run.\n${stages}${faults}`, error: true }
     case "unknown":
       return { text: `Root v1 outcome unknown (${value.meaning}): the command may have run. Do not replay.\n` +
-        `${stages}${faults}${presentation}${bytes.length ? `${body}\n(output above is partial and unproven)` : ""}`, error: true }
+        `${stages}${faults}${presentation}${retention}${bytes.length ? `${body}\n(output above is partial and unproven)` : ""}`, error: true }
     default: {
       const wait = value.wait.exit?.code !== undefined
         ? `exited with code ${value.wait.exit.code}`
@@ -207,24 +208,66 @@ export function renderRootV1(exitCode, stdout, stderr) {
         ? `output ${totalOmitted ? "partial" : "complete"} (full stream counted, closed, matched by the end)`
         : "output delivery unproven: the output below may be incomplete; do not replay"
       return { text: `Root v1 work ended: ${wait} (${value.wait.status}, observer ${value.wait.observer}); ` +
-        `${status}.\n${stages}${faults}${presentation}${body}`, error: false }
+        `${status}.\n${stages}${faults}${presentation}${retention}${body}`, error: false }
     }
   }
 }
 
+function renderRetention(record, reference) {
+  if (!record) return reference ? `\nOwner output reference=${reference}; seal not observed. ` +
+    `Use {output_identity: "${reference}"} to request retained bytes from the current owner; availability/loss may remain unknown.` : ""
+  if (!["complete", "partial"].includes(record.state) || typeof record.identity !== "string") {
+    return `\nOwner retention: ${record.state ?? "unknown"}; no recoverable identity. ${JSON.stringify(record.losses ?? record.reason ?? "")}`
+  }
+  return `\nOwner retention: ${record.state}, ${record.bytes} bytes; received=${record.received ?? "unknown"}; ` +
+    `losses=${JSON.stringify(record.losses)}. identity=${record.identity}` +
+    `\nRead with {output_identity: "${record.identity}", output_offset: 0, output_length: 1024}; continue at next_offset. ` +
+    `Explicit local acceptance: {output_identity: "${record.identity}", accept_output: true}. ` +
+    "Acceptance names retained bytes only; no input ACK, processing, remote settlement or drain. Retention ends with root/store retirement."
+}
+
+export function renderRootOutput(exitCode, stdout) {
+  const unknown = { text: "Native output reply unresolved; local acceptance unconfirmed. No command replay.", error: true }
+  if (exitCode !== 0) return unknown
+  let value
+  try { value = JSON.parse(stdout) } catch { return unknown }
+  if (value.result_surface !== "agent-bash-root-v1-output" || value.version !== 1) return unknown
+  if (["refused", "unknown"].includes(value.outcome)) {
+    return { text: `Root v1 output ${value.outcome}: ${value.reason}. Local acceptance unconfirmed; no command replay.`, error: true }
+  }
+  const reply = value.reply
+  if (value.outcome === "accepted") {
+    return { text: `Root v1 exact local acceptance: ${reply.retained.identity}; durable=${reply.durable}; repeat=${reply.repeat}. ` +
+      `receipt=${JSON.stringify(reply.receipt)}. Not an input ACK, processing, remote settlement or drain.`, error: false }
+  }
+  if (value.outcome !== "read") return unknown
+  const bytes = Buffer.from(reply.b64, "base64")
+  const text = bytes.toString("utf8")
+  const utf8 = !bytes.includes(0) && Buffer.from(text, "utf8").equals(bytes)
+  return { text: `Root v1 retained range: identity=${reply.retained.identity}; state=${reply.retained.state}; ` +
+    `offset=${reply.offset}; length=${bytes.length}; next_offset=${reply.next_offset}; eof=${reply.eof}; ` +
+    `received=${reply.retained.received ?? "unknown"}; losses=${JSON.stringify(reply.retained.losses)}. ` +
+    "No local acceptance was recorded by this read." +
+    `\n--- retained bytes (${utf8 ? "utf8" : "hex"}; ${bytes.length} bytes) ---\n${utf8 ? text : bytes.toString("hex")}`, error: false }
+}
+
 // One command through agent-bash and so through the root's Bash ingress.
-function runRootBash(command, cwd) {
+function runRootBash(command, cwd, outputRequest) {
   return new Promise((done) => {
     let stdout = ""
     let stderr = ""
     let size = 0
     let child
     try {
-      child = spawn(config.agent_bash_bin, ["run", "--delivery", "sync", "--", "bash", "-lc", command], {
+      const argv = outputRequest ? (outputRequest.accept_output ? ["native-accept", outputRequest.output_identity]
+        : ["native-output", outputRequest.output_identity, "--offset", String(outputRequest.output_offset ?? 0),
+           "--length", String(outputRequest.output_length ?? 1024)]) : ["run", "--delivery", "sync", "--", "bash", "-lc", command]
+      child = spawn(config.agent_bash_bin, argv, {
         cwd, env: process.env, stdio: ["ignore", "pipe", "pipe"],
       })
     } catch (error) {
-      done({ text: `agent-bash not started (${error?.code ?? error}); nothing was run.`, error: true })
+      done({ text: outputRequest ? `Native output client not started (${error?.code ?? error}); no request sent.`
+        : `agent-bash not started (${error?.code ?? error}); nothing was run.`, error: true })
       return
     }
     const take = (sink) => (chunk) => {
@@ -239,13 +282,15 @@ function runRootBash(command, cwd) {
     child.stdout.setEncoding("utf8").on("data", take("out"))
     child.stderr.setEncoding("utf8").on("data", take("err"))
     child.on("error", (error) =>
-      done({ text: `agent-bash not started (${error?.code ?? error}); nothing was run.`, error: true }))
+      done({ text: outputRequest ? `Native output client not started (${error?.code ?? error}); no request sent.`
+        : `agent-bash not started (${error?.code ?? error}); nothing was run.`, error: true }))
     child.on("close", (code) => {
       if (size > OUTPUT_LIMIT) {
-        done({ text: "Root v1 result unresolved (result larger than this tool's bound); the command may have run; do not replay.", error: true })
+        done({ text: outputRequest ? "Native output result unresolved (result larger than this tool's bound); local acceptance unconfirmed."
+          : "Root v1 result unresolved (result larger than this tool's bound); the command may have run; do not replay.", error: true })
         return
       }
-      done(renderRootV1(code, stdout.trim(), stderr))
+      done(outputRequest ? renderRootOutput(code, stdout.trim()) : renderRootV1(code, stdout.trim(), stderr))
     })
   })
 }
@@ -494,10 +539,24 @@ function bashServer(cwd) {
     version: "1",
     alwaysLoad: true,
     tools: [
-      tool("bash", description, {
-        command: z.string().describe("the shell command to run"),
+      tool("bash", description + " Read retained output with output_identity/output_offset/output_length; accept_output records explicit exact local acceptance.", {
+        output_identity: z.string().optional().describe("native retained identity (rv1o:...) or pre-seal work reference (rv1w:...) returned by Bash"),
+        output_offset: z.number().int().nonnegative().optional().describe("native byte offset (default 0)"),
+        output_length: z.number().int().min(1).max(1024).optional().describe("native range byte count, 1..1024 (default 1024)"),
+        accept_output: z.boolean().optional().describe("explicit local acceptance of precisely output_identity; no ACK/processing/drain"),
+        command: z.string().optional().describe("the shell command to run"),
         workdir: z.string().optional().describe("absolute working directory (default: the session's)"),
       }, async (args) => {
+        const retained = ["output_identity", "output_offset", "output_length", "accept_output"].some(key => args[key] !== undefined)
+        if (retained) {
+          if (typeof args.output_identity !== "string" || args.command !== undefined || args.workdir !== undefined ||
+              (args.accept_output && (args.output_offset !== undefined || args.output_length !== undefined))) {
+            return { content: [{ type: "text", text: "Native output request conflicts with command/workdir or acceptance range. Nothing sent." }], isError: true }
+          }
+          const result = await runRootBash(undefined, cwd, args)
+          return { content: [{ type: "text", text: result.text }], isError: result.error }
+        }
+        if (typeof args.command !== "string") return { content: [{ type: "text", text: "command or output_identity required. Nothing sent." }], isError: true }
         const decision = bashDecision(args.command, config.bash)
         if (!decision.run) return { content: [{ type: "text", text: decision.text }], isError: true }
         const workdir = args.workdir ?? cwd

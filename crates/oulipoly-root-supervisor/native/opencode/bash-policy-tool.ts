@@ -27,12 +27,17 @@ export default tool({
   description: agentBash.description,
   args: agentBash.args,
   async execute(args, context) {
-    const pattern = args.command ?? `handle ${args.handle ?? ""}`
+    const pattern = args.output_identity !== undefined
+      ? `native-${args.accept_output ? "accept" : "output"} ${args.output_identity}` +
+        (args.accept_output ? "" : ` offset=${args.output_offset ?? 0} length=${args.output_length ?? 16384}`)
+      : args.command ?? `handle ${args.handle ?? ""}`
     await context.ask({
       permission: "bash",
       patterns: [pattern],
       always: [pattern],
-      metadata: { command: args.command, handle: args.handle, delivery: args.delivery, workdir: args.workdir },
+      metadata: { command: args.command, handle: args.handle, delivery: args.delivery, workdir: args.workdir,
+        output_identity: args.output_identity, output_offset: args.output_offset, output_length: args.output_length,
+        accept_output: args.accept_output },
     })
     return agentBash.execute(args, context)
   },

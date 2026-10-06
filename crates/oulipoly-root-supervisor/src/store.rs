@@ -42,6 +42,14 @@
 //!   rechecked at commit), and how the child ended (`outcome`). Its prompt is
 //!   its one message. A `bash_run` also keeps the requesting harness work.
 //!   Version 7 added both (no migration: no legacy data is kept).
+//! * `bash_output` is a Bash run's sealed retained output (the
+//!   [`crate::retention`] module): how many bytes were kept in its file, of
+//!   how many received, their SHA-256, `complete` or `partial`, and every
+//!   recorded loss. `bash_output_accept` is the requesting harness's one
+//!   local acceptance of exactly that identity: which harness work accepted
+//!   it, under which owner generation, when. Local only: not an insertion
+//!   acknowledgement, processing, remote settlement or a drain. Version 8
+//!   added both (no migration).
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -59,7 +67,7 @@ pub(crate) const LOCK_FILE: &str = "owner.lock";
 pub(crate) const DB_FILE: &str = "intent.sqlite3";
 /// Version of this new per-root lineage. There is no migration chain: a
 /// store of any other version is refused.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 /// How long a write waits for a foreign SQLite lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -158,6 +166,25 @@ CREATE TABLE bash_run (
     inputs_open TEXT NOT NULL,
     argv TEXT NOT NULL,
     cwd TEXT NOT NULL
+);
+CREATE TABLE bash_output (
+    work INTEGER PRIMARY KEY REFERENCES bash_run(work),
+    received INTEGER,
+    retained INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('complete', 'partial', 'unsealed')),
+    losses TEXT NOT NULL,
+    sealed_generation INTEGER NOT NULL
+);
+CREATE TABLE bash_output_accept (
+    work INTEGER PRIMARY KEY REFERENCES bash_output(work),
+    harness INTEGER NOT NULL REFERENCES harness(position),
+    harness_work INTEGER NOT NULL REFERENCES work(id),
+    requester_pid INTEGER NOT NULL,
+    retained INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    accepted_unix INTEGER NOT NULL
 );
 CREATE TABLE attempt (
     id INTEGER PRIMARY KEY,
@@ -282,6 +309,38 @@ pub(crate) struct OpenChild {
     pub(crate) id: String,
     pub(crate) work: i64,
     pub(crate) incarnation: i64,
+}
+
+/// A Bash run's sealed retained output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OutputRecord {
+    /// Bytes read from the stream by the sealing lineage; `None` when an
+    /// earlier owner read part of it.
+    pub(crate) received: Option<u64>,
+    pub(crate) retained: u64,
+    pub(crate) sha256: String,
+    /// `complete`, `partial`, or `unsealed` (durable loss without an identity).
+    pub(crate) state: String,
+    /// JSON array of recorded losses.
+    pub(crate) losses: String,
+}
+
+/// A Bash work as a retained-output request finds it.
+pub(crate) struct OutputLookup {
+    /// Position of the harness that requested the run.
+    pub(crate) harness: usize,
+    pub(crate) record: Option<OutputRecord>,
+}
+
+/// The one local acceptance of a run's retained output.
+#[derive(Debug, Clone)]
+pub(crate) struct OutputAccept {
+    pub(crate) harness_work: i64,
+    pub(crate) requester_pid: i32,
+    pub(crate) retained: u64,
+    pub(crate) sha256: String,
+    pub(crate) generation: i64,
+    pub(crate) accepted_unix: i64,
 }
 
 /// A root PID 1 incarnation not yet recorded as ended.
@@ -868,6 +927,129 @@ impl Store {
                 params![work, outcome, observer, generation],
             )
             .map(drop)
+        })
+    }
+
+    /// Commits a run's sealed retained output, once.
+    pub(crate) fn seal_output(
+        &mut self,
+        work: i64,
+        record: &OutputRecord,
+    ) -> Result<(), StoreError> {
+        let generation = self.generation;
+        self.write(|tx| {
+            tx.execute(
+                "INSERT INTO bash_output (work, received, retained, sha256, state, losses,
+                                          sealed_generation)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    work,
+                    record.received.map(int),
+                    int(record.retained),
+                    record.sha256,
+                    record.state,
+                    record.losses,
+                    generation
+                ],
+            )
+            .map(drop)
+        })
+    }
+
+    /// The Bash work `work` and its seal, if it is a Bash work of this root.
+    pub(crate) fn output(&self, work: i64) -> rusqlite::Result<Option<OutputLookup>> {
+        self.conn
+            .query_row(
+                "SELECT w.harness, o.received, o.retained, o.sha256, o.state, o.losses
+                 FROM work w LEFT JOIN bash_output o ON o.work = w.id
+                 WHERE w.id = ?1 AND w.kind = 'bash'",
+                params![work],
+                |row| {
+                    let retained: Option<i64> = row.get(2)?;
+                    Ok(OutputLookup {
+                        harness: usize::try_from(row.get::<_, i64>(0)?).unwrap_or(usize::MAX),
+                        record: match retained {
+                            Some(retained) => Some(OutputRecord {
+                                received: row
+                                    .get::<_, Option<i64>>(1)?
+                                    .map(|value| u64::try_from(value).unwrap_or(0)),
+                                retained: u64::try_from(retained).unwrap_or(0),
+                                sha256: row.get(3)?,
+                                state: row.get(4)?,
+                                losses: row.get(5)?,
+                            }),
+                            None => None,
+                        },
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// A failed SQL seal can coincide with a resolved wait. Revisit these on
+    /// takeover so an outward unsealed result is not their only loss account.
+    pub(crate) fn ended_without_output(&self) -> rusqlite::Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT w.id FROM work w LEFT JOIN bash_output o ON o.work = w.id
+             WHERE w.kind = 'bash' AND w.outcome IS NOT NULL AND o.work IS NULL",
+        )?;
+        stmt.query_map([], |row| row.get(0))?.collect()
+    }
+
+    /// Records the requesting harness's local acceptance of exactly
+    /// `retained` bytes hashing to `sha256`, unless one is recorded: then
+    /// returns that one (`true`: a repeat). The caller has checked the
+    /// identity against the seal.
+    pub(crate) fn accept_output(
+        &mut self,
+        work: i64,
+        harness: usize,
+        accept: &OutputAccept,
+    ) -> Result<(OutputAccept, bool), StoreError> {
+        let generation = self.generation;
+        self.write(|tx| {
+            let earlier = tx
+                .query_row(
+                    "SELECT harness_work, requester_pid, retained, sha256, generation, accepted_unix
+                     FROM bash_output_accept WHERE work = ?1",
+                    params![work],
+                    |row| {
+                        Ok(OutputAccept {
+                            harness_work: row.get(0)?,
+                            requester_pid: row.get(1)?,
+                            retained: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+                            sha256: row.get(3)?,
+                            generation: row.get(4)?,
+                            accepted_unix: row.get(5)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(earlier) = earlier {
+                return Ok((earlier, true));
+            }
+            tx.execute(
+                "INSERT INTO bash_output_accept (work, harness, harness_work, requester_pid,
+                                                 retained, sha256, generation, accepted_unix)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    work,
+                    int(harness),
+                    accept.harness_work,
+                    accept.requester_pid,
+                    int(accept.retained),
+                    accept.sha256,
+                    generation,
+                    accept.accepted_unix
+                ],
+            )?;
+            Ok((
+                OutputAccept {
+                    generation,
+                    ..accept.clone()
+                },
+                false,
+            ))
         })
     }
 
