@@ -338,7 +338,7 @@ fn trusted_task_turn_runs_attributed_bash_and_links_answers_to_inputs() {
     assert_eq!(answer["input_attribution"], "native-parent", "{answer}");
     assert_eq!(
         answer["text"],
-        "DONE Root v1 work ended: exited with code 0 (code:0, observer work-pid1-wait); output complete (counted, closed, matched by the end).",
+        "DONE Root v1 work ended: exited with code 0 (code:0, observer work-pid1-wait); output complete (full stream counted, closed, matched by the end).",
         "{answer}"
     );
     let end = run.until("turn end 0", |value| {
@@ -464,6 +464,128 @@ fn trusted_task_turn_runs_attributed_bash_and_links_answers_to_inputs() {
     // Claude Code's store was only named: neither setup nor the stand-in
     // made it.
     assert!(!fixture.store_dir.exists());
+}
+
+/// The real receiver + published SDK's MCP Bash contract, a stand-in CLI,
+/// and actual owner/namespace custody. Acquires all bytes past the inline
+/// bound and explicitly accepts the exact identity twice without new runs.
+#[test]
+#[ignore = "needs OULIPOLY_NATIVE_CLAUDE_DEPS, OULIPOLY_NATIVE_NODE and AGENT_BASH_BIN"]
+fn retained_output_is_acquired_and_locally_accepted_through_the_supported_mcp_tool() {
+    const COMMAND: &str = "python3 -c 'import sys; sys.stdout.buffer.write(bytes((i * 37) % 256 for i in range(100000)))'; exit 7";
+    let fixture = Fixture::new("normal", None, None);
+    let mut run = Run::start(
+        &fixture,
+        &fixture.spec("root", &format!("RETAIN {COMMAND}")),
+    );
+    run.event("ack");
+    let answer = run.until("retained answer", |v| {
+        v["event"] == "agent-message"
+            && v["text"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("DONE RETAINED")
+    });
+    let ended = run.until("turn end", |v| v["event"] == "turn-end");
+    assert_eq!(ended["stop_reason"], "end_turn");
+    run.control(json!({ "cmd": "close" }));
+    let (terminal, code, seen) = run.end();
+    assert_eq!(code, Some(7));
+    assert_eq!(terminal["bash"]["accepted"], 1);
+    assert_eq!(terminal["bash"]["ended"], 1);
+    assert_eq!(terminal["bash"]["open"], 0);
+    assert_eq!(terminal["bash"]["output_open"], 0);
+    assert_eq!(terminal["bash"]["output_requests"], 101); // 98 pages + wrong/first/repeat
+    let bash_end = seen.iter().find(|v| v["event"] == "bash-ended").unwrap();
+    assert_eq!(bash_end["status"], "code:7");
+    assert_eq!(bash_end["output"]["state"], "closed");
+    assert_eq!(bash_end["retained"]["state"], "complete");
+    assert_eq!(bash_end["retained"]["bytes"], 100000);
+    assert_eq!(
+        std::fs::metadata(fixture.dir.join("root/output"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(fixture.dir.join(format!(
+            "root/output/{}",
+            bash_end["work"].as_i64().unwrap()
+        )))
+        .unwrap()
+        .permissions()
+        .mode()
+            & 0o777,
+        0o600
+    );
+    let records = fixture.records();
+    let acquired = records
+        .iter()
+        .find(|v| v.get("acquired_b64").is_some())
+        .unwrap();
+    let expected: Vec<u8> = (0..100000).map(|i| ((i * 37) % 256) as u8).collect();
+    use sha2::Digest;
+    assert_eq!(acquired["identity"], bash_end["retained"]["identity"]);
+    assert_eq!(acquired["pages"], 98);
+    // Exact byte oracle uses Base64 generated independently by the fixture
+    // requester helper, not a mere count/hash/definition check.
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut b64 = String::new();
+    for chunk in expected.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - i * 8));
+        for i in 0..4 {
+            b64.push(if i <= chunk.len() {
+                alphabet[((n >> (18 - i * 6)) & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    assert_eq!(acquired["acquired_b64"], b64);
+    assert_eq!(
+        bash_end["retained"]["sha256"],
+        format!("{:x}", sha2::Sha256::digest(&expected))
+    );
+    let receipts: Vec<_> = seen
+        .iter()
+        .filter(|v| v["event"] == "bash-output-accepted")
+        .collect();
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(receipts[0]["repeat"], false);
+    assert_eq!(receipts[1]["repeat"], true);
+    assert_eq!(receipts[0]["receipt"], receipts[1]["receipt"]);
+    assert_eq!(receipts[0]["receipt"]["work"], bash_end["work"]);
+    assert_eq!(receipts[0]["receipt"]["bytes"], 100000);
+    assert!(
+        answer["text"]
+            .as_str()
+            .unwrap()
+            .contains("bytes=100000 pages=98")
+    );
+    let conn = rusqlite::Connection::open(fixture.dir.join("root/intent.sqlite3")).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM bash_output_accept", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    if let Ok(path) = std::env::var("OULIPOLY_NATIVE_OUTPUT_EVIDENCE") {
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(
+                &json!({ "records": records, "events": seen, "terminal": terminal }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    drop(conn);
+    std::fs::remove_dir_all(&fixture.dir).unwrap();
 }
 
 /// An allow list: a command it does not name is refused by the tool and

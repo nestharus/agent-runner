@@ -90,10 +90,10 @@ async function turn(user) {
     result({ is_error: true, result: "model not available", api_error_status: 404 })
     return
   }
-  if (text.startsWith("RUN ") || text.startsWith("EXPLORE ")) {
+  if (text.startsWith("RUN ") || text.startsWith("EXPLORE ") || text.startsWith("RETAIN ")) {
     const exploring = text.startsWith("EXPLORE ")
     const name = exploring ? "explore" : "bash"
-    const arguments_ = exploring ? { question: text.slice(8) } : { command: text.slice(4) }
+    const arguments_ = exploring ? { question: text.slice(8) } : { command: text.slice(text.startsWith("RETAIN ") ? 7 : 4) }
     if (!mcpReady) {
       mcpReady = true
       await mcp({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "fake-claude", version: "0" } } })
@@ -104,7 +104,46 @@ async function turn(user) {
     assistant([{ type: "tool_use", id: "toolu_1", name: `mcp__oulipoly__${name}`, input: arguments_ }], attribution)
     const called = await mcp({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name, arguments: arguments_ } })
     record({ tool_result: called })
-    const body = called?.mcp_response?.result?.content?.[0]?.text ?? ""
+    let body = called?.mcp_response?.result?.content?.[0]?.text ?? ""
+    if (text.startsWith("RETAIN ")) {
+      const identity = body.match(/identity=(rv1o:[^\s]+)/)?.[1]
+      if (!identity) throw new Error("no retained identity in actual Bash result")
+      const call = async (args) => {
+        const called = await mcp({ jsonrpc: "2.0", id: ++requests + 10, method: "tools/call", params: { name: "bash", arguments: args } })
+        record({ retained_call: args, retained_result: called })
+        const reply = called?.mcp_response?.result
+        if (!reply) throw new Error("missing retained result")
+        return reply
+      }
+      let offset = 0
+      let pages = 0
+      const chunks = []
+      while (true) {
+        const reference = "rv1w:" + identity.split(":").slice(1, 3).join(":")
+        const reply = await call({ output_identity: offset === 0 ? reference : identity, output_offset: offset, output_length: 1024 })
+        if (reply.isError) throw new Error(JSON.stringify(reply))
+        const text = reply.content[0].text
+        const mode = text.match(/--- retained bytes \((utf8|hex);/)[1]
+        const chunk = text.split(" ---\n")[1]
+        chunks.push(Buffer.from(chunk, mode === "utf8" ? "utf8" : "hex"))
+        const next = Number(text.match(/next_offset=(\d+)/)[1])
+        if (next !== offset + chunks.at(-1).length) throw new Error("range progress mismatch")
+        offset = next
+        pages++
+        if (text.includes("eof=true")) break
+        if (pages > 1024) throw new Error("finite page bound")
+      }
+      const acquired = Buffer.concat(chunks)
+      record({ acquired_b64: acquired.toString("base64"), identity, pages })
+      const bad = await call({ output_identity: identity.replace(/:[0-9a-f]{64}$/, ":" + "0".repeat(64)), accept_output: true })
+      if (!bad.isError) throw new Error("wrong identity accepted")
+      const accepted = await call({ output_identity: identity, accept_output: true })
+      const repeat = await call({ output_identity: identity, accept_output: true })
+      if (accepted.isError || repeat.isError || !accepted.content[0].text.includes("repeat=false") || !repeat.content[0].text.includes("repeat=true")) {
+        throw new Error("exact acceptance or repeat failed")
+      }
+      body = `RETAINED identity=${identity} bytes=${acquired.length} pages=${pages}; exact local acceptance and repeat returned`
+    }
     send({ type: "user", uuid: randomUUID(), session_id: session, parent_tool_use_id: null,
       message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: body }] } })
     assistant([{ type: "text", text: `DONE ${exploring ? body : body.split("\n")[0]}` }])

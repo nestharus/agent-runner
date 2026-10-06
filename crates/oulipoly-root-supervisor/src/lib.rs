@@ -114,7 +114,11 @@
 //! cancel, survives owner death like any work, and the run does not end
 //! until its end (or why it is unknown) is reported. Delivery is in-band to
 //! the requester only: no completion is supplied to any harness as a new
-//! input. Nested requests (from inside a Bash run's own namespace) are
+//! input. Each run's output is also retained by the owner, within bounds,
+//! and sealed (count, SHA-256, losses) before its `end`, which names that
+//! identity; the requesting harness alone can read it back past any inline
+//! prefix (`op` `output`) and record its local acceptance of exactly that
+//! identity (`op` `accept`), see the [`bash`] module. Nested requests (from inside a Bash run's own namespace) are
 //! refused: they are not inside a harness namespace.
 //!
 //! **Per-input attribution.** Inputs are still submitted as soon as the
@@ -435,7 +439,8 @@
 //!   shown here only with a test process standing in for the newer owner.
 //! * Attach waits up to 2 s to observe an unreachable root PID 1's exit
 //!   before reporting it owned-unattached (observation only).
-//! * Store growth and retention are unbounded; nothing is pruned.
+//! * Store growth is unbounded apart from retained Bash output; nothing is
+//!   pruned. Retained output lasts until the store is removed.
 //! * Exit observation waits for protocol-read progress; a descendant holding
 //!   stdout can delay it. A caller that does not drain output can delay cancel.
 //! * Bash ingress: the agent-bash tool speaks it (root v1). A native
@@ -454,7 +459,11 @@
 //!   a harness namespace of this owner); a process that leaves its work's
 //!   PID namespace (e.g. a nested `unshare`) is refused, not followed.
 //!   Attribution assumes `/proc` shows the owner's own PID namespace. Output
-//!   is relayed unbounded and not retained. A requester that stays
+//!   is relayed unbounded; it is retained only up to the retention bounds
+//!   (64 MiB per run, 512 MiB per root), with the loss recorded beyond them.
+//!   A local acceptance is the requester's own statement, checked only
+//!   against the sealed identity: it does not prove that a model read the
+//!   bytes. A requester that stays
 //!   connected but stops reading stalls the relay and then, once the pipe
 //!   fills, its own run; nothing times it out.
 //! * Turn-end attribution relies on the agent's tags and on its message ids
@@ -472,6 +481,7 @@ mod conversation;
 mod custody;
 mod harness;
 mod live;
+mod retention;
 pub mod native;
 pub mod native_claude;
 mod store;

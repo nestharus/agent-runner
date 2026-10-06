@@ -2042,7 +2042,7 @@ fn in_root_bash_reaches_its_own_owner_with_attributed_output_and_waited_end() {
     assert_eq!(status.code(), Some(0));
     assert_eq!(
         terminal["bash"],
-        json!({ "accepted": 1, "refused": 0, "not_run": 0, "ended": 1, "end_unknown": 0, "open": 0 })
+        json!({ "accepted": 1, "refused": 0, "not_run": 0, "ended": 1, "end_unknown": 0, "open": 0, "output_open": 0, "output_requests": 0 })
     );
     let listening = owner_event(&seen, "bash-ingress")[0];
     assert_eq!(listening["listening"], true);
@@ -2105,29 +2105,38 @@ fn bash_from_outside_every_harness_namespace_is_refused_and_nothing_runs() {
     let listening = run.until("bash ingress", |value| value["event"] == "bash-ingress");
     run.event("a", "launched");
     let marker = dir.0.join("ran");
-    let mut stream =
-        std::os::unix::net::UnixStream::connect(listening["path"].as_str().unwrap()).unwrap();
-    // The owner may refuse and close before reading this: not an error.
-    let _ = writeln!(
-        stream,
-        "{}",
-        json!({ "v": 1, "op": "run", "argv": ["/bin/touch", marker], "cwd": "/" })
-    );
-    let mut reply = String::new();
-    BufReader::new(&stream).read_line(&mut reply).unwrap();
-    let reply: Value = serde_json::from_str(&reply).unwrap();
-    assert_eq!(reply["event"], "refused");
-    assert_eq!(
-        reply["reason"],
-        "peer-unattributed: outside-every-harness-namespace"
-    );
+    for request in [
+        json!({ "v": 1, "op": "run", "argv": ["/bin/touch", marker], "cwd": "/" }),
+        json!({ "v": 1, "op": "output", "root_id": "supplied-marker", "work": 2 }),
+        json!({ "v": 1, "op": "accept", "root_id": "supplied-marker", "work": 2, "bytes": 0, "sha256": "0".repeat(64) }),
+    ] {
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(listening["path"].as_str().unwrap()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let _ = writeln!(stream, "{request}");
+        let mut reply = String::new();
+        BufReader::new(&stream).read_line(&mut reply).unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["event"], "refused");
+        assert_eq!(
+            reply["reason"],
+            "peer-unattributed: outside-every-harness-namespace"
+        );
+    }
     let refused = run.until("bash refused", |value| value["event"] == "bash-refused");
     assert_eq!(refused["peer"]["pid"], std::process::id());
     run.cancel();
     let (terminal, _, seen) = run.terminal();
-    assert_eq!(terminal["bash"]["refused"], 1, "{terminal}");
+    assert_eq!(terminal["bash"]["refused"], 3, "{terminal}");
     assert_eq!(terminal["bash"]["accepted"], 0);
     assert!(owner_event(&seen, "bash-accepted").is_empty());
+    assert!(owner_event(&seen, "bash-output-accepted").is_empty());
+    assert_eq!(
+        count(&db(&dir), "SELECT count(*) FROM bash_output_accept"),
+        0
+    );
     assert!(!marker.exists(), "a refused request runs nothing");
     assert_eq!(
         count(&db(&dir), "SELECT count(*) FROM work WHERE kind = 'bash'"),
@@ -2217,6 +2226,18 @@ fn bash_run_survives_owner_death_and_requester_sees_unknown_not_success() {
     assert_eq!(ended["observer"], "work-pid1-wait");
     assert_eq!(ended["requester"], "lost-with-prior-owner");
     assert_eq!(terminal["bash"]["ended"], 1);
+    assert_eq!(ended["retained"]["state"], "partial");
+    assert_eq!(ended["retained"]["received"], Value::Null);
+    assert_eq!(ended["retained"]["bytes"], 5);
+    assert_eq!(ended["retained"]["losses"][0]["reason"], "owner-changed");
+    let stored: (String, Option<i64>, i64) = db(&dir)
+        .query_row(
+            "SELECT state, received, retained FROM bash_output WHERE work = ?1",
+            [ended["work"].as_i64().unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(stored, ("partial".into(), None, 5));
     assert_eq!(
         count(
             &db(&dir),

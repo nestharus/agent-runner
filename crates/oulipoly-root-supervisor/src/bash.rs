@@ -33,6 +33,27 @@
 //! * The same socket admits registered children (`op` `child`, the
 //!   [`crate::children`] module). A child's own Bash runs are attributed to
 //!   the child, refused once it is stopped, and killed when it stops or ends.
+//! * Every run's output is also retained by this owner (the
+//!   [`crate::retention`] module) and sealed before its `end` is sent; the
+//!   `end` (and the owner's `bash-ended`) carry the sealed identity as
+//!   `retained`. Two more ops on the same socket, attributed the same way,
+//!   serve only the attributed harness's own runs (another harness's run,
+//!   or a work that is not a Bash run of this root, is `unknown-work`):
+//!   - `{"v":1,"op":"output","root_id":..,"work":N,"offset":O,"length":L}`,
+//!     optionally with the `bytes` and `sha256` the requester holds: one
+//!     line `output-range` with the sealed identity and the retained bytes
+//!     `[O, O+n)` (`b64`), `n` clipped to what was retained and to
+//!     [`crate::retention::MAX_READ`].
+//!   - `{"v":1,"op":"accept","root_id":..,"work":N,"bytes":B,"sha256":H}`:
+//!     only when `B`/`H` are exactly the seal's and the file still hashes
+//!     to them, one line `output-accepted` with the durable receipt
+//!     (`repeat` when an earlier acceptance of it is returned). Local
+//!     acceptance only; it is never an insertion ACK, processing, remote
+//!     settlement or drain.
+//!   Refusals (`refused`, nothing recorded): `wrong-root`, `unknown-work`,
+//!   `not-sealed`, `identity-mismatch`, `offset-beyond-retained`,
+//!   `retained-bytes-missing`, `retained-bytes-changed`, `bad-identity`,
+//!   `store-failed`, `authority-lost`.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -50,7 +71,8 @@ use crate::Event;
 use crate::children::Registry;
 use crate::custody::{Adopted, PidNs, ReceiptWait, Root, RootSlot, SpawnError};
 use crate::live::Custody;
-use crate::store::Store;
+use crate::retention::{self, Budget, Retainer};
+use crate::store::{OutputAccept, Store};
 use crate::sys;
 use crate::transport;
 
@@ -62,6 +84,8 @@ pub(crate) const SOCKET_FILE: &str = "bash.sock";
 pub const PROTOCOL: u64 = 1;
 /// Longest request line accepted.
 const MAX_REQUEST: u64 = 1 << 16;
+/// Bound the new retained-output hash/range/reply work independently of Bash.
+const MAX_OUTPUT_REQUESTS: usize = 8;
 
 /// An owner input sent (or being sent) to a harness's live process and not
 /// yet covered by a turn end the harness attributed to it. `message_id` is
@@ -92,6 +116,8 @@ pub(crate) struct Gate {
     open: usize,
     /// Children admitted and not yet finished.
     children_open: usize,
+    output_open: usize,
+    output_requests: u64,
     accepted: u64,
     refused: u64,
     not_run: u64,
@@ -138,6 +164,9 @@ pub(crate) struct Ingress {
     children: Arc<Registry>,
     /// Every child harness starts here (the intent's `cwd`).
     cwd: String,
+    /// Retained output of this root, against its bound.
+    pub(crate) budget: Budget,
+    budget_unknown: bool,
     #[cfg(test)]
     pub(crate) after_spawn_error_unlock: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
@@ -171,7 +200,18 @@ impl Ingress {
         children: Arc<Registry>,
         cwd: String,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        // Physical files, including unsealed/resolved orphans, are charged
+        // synchronously before recovery threads or new work can allocate.
+        let usage = retention::initial_usage(&slot.store_dir);
+        let used = usage
+            .as_ref()
+            .copied()
+            .unwrap_or(retention::LIMITS.per_root);
+        let budget_unknown = usage.is_err();
+        let missing = store.lock().expect("store lock").ended_without_output();
+        let ingress = Arc::new(Self {
+            budget: Budget::new(retention::LIMITS, used),
+            budget_unknown,
             root_id,
             slot,
             custody,
@@ -183,7 +223,21 @@ impl Ingress {
             cwd,
             #[cfg(test)]
             after_spawn_error_unlock: Mutex::new(None),
-        })
+        });
+        if budget_unknown {
+            ingress.report(json!({ "event": "bash-output-budget-unknown", "meaning": "fresh retention denied" }));
+        }
+        match missing {
+            Ok(works) => {
+                for work in works {
+                    ingress.seal_found_ended(work);
+                }
+            }
+            Err(_) => ingress.report(
+                json!({ "event": "bash-output-recovery-unknown", "reason": "store-read-failed" }),
+            ),
+        }
+        ingress
     }
 
     pub(crate) fn socket_path(store: &Path) -> PathBuf {
@@ -228,7 +282,7 @@ impl Ingress {
 
     fn closed_and_idle(&self) -> bool {
         let gate = self.gate.0.lock().expect("bash gate");
-        gate.closed && gate.open == 0
+        gate.closed && gate.open == 0 && gate.output_open == 0
     }
 
     /// Whether no run is in progress. When none is, closes the ingress: no
@@ -236,7 +290,7 @@ impl Ingress {
     /// harness's end is reported.
     pub(crate) fn close_if_idle(&self) -> bool {
         let mut gate = self.gate.0.lock().expect("bash gate");
-        if gate.open > 0 || gate.children_open > 0 {
+        if gate.open > 0 || gate.children_open > 0 || gate.output_open > 0 {
             return false;
         }
         if !gate.closed {
@@ -260,6 +314,8 @@ impl Ingress {
             "ended": gate.ended,
             "end_unknown": gate.unknown,
             "open": gate.open,
+            "output_open": gate.output_open,
+            "output_requests": gate.output_requests,
         })
     }
 
@@ -318,6 +374,16 @@ impl Ingress {
                 let mut sink = Sink(Some(stream));
                 self.run(&attributed, cred.pid, &request, &mut sink);
             }
+            Request::Retained(request) => {
+                if let Err(reason) = self.enter_retained() {
+                    return self.refused(&stream, peer, reason);
+                }
+                match self.retained_inner(&attributed, cred.pid, &request, Some(&cred)) {
+                    Ok(reply) => Sink(Some(stream)).send(&reply),
+                    Err(reason) => self.refused(&stream, peer, &reason),
+                }
+                self.leave_retained();
+            }
             Request::Child(request) => {
                 let ctx = crate::children::Context {
                     root_id: &self.root_id,
@@ -333,6 +399,20 @@ impl Ingress {
                 crate::children::serve(&ctx, &attributed, cred.pid, request, stream);
             }
         }
+    }
+
+    fn enter_retained(&self) -> Result<(), &'static str> {
+        let mut gate = self.gate.0.lock().expect("bash gate");
+        if gate.closed { return Err("ingress-closed"); }
+        if gate.output_open >= MAX_OUTPUT_REQUESTS { return Err("output-request-bound"); }
+        gate.output_open += 1;
+        gate.output_requests += 1;
+        Ok(())
+    }
+
+    fn leave_retained(&self) {
+        self.gate.0.lock().expect("bash gate").output_open -= 1;
+        let _ = self.tx.send(Event::BashDone);
     }
 
     /// The harness whose live work's own PID namespace the peer is in.
@@ -534,14 +614,35 @@ impl Ingress {
             // At this moment only; a short run may already be gone (null).
             "identity": spawned.harness_host_pid.map(crate::workload::observe),
         }));
-        self.finish(&root, work, token, spawned.stdio.stdout, Some(sink));
+        let mut retainer = Retainer::start(&self.slot.store_dir, work, &self.budget);
+        if self.budget_unknown {
+            retainer.deny_unknown_budget();
+        }
+        self.finish(
+            &root,
+            work,
+            token,
+            spawned.stdio.stdout,
+            Some(sink),
+            retainer,
+        );
     }
 
-    /// Streams the work's output to `sink` (or discards it), then waits for
-    /// its end from its work PID 1's report, records it and says so.
-    fn finish(&self, root: &Root, work: i64, token: u64, stdout: File, sink: Option<&mut Sink>) {
+    /// Streams the work's output to `sink` (or to no one) while retaining
+    /// it, seals what was retained, then waits for its end from its work
+    /// PID 1's report, records it and says so.
+    fn finish(
+        &self,
+        root: &Root,
+        work: i64,
+        token: u64,
+        stdout: File,
+        sink: Option<&mut Sink>,
+        mut retainer: Retainer<'_>,
+    ) {
         let mut sink = sink;
-        let (bytes, output) = relay_output(&self.slot.stop, stdout, &mut sink);
+        let (bytes, output) = relay_output(&self.slot.stop, stdout, &mut sink, &mut retainer);
+        let retained = retainer.seal(&output, &self.store, &self.root_id);
         let (mut event, outcome) = match root.wait_receipt(work) {
             ReceiptWait::Receipt(receipt) => match receipt["harness"].as_str() {
                 Some(status) => {
@@ -583,6 +684,7 @@ impl Ingress {
             ReceiptWait::Detached => (json!({ "event": "left-to-successor" }), Outcome::Unknown),
         };
         event["output"] = output;
+        event["retained"] = retained;
         self.custody.lock().expect("custody lock").release(token);
         self.children
             .remove_run(work, matches!(outcome, Outcome::Ended));
@@ -638,13 +740,22 @@ impl Ingress {
                     "harness_position": harness,
                     "pid": adopted.harness_host_pid,
                 }));
-                ingress.finish(&root, adopted.work, token, adopted.stdio.stdout, None);
+                let retainer = ingress.resume_retainer(adopted.work);
+                ingress.finish(
+                    &root,
+                    adopted.work,
+                    token,
+                    adopted.stdio.stdout,
+                    None,
+                    retainer,
+                );
             }
             Prior::Exited {
                 harness,
                 work,
                 receipt,
             } => {
+                ingress.seal_found_ended(work);
                 let status = receipt["harness"].as_str();
                 let outcome = status.unwrap_or("ended-with-work-namespace-status-unknown");
                 let _ = ingress.store.lock().expect("store lock").resolve_work(
@@ -666,6 +777,7 @@ impl Ingress {
                 });
             }
             Prior::Unknown { harness, work } => {
+                ingress.seal_found_ended(work);
                 let _ = ingress.store.lock().expect("store lock").resolve_work(
                     work,
                     "ended-with-root-namespace-status-unknown",
@@ -682,6 +794,210 @@ impl Ingress {
             }
         });
     }
+
+    /// Continues retention of a run an earlier owner accepted.
+    fn resume_retainer(&self, work: i64) -> Retainer<'_> {
+        let sealed = self
+            .store
+            .lock()
+            .expect("store lock")
+            .output(work)
+            .ok()
+            .flatten()
+            .and_then(|lookup| lookup.record);
+        let mut retainer = Retainer::resume(&self.slot.store_dir, work, &self.budget, sealed);
+        if self.budget_unknown {
+            retainer.deny_unknown_budget();
+        }
+        retainer
+    }
+
+    /// Seals what an earlier owner kept of a run found ended (unless it
+    /// sealed it itself): its unread remainder, if any, is a loss.
+    fn seal_found_ended(&self, work: i64) {
+        let retained = self.resume_retainer(work).seal(
+            &json!({ "state": "unknown", "reason": "ended-without-this-owner-reading" }),
+            &self.store,
+            &self.root_id,
+        );
+        self.report(json!({ "event": "bash-output-sealed", "work": work, "retained": retained }));
+    }
+
+    /// Serves one retained-output request of the attributed harness.
+    #[cfg(test)]
+    fn retained(
+        &self,
+        who: &Attributed,
+        requester: i32,
+        request: &RetainedRequest,
+    ) -> Result<Value, String> {
+        self.retained_inner(who, requester, request, None)
+    }
+
+    fn retained_inner(
+        &self,
+        who: &Attributed,
+        requester: i32,
+        request: &RetainedRequest,
+        peer: Option<&libc::ucred>,
+    ) -> Result<Value, String> {
+        let custody = self.custody.lock().expect("custody lock");
+        if let Some(reason) = custody.reason() {
+            return Err(format!("owner-stopping: {reason}"));
+        }
+        self.retained_current(who, peer)?;
+        if request.root_id != self.root_id {
+            return Err("wrong-root".to_owned());
+        }
+        let lookup = self
+            .store
+            .lock()
+            .expect("store lock")
+            .output(request.work)
+            .map_err(|_| "store-failed".to_owned())?;
+        // Another harness's run is not distinguished from no run at all.
+        let lookup = lookup
+            .filter(|lookup| lookup.harness == who.position)
+            .ok_or("unknown-work")?;
+        let record = lookup.record.ok_or("not-sealed")?;
+        if record.state == "unsealed" {
+            return Err("output-unsealed-loss-recorded".into());
+        }
+        if request.bytes.is_some_and(|bytes| bytes != record.retained)
+            || request
+                .sha256
+                .as_ref()
+                .is_some_and(|sha256| *sha256 != record.sha256)
+        {
+            return Err("identity-mismatch".to_owned());
+        }
+        let identity = retention::record_json(&self.root_id, request.work, &record);
+        if !request.accept {
+            if request.offset > record.retained {
+                return Err("offset-beyond-retained".to_owned());
+            }
+            let bytes = retention::read_range(
+                &self.slot.store_dir,
+                request.work,
+                record.retained,
+                &record.sha256,
+                request.offset,
+                request.length,
+            )
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::InvalidData {
+                    "retained-bytes-changed".to_owned()
+                } else {
+                    "retained-bytes-missing".to_owned()
+                }
+            })?;
+            self.retained_current(who, peer)?;
+            let next = request.offset + bytes.len() as u64;
+            self.report(json!({
+                "event": "bash-output-read",
+                "work": request.work,
+                "harness": who.harness,
+                "offset": request.offset,
+                "length": bytes.len(),
+            }));
+            return Ok(json!({
+                "event": "output-range",
+                "retained": identity,
+                "offset": request.offset,
+                "length": bytes.len(),
+                "next_offset": next,
+                "eof": next == record.retained,
+                "b64": base64(&bytes),
+            }));
+        }
+        // The bytes acceptance names must still be the bytes on disk.
+        match retention::hash_prefix(
+            &retention::path(&self.slot.store_dir, request.work),
+            record.retained,
+        ) {
+            Ok(sha256) if sha256 == record.sha256 => {}
+            Ok(_) => return Err("retained-bytes-changed".to_owned()),
+            Err(_) => return Err("retained-bytes-missing".to_owned()),
+        }
+        self.retained_current(who, peer)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+            });
+        let accept = OutputAccept {
+            harness_work: who.harness_work,
+            requester_pid: requester,
+            retained: record.retained,
+            sha256: record.sha256.clone(),
+            generation: 0,
+            accepted_unix: now,
+        };
+        // Hold the live-work view through the local acceptance transaction:
+        // a harness-end update cannot slip between this check and commit.
+        let views = self.views.lock().expect("views");
+        if !views
+            .get(who.position)
+            .is_some_and(|view| view.works.iter().any(|(work, _)| *work == who.harness_work))
+        {
+            return Err("parent-not-current".into());
+        }
+        let (receipt, repeat) = self
+            .store
+            .lock()
+            .expect("store lock")
+            .accept_output(request.work, who.position, &accept)
+            .map_err(|error| error.label().to_owned())?;
+        drop(views);
+        let receipt = json!({
+            "root_id": self.root_id,
+            "work": request.work,
+            "harness": who.harness,
+            "harness_work": receipt.harness_work,
+            "requester_pid": receipt.requester_pid,
+            "bytes": receipt.retained,
+            "sha256": receipt.sha256,
+            "generation": receipt.generation,
+            "accepted_unix": receipt.accepted_unix,
+            "verified": "retained-file-rehashed",
+        });
+        self.report(json!({
+            "event": "bash-output-accepted",
+            "work": request.work,
+            "repeat": repeat,
+            "receipt": receipt,
+        }));
+        Ok(json!({
+            "event": "output-accepted",
+            "durable": true,
+            "repeat": repeat,
+            "retained": identity,
+            "receipt": receipt,
+            "meaning": "local acceptance of exactly these retained bytes by their requesting harness; \
+                        not an insertion ACK, processing, remote settlement or drain",
+        }))
+    }
+    fn retained_current(&self, who: &Attributed, peer: Option<&libc::ucred>) -> Result<(), String> {
+        if let Some(peer) = peer {
+            let now = self.attribute(peer)?;
+            if now.position != who.position || now.harness_work != who.harness_work {
+                return Err("parent-not-current".into());
+            }
+        }
+        if let Some(reason) = self.children.refuses_bash(who.position) {
+            return Err(format!("requester-stopped: {reason}"));
+        }
+        if !self
+            .views
+            .lock()
+            .expect("views")
+            .get(who.position)
+            .is_some_and(|view| view.works.iter().any(|(work, _)| *work == who.harness_work))
+        {
+            return Err("parent-not-current".into());
+        }
+        Ok(())
+    }
 }
 
 /// EOF, read failure and detach are different observations; none is a wait.
@@ -689,6 +1005,7 @@ fn relay_output(
     stop: &transport::StopSignal,
     mut stdout: File,
     sink: &mut Option<&mut Sink>,
+    retainer: &mut Retainer<'_>,
 ) -> (u64, Value) {
     let mut bytes = 0u64;
     let mut buf = [0u8; 16 * 1024];
@@ -704,6 +1021,9 @@ fn relay_output(
             Err(error) => break json!({ "state": "failed", "reason": error.to_string() }),
             Ok(read) => {
                 bytes += read as u64;
+                // Kept before it is sent: a chunk the requester saw is kept
+                // unless a recorded loss says otherwise.
+                retainer.take(&buf[..read]);
                 if let Some(sink) = sink.as_deref_mut() {
                     sink.send(&json!({ "event": "output", "b64": base64(&buf[..read]) }));
                 }
@@ -722,6 +1042,7 @@ fn relay_output(
     (bytes, output)
 }
 
+#[derive(Clone)]
 pub(crate) struct Attributed {
     pub(crate) position: usize,
     pub(crate) harness: String,
@@ -735,9 +1056,65 @@ struct RunRequest {
     cwd: String,
 }
 
+/// A read (`op` `output`) or local acceptance (`op` `accept`) of one run's
+/// retained output.
+struct RetainedRequest {
+    accept: bool,
+    root_id: String,
+    work: i64,
+    /// What the requester holds; required for acceptance.
+    bytes: Option<u64>,
+    sha256: Option<String>,
+    offset: u64,
+    length: u64,
+}
+
 enum Request {
     Run(RunRequest),
     Child(crate::children::ChildRequest),
+    Retained(RetainedRequest),
+}
+
+fn parse_retained(value: &Value) -> Result<RetainedRequest, String> {
+    let accept = value["op"] == "accept";
+    let bad = || "bad-identity".to_owned();
+    let root_id = value["root_id"].as_str().ok_or_else(bad)?.to_owned();
+    let work = value["work"]
+        .as_i64()
+        .filter(|work| *work > 0)
+        .ok_or_else(bad)?;
+    let bytes = match &value["bytes"] {
+        Value::Null if !accept => None,
+        bytes => Some(bytes.as_u64().ok_or_else(bad)?),
+    };
+    let sha256 = match &value["sha256"] {
+        Value::Null if !accept => None,
+        sha256 => Some(
+            sha256
+                .as_str()
+                .filter(|sha256| {
+                    sha256.len() == 64
+                        && sha256
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+                .ok_or_else(bad)?
+                .to_owned(),
+        ),
+    };
+    let number = |key: &str, default: u64| match &value[key] {
+        Value::Null => Ok(default),
+        number => number.as_u64().ok_or_else(|| format!("bad-{key}")),
+    };
+    Ok(RetainedRequest {
+        accept,
+        root_id,
+        work,
+        bytes,
+        sha256,
+        offset: number("offset", 0)?,
+        length: number("length", retention::MAX_READ)?,
+    })
 }
 
 /// The requester's connection; writes stop being attempted once it fails.
@@ -828,6 +1205,9 @@ fn read_request(stream: &UnixStream) -> Result<Request, String> {
     }
     if value["op"] == "child" {
         return crate::children::parse_request(&value).map(Request::Child);
+    }
+    if value["op"] == "output" || value["op"] == "accept" {
+        return parse_retained(&value).map(Request::Retained);
     }
     if value["op"] != "run" {
         return Err("unknown-op".to_owned());
@@ -955,6 +1335,17 @@ mod tests {
             .begin_incarnation("fixture", "fixture")
             .unwrap();
         let parent = claimed.store.begin_work(0, 1).unwrap();
+        let (ingress, root, far) = ingress_over(dir, claimed, parent);
+        (ingress, root, far, parent)
+    }
+
+    /// An ingress over an already claimed store (a successor's, say).
+    fn ingress_over(
+        dir: &Path,
+        claimed: crate::store::Claimed,
+        parent: i64,
+    ) -> (Arc<Ingress>, Arc<Root>, OwnedFd) {
+        let generation = claimed.store.generation();
         let views: Views = Arc::new(Mutex::new(vec![View {
             id: "h".into(),
             session: None,
@@ -965,14 +1356,14 @@ mod tests {
         let (root, far) = Root::seam(false, i32::try_from(std::process::id()).unwrap(), &stop);
         let slot = Arc::new(RootSlot::new(
             dir.join("store"),
-            1,
+            generation,
             crate::workload::unprivileged_for_tests(&dir.join("store")),
             Arc::clone(&stop),
             Some(Arc::clone(&root)),
         ));
         let (tx, _rx) = channel();
         let custody = Arc::new(Mutex::new(Custody::new(stop)));
-        let children = Registry::new(None, 1, 0, Arc::clone(&custody));
+        let children = Registry::new(None, 2, 0, Arc::clone(&custody));
         let ingress = Ingress::new(
             claimed.root_id,
             slot,
@@ -983,7 +1374,7 @@ mod tests {
             children,
             dir.display().to_string(),
         );
-        (ingress, root, far, parent)
+        (ingress, root, far)
     }
 
     #[test]
@@ -1121,12 +1512,14 @@ mod tests {
         far.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let mut sink = Sink(Some(near));
         // Linux directory read yields EISDIR; it is not EOF.
+        let retainer = Retainer::start(&dir.0.join("store"), work, &ingress.budget);
         ingress.finish(
             &root,
             work,
             token,
             File::open(&dir.0).unwrap(),
             Some(&mut sink),
+            retainer,
         );
         drop(sink);
         let events: Vec<Value> = BufReader::new(far)
@@ -1143,6 +1536,625 @@ mod tests {
             1,
             "actual wait remains distinct"
         );
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// Bytes no prefix bound keeps whole: binary, NUL, invalid UTF-8.
+    fn payload(len: usize) -> Vec<u8> {
+        let mut state = 0x9e37_79b9u32;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect()
+    }
+
+    /// Runs one recorded Bash work whose stdout is `data` and whose work
+    /// PID 1 reports `status`; returns the requester's stage lines.
+    fn finished_run(
+        ingress: &Arc<Ingress>,
+        root: &Arc<Root>,
+        far: &OwnedFd,
+        dir: &Path,
+        parent: i64,
+        data: &[u8],
+        status: &str,
+    ) -> (i64, Vec<Value>) {
+        let work = ingress
+            .store
+            .lock()
+            .unwrap()
+            .begin_bash(0, parent, 1, 1, "[]", &["fixture".into()], "/")
+            .unwrap();
+        assert!(ingress.enter());
+        let token = ingress
+            .custody
+            .lock()
+            .unwrap()
+            .register(Arc::clone(root), work);
+        let receipt = json!({ "event": "receipt", "work": crate::custody::work_name(work), "harness": status, "work_pid1": "code:0" });
+        sys::send(far, receipt.to_string().as_bytes(), &[]).unwrap();
+        let source = dir.join(format!("stdout-{work}"));
+        std::fs::write(&source, data).unwrap();
+        let (near, far) = UnixStream::pair().unwrap();
+        far.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        near.set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let reader = thread::spawn(move || {
+            BufReader::new(far)
+                .lines()
+                .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
+                .collect::<Vec<Value>>()
+        });
+        let mut sink = Sink(Some(near));
+        let retainer = Retainer::start(&dir.join("store"), work, &ingress.budget);
+        ingress.finish(
+            root,
+            work,
+            token,
+            File::open(&source).unwrap(),
+            Some(&mut sink),
+            retainer,
+        );
+        drop(sink);
+        let events = reader.join().unwrap();
+        (work, events)
+    }
+
+    fn read_request(root_id: &str, work: i64, offset: u64, length: u64) -> RetainedRequest {
+        RetainedRequest {
+            accept: false,
+            root_id: root_id.to_owned(),
+            work,
+            bytes: None,
+            sha256: None,
+            offset,
+            length,
+        }
+    }
+
+    fn accept_request(root_id: &str, work: i64, bytes: u64, sha256: &str) -> RetainedRequest {
+        RetainedRequest {
+            accept: true,
+            root_id: root_id.to_owned(),
+            work,
+            bytes: Some(bytes),
+            sha256: Some(sha256.to_owned()),
+            offset: 0,
+            length: 0,
+        }
+    }
+
+    /// Reassembles a run's retained bytes through `op` `output` alone.
+    fn read_all(ingress: &Ingress, who: &Attributed, root_id: &str, work: i64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let reply = ingress
+                .retained(
+                    who,
+                    1,
+                    &read_request(root_id, work, out.len() as u64, 50_000),
+                )
+                .unwrap();
+            assert_eq!(reply["offset"], out.len());
+            out.extend(unbase64(reply["b64"].as_str().unwrap()).unwrap());
+            assert_eq!(reply["next_offset"], out.len());
+            if reply["eof"] == true {
+                return out;
+            }
+        }
+    }
+
+    /// The whole output, well past any inline prefix, is retained exactly,
+    /// named by an identity the requester gets with its actual wait, and
+    /// served and accepted only for that harness, that root and those bytes.
+    #[test]
+    fn retained_output_is_exact_and_accepted_only_by_its_requester_for_its_identity() {
+        let dir = Fixture::new();
+        let (ingress, root, far, parent) = fixture(&dir.0);
+        let root_id = ingress.root_id.clone();
+        let data = payload(300_000);
+        let (work, events) = finished_run(&ingress, &root, &far, &dir.0, parent, &data, "code:7");
+        let end = events.last().unwrap();
+        // The wait is its waiter's, apart from retention.
+        assert_eq!(end["event"], "end");
+        assert_eq!(end["status"], "code:7");
+        assert_eq!(
+            end["output"],
+            json!({ "state": "closed", "bytes": 300_000 })
+        );
+        let retained = &end["retained"];
+        assert_eq!(retained["state"], "complete");
+        assert_eq!(retained["bytes"], 300_000);
+        assert_eq!(retained["received"], 300_000);
+        assert_eq!(retained["sha256"], sha256_hex(&data));
+        assert_eq!(retained["root_id"], root_id.as_str());
+        assert_eq!(
+            retained["identity"],
+            format!("rv1o:{root_id}:{work}:300000:{}", sha256_hex(&data))
+        );
+        let who = Attributed {
+            position: 0,
+            harness: "h".into(),
+            harness_work: parent,
+            session: None,
+            open: vec![],
+        };
+        assert_eq!(read_all(&ingress, &who, &root_id, work), data);
+        // A range is clipped to what was retained and says where it ended.
+        let tail = ingress
+            .retained(&who, 1, &read_request(&root_id, work, 299_990, 4096))
+            .unwrap();
+        assert_eq!(
+            unbase64(tail["b64"].as_str().unwrap()).unwrap(),
+            data[299_990..]
+        );
+        assert_eq!(tail["eof"], true);
+        let sha = sha256_hex(&data);
+        let other = Attributed {
+            position: 1,
+            harness: "other".into(),
+            ..who.clone()
+        };
+        ingress.views.lock().unwrap().push(View {
+            id: "other".into(),
+            works: vec![(parent, PidNs { dev: 0, ino: 0 })],
+            ..View::default()
+        });
+        let refusals = [
+            (&other, read_request(&root_id, work, 0, 10), "unknown-work"),
+            (
+                &who,
+                read_request(&"0".repeat(32), work, 0, 10),
+                "wrong-root",
+            ),
+            (&who, read_request(&root_id, parent, 0, 10), "unknown-work"),
+            (&who, read_request(&root_id, 999, 0, 10), "unknown-work"),
+            (
+                &who,
+                read_request(&root_id, work, 300_001, 10),
+                "offset-beyond-retained",
+            ),
+            (
+                &who,
+                accept_request(&root_id, work, 300_000, &"0".repeat(64)),
+                "identity-mismatch",
+            ),
+            (
+                &who,
+                accept_request(&root_id, work, 299_999, &sha),
+                "identity-mismatch",
+            ),
+            (
+                &other,
+                accept_request(&root_id, work, 300_000, &sha),
+                "unknown-work",
+            ),
+        ];
+        for (asker, request, reason) in &refusals {
+            assert_eq!(ingress.retained(asker, 1, request).unwrap_err(), *reason);
+        }
+        let db =
+            || rusqlite::Connection::open(dir.0.join("store").join(crate::store::DB_FILE)).unwrap();
+        let accepts = |conn: &rusqlite::Connection| -> i64 {
+            conn.query_row("SELECT count(*) FROM bash_output_accept", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(accepts(&db()), 0, "no refusal records an acceptance");
+        let first = ingress
+            .retained(&who, 4242, &accept_request(&root_id, work, 300_000, &sha))
+            .unwrap();
+        assert_eq!(first["event"], "output-accepted");
+        assert_eq!(first["durable"], true);
+        assert_eq!(first["repeat"], false);
+        assert_eq!(first["receipt"]["bytes"], 300_000);
+        assert_eq!(first["receipt"]["sha256"], sha.as_str());
+        assert_eq!(first["receipt"]["requester_pid"], 4242);
+        assert_eq!(first["receipt"]["harness_work"], parent);
+        let row: (i64, String, i64) = db()
+            .query_row(
+                "SELECT retained, sha256, harness FROM bash_output_accept WHERE work = ?1",
+                [work],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (300_000, sha.clone(), 0));
+        let again = ingress
+            .retained(&who, 7, &accept_request(&root_id, work, 300_000, &sha))
+            .unwrap();
+        assert_eq!(again["repeat"], true);
+        assert_eq!(
+            again["receipt"], first["receipt"],
+            "the earlier receipt, unchanged"
+        );
+        assert_eq!(accepts(&db()), 1);
+
+        // A successor owner of the same store serves and recognizes the same
+        // identity: retention and acceptance outlive the owner that made them.
+        drop(ingress);
+        let claimed = Store::claim(&dir.0.join("store"), None).unwrap();
+        assert_eq!(claimed.store.generation(), 2);
+        let (successor, _root2, _far2) = ingress_over(&dir.0, claimed, parent);
+        assert_eq!(read_all(&successor, &who, &root_id, work), data);
+        let later = successor
+            .retained(&who, 9, &accept_request(&root_id, work, 300_000, &sha))
+            .unwrap();
+        assert_eq!(later["repeat"], true);
+        assert_eq!(later["receipt"]["generation"], 1);
+        // Changed bytes on disk are never accepted, even as a repeat.
+        let path = retention::path(&dir.0.join("store"), work);
+        let mut changed = std::fs::read(&path).unwrap();
+        changed[150_000] ^= 1;
+        std::fs::write(&path, &changed).unwrap();
+        assert_eq!(
+            successor
+                .retained(&who, 9, &read_request(&root_id, work, 0, 10))
+                .unwrap_err(),
+            "retained-bytes-changed"
+        );
+        assert_eq!(
+            successor
+                .retained(&who, 9, &accept_request(&root_id, work, 300_000, &sha))
+                .unwrap_err(),
+            "retained-bytes-changed"
+        );
+        std::fs::write(&path, &changed[..1000]).unwrap();
+        assert_eq!(
+            successor
+                .retained(&who, 9, &read_request(&root_id, work, 5000, 10))
+                .unwrap_err(),
+            "retained-bytes-missing"
+        );
+    }
+
+    /// Bounds keep a prefix and say so: never `complete`, the received
+    /// count stays exact, and the requester's own stream is unaffected.
+    #[test]
+    fn retention_bounds_keep_a_counted_prefix_and_record_the_loss() {
+        let dir = Fixture::new();
+        let (ingress, root, far, parent) = fixture(&dir.0);
+        let root_id = ingress.root_id.clone();
+        let who = Attributed {
+            position: 0,
+            harness: "h".into(),
+            harness_work: parent,
+            session: None,
+            open: vec![],
+        };
+        ingress.budget.set_limits(retention::Limits {
+            per_run: 40_000,
+            per_root: 60_000,
+        });
+        let data = payload(100_000);
+        let (work, events) = finished_run(&ingress, &root, &far, &dir.0, parent, &data, "code:0");
+        let streamed: Vec<u8> = events
+            .iter()
+            .filter(|event| event["event"] == "output")
+            .flat_map(|event| unbase64(event["b64"].as_str().unwrap()).unwrap())
+            .collect();
+        assert_eq!(streamed, data, "the live relay is not bounded by retention");
+        let retained = &events.last().unwrap()["retained"];
+        assert_eq!(retained["state"], "partial");
+        assert_eq!(retained["bytes"], 40_000);
+        assert_eq!(retained["received"], 100_000);
+        assert_eq!(retained["losses"][0]["reason"], "per-run-bound");
+        assert_eq!(retained["sha256"], sha256_hex(&data[..40_000]));
+        assert_eq!(read_all(&ingress, &who, &root_id, work), data[..40_000]);
+        // The root bound leaves 20 000 for the next run.
+        let (second, events) = finished_run(&ingress, &root, &far, &dir.0, parent, &data, "code:0");
+        let retained = &events.last().unwrap()["retained"];
+        assert_eq!(retained["state"], "partial");
+        assert_eq!(retained["bytes"], 20_000);
+        assert_eq!(retained["losses"][0]["reason"], "per-root-bound");
+        assert_eq!(read_all(&ingress, &who, &root_id, second), data[..20_000]);
+        // An empty run is complete with zero bytes, not a missing record.
+        let (_, events) = finished_run(&ingress, &root, &far, &dir.0, parent, b"", "code:0");
+        let retained = &events.last().unwrap()["retained"];
+        assert_eq!(retained["state"], "complete");
+        assert_eq!(retained["bytes"], 0);
+    }
+
+    /// A run a successor finds ended keeps what the earlier owner wrote,
+    /// sealed as partial with the takeover recorded; a run that owner had
+    /// already sealed keeps that seal.
+    #[test]
+    fn takeover_seals_what_was_kept_and_records_the_owner_change() {
+        let dir = Fixture::new();
+        let (ingress, root, far, parent) = fixture(&dir.0);
+        let root_id = ingress.root_id.clone();
+        let who = Attributed {
+            position: 0,
+            harness: "h".into(),
+            harness_work: parent,
+            session: None,
+            open: vec![],
+        };
+        let data = payload(5000);
+        let (sealed, events) = finished_run(&ingress, &root, &far, &dir.0, parent, &data, "code:0");
+        let first_seal = events.last().unwrap()["retained"].clone();
+        let orphan = ingress
+            .store
+            .lock()
+            .unwrap()
+            .begin_bash(0, parent, 1, 1, "[]", &["fixture".into()], "/")
+            .unwrap();
+        std::fs::create_dir_all(dir.0.join("store").join(retention::DIR)).unwrap();
+        std::fs::write(retention::path(&dir.0.join("store"), orphan), &data[..1234]).unwrap();
+        assert_eq!(
+            ingress
+                .retained(&who, 1, &read_request(&root_id, orphan, 0, 10))
+                .unwrap_err(),
+            "not-sealed"
+        );
+        ingress.seal_found_ended(orphan);
+        ingress.seal_found_ended(sealed);
+        let reply = ingress
+            .retained(&who, 1, &read_request(&root_id, orphan, 0, 10_000))
+            .unwrap();
+        let retained = &reply["retained"];
+        assert_eq!(retained["state"], "partial");
+        assert_eq!(retained["bytes"], 1234);
+        assert_eq!(retained["received"], Value::Null);
+        assert_eq!(retained["losses"][0]["reason"], "owner-changed");
+        assert_eq!(retained["losses"][0]["at"], 1234);
+        assert_eq!(retained["losses"][1]["reason"], "stream-not-closed");
+        assert_eq!(
+            unbase64(reply["b64"].as_str().unwrap()).unwrap(),
+            data[..1234]
+        );
+        let reply = ingress
+            .retained(&who, 1, &read_request(&root_id, sealed, 0, 1))
+            .unwrap();
+        assert_eq!(
+            reply["retained"], first_seal,
+            "an earlier seal is kept as it was"
+        );
+    }
+
+    #[test]
+    fn retained_stale_parent_and_owner_stop_never_commit_acceptance() {
+        let dir = Fixture::new();
+        let (ingress, root, far, parent) = fixture(&dir.0);
+        let data = payload(100);
+        let (work, _) = finished_run(&ingress, &root, &far, &dir.0, parent, &data, "code:7");
+        let who = Attributed {
+            position: 0,
+            harness: "h".into(),
+            harness_work: parent,
+            session: None,
+            open: vec![],
+        };
+        let accept = accept_request(&ingress.root_id, work, 100, &sha256_hex(&data));
+        ingress.views.lock().unwrap()[0].works.clear();
+        assert_eq!(
+            ingress.retained(&who, 1, &accept).unwrap_err(),
+            "parent-not-current"
+        );
+        assert_eq!(
+            ingress
+                .retained(&who, 1, &read_request(&ingress.root_id, work, 0, 10))
+                .unwrap_err(),
+            "parent-not-current"
+        );
+        let conn =
+            rusqlite::Connection::open(dir.0.join("store").join(crate::store::DB_FILE)).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM bash_output_accept", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        ingress.views.lock().unwrap()[0]
+            .works
+            .push((parent, PidNs { dev: 0, ino: 0 }));
+        ingress.custody.lock().unwrap().stop("fixture-stop");
+        assert!(
+            ingress
+                .retained(&who, 1, &accept)
+                .unwrap_err()
+                .starts_with("owner-stopping:")
+        );
+    }
+
+    #[test]
+    fn failed_file_seal_is_a_persisted_loss_not_a_recoverable_identity() {
+        let dir = Fixture::new();
+        let (ingress, _root, _far, parent) = fixture(&dir.0);
+        let work = ingress
+            .store
+            .lock()
+            .unwrap()
+            .begin_bash(0, parent, 1, 1, "[]", &["fixture".into()], "/")
+            .unwrap();
+        let mut retainer = Retainer::start(&dir.0.join("store"), work, &ingress.budget);
+        retainer.take(b"abc");
+        // Removing the name leaves the open FD but makes its hash impossible.
+        std::fs::remove_file(retention::path(&dir.0.join("store"), work)).unwrap();
+        let failed = retainer.seal(
+            &json!({ "state": "closed", "bytes": 3 }),
+            &ingress.store,
+            &ingress.root_id,
+        );
+        assert_eq!(failed["state"], "unsealed");
+        assert!(failed["identity"].is_null());
+        assert_eq!(failed["losses"][0]["reason"], "seal-failed");
+        ingress
+            .store
+            .lock()
+            .unwrap()
+            .resolve_work(work, "code:7", Some("work-pid1-wait"))
+            .unwrap();
+        drop(ingress);
+        let claimed = Store::claim(&dir.0.join("store"), None).unwrap();
+        let (next, _, _) = ingress_over(&dir.0, claimed, parent);
+        let lookup = next.store.lock().unwrap().output(work).unwrap().unwrap();
+        assert_eq!(lookup.record.unwrap().state, "unsealed");
+        let who = Attributed {
+            position: 0,
+            harness: "h".into(),
+            harness_work: parent,
+            session: None,
+            open: vec![],
+        };
+        assert_eq!(
+            next.retained(&who, 1, &read_request(&next.root_id, work, 0, 3))
+                .unwrap_err(),
+            "output-unsealed-loss-recorded"
+        );
+    }
+
+    #[test]
+    fn takeover_charges_all_files_before_grants_and_revisits_resolved_missing_seals() {
+        let dir = Fixture::new();
+        let (ingress, _root, _far, parent) = fixture(&dir.0);
+        let work = ingress
+            .store
+            .lock()
+            .unwrap()
+            .begin_bash(0, parent, 1, 1, "[]", &["fixture".into()], "/")
+            .unwrap();
+        let mut retainer = Retainer::start(&dir.0.join("store"), work, &ingress.budget);
+        retainer.take(b"orphan-prefix");
+        let conn =
+            rusqlite::Connection::open(dir.0.join("store").join(crate::store::DB_FILE)).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_seal BEFORE INSERT ON bash_output BEGIN SELECT RAISE(ABORT, 'fixture'); END;").unwrap();
+        let result = retainer.seal(
+            &json!({ "state": "closed", "bytes": 13 }),
+            &ingress.store,
+            &ingress.root_id,
+        );
+        assert_eq!(result["state"], "unsealed");
+        ingress
+            .store
+            .lock()
+            .unwrap()
+            .resolve_work(work, "code:7", Some("work-pid1-wait"))
+            .unwrap();
+        conn.execute_batch("DROP TRIGGER fail_seal").unwrap();
+        drop(ingress);
+        // An additional open prefix must already count at construction.
+        std::fs::write(
+            retention::path(&dir.0.join("store"), 999),
+            b"another-orphan",
+        )
+        .unwrap();
+        let claimed = Store::claim(&dir.0.join("store"), None).unwrap();
+        let (next, _, _) = ingress_over(&dir.0, claimed, parent);
+        next.budget.set_limits(retention::Limits {
+            per_run: 100,
+            per_root: 30,
+        });
+        let new = next
+            .store
+            .lock()
+            .unwrap()
+            .begin_bash(0, parent, 1, 1, "[]", &["fixture".into()], "/")
+            .unwrap();
+        let mut retainer = Retainer::start(&dir.0.join("store"), new, &next.budget);
+        retainer.take(b"abcdefghij");
+        let record = retainer.seal(
+            &json!({ "state": "closed", "bytes": 10 }),
+            &next.store,
+            &next.root_id,
+        );
+        assert_eq!(record["bytes"], 3); // 30 - 13 - 14, no deferred recovery charge
+        assert_eq!(record["losses"][0]["reason"], "per-root-bound");
+        let who = Attributed {
+            position: 0,
+            harness: "h".into(),
+            harness_work: parent,
+            session: None,
+            open: vec![],
+        };
+        let old = next
+            .retained(&who, 1, &read_request(&next.root_id, work, 0, 20))
+            .unwrap();
+        assert_eq!(old["retained"]["state"], "partial");
+        assert_eq!(old["retained"]["received"], Value::Null);
+        assert_eq!(old["retained"]["losses"][0]["reason"], "owner-changed");
+        assert_eq!(
+            unbase64(old["b64"].as_str().unwrap()).unwrap(),
+            b"orphan-prefix"
+        );
+    }
+
+    #[test]
+    fn unknown_initial_budget_denies_storage_and_reports_the_uncertainty() {
+        let dir = Fixture::new();
+        let (ingress, _root, _far, parent) = fixture(&dir.0);
+        std::fs::create_dir_all(dir.0.join("store/output/unexpected-directory")).unwrap();
+        drop(ingress);
+        let claimed = Store::claim(&dir.0.join("store"), None).unwrap();
+        let (next, root, far) = ingress_over(&dir.0, claimed, parent);
+        assert!(next.budget_unknown);
+        let work = next
+            .store
+            .lock()
+            .unwrap()
+            .begin_bash(0, parent, 1, 1, "[]", &["fixture".into()], "/")
+            .unwrap();
+        // This is the same unknown-budget denial the production start applies.
+        let mut retainer = Retainer::start(&dir.0.join("store"), work, &next.budget);
+        retainer.deny_unknown_budget();
+        retainer.take(b"lost");
+        let record = retainer.seal(
+            &json!({ "state": "closed", "bytes": 4 }),
+            &next.store,
+            &next.root_id,
+        );
+        assert_eq!(record["state"], "partial");
+        assert_eq!(record["bytes"], 0);
+        assert_eq!(record["received"], 4);
+        assert_eq!(record["losses"][0]["reason"], "budget-unknown");
+        drop((root, far));
+    }
+
+    #[test]
+    fn retained_request_budget_is_bounded_and_reply_work_prevents_idle_close() {
+        let dir = Fixture::new();
+        let (ingress, _root, _far, _parent) = fixture(&dir.0);
+        for _ in 0..MAX_OUTPUT_REQUESTS { ingress.enter_retained().unwrap(); }
+        assert_eq!(ingress.enter_retained().unwrap_err(), "output-request-bound");
+        assert_eq!(ingress.summary()["output_open"], MAX_OUTPUT_REQUESTS);
+        assert_eq!(ingress.summary()["accepted"], 0); // retrieval is not a Bash launch
+        assert!(!ingress.close_if_idle());
+        for _ in 0..MAX_OUTPUT_REQUESTS { ingress.leave_retained(); }
+        assert!(ingress.close_if_idle());
+        assert_eq!(ingress.summary()["output_open"], 0);
+        assert_eq!(ingress.summary()["output_requests"], MAX_OUTPUT_REQUESTS);
+        assert_eq!(ingress.enter_retained().unwrap_err(), "ingress-closed");
+    }
+
+    #[test]
+    fn retained_requests_parse_strictly() {
+        let sha = "a".repeat(64);
+        let ok = parse_retained(&json!({ "op": "output", "root_id": "r", "work": 3 })).unwrap();
+        assert_eq!(
+            (ok.offset, ok.length, ok.accept),
+            (0, retention::MAX_READ, false)
+        );
+        for bad in [
+            json!({ "op": "accept", "root_id": "r", "work": 3, "bytes": 1 }),
+            json!({ "op": "accept", "root_id": "r", "work": 3, "sha256": sha }),
+            json!({ "op": "accept", "root_id": "r", "work": 3, "bytes": 1, "sha256": "A".repeat(64) }),
+            json!({ "op": "output", "root_id": "r", "work": 0 }),
+            json!({ "op": "output", "work": 3 }),
+            json!({ "op": "output", "root_id": "r", "work": 3, "offset": -1 }),
+        ] {
+            assert!(parse_retained(&bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
