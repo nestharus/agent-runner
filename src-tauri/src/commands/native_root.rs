@@ -33,14 +33,17 @@
 //! ingress. `setup-completed` reports the effective policy (`launch.policy`,
 //! with the native permission config as written).
 //!
-//! The request names exactly one harness: `opencode` (above and below) or
-//! `claude` (`deps`, `node`, `agent_bash_bin`, `bash_allow` or
+//! The request names exactly one harness: `opencode` (above and below),
+//! `claude` (below) or a registered external `provider`, which is refused
+//! before any effect (see [`registered`]). `claude` (`deps`, `node`, `agent_bash_bin`, `bash_allow` or
 //! `bash_authority`, `model`, `effort`, `config_dir`): one native Claude
 //! Code harness through the owner crate's ACP v2 receiver (`stdio`), as
 //! its `native_claude` module docs describe. No credential passes: Claude
 //! Code uses the work user's own login in `config_dir`, which this entry
 //! never reads. Its policy is the same named-list or `trusted-task` choice;
 //! `trusted-task` also offers the built-in Read, Write and Edit tools.
+//! `opencode` and `claude` are embedded harnesses, to be retired once
+//! registered providers can supply theirs.
 //!
 //! `opencode.auth` (opt-in, with a model) names a private OpenCode
 //! `auth.json` that setup checks before any effect and places in the
@@ -148,6 +151,8 @@ use oulipoly_root_supervisor::{Endpoint, HarnessSpec, Intent, Recover, Request, 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+mod registered;
+
 const OWNER_BINARY: &str = "oulipoly-root-supervisor";
 
 const EXIT_REFUSED: i32 = 64;
@@ -184,6 +189,10 @@ pub(crate) struct NativeRootRequest {
     /// The native Claude Code setup inputs, instead of `opencode`.
     #[serde(default)]
     claude: Option<ClaudeRequest>,
+    /// A registered external provider, instead of `opencode` or `claude`
+    /// (see [`registered`]).
+    #[serde(default)]
+    provider: Option<registered::Registration>,
     /// Registered children the harness may ask for (see the module docs).
     #[serde(default)]
     children: Option<ChildrenRequest>,
@@ -350,6 +359,9 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
         Ok(request) => request,
         Err(reason) => return Ok(refused(&out, reason)),
     };
+    if let Some(registration) = &request.provider {
+        return Ok(refused(&out, registered_receiver(&out, registration)));
+    }
     let owner = match owner_binary() {
         Ok(owner) => owner,
         Err(reason) => return Ok(refused(&out, reason)),
@@ -437,6 +449,18 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
         &owner_request,
         &context,
     ))
+}
+
+/// Resolves a registered provider's harness: describes the provider and
+/// reports what it declared, then says why its harness cannot be taken.
+/// Nothing but the provider's `describe` is run.
+fn registered_receiver(out: &Out, registration: &registered::Registration) -> String {
+    let declared = match registered::check(registration).and_then(registered::describe) {
+        Ok(declared) => declared,
+        Err(reason) => return reason,
+    };
+    out.entry(declared.entry());
+    declared.unsupported()
 }
 
 /// Provisions the request's one harness. `Err((false, _))`: refused before
@@ -803,8 +827,13 @@ fn read_request(path: &Path) -> Result<NativeRootRequest, String> {
     if request.messages.is_empty() {
         return Err("messages names nothing to deliver".to_owned());
     }
-    if request.opencode.is_some() == request.claude.is_some() {
-        return Err("request names exactly one of opencode and claude".to_owned());
+    let harnesses = [
+        request.opencode.is_some(),
+        request.claude.is_some(),
+        request.provider.is_some(),
+    ];
+    if harnesses.into_iter().filter(|named| *named).count() != 1 {
+        return Err("request names exactly one of opencode, claude and provider".to_owned());
     }
     Ok(request)
 }
@@ -1174,6 +1203,79 @@ mod tests {
         );
         claude["claude"]["credential"] = json!("x");
         assert!(read(claude).unwrap_err().contains("unknown field"));
+    }
+
+    /// A registered provider is a third harness kind, exclusive of the
+    /// embedded ones; its registration is checked when resolved, not here.
+    #[test]
+    fn request_names_a_registered_provider_instead_of_an_embedded_harness() {
+        let dir = tempfile::tempdir().unwrap();
+        let read = |value: Value| {
+            let path = dir.path().join("request.json");
+            std::fs::write(&path, value.to_string()).unwrap();
+            read_request(&path)
+        };
+        let base = json!({
+            "store": dir.path().join("store"),
+            "launch_dir": dir.path().join("launch"),
+            "cwd": "/",
+            "env": {},
+            "messages": ["m"],
+            "outage_closure_cap": 1,
+            "delivery_attempt_cap": 1,
+            "provider": { "executable": "/opt/provider/bin/provider" },
+            "workload": { "isolation": "unprivileged-userns" },
+        });
+        let request = read(base.clone()).unwrap();
+        assert_eq!(
+            request.provider.unwrap().executable,
+            "/opt/provider/bin/provider"
+        );
+        let mut with_claude = base.clone();
+        with_claude["claude"] = claude_setup();
+        assert!(read(with_claude).unwrap_err().contains("exactly one"));
+        let mut native_fields = base;
+        native_fields["provider"]["model"] = json!("m");
+        assert!(read(native_fields).unwrap_err().contains("unknown field"));
+    }
+
+    /// Resolution runs the provider's `describe` only, and refuses with
+    /// what it declared; a registration that fails its checks runs nothing.
+    #[test]
+    fn registered_receiver_describes_then_refuses_without_an_embedded_harness() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = registered::tests::fake_provider(
+            dir.path(),
+            &registered::tests::described("fake-external"),
+        );
+        let sink = Captured::default();
+        let out = Out::new(Box::new(sink.clone()));
+        let reason = registered_receiver(
+            &out,
+            &registered::Registration {
+                executable: fake.to_string_lossy().into_owned(),
+            },
+        );
+        assert!(
+            reason.contains("fake-external declares no resident-acp-v2-harness"),
+            "{reason}"
+        );
+        let lines = sink.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["entry"], "provider-described");
+        assert_eq!(lines[0]["provider_id"], "fake-external");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+            "describe\n"
+        );
+        let relative = registered_receiver(
+            &out,
+            &registered::Registration {
+                executable: "fake-provider".to_owned(),
+            },
+        );
+        assert!(relative.contains("absolute"), "{relative}");
+        assert_eq!(sink.lines().len(), 1, "nothing described");
     }
 
     fn claude_setup() -> Value {
