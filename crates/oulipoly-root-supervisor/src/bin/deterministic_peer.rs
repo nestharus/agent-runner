@@ -13,6 +13,8 @@
 //! * `silent`: never answer prompts; stay alive reading stdin.
 //! * `insert-then-silent`: insert each prompt (honouring dedup) but never
 //!   acknowledge it; stay alive reading stdin (an owner killed mid-delivery).
+//! * `off-session-no-ack`: emit the configured off-session turn, then exit
+//!   without acknowledging insertion.
 //! * `close-stdin`: close its stdin before answering `session/new`, then stay
 //!   alive without reading or writing.
 //!
@@ -25,6 +27,11 @@
 //! answers them once it has acknowledged N.
 //! `--turn-before-ack` sends an echo reply and idle before the insertion
 //! response, exercising the ordering allowed by the native endpoint.
+//!
+//! `--off-session-turn SESSION --turn-gate PATH` emits a colliding reply/idle
+//! for SESSION before the first ACK (or after with `--off-session-after-ack`),
+//! then waits at PATH before the real idle.
+//! The current-session notice marks the end of the injected evidence.
 //!
 //! `--reject-completion-once` conclusively rejects the first background
 //! completion with -32001 before insertion, then stays alive for later inputs.
@@ -88,6 +95,9 @@ struct Args {
     silent_after_acks: Option<u64>,
     turn_before_ack: bool,
     reject_completion_once: bool,
+    off_session_turn: Option<String>,
+    off_session_after_ack: bool,
+    turn_gate: Option<PathBuf>,
 }
 
 fn parse_args() -> Args {
@@ -104,6 +114,9 @@ fn parse_args() -> Args {
         silent_after_acks: None,
         turn_before_ack: false,
         reject_completion_once: false,
+        off_session_turn: None,
+        off_session_after_ack: false,
+        turn_gate: None,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -116,6 +129,9 @@ fn parse_args() -> Args {
             "--untagged" => args.tagged = false,
             "--no-idle" => args.idle = false,
             "--turn-before-ack" => args.turn_before_ack = true,
+            "--off-session-turn" => args.off_session_turn = Some(iter.next().expect("session")),
+            "--off-session-after-ack" => args.off_session_after_ack = true,
+            "--turn-gate" => args.turn_gate = Some(iter.next().expect("gate path").into()),
             "--silent-after-acks" => {
                 args.silent_after_acks = Some(
                     iter.next()
@@ -161,6 +177,23 @@ fn save(path: &PathBuf, state: &Value) {
 
 fn send(out: &mut impl Write, value: &Value) {
     let _ = writeln!(out, "{value}").and_then(|()| out.flush());
+}
+
+/// Real supported native updates with colliding parent and last-user tags.
+fn off_session_turn(out: &mut impl Write, session: &str, message_id: &Value) {
+    for update in [
+        json!({ "sessionUpdate": "agent_message", "messageId": "foreign-reply",
+            "content": [{ "type": "text", "text": "OFF-SESSION" }],
+            "_meta": { PARENT_MESSAGE_META: message_id } }),
+        json!({ "sessionUpdate": "state_update", "state": "idle",
+            "stopReason": "end_turn", "_meta": { TURN_INPUT_META: message_id } }),
+    ] {
+        send(
+            out,
+            &json!({ "jsonrpc": "2.0", "method": "session/update",
+            "params": { "sessionId": session, "update": update } }),
+        );
+    }
 }
 
 fn linger() -> ! {
@@ -359,11 +392,38 @@ impl Peer {
                         result["_meta"] =
                             json!({ MESSAGE_KEY_META: key, DUPLICATE_META: duplicate });
                     }
+                    if *acks == 0 && !args.off_session_after_ack {
+                        if let Some(other) = &args.off_session_turn {
+                            off_session_turn(out, other, &message_id);
+                        }
+                    }
+                    if args.mode == "off-session-no-ack" {
+                        std::process::exit(0);
+                    }
                     if !args.turn_before_ack {
                         send(
                             out,
                             &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
                         );
+                    }
+                    if *acks == 0 && args.off_session_after_ack {
+                        if let Some(other) = &args.off_session_turn {
+                            off_session_turn(out, other, &message_id);
+                        }
+                    }
+                    if *acks == 0 && args.off_session_turn.is_some() {
+                        send(
+                            out,
+                            &json!({ "jsonrpc": "2.0", "method": "session/update",
+                            "params": { "sessionId": session_id, "update": {
+                                "sessionUpdate": "notice", "severity": "info", "title": "off-session-sent"
+                            } } }),
+                        );
+                        if let Some(gate) = &args.turn_gate {
+                            while !gate.exists() {
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                        }
                     }
                     if args.turn_before_ack {
                         let mut update = json!({

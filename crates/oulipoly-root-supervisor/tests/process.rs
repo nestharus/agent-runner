@@ -2485,6 +2485,146 @@ fn turn_before_ack_preserves_correlation_follow_up_and_close() {
     assert_eq!(peer["prompts"].as_array().unwrap().len(), 2);
 }
 
+/// Colliding tags from a historical or never-opened session cannot end
+/// this worker's input or enable its next admission. A later genuine idle
+/// must release it, without counting the other session's reply as its output.
+#[test]
+fn prior_session_evidence_cannot_release_current_input() {
+    off_session_evidence_cannot_release_current_input("sess-prior", false);
+}
+
+#[test]
+fn unknown_session_evidence_cannot_release_current_input() {
+    off_session_evidence_cannot_release_current_input("sess-unknown", true);
+}
+
+fn off_session_evidence_cannot_release_current_input(other: &str, after_ack: bool) {
+    let dir = Scratch::new("session-fence");
+    let state = dir.state("a");
+    if other == "sess-prior" {
+        std::fs::write(
+            &state,
+            json!({
+                "launches": [], "sessions": [other], "prompts": [],
+                "insertions": [], "fault_used": false,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let gate = dir.0.join("current-turn");
+    let mut extra = vec![
+        "--off-session-turn",
+        other,
+        "--turn-gate",
+        gate.to_str().unwrap(),
+    ];
+    if after_ack {
+        extra.push("--off-session-after-ack");
+    }
+    let mut run = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            1,
+            json!([{
+                "id": "a", "argv": peer(&state, &extra), "messages": ["one"]
+            }]),
+        ),
+    );
+    let opened = run.event("a", "session-opened");
+    assert_ne!(opened["session"], other);
+    let ack = run.event("a", "ack");
+    run.until("injected evidence consumed", |v| {
+        v["event"] == "notice" && v["title"] == "off-session-sent"
+    });
+    // This is the recipient admission effect, not a predicate-only test.
+    run.control(r#"{"cmd":"send","text":"must-stay-blocked"}"#);
+    let decision = run.until("overlap decision", |v| {
+        v["event"] == "follow-up-refused" || v["event"] == "follow-up-admitted"
+    });
+    assert_eq!(
+        decision["event"], "follow-up-refused",
+        "{other}: {decision}"
+    );
+    assert_eq!(decision["reason"], "input-open");
+    assert!(
+        events(&run.seen, "a", "turn-end").is_empty(),
+        "{:#?}",
+        run.seen
+    );
+    let reply = events(&run.seen, "a", "agent-message")[0];
+    assert_eq!(reply["session"], other);
+    assert_eq!(reply["parent_message_id"], ack["message_id"]);
+    assert!(
+        reply["input"].is_null(),
+        "off-session reply was attributed: {reply}"
+    );
+    assert_eq!(read_state(&state)["prompts"].as_array().unwrap().len(), 1);
+    std::fs::write(&gate, b"release").unwrap();
+    let turn = run.event("a", "turn-end");
+    assert_eq!(turn["session"], opened["session"]);
+    assert_eq!(turn["message_id"], ack["message_id"]);
+    assert_eq!(
+        turn["own_output"], false,
+        "off-session reply poisoned own_output"
+    );
+    run.control(r#"{"cmd":"send","text":"echo:CURRENT"}"#);
+    run.event("a", "follow-up-admitted");
+    let turn = run.until("valid next turn", |v| {
+        v["event"] == "turn-end" && v["input"] == 1
+    });
+    assert_eq!(turn["session"], opened["session"]);
+    assert_eq!(turn["own_output"], true);
+    run.control(r#"{"cmd":"close"}"#);
+    let (terminal, status, seen) = run.terminal();
+    assert_eq!(status.code(), Some(7), "{terminal}");
+    assert_eq!(terminal["owed"], 0);
+    assert_eq!(terminal["all_harnesses_reaped"], true);
+    assert_eq!(events(&seen, "a", "turn-end").len(), 2);
+    assert_eq!(read_state(&state)["prompts"].as_array().unwrap().len(), 2);
+}
+
+/// Updates do not constitute insertion receipts. Without the correlated
+/// response, unknown-session output/idle leaves the actual message owed.
+#[test]
+fn unknown_session_updates_without_ack_leave_input_owed() {
+    let dir = Scratch::new("unknown-no-ack");
+    let state = dir.state("a");
+    let run = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            1,
+            json!([{
+                "id": "a", "argv": peer(&state, &[
+                    "--mode", "off-session-no-ack", "--off-session-turn", "sess-unknown"
+                ]), "messages": ["one"]
+            }]),
+        ),
+    );
+    let (terminal, _, seen) = run.terminal();
+    assert_eq!(terminal["status"], "ended-owed", "{terminal}");
+    assert_eq!(terminal["owed"], 1);
+    assert_eq!(terminal["all_harnesses_reaped"], true);
+    assert!(events(&seen, "a", "ack").is_empty());
+    assert!(events(&seen, "a", "turn-end").is_empty());
+    let reply = events(&seen, "a", "agent-message")[0];
+    assert_eq!(reply["session"], "sess-unknown");
+    assert!(reply["input"].is_null());
+    let message = &harness(&terminal, "a")["messages"][0];
+    assert_eq!(message["state"], "owed");
+    assert_eq!(message["attempts"], 1);
+    assert_eq!(
+        count(
+            &db(&dir),
+            "SELECT count(*) FROM message WHERE ack_label IS NOT NULL"
+        ),
+        0
+    );
+    assert_eq!(read_state(&state)["prompts"].as_array().unwrap().len(), 1);
+}
+
 /// Live follow-up: a further caller input reaches the same live harness
 /// and session, durably admitted before it is reported, with its own
 /// correlated ack and turn end. Malformed controls admit nothing. `close`

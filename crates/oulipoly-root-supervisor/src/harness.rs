@@ -1539,8 +1539,9 @@ impl Worker {
     /// the agent requests this owner refused. None of it is an ACK.
     ///
     /// Output names the owner input it answers only by the agent's own
-    /// parent tag. A turn end is reported for an input only from an idle
-    /// the agent tagged with that input's or a later user message (native
+    /// parent tag in this worker's native session. A turn end is reported
+    /// for an input only from an idle in that session which the agent
+    /// tagged with that input's or a later user message (native
     /// ids ascend); then `own_output` says whether any output named it.
     /// An untagged idle stays readiness: no input's end.
     fn report_turn(&mut self, client: &AcpClient<HarnessTransport>, seen: &mut usize) {
@@ -1552,10 +1553,12 @@ impl Worker {
                     text,
                     parent_message_id,
                 } => {
+                    let current_session = self.session.as_deref() == Some(session_id.as_str());
                     let input = parent_message_id
                         .as_deref()
+                        .filter(|_| current_session)
                         .and_then(|parent| self.input_of(parent));
-                    if let Some(parent) = parent_message_id {
+                    if let Some(parent) = parent_message_id.as_ref().filter(|_| current_session) {
                         self.answered.insert(parent.clone());
                     }
                     self.report(json!({
@@ -1576,7 +1579,7 @@ impl Worker {
                     session_id,
                     stop_reason,
                     last_user_message_id: Some(last),
-                } => {
+                } if self.session.as_deref() == Some(session_id.as_str()) => {
                     let mut covered = Vec::new();
                     self.view(|view| {
                         view.open.retain(|input| match &input.message_id {
