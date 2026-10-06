@@ -63,10 +63,18 @@ bunx tauri build
 cp src-tauri/target/release/oulipoly-agent-runner ~/.local/bin/
 ```
 
-The Linux `.deb` and raw binary use the legacy entry topology. A separate
-[paired Linux archive](packaging/linux/README.md) stages a broker, fixed Runner,
-service, and CLI/GUI links with a versioned image check; it is an inactive
-cutover prerequisite, not an installable v30 or one-supervisor deployment.
+Ordinary Linux CLI agent launches require explicit `native.toml`
+configuration and use the configured installed ACP v2 native caller before
+legacy owner/State bootstrap. Missing, unreadable or invalid native
+configuration and unsupported launch forms refuse with exit 3, with no legacy
+fallback or substitute model. See the [native Linux entry configuration](packaging/native-linux/README.md#ordinary-agents-entry-nativetoml)
+for supported forms, exact model-to-site-route mappings and caller/output
+contracts. Building this frontend does not install the native caller package.
+
+Help/usage, non-launch subcommands, GUI and wider legacy-source retirement
+remain separate and unclosed. The older [paired Linux archive](packaging/linux/README.md)
+stages a broker, fixed Runner, service and CLI/GUI links; its inactive cutover
+prerequisite does not establish an installable v30 or one-supervisor deployment.
 
 ## Testing
 

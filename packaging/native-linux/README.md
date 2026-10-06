@@ -237,8 +237,9 @@ or tool echo can be answered/0; entry 87 means close followed through.
 
 ## Ordinary `agents` entry (`native.toml`)
 
-When `<runner config root>/native.toml` exists (normally
-`~/.config/oulipoly-agent-runner/native.toml`), the ordinary launch forms
+Ordinary Linux CLI launch requires `<runner config root>/native.toml`
+(normally `~/.config/oulipoly-agent-runner/native.toml`). With valid
+configuration, the launch forms
 `agents -m MODEL PROMPT`, `agents AGENT PROMPT` and `--agent-file` run as one
 call of the configured installed caller, before any legacy
 maintenance/owner/State/provider path. The selected model name, from `-m` or
@@ -266,11 +267,13 @@ The final answer goes to stdout; a status line (class, caller and front-door
 exits, record directory) goes to stderr. Answer read/write/flush failures are
 also reported there; after caller success they return entry exit 6, while a
 nonzero caller exit is preserved. Caller 0/answered is not correctness.
-Unmapped models, an invalid file, `--resume`, `repl`, `resume`, `--new`,
+Unmapped models, a missing/unreadable/invalid file, `--resume`, `repl`, `resume`, `--new`,
 provider pinning/rotation and `-i`
 with `-m` are refused with exit 3 and nothing launched: no legacy launch and
-no substitute model. An unresolved config root is also refused with exit 3;
-only a resolved root with an absent file leaves the entry unselected.
+no substitute model. An unresolved config root is also refused with exit 3.
+Missing configuration never falls through to the legacy owner/State path.
+Help/usage, non-launch subcommands and GUI retain their separate paths; this
+launch closure does not retire those or the wider legacy source.
 The credential is the explicitly named profile only: no rotation, lease or
 renewal (the caller
 refuses a stale one). One attempt, synchronous, no streaming or resume yet.

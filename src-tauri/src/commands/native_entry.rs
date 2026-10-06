@@ -12,13 +12,14 @@
 //!     role: intrinsic-surface
 //!     Domain: native_entry_cli_selection
 //!     Owns:
-//!       - native.toml presence as the ordinary-launch entry selection
+//!       - native.toml requirement for ordinary Linux CLI launch
 //!       - model-name to site-route mapping for -m and agent frontmatter selection
 //!       - refusal of launch forms the native entry does not support
 //!       - one installed native caller invocation and its result rendering
 //! ```
 //!
-//! When `<config root>/native.toml` exists, the ordinary launch forms
+//! The ordinary Linux CLI launch forms require `<config root>/native.toml`.
+//! With valid configuration, those forms
 //! (`agents -m MODEL PROMPT`, `agents AGENT PROMPT`, `--agent-file`) run as
 //! one installed native caller task (`oulipoly-native-call` through the
 //! privileged front door) before any legacy owner bootstrap, State, runtime
@@ -26,8 +27,8 @@
 //! agent's frontmatter, must have an explicit `[models."NAME"]` mapping to a
 //! site route. Anything else, including resume/REPL/provider pinning and
 //! unmapped models, is refused: never a legacy launch, never a substitute
-//! model. A resolved root without `native.toml` leaves the entry unselected;
-//! an unresolved config root is refused, never treated as an absent file.
+//! model. Missing, unreadable or invalid configuration, and an unresolved
+//! config root, are refused before legacy bootstrap.
 //!
 //! The caller is one attempt, with no replay. Its exit code is returned as
 //! is unless answer presentation fails after caller success (entry exit 6);
@@ -85,14 +86,20 @@ enum Selection {
     Agent,
 }
 
-/// Runs the ordinary launch on the native root when `native.toml` selects it.
-/// `Ok(None)`: not selected (no file, or not a launch form); legacy dispatch
-/// continues unchanged.
+/// Runs ordinary Linux CLI launches on the configured native root or refuses.
+/// `Ok(None)` is reserved for help/usage and non-launch forms.
 pub(crate) fn run_if_selected(cli: &Cli) -> Result<Option<i32>, String> {
+    run_if_selected_with_root(cli, crate::cli::paths::default_config_root)
+}
+
+fn run_if_selected_with_root(
+    cli: &Cli,
+    config_root: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<Option<i32>, String> {
     if !is_launch_form(cli) {
         return Ok(None);
     }
-    let root = match crate::cli::paths::default_config_root() {
+    let root = match config_root() {
         Ok(root) => root,
         Err(reason) => {
             return refuse(&format!(
@@ -101,8 +108,7 @@ pub(crate) fn run_if_selected(cli: &Cli) -> Result<Option<i32>, String> {
         }
     };
     let config = match selected_config(&root) {
-        Ok(None) => return Ok(None),
-        Ok(Some(config)) => config,
+        Ok(config) => config,
         Err(reason) => return refuse(&reason),
     };
     match run_selected(cli, &config) {
@@ -111,18 +117,20 @@ pub(crate) fn run_if_selected(cli: &Cli) -> Result<Option<i32>, String> {
     }
 }
 
-/// The entry selection: `None` only when `native.toml` does not exist. An
-/// unreadable or invalid file selects the native entry and refuses there.
-fn selected_config(root: &Path) -> Result<Option<NativeEntryConfig>, String> {
+/// Launch requires valid native configuration; every read/parse error refuses.
+fn selected_config(root: &Path) -> Result<NativeEntryConfig, String> {
     let path = root.join(CONFIG_FILE);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "native launch is not configured: {} is missing; configure the installed native caller and model routes",
+                path.display()
+            ));
+        }
         Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
     };
-    parse_config(&text)
-        .map(Some)
-        .map_err(|error| format!("{}: {error}", path.display()))
+    parse_config(&text).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 fn refuse(reason: &str) -> Result<Option<i32>, String> {
@@ -498,23 +506,83 @@ mod tests {
 
     #[test]
     fn non_launch_subcommands_are_not_selected() {
-        assert!(!is_launch_form(&cli(&["--usage"])));
-        assert!(!is_launch_form(&cli(&["migrate-db"])));
+        for args in [&["--usage"][..], &["migrate-db"][..]] {
+            let cli = cli(args);
+            assert!(!is_launch_form(&cli));
+            assert_eq!(
+                run_if_selected_with_root(&cli, || panic!("non-launch must not read config"))
+                    .unwrap(),
+                None
+            );
+        }
         assert!(is_launch_form(&cli(&["-m", "m", "hi"])));
     }
 
     #[test]
-    fn only_an_absent_file_leaves_the_entry_unselected() {
+    fn missing_unreadable_and_invalid_config_refuse_launch_without_fallthrough() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(selected_config(dir.path()).unwrap().is_none());
-        std::fs::write(dir.path().join(CONFIG_FILE), "caller = 1\n").unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        let launch_forms = [
+            cli(&["-m", "m", "hi"]),
+            cli(&["agent", "hi"]),
+            cli(&["--agent-file", "absent-agent.md", "hi"]),
+            cli(&["--resume", "x", "hi"]),
+            cli(&["repl", "m"]),
+            cli(&["resume", "x"]),
+        ];
+        let assert_refused = || {
+            for cli in &launch_forms {
+                assert_eq!(
+                    run_if_selected_with_root(cli, || Ok(dir.path().to_owned())).unwrap(),
+                    Some(REFUSED)
+                );
+            }
+        };
+        let reason = selected_config(dir.path()).unwrap_err();
+        assert!(reason.contains("native launch is not configured"));
+        assert!(reason.contains(&path.display().to_string()));
+        assert_refused();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        // A directory at the config path is unreadable as a TOML file even
+        // under a privileged test runner (unlike a mode-000 fixture).
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            selected_config(dir.path())
+                .unwrap_err()
+                .contains("cannot read")
+        );
+        assert_refused();
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, "caller = 1\n").unwrap();
         assert!(selected_config(dir.path()).is_err());
-        std::fs::write(
-            dir.path().join(CONFIG_FILE),
-            "caller = \"/c\"\nruns_dir = \"/r\"\n",
-        )
-        .unwrap();
-        assert!(selected_config(dir.path()).unwrap().is_some());
+        assert_refused();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        std::fs::write(&path, "caller = \"/c\"\nruns_dir = \"/r\"\n").unwrap();
+        let configured = selected_config(dir.path()).unwrap();
+        assert_eq!(configured.caller, Path::new("/c"));
+        assert_eq!(configured.runs_dir, Path::new("/r"));
+        // Valid configuration still refuses unsupported and unmapped launches
+        // before prompt/agent reads or any caller invocation.
+        for cli in [
+            cli(&["-m", "m", "hi"]),
+            cli(&["--resume", "x", "hi"]),
+            cli(&["repl", "m"]),
+            cli(&["resume", "x"]),
+        ] {
+            assert_eq!(
+                run_if_selected_with_root(&cli, || Ok(dir.path().to_owned())).unwrap(),
+                Some(REFUSED)
+            );
+        }
+        for cli in &launch_forms {
+            assert_eq!(
+                run_if_selected_with_root(cli, || Err("fixture root unavailable".into())).unwrap(),
+                Some(REFUSED)
+            );
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]
