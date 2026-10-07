@@ -1,5 +1,4 @@
-//! Shared provider-turn boundaries consumed by both the current resume path and
-//! the target resident-supervisor adapter.
+//! Provider-turn batch bound consumed by the retained ordinary resume path.
 //!
 //! ## Declared roles
 //!

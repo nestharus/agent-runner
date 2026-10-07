@@ -4,11 +4,9 @@
 //!
 //! ## Lifecycle relationship
 //!
-//! This module is the current production authority for headless resume outcome
-//! classification and settlement. `ProviderTurnAdapter` is the target
-//! resident-supervisor boundary, not another active path. Their staged
-//! migration contract is owned by
-//! `docs/architecture/provider-turn-lifecycle.md`.
+//! This module retains ordinary headless resume outcome classification and
+//! settlement. See `docs/architecture/provider-turn-lifecycle.md` for the
+//! retained functions and retired public supervisor/adapter surfaces.
 
 use oulipoly_runtime::executor;
 use oulipoly_runtime::executor::prompt_acceptance::ValidatedPromptAcceptance;

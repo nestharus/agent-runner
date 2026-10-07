@@ -1,4 +1,10 @@
-# Native completion continuation v2
+# Internal completion continuation v2
+
+The ordinary `notify` CLI, including completion-continuation-v2 registration,
+publication and recovery commands, has been retired. The shared driver, custody
+and delivery internals described below remain for a later removal slice; they
+are separate from the selected native-root ACP v2 route. This document supplies
+no replacement operator command or activation authority.
 
 The current guardian also hosts the separate
 [`original-work-v1`](root-original-work-v1.md) lane. Sharing the guardian,

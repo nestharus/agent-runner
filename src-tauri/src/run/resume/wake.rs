@@ -4,10 +4,8 @@
 //!
 //! ## Lifecycle relationship
 //!
-//! This module currently owns production resume evidence acquisition and
-//! mailbox/wake projection. It remains compatible with the target
-//! `ProviderTurnAdapter` until AGE-278 performs the joined cutover; the exact
-//! domain boundary and retirement criteria are owned by
+//! This module retains ordinary resume evidence acquisition and mailbox/wake
+//! projection for the later delivery-internal removal slice. See
 //! `docs/architecture/provider-turn-lifecycle.md`.
 
 use oulipoly_provider::client::CancellationToken;

@@ -1381,7 +1381,7 @@ fn source_command(
     }
     let confirmation =
         Path::new(&attempt.result_path).with_file_name("registration-confirmation-v2.json");
-    let mut receipt = crate::commands::notify_continuation::response(binding, "exact_committed")?;
+    let mut receipt = super::publication::response(binding, "exact_committed")?;
     receipt["authority"] = "completion_only".into();
     receipt["registration_committed"] = true.into();
     durable_write(

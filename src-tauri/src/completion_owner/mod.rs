@@ -13,6 +13,8 @@ pub(crate) mod broker_route;
 mod custody;
 #[cfg(target_os = "linux")]
 mod driver;
+#[cfg(target_os = "linux")]
+mod publication;
 #[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
 pub(crate) const PRIVATE_DRIVER_ARG: &str = driver::DRIVER_ARG;
 #[cfg(target_os = "linux")]
@@ -224,23 +226,11 @@ pub(crate) fn bootstrap(cli: &crate::usage::cli::Cli) -> Result<(), BootstrapErr
 // Process-entry boundary, before runtime threads or recovery. Database opens,
 // readback, ACK and maintenance do not acquire a service lease.
 fn requires_service(cli: &crate::usage::cli::Cli) -> bool {
-    use crate::usage::cli::{MailboxSubcommands, NotifySubcommands, Subcommands};
+    use crate::usage::cli::Subcommands;
     !cli.usage
         && (matches!(
             &cli.command,
-            None | Some(Subcommands::Repl { .. })
-                | Some(Subcommands::Resume { .. })
-                | Some(Subcommands::Notify {
-                    command: NotifySubcommands::Register {
-                        accepted_intent_file: None,
-                        ..
-                    } | NotifySubcommands::Listen { .. }
-                        | NotifySubcommands::Activate { .. }
-                        | NotifySubcommands::Complete { .. }
-                })
-                | Some(Subcommands::Mailbox {
-                    command: MailboxSubcommands::Resume { .. }
-                })
+            None | Some(Subcommands::Repl { .. }) | Some(Subcommands::Resume { .. })
         ) || startup_wake_reclaim_sweep_enabled(cli))
 }
 
@@ -297,16 +287,11 @@ pub(crate) fn require_owner(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
 pub(crate) fn discover_v30_owner(
     query_pid: Option<i32>,
 ) -> Result<oulipoly_kernel_broker::protocol::OwnerDiscoveryReadback, String> {
     linux::discover_v30_owner(query_pid)
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn v30_broker_socket() -> std::path::PathBuf {
-    linux::owner_broker_socket()
 }
 
 #[cfg(target_os = "linux")]

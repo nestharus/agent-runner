@@ -528,7 +528,7 @@ fn run_owned(path: &Path, owner: &CompletionDomainOwner) -> Result<(), String> {
             // bounded durable scope. An absent snapshot cannot be accepted.
             // Presence is a hint, never acceptance or workload replay authority.
             let accepted = snapshot.is_file()
-                && crate::commands::notify_continuation::accept(&binding, &snapshot).is_ok();
+                && super::publication::accept(&binding, &snapshot).is_ok();
             if accepted {
                 continue;
             }
