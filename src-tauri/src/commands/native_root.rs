@@ -1,5 +1,6 @@
-//! `native-root`: start one fresh native ACP v2 root (OpenCode or Claude
-//! Code harness), or recover one this entry started, for cancel or attached
+//! `native-root`: start one fresh native ACP v2 root (a registered external
+//! provider's resident harness, or an embedded OpenCode or Claude Code
+//! harness), or recover one this entry started, for cancel or attached
 //! continuation (Linux, opt-in, source build).
 //!
 //! `--request <file>` starts a root. The request file names everything the
@@ -33,9 +34,16 @@
 //! ingress. `setup-completed` reports the effective policy (`launch.policy`,
 //! with the native permission config as written).
 //!
-//! The request names exactly one harness: `opencode` (above and below),
-//! `claude` (below) or a registered external `provider`, which is refused
-//! before any effect (see [`registered`]). `claude` (`deps`, `node`, `agent_bash_bin`, `bash_allow` or
+//! The request names exactly one harness: a registered external `provider`,
+//! `opencode` (above and below) or `claude` (below). `provider`
+//! (`executable`, `settings`, optional `config_root` and `env`,
+//! `agent_bash_bin`, `bash_allow` or `bash_authority`): the provider's own
+//! resident ACP v2 harness on stdio, resolved through what it declares and
+//! prepares, as the [`registered`] module docs describe. Its `settings` and
+//! `env` are the provider's, never read here; its tool policy reaches the
+//! provider as [`registered::TOOLS_ENV`] in its launch template, for the
+//! provider to translate. The owner labels the harness with the provider's
+//! declared id. `claude` (`deps`, `node`, `agent_bash_bin`, `bash_allow` or
 //! `bash_authority`, `model`, `effort`, `config_dir`): one native Claude
 //! Code harness through the owner crate's ACP v2 receiver (`stdio`), as
 //! its `native_claude` module docs describe. No credential passes: Claude
@@ -55,7 +63,7 @@
 //! entry does not refresh, copy back or remove them: the caller owns the
 //! source file and the launch directory's copy after the root ends.
 //!
-//! `children` (opt-in) lets the root's harness ask the owner for registered
+//! `children` (opt-in, any harness) lets the root's harness ask the owner for registered
 //! read-only children: `{"routes": {NAME: {"model", "provider"}},
 //! "opencode": {"deps", "agent_bash_tool", "agent_bash_bin"}, "auth"?,
 //! "max_starts", "max_concurrent"}`. Each child is a native OpenCode host
@@ -112,9 +120,14 @@
 //!   caller's close was followed through, its host ended by a kill: not
 //!   that anything was processed. Owed work stays in the store, for an
 //!   explicit recovery, never by replaying a request.
-//! * `64`: the request was refused before any effect.
+//! * `64`: the request was refused before any effect: nothing was run.
+//! * `65`: a registered provider refused or failed its `describe` or
+//!   `policy.evaluate`. This entry made no store or launch directory, but
+//!   the provider ran and its own effects are unknown (`effects` says
+//!   which). Do not replay as if nothing ran.
 //! * `73`: setup construction failed: the launch directory may hold partial
-//!   effects. Do not replay.
+//!   effects, a registered provider's `resident.prepare` among them. Do not
+//!   replay.
 //! * `66`: the owner refused the request or its store (its 64 or 65),
 //!   after setup's effects for a fresh root. Do not replay.
 //! * `69`: the owner process could not be started (after setup's effects
@@ -156,6 +169,7 @@ mod registered;
 const OWNER_BINARY: &str = "oulipoly-root-supervisor";
 
 const EXIT_REFUSED: i32 = 64;
+const EXIT_PROVIDER_REFUSED: i32 = 65;
 const EXIT_OWNER_REFUSED: i32 = 66;
 const EXIT_OWNER_NOT_STARTED: i32 = 69;
 const EXIT_OWNER_UNKNOWN: i32 = 70;
@@ -359,9 +373,6 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
         Ok(request) => request,
         Err(reason) => return Ok(refused(&out, reason)),
     };
-    if let Some(registration) = &request.provider {
-        return Ok(refused(&out, registered_receiver(&out, registration)));
-    }
     let owner = match owner_binary() {
         Ok(owner) => owner,
         Err(reason) => return Ok(refused(&out, reason)),
@@ -370,7 +381,11 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
     // effects. They read only that the argv is non-empty; every
     // provisioned argv is. They include resolving the work declaration
     // against this process (the owner's euid is this entry's).
-    let checked = owner_request(&request, vec!["/usr/bin/env".to_owned()]);
+    let checked = owner_request(
+        &request,
+        harness_kind(&request),
+        vec!["/usr/bin/env".to_owned()],
+    );
     if let Err(reason) = checked.validate() {
         return Ok(refused(&out, format!("owner request: {reason}")));
     }
@@ -401,6 +416,15 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
         Ok(workload) => workload,
         Err(reason) => return Ok(refused(&out, format!("owner request: {reason}"))),
     };
+    if let Some(registration) = &request.provider {
+        return Ok(run_registered(
+            &out,
+            &request,
+            registration,
+            &owner,
+            &workload,
+        ));
+    }
     let provisioned = match provision(&request, workload.identity.as_ref()) {
         Ok(provisioned) => provisioned,
         Err((false, reason)) => return Ok(refused(&out, format!("setup: {reason}"))),
@@ -427,13 +451,7 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
         "launch": provisioned.receipt,
         "owner": owner,
         "env": reach,
-        "workload": {
-            "isolation": workload.isolation.label(),
-            "user": workload.identity.as_ref().map(|identity| &identity.user),
-            "uid": workload.identity.as_ref().map(|identity| identity.uid),
-            "gid": workload.identity.as_ref().map(|identity| identity.gid),
-            "ipc_dir": workload.ipc_dir,
-        },
+        "workload": workload_report(&workload),
     }));
     let context = json!({
         "store": request.store,
@@ -441,7 +459,7 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
         "setup": "retained",
         "retry": "do-not-replay",
     });
-    let owner_request = owner_request(&request, provisioned.argv);
+    let owner_request = owner_request(&request, harness_kind(&request), provisioned.argv);
     Ok(start_owner(
         &out,
         &owner,
@@ -451,16 +469,137 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
     ))
 }
 
-/// Resolves a registered provider's harness: describes the provider and
-/// reports what it declared, then says why its harness cannot be taken.
-/// Nothing but the provider's `describe` is run.
-fn registered_receiver(out: &Out, registration: &registered::Registration) -> String {
-    let declared = match registered::check(registration).and_then(registered::describe) {
-        Ok(declared) => declared,
-        Err(reason) => return reason,
+/// Resolves, prepares and starts a registered provider's harness (see
+/// [`registered`]). Everything this entry checks itself was checked before.
+fn run_registered(
+    out: &Out,
+    request: &NativeRootRequest,
+    registration: &registered::Registration,
+    owner: &Path,
+    workload: &oulipoly_root_supervisor::workload::Resolved,
+) -> i32 {
+    let admitted =
+        match registered::check(registration).and_then(|()| registered::admit(registration)) {
+            Ok(admitted) => admitted,
+            Err(reason) => return refused(out, reason),
+        };
+    let prepared = admitted.describe().and_then(|declared| {
+        out.entry(declared.entry());
+        let template = admitted.template(&tools(request))?;
+        let prepared = admitted.prepare(Path::new(&request.launch_dir), template)?;
+        let handed = match &workload.identity {
+            Some(identity) => registered::hand_over(
+                Path::new(&request.launch_dir),
+                &prepared.data_root,
+                identity,
+            )
+            .map(|count| {
+                json!({
+                    "to": { "user": identity.user, "uid": identity.uid, "gid": identity.gid },
+                    "entries": count,
+                })
+            })
+            .map_err(|reason| registered::Failure::Setup {
+                provider: true,
+                reason,
+            })?,
+            None => json!("none: the work runs as this entry's user"),
+        };
+        Ok((declared, prepared, handed))
+    });
+    let (declared, prepared, handed) = match prepared {
+        Ok(prepared) => prepared,
+        Err(failure) => return registered_failure(out, request, failure),
     };
-    out.entry(declared.entry());
-    declared.unsupported()
+    let receipt = json!({
+        "provider_id": declared.provider_id,
+        "agreed_contract": declared.contract,
+        "resident_session": declared.resident_session,
+        "executable": registration.executable,
+        "executable_identity_sha256": admitted.identity,
+        "argv": prepared.argv,
+        "endpoint": prepared.result.invocation.endpoint,
+        "acp": prepared.result.acp,
+        "operations": prepared.result.operations,
+        "config_sha256": prepared.result.config_sha256,
+        "data_root": prepared.data_root,
+        "data_root_handed_over": handed,
+        "template_env": prepared.template_env,
+        "tools": tools(request),
+        "identity": {
+            "describe_policy_prepare": "this entry's",
+            "resident_serve": "the work identity, in the root's work namespaces",
+        },
+    });
+    let reach = env_reach(&request.env, &[], &[]);
+    out.entry(json!({
+        "entry": "setup-completed",
+        "harness": "registered-provider",
+        "launch": receipt,
+        "owner": owner,
+        "env": reach,
+        "workload": workload_report(workload),
+    }));
+    let context = json!({
+        "store": request.store,
+        "launch_dir": request.launch_dir,
+        "setup": "retained",
+        "retry": "do-not-replay",
+    });
+    let owner_request = owner_request(
+        request,
+        (declared.provider_id.as_str(), Endpoint::Stdio),
+        prepared.argv,
+    );
+    start_owner(out, owner, &request.env, &owner_request, &context)
+}
+
+/// The terminal line of a registered provider's refusal or failure: what
+/// ran, and so which effects there may be.
+fn registered_failure(out: &Out, request: &NativeRootRequest, failure: registered::Failure) -> i32 {
+    match failure {
+        registered::Failure::Provider { operation, reason } => {
+            out.entry(json!({
+                "entry": "terminal",
+                "stage": "provider-refused",
+                "operation": operation,
+                "reason": reason,
+                "effects": { "runner_setup": "none", "provider": "unknown: it ran" },
+                "retry": "do-not-replay-as-unrun",
+            }));
+            out.exit(EXIT_PROVIDER_REFUSED)
+        }
+        registered::Failure::Setup { provider, reason } => {
+            out.entry(json!({
+                "entry": "terminal",
+                "stage": "setup-failed",
+                "reason": reason,
+                "launch_dir": request.launch_dir,
+                "effects": "possible",
+                "provider": if provider { "unknown: it ran" } else { "not run" },
+                "retry": "do-not-replay",
+            }));
+            out.exit(EXIT_SETUP_FAILED)
+        }
+    }
+}
+
+/// Runner's policy for the root's tools, for a registered provider to
+/// translate (see [`registered::TOOLS_ENV`]).
+fn tools(request: &NativeRootRequest) -> Value {
+    let (bash_allow, bash_authority) = bash_policy(request);
+    let bash = match bash_authority {
+        Some(authority) => json!({ "authority": authority }),
+        None => json!({ "allow": bash_allow }),
+    };
+    json!({
+        "v": 1,
+        "bash": bash,
+        "requester": request.provider.as_ref().map(|provider| &provider.agent_bash_bin),
+        "ingress_env": oulipoly_root_supervisor::bash::BASH_ENV,
+        "other_native_tools": "deny",
+        "explore": explore_tool(request),
+    })
 }
 
 /// Provisions the request's one harness. `Err((false, _))`: refused before
@@ -520,6 +659,16 @@ fn provision(
     }
 }
 
+fn workload_report(workload: &oulipoly_root_supervisor::workload::Resolved) -> Value {
+    json!({
+        "isolation": workload.isolation.label(),
+        "user": workload.identity.as_ref().map(|identity| &identity.user),
+        "uid": workload.identity.as_ref().map(|identity| identity.uid),
+        "gid": workload.identity.as_ref().map(|identity| identity.gid),
+        "ipc_dir": workload.ipc_dir,
+    })
+}
+
 /// The parent's `explore` tool, when the request allows children.
 fn explore_tool(request: &NativeRootRequest) -> Option<ExploreTool> {
     request.children.as_ref().map(|children| ExploreTool {
@@ -531,10 +680,11 @@ fn explore_tool(request: &NativeRootRequest) -> Option<ExploreTool> {
 
 /// The parent harness's `bash` policy, which its children inherit.
 fn bash_policy(request: &NativeRootRequest) -> (Vec<String>, Option<BashAuthority>) {
-    match (&request.opencode, &request.claude) {
-        (Some(opencode), _) => (opencode.bash_allow.clone(), opencode.bash_authority),
-        (None, Some(claude)) => (claude.bash_allow.clone(), claude.bash_authority),
-        (None, None) => (Vec::new(), None),
+    match (&request.opencode, &request.claude, &request.provider) {
+        (Some(opencode), _, _) => (opencode.bash_allow.clone(), opencode.bash_authority),
+        (None, Some(claude), _) => (claude.bash_allow.clone(), claude.bash_authority),
+        (None, None, Some(provider)) => (provider.bash_allow.clone(), provider.bash_authority),
+        (None, None, None) => (Vec::new(), None),
     }
 }
 
@@ -571,9 +721,13 @@ fn child_policy(request: &NativeRootRequest) -> Option<ChildPolicy> {
     })
 }
 
-/// The harness id and endpoint of the request's one harness.
+/// The harness id and endpoint of the request's one harness. A registered
+/// provider's id is what it declares; this placeholder serves the owner's
+/// checks before it is described.
 fn harness_kind(request: &NativeRootRequest) -> (&'static str, Endpoint) {
-    if request.claude.is_some() {
+    if request.provider.is_some() {
+        ("registered-provider", Endpoint::Stdio)
+    } else if request.claude.is_some() {
         ("claude", Endpoint::Stdio)
     } else {
         ("opencode", Endpoint::UnixSocket)
@@ -874,8 +1028,11 @@ fn owner_binary() -> Result<PathBuf, String> {
     Ok(owner)
 }
 
-fn owner_request(request: &NativeRootRequest, argv: Vec<String>) -> Request {
-    let (id, endpoint) = harness_kind(request);
+fn owner_request(
+    request: &NativeRootRequest,
+    (id, endpoint): (&str, Endpoint),
+    argv: Vec<String>,
+) -> Request {
     Request {
         store: request.store.clone(),
         intent: Some(Intent {
@@ -1195,7 +1352,11 @@ mod tests {
         claude["claude"] = claude_setup();
         let request = read(claude.clone()).unwrap();
         assert_eq!(harness_kind(&request), ("claude", Endpoint::Stdio));
-        let owner = owner_request(&request, vec!["/usr/bin/env".to_owned()]);
+        let owner = owner_request(
+            &request,
+            harness_kind(&request),
+            vec!["/usr/bin/env".to_owned()],
+        );
         let spec = &owner.intent.as_ref().unwrap().harnesses[0];
         assert_eq!(
             (spec.id.as_str(), spec.endpoint),
@@ -1223,59 +1384,102 @@ mod tests {
             "messages": ["m"],
             "outage_closure_cap": 1,
             "delivery_attempt_cap": 1,
-            "provider": { "executable": "/opt/provider/bin/provider" },
+            "provider": {
+                "executable": "/opt/provider/bin/provider",
+                "settings": { "settings_id": "s" },
+                "agent_bash_bin": "/opt/agent-bash",
+                "bash_allow": ["git status"],
+            },
             "workload": { "isolation": "unprivileged-userns" },
         });
         let request = read(base.clone()).unwrap();
         assert_eq!(
-            request.provider.unwrap().executable,
-            "/opt/provider/bin/provider"
+            harness_kind(&request),
+            ("registered-provider", Endpoint::Stdio)
+        );
+        assert_eq!(bash_policy(&request), (vec!["git status".to_owned()], None));
+        let policy = tools(&request);
+        assert_eq!(policy["bash"], json!({ "allow": ["git status"] }));
+        assert_eq!(policy["requester"], "/opt/agent-bash");
+        assert_eq!(
+            policy["ingress_env"],
+            oulipoly_root_supervisor::bash::BASH_ENV
+        );
+        assert_eq!(policy["explore"], Value::Null);
+        let owner = owner_request(
+            &request,
+            ("fake-external", Endpoint::Stdio),
+            vec!["/p".to_owned()],
+        );
+        let spec = &owner.intent.as_ref().unwrap().harnesses[0];
+        assert_eq!(
+            (spec.id.as_str(), spec.endpoint),
+            ("fake-external", Endpoint::Stdio)
         );
         let mut with_claude = base.clone();
         with_claude["claude"] = claude_setup();
         assert!(read(with_claude).unwrap_err().contains("exactly one"));
-        let mut native_fields = base;
+        let mut native_fields = base.clone();
         native_fields["provider"]["model"] = json!("m");
         assert!(read(native_fields).unwrap_err().contains("unknown field"));
+        let mut children = base;
+        children["children"] = json!({
+            "routes": { "luna": { "model": "openai/luna", "provider": { "openai": {} } } },
+            "opencode": { "deps": "/d", "agent_bash_tool": "/t", "agent_bash_bin": "/b" },
+            "max_starts": 2, "max_concurrent": 1,
+        });
+        let request = read(children).unwrap();
+        assert_eq!(
+            tools(&request)["explore"],
+            json!({ "routes": ["luna"], "max_starts": 2, "max_concurrent": 1 })
+        );
     }
 
-    /// Resolution runs the provider's `describe` only, and refuses with
-    /// what it declared; a registration that fails its checks runs nothing.
+    /// A provider that cannot be admitted runs nothing (64); once it ran,
+    /// a refusal is the provider's (65) and never says that nothing ran.
     #[test]
-    fn registered_receiver_describes_then_refuses_without_an_embedded_harness() {
+    fn registered_failures_say_what_ran() {
         let dir = tempfile::tempdir().unwrap();
-        let fake = registered::tests::fake_provider(
-            dir.path(),
-            &registered::tests::described("fake-external"),
-        );
+        let request: NativeRootRequest = serde_json::from_value(json!({
+            "store": dir.path().join("store"),
+            "launch_dir": dir.path().join("launch"),
+            "cwd": "/", "env": {}, "messages": ["m"],
+            "outage_closure_cap": 1, "delivery_attempt_cap": 1,
+            "workload": { "isolation": "unprivileged-userns" },
+        }))
+        .unwrap();
         let sink = Captured::default();
         let out = Out::new(Box::new(sink.clone()));
-        let reason = registered_receiver(
+        let code = registered_failure(
             &out,
-            &registered::Registration {
-                executable: fake.to_string_lossy().into_owned(),
+            &request,
+            registered::Failure::Provider {
+                operation: "describe",
+                reason: "r".to_owned(),
             },
         );
-        assert!(
-            reason.contains("fake-external declares no resident-acp-v2-harness"),
-            "{reason}"
+        assert_eq!(code, EXIT_PROVIDER_REFUSED);
+        let code = registered_failure(
+            &out,
+            &request,
+            registered::Failure::Setup {
+                provider: true,
+                reason: "r".to_owned(),
+            },
         );
+        assert_eq!(code, EXIT_SETUP_FAILED);
         let lines = sink.lines();
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert_eq!(lines[0]["entry"], "provider-described");
-        assert_eq!(lines[0]["provider_id"], "fake-external");
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("calls")).unwrap(),
-            "describe\n"
+        assert_eq!(lines[0]["stage"], "provider-refused");
+        assert_eq!(lines[0]["operation"], "describe");
+        assert_eq!(lines[0]["effects"]["runner_setup"], "none");
+        assert_eq!(lines[0]["effects"]["provider"], "unknown: it ran");
+        assert_eq!(lines[1]["stage"], "setup-failed");
+        assert_eq!(lines[1]["effects"], "possible");
+        assert_eq!(lines[1]["provider"], "unknown: it ran");
+        assert!(
+            lines.iter().all(|line| line["effects"] != "none"),
+            "{lines:?}"
         );
-        let relative = registered_receiver(
-            &out,
-            &registered::Registration {
-                executable: "fake-provider".to_owned(),
-            },
-        );
-        assert!(relative.contains("absolute"), "{relative}");
-        assert_eq!(sink.lines().len(), 1, "nothing described");
     }
 
     fn claude_setup() -> Value {
@@ -1350,7 +1554,7 @@ mod tests {
         assert!(request(Some(json!({ "isolation": "host-root" }))).is_err());
         // These tests run unprivileged.
         let host = request(Some(json!({ "isolation": "host-root", "user": "nobody" }))).unwrap();
-        let checked = owner_request(&host, vec!["/usr/bin/env".to_owned()]);
+        let checked = owner_request(&host, harness_kind(&host), vec!["/usr/bin/env".to_owned()]);
         let refused = checked.validate().unwrap_err();
         assert!(
             refused.contains("workload-refused: host-root declared but the owner is euid"),
@@ -1364,8 +1568,12 @@ mod tests {
         }
         assert!(!dir.path().join("launch").exists() && !dir.path().join("store").exists());
         let unprivileged = request(Some(json!({ "isolation": "unprivileged-userns" }))).unwrap();
-        owner_request(&unprivileged, vec!["/usr/bin/env".to_owned()])
-            .validate()
-            .unwrap();
+        owner_request(
+            &unprivileged,
+            harness_kind(&unprivileged),
+            vec!["/usr/bin/env".to_owned()],
+        )
+        .validate()
+        .unwrap();
     }
 }

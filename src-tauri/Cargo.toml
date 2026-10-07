@@ -57,6 +57,9 @@ rusqlite.workspace = true
 serde_yaml_ng.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# The provider contract source (resident-session extension and common-version
+# selection); its version is the lock's exact commit.
+agent-provider-contract = { git = "https://github.com/nestharus/agent-provider-sdk.git" }
 oulipoly-root-supervisor = { path = "../crates/oulipoly-root-supervisor" }
 
 [target.'cfg(windows)'.dependencies]

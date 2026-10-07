@@ -359,6 +359,16 @@ pub const SUBCOMMAND_SCHEMAS: &[SubcommandSchema] = &[
     row!("setup_brain.turn", "setup.schema.json", "SetupBrainTurn"),
     row!("migration.plan", "migration.schema.json", "MigrationPlan"),
     row!("migration.apply", "migration.schema.json", "MigrationApply"),
+    // The host-selected resident-session/v1 extension's one subcommand. Its
+    // envelopes are the base provider/v1 ones; the extension's own schema
+    // (in the provider contract crate) admits its params and result.
+    SubcommandSchema {
+        subcommand: "resident.prepare",
+        schema_file: "common.schema.json",
+        request_def: "RequestEnvelope",
+        response_def: Some("SuccessResponseEnvelope"),
+        error_response_def: Some("ErrorResponseEnvelope"),
+    },
 ];
 
 pub const LAUNCH_EVENT_SCHEMAS: &[LaunchEventSchema] = &[
