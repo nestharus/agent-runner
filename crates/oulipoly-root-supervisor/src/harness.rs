@@ -432,6 +432,7 @@ impl Worker {
     fn settle_async(&self, work: i64, resolution: &str, reason: Option<&str>) {
         bash::settle_async(
             &self.views,
+            &self.store,
             &self.tx,
             self.position,
             work,
@@ -717,6 +718,7 @@ impl Worker {
             "turns_reason": turns.err(),
             "capability": capability,
             "session": self.session,
+            "inherited_async": bash::inherited_summary(&self.store, Some(self.position)),
         });
         match decision {
             Ok(()) => {
@@ -741,7 +743,6 @@ impl Worker {
             match (&tracked.ack, tracked.label.as_deref()) {
                 (Some(_), _) if !tracked.turn_ended => return Err("turn-end-unrecorded"),
                 (Some(_), _) => {}
-                (None, Some("rejected")) => {}
                 (None, _) if tracked.unknown_attempts > 0 => return Err("delivery-unresolved"),
                 (None, _) => {}
             }
@@ -850,7 +851,7 @@ impl Worker {
         conversation["basis"] =
             json!("harness-declared-live-reattach-at-first-and-current-negotiation");
         conversation["meaning"] = json!(
-            "new input is admitted durably under this owner generation, then delivered on the resumed session; continuity is the harness's declaration, not observed; nothing settled is resubmitted"
+            "new input is admitted durably under this owner generation, then delivered on the resumed session; continuity is the harness's declaration, not observed; nothing settled is resubmitted; inherited_async qualifies recipient obligations separately from transport usability"
         );
         self.recovered_conversation = Some(conversation.clone());
         conversation["event"] = json!("recovered-conversation");
@@ -2260,6 +2261,16 @@ mod tests {
     /// effects: reported `launch-unknown`, the work row stays unresolved,
     /// the run cannot read as reaped, and nothing is relaunched. Only a
     /// positive no-start reply resolves the work as never started.
+    #[test]
+    fn current_rejection_cannot_settle_an_unknown_prior_attempt() {
+        let (mut worker, _rx, _dir) = worker();
+        worker.tracked[0].label = Some("rejected".into());
+        worker.tracked[0].unknown_attempts = 1;
+        assert_eq!(worker.settled_turns(), Err("delivery-unresolved"));
+        worker.tracked[0].unknown_attempts = 0;
+        assert_eq!(worker.settled_turns(), Ok(()));
+    }
+
     #[test]
     fn lost_or_unproven_spawn_reply_is_launch_unknown_not_refused() {
         for mode in ["lost", "unproven", "refused"] {

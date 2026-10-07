@@ -335,7 +335,8 @@
 //! * `live-usable`: only under an explicit `continue-attached` recovery,
 //!   when every input's turn is settled (an acknowledged input's tagged
 //!   turn end was durably recorded; an unacknowledged one was conclusively
-//!   rejected, or stopped with no attempt of unknown outcome), the store
+//!   stopped with no attempt of unknown outcome; a later refusal cannot
+//!   settle prior uncertainty), the store
 //!   has a session for the harness, and the harness of **this** work
 //!   declared the live reattachment contract (`oulipoly-acp`) when an owner
 //!   negotiated with it. The owner then negotiates on the same live process
@@ -354,6 +355,19 @@
 //!   turn), a stopped input has attempts of unknown outcome, no negotiation
 //!   with this work was recorded, a reply was interrupted, or the protocol
 //!   was violated. Never promoted to usable.
+//!
+//! A later refusal establishes only its own attempt; it cannot settle an
+//! earlier unknown insertion. Caller logical identity is root + producer
+//! scope + ref: owner completions cannot suppress a distinct caller input.
+//! `inherited_async` accompanies recovery reports, and the terminal async
+//! account labels its counters `current-owner-generation` and retains prior
+//! recipient facts separately. Known promises and unknown modes/delivery
+//! survive owner churn and run end. Healthy transport and explicit close of
+//! settled turns remain available with this qualification. Recipient delivery
+//! reconstruction is outside this path. Schema 10 refuses older stores.
+//! The inherited owed-input path still reinitializes/resubmits without a live
+//! reattachment declaration; at-most-once is unproven there. This settled
+//! survivor contract must not be read as covering that path.
 //!
 //! Retained descriptors are custody, not a usable conversation, and a
 //! stored session string is scope, not continuity: neither alone opens one.
@@ -1016,6 +1030,13 @@ where
             &json!({ "event": "bash-ingress", "listening": false, "reason": reason }),
         ),
     }
+    emit(
+        &mut out,
+        &json!({
+            "event": "inherited-completion-account",
+            "inherited_async": bash::inherited_summary(&store, None),
+        }),
+    );
     for prior in recovery.bash.drain(..) {
         ingress.recover(prior);
     }
@@ -1228,6 +1249,7 @@ where
     }
     report["bash"] = ingress.summary();
     report["async"] = bash::async_summary(&views);
+    report["async"]["inherited"] = bash::inherited_summary(&store, None);
     report["children"] = registry.summary();
     report["root_pid1"] = root_pid1;
     emit(&mut out, &report);
