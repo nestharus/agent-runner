@@ -124,6 +124,42 @@ pub(super) struct Registration {
     pub(super) bash_authority: Option<BashAuthority>,
 }
 
+/// A child route's registered provider (the request's
+/// `children.routes.NAME.registered`): a [`Registration`] less its tool
+/// policy, which is always the parent's. Nothing here offers the child any
+/// route of its own.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ChildRegistration {
+    executable: String,
+    settings: Map<String, Value>,
+    #[serde(default)]
+    config_root: Option<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    agent_bash_bin: String,
+}
+
+impl ChildRegistration {
+    /// The registration of a child that inherits `bash_allow` or
+    /// `bash_authority` from its parent.
+    pub(super) fn with_policy(
+        &self,
+        bash_allow: Vec<String>,
+        bash_authority: Option<BashAuthority>,
+    ) -> Registration {
+        Registration {
+            executable: self.executable.clone(),
+            settings: self.settings.clone(),
+            config_root: self.config_root.clone(),
+            env: self.env.clone(),
+            agent_bash_bin: self.agent_bash_bin.clone(),
+            bash_allow,
+            bash_authority,
+        }
+    }
+}
+
 /// A refusal or failure of resolution, by whether the provider had run.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Failure {
@@ -413,7 +449,7 @@ pub(super) struct Prepared {
 
 /// The provider's evaluated template and its reported configuration.
 /// This marker is not evidence that a live native CLI enforces it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct Evaluated {
     pub(super) launch: ResidentLaunchTemplate,
     pub(super) effective: EffectiveMediation,
@@ -691,6 +727,22 @@ impl Admitted<'_> {
             effective_mediation: evaluated.effective,
         })
     }
+}
+
+/// Makes a fresh directory above child slots, private to this entry and,
+/// when the work runs as another identity, traversable by its group.
+pub(super) fn make_slot_base(path: &Path, identity: Option<&Identity>) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if let Some(identity) = identity {
+        std::os::unix::fs::lchown(path, None, Some(identity.gid))
+            .and_then(|()| std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o750)))
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Makes the fresh launch directory and its provider data root, both

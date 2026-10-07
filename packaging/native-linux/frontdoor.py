@@ -271,9 +271,9 @@ def load_site(path):
 
 
 def check_site_children(site):
-    """`child_routes` (OpenCode routes a child may run on), each parent
-    route's `children` (the child routes it may offer) and `child_limits`
-    (at most the owner's ceilings)."""
+    """`child_routes` (OpenCode or registered-provider routes a child may
+    run on), each parent route's `children` (the child routes it may offer)
+    and `child_limits` (at most the owner's ceilings)."""
     child_routes = site.setdefault("child_routes", {})
     if not isinstance(child_routes, dict):
         raise Refused("site config: child_routes")
@@ -281,7 +281,7 @@ def check_site_children(site):
         if (
             not isinstance(name, str)
             or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name)
-            or not opencode_route(route)
+            or not (opencode_route(route) or provider_route(route))
             or "children" in route
         ):
             raise Refused(f"site config: child route {name}")
@@ -743,20 +743,38 @@ def write_private(path, value):
         file.write(value if isinstance(value, str) else json.dumps(value))
 
 
+def child_route_request(package, child):
+    """A child route as the entry takes it: an OpenCode model and provider,
+    or a registered provider (opaque settings and environment, the
+    package's Bash requester; its tool policy is always the parent's)."""
+    if child.get("harness") != "provider":
+        return {"model": child["model"], "provider": child["provider"]}
+    registered = {
+        "executable": child["executable"],
+        "settings": child["settings"],
+        "env": child.get("env", {}),
+        "agent_bash_bin": os.path.join(package, BASH_BIN),
+    }
+    if "config_root" in child:
+        registered["config_root"] = child["config_root"]
+    return {"registered": registered}
+
+
 def children_request(package, run, checked):
     children = checked.get("children")
     if children is None:
         return {}
     value = {
-        "routes": {name: {"model": child["model"], "provider": child["provider"]} for name, child in children["routes"].items()},
-        "opencode": {
-            "deps": os.path.join(package, DEPS),
-            "agent_bash_tool": os.path.join(package, BASH_TOOL),
-            "agent_bash_bin": os.path.join(package, BASH_BIN),
-        },
+        "routes": {name: child_route_request(package, child) for name, child in children["routes"].items()},
         "max_starts": children["max_starts"],
         "max_concurrent": children["max_concurrent"],
     }
+    if any(child.get("harness") != "provider" for child in children["routes"].values()):
+        value["opencode"] = {
+            "deps": os.path.join(package, DEPS),
+            "agent_bash_tool": os.path.join(package, BASH_TOOL),
+            "agent_bash_bin": os.path.join(package, BASH_BIN),
+        }
     if children["grant"] is not None:
         value["auth"] = os.path.join(run, "private", "child-auth.json")
     return {"children": value}
@@ -1664,6 +1682,8 @@ def admit(argv, environ, stdin_fd, now):
         raise Refused("request is not JSON") from None
     checked = check_request(request, site, now)
     check_provider_executable(checked["route"])
+    for child in (checked["children"] or {}).get("routes", {}).values():
+        check_provider_executable(child)
     env = root_env(user, site, checked["extra_env"])
     check_cwd_as(user, checked["cwd"])
     if checked["credential"] is not None:
@@ -1743,7 +1763,9 @@ def run_locked(argv, environ, stdin_fd=0):
             "credential": credential_public,
             "children": None if children is None else {
                 "routes": sorted(children["routes"]),
-                "models": {name: child["model"] for name, child in children["routes"].items()},
+                "models": {name: child["model"] for name, child in children["routes"].items() if "model" in child},
+                "providers": {name: harness_report(child)["provider"] for name, child in children["routes"].items()
+                              if child.get("harness") == "provider"},
                 "max_starts": children["max_starts"],
                 "max_concurrent": children["max_concurrent"],
                 "depth": 1,

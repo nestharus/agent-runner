@@ -492,6 +492,21 @@ credentials' locations for the owner. A child never offers children.
 The root owns its children's lifetime; close, cancel, requester loss,
 parent-work end and the outer deadline stop them, without replay.
 
+A site child route may also be a registered provider route (the same
+`{"harness": "provider", "executable", "settings", "config_root"?, "env"?,
+"credential": "none"}` shape as a parent route, without `children`). Its
+settings and environment are opaque here: the site chooses model, account
+and provider configuration there; the front door checks the executable's
+root custody at admission and passes the route to the entry as
+`registered`, with the package's Bash requester. Such a child takes no
+child credential and its tool policy is the parent's. The entry prepares
+one fresh slot per possible start for it before the owner starts (its
+describe, policy and prepare run as root, like a provider parent's), and
+each admission takes one unused slot, once. A child's read-only brief is
+its task, not a write barrier. A registered parent has no exploration tool
+of its own yet; fake-provider witnesses only, unqualified with real
+adapters, host-root or installed.
+
 `frontdoor.example.json` offers `luna-max`: **openai/gpt-6-luna** with
 model `options.reasoningEffort: "max"`, `reasoningSummary: "auto"`,
 `include: ["reasoning.encrypted_content"]` and `store: false`, using

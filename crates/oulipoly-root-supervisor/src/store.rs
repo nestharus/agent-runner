@@ -51,6 +51,7 @@
 //!   acknowledgement, processing, remote settlement or a drain. Version 8
 //!   added both (no migration).
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -374,6 +375,8 @@ pub(crate) struct Claimed {
     pub(crate) positions: usize,
     /// Children admitted by every generation (the start budget's use).
     pub(crate) child_starts: u32,
+    /// The same, by route (a prepared route's slots used).
+    pub(crate) child_route_starts: BTreeMap<String, u32>,
     pub(crate) open_children: Vec<OpenChild>,
     /// Children an earlier owner admitted whose end it never recorded and
     /// which have no open launch: this claim labelled them lost.
@@ -516,6 +519,16 @@ impl Store {
         )?;
         let positions: i64 = tx.query_row("SELECT count(*) FROM harness", [], |row| row.get(0))?;
         let child_starts: i64 = tx.query_row("SELECT count(*) FROM child", [], |row| row.get(0))?;
+        let child_route_starts = tx
+            .prepare("SELECT route, count(*) FROM child GROUP BY route")?
+            .query_map([], |row| {
+                let count: i64 = row.get(1)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    u32::try_from(count).unwrap_or(u32::MAX),
+                ))
+            })?
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
         let open_children = tx
             .prepare(
                 "SELECT w.id, w.incarnation, w.harness, h.id FROM work w
@@ -589,6 +602,7 @@ impl Store {
             children,
             positions: usize::try_from(positions).unwrap_or(usize::MAX),
             child_starts: u32::try_from(child_starts).unwrap_or(u32::MAX),
+            child_route_starts,
             open_children,
             children_lost: u32::try_from(children_lost).unwrap_or(u32::MAX),
         })
