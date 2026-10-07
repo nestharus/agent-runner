@@ -191,6 +191,14 @@
 //!   harness lives. A harness that ends naturally and is waited can also
 //!   close with no owed insertion, without a tagged idle or owner stop.
 //!   A close is not durable: a recovery after owner death knows nothing of it.
+//! * `rejected` with `durable: true` reports a conclusive refusal only after
+//!   the attempt outcome and message stop commit together without an ACK.
+//!   That logical input no longer holds close or later eligible input. The
+//!   event describes this attempt, not every historical attempt or recipient
+//!   processing. Before commit, owner loss or a failed write leaves delivery
+//!   unresolved and publishes no conclusive rejection; existing capped recovery
+//!   may resubmit the same key with its prior history unknown. Commit followed
+//!   by owner loss before publication can leave a durable stop without an event.
 //! * `cancel` stays what it was, and outranks a close.
 //!
 //! None of this observes processing: a turn's end is the agent's tag, and
@@ -326,9 +334,10 @@
 //! * An owed message keeps its reason: `cancelled`, `outage`, `rejected`,
 //!   `not-negotiated:*`, `session-*`, `invalid-response`, `launch-failed`,
 //!   `wait-unproven`, `authority-lost`, `store-failed`, `not-attempted`,
-//!   `attempts-exhausted`. Only `outage` and `attempts-exhausted` are durable
-//!   stops; the others end this instance's attempts and a later recovery
-//!   retries the message.
+//!   `attempts-exhausted`. Durable stops are `outage`, `attempts-exhausted`,
+//!   and a conclusively resolved `rejected` attempt; the
+//!   others end this instance's attempts and a later recovery retries the
+//!   message. Rejection remains unacknowledged and is never replayed.
 //! * A **closure** is a no-acknowledgement end whose harness exit was
 //!   reported by that harness's actual waiter (its work PID 1). Only closures
 //!   count toward [`Intent::outage_closure_cap`]. Rejections and negotiation
@@ -349,8 +358,10 @@
 //!   end observed; if its end is not observed the run is `incomplete`.
 //! * `closed`: the caller's `close` was followed through: every launched
 //!   or reattached harness's end was reported (those stopped for the close
-//!   by their work PID 1's kill, with `close` saying so), and nothing is
-//!   owed (exit 7). It says how the run ended, not that any input was
+//!   by their work PID 1's kill, with `close` saying so), and any remaining
+//!   unacknowledged debt is conclusively rejected (exit 7). The rejection
+//!   and delivery debt remain in the report/store. It says how the run ended,
+//!   not that any input was
 //!   processed: a harness stopped for the close ended by a signal.
 //! * `ended-owed`: every launched or reattached harness's end was reported,
 //!   no further attempt is authorized in this instance, and debt remains,
@@ -1557,7 +1568,13 @@ fn terminal_report(
         ("cancelled", EXIT_CANCELLED)
     } else if !all_reaped {
         ("incomplete", EXIT_INCOMPLETE)
-    } else if known_owed > 0 {
+    } else if known_owed > 0
+        && (!close_requested
+            || records
+                .iter()
+                .flat_map(|record| &record.messages)
+                .any(|message| message.owed && message.label != "rejected"))
+    {
         ("ended-owed", EXIT_ENDED_OWED)
     } else if close_requested {
         ("closed", EXIT_CLOSED)

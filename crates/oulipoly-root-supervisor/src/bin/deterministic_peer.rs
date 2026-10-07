@@ -33,6 +33,9 @@
 //! then waits at PATH before the real idle.
 //! The current-session notice marks the end of the injected evidence.
 //!
+//! `--reject-prompt-once` rejects the first ordinary prompt with -32011
+//! before insertion, then stays alive for later inputs.
+//!
 //! `--reject-completion-once` conclusively rejects the first background
 //! completion with -32001 before insertion, then stays alive for later inputs.
 //!
@@ -95,6 +98,7 @@ struct Args {
     silent_after_acks: Option<u64>,
     turn_before_ack: bool,
     reject_completion_once: bool,
+    reject_prompt_once: bool,
     off_session_turn: Option<String>,
     off_session_after_ack: bool,
     turn_gate: Option<PathBuf>,
@@ -114,6 +118,7 @@ fn parse_args() -> Args {
         silent_after_acks: None,
         turn_before_ack: false,
         reject_completion_once: false,
+        reject_prompt_once: false,
         off_session_turn: None,
         off_session_after_ack: false,
         turn_gate: None,
@@ -125,6 +130,7 @@ fn parse_args() -> Args {
             "--mode" => args.mode = iter.next().expect("--mode value"),
             "--launch-modes" => args.launch_modes = iter.next().expect("--launch-modes value"),
             "--no-dedup" => args.dedup = false,
+            "--reject-prompt-once" => args.reject_prompt_once = true,
             "--reject-completion-once" => args.reject_completion_once = true,
             "--untagged" => args.tagged = false,
             "--no-idle" => args.idle = false,
@@ -340,6 +346,19 @@ impl Peer {
                         _ => {}
                     }
                     let text = params["prompt"][0]["text"].as_str().unwrap_or_default();
+                    if args.reject_prompt_once
+                        && !text.starts_with("[Background Bash completion]")
+                        && state["fault_used"] == false
+                    {
+                        state["fault_used"] = Value::Bool(true);
+                        save(&args.state, state);
+                        send(
+                            out,
+                            &json!({ "jsonrpc": "2.0", "id": id,
+                            "error": { "code": -32011, "message": "fixture prompt rejected" } }),
+                        );
+                        continue;
+                    }
                     if args.reject_completion_once
                         && text.starts_with("[Background Bash completion]")
                         && state["fault_used"] == false

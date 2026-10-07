@@ -1310,11 +1310,7 @@ impl Worker {
                         self.report_turn(client, &mut seen);
                         continue;
                     }
-                    DeliveryOutcome::Rejected { code, .. } => {
-                        self.tracked[index].label = Some("rejected".to_owned());
-                        self.report(json!({ "event": "rejected", "index": index, "code": code }));
-                        ("rejected", None)
-                    }
+                    DeliveryOutcome::Rejected { .. } => ("rejected", None),
                     DeliveryOutcome::NotAcknowledged(NoAckCause::PeerGone) => {
                         ("no-ack:transport-closed", Some(ConnEnd::Gone))
                     }
@@ -1343,12 +1339,19 @@ impl Worker {
                 {
                     return ConnEnd::Stop;
                 }
-                if matches!(outcome, DeliveryOutcome::Rejected { .. }) {
+                if let DeliveryOutcome::Rejected { code, .. } = outcome {
+                    // A public conclusive rejection must survive owner loss.
+                    // A failed resolution leaves this attempt unknown, just as
+                    // owner death before commit does; neither publishes rejection.
+                    self.tracked[index].label = Some("rejected".to_owned());
+                    self.report(json!({
+                        "event": "rejected", "index": index, "code": code, "durable": true,
+                    }));
+                    // Conclusive rejection ends this logical input without an
+                    // ACK or turn end. Release it only after durable resolution;
+                    // unknown delivery remains open and never licenses replay.
+                    self.view(|view| view.open.retain(|input| input.index != index));
                     if let Some(work) = self.completion_of.remove(&index) {
-                        // A conclusive refusal cannot acquire an ACK or a
-                        // carrying turn later. Release only this completion,
-                        // after its attempt resolution is durable; never replay.
-                        self.view(|view| view.open.retain(|input| input.index != index));
                         self.settle_async(work, "undelivered", Some("not-acknowledged: rejected"));
                     }
                 }
@@ -1410,8 +1413,8 @@ impl Worker {
         }
     }
 
-    /// Whether every input sent on this harness's session has had its turn
-    /// end reported (idle-tag coverage, not processing).
+    /// Whether every input on this session has a tagged turn end or a
+    /// durably resolved conclusive rejection (neither proves processing).
     fn no_open_input(&self) -> bool {
         self.views
             .lock()
@@ -1420,8 +1423,8 @@ impl Worker {
             .is_none_or(|view| view.open.is_empty())
     }
 
-    /// The caller closed the conversation and every admitted input's turn
-    /// has ended: attempt a stop through its work PID 1. Its end is still
+    /// The caller closed the conversation and no logical input or async
+    /// completion remains open: attempt a stop through its work PID 1. Its end is still
     /// known only from that waiter's report, even if the request was sent.
     fn stop_for_close(&mut self, live: &Live) {
         self.close_stop_attempted = true;
@@ -1447,7 +1450,7 @@ impl Worker {
 
     /// Takes what the caller queued. One input at a time: a follow-up is
     /// admitted only when nothing is owed or open on this harness (every
-    /// earlier input acknowledged and its turn ended); otherwise it is
+    /// earlier input ended or conclusively rejected); otherwise it is
     /// refused at this admission-time check. Receipt may have queued it
     /// during a turn that has since ended. A check already passed can
     /// commit after close is requested. Admission is a durable commit of

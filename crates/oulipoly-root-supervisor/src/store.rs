@@ -650,8 +650,18 @@ impl Store {
             tx.execute(
                 "UPDATE attempt SET outcome = ?2, resolved_generation = ?3 WHERE id = ?1",
                 params![attempt, outcome, generation],
-            )
-            .map(drop)
+            )?;
+            if outcome == "rejected" {
+                // Conclusive refusal is not replayable on recovery. Commit
+                // this stop together with resolution, without creating an ACK.
+                tx.execute(
+                    "UPDATE message SET stop = 'rejected'
+                     WHERE (harness, idx) =
+                       (SELECT harness, idx FROM attempt WHERE id = ?1)",
+                    [attempt],
+                )?;
+            }
+            Ok(())
         })
     }
 
