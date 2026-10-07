@@ -48,6 +48,7 @@ BINARIES = (
     ("bin/oulipoly-agent-runner", "target/release/oulipoly-agent-runner"),
     ("bin/oulipoly-root-supervisor", "target/release/oulipoly-root-supervisor"),
     ("bin/oulipoly-root-pid1", "target/release/oulipoly-root-pid1"),
+    ("bin/oulipoly-root-child", "target/release/oulipoly-root-child"),
     ("agent-bash/agent-bash", "agent-bash-target/release/agent-bash"),
 )
 ASSETS = (
@@ -120,7 +121,8 @@ def agent_bash_source(build, repo, commit):
 def build_binaries(build, runner_repo, bash_source, log):
     env = dict(os.environ, CARGO_HOME=os.path.join(build, "cargo-home"))
     run(["cargo", "build", "--release", "--locked", "-p", "oulipoly-root-supervisor",
-         "--bin", "oulipoly-root-supervisor", "--bin", "oulipoly-root-pid1"],
+         "--bin", "oulipoly-root-supervisor", "--bin", "oulipoly-root-pid1",
+         "--bin", "oulipoly-root-child"],
         log, cwd=runner_repo, env=dict(env, CARGO_TARGET_DIR=os.path.join(build, "target")))
     # Default features only: never `age319-closed-fresh` or a fixture feature.
     run(["cargo", "build", "--release", "--locked", "-p", "oulipoly-agent-runner",
@@ -128,6 +130,16 @@ def build_binaries(build, runner_repo, bash_source, log):
         log, cwd=runner_repo, env=dict(env, CARGO_TARGET_DIR=os.path.join(build, "target")))
     run(["cargo", "build", "--release", "--locked", "--bin", "agent-bash"],
         log, cwd=bash_source, env=dict(env, CARGO_TARGET_DIR=os.path.join(build, "agent-bash-target")))
+
+
+def stage_binaries(build, stage):
+    """Stage the executable inventory; absent or malformed products fail construction."""
+    for target, product in BINARIES:
+        source = os.path.join(build, product)
+        if not os.path.isfile(source) or not os.access(source, os.X_OK):
+            raise SystemExit(f"build: no executable {product}")
+        os.makedirs(os.path.join(stage, os.path.dirname(target)), exist_ok=True)
+        shutil.copy2(source, os.path.join(stage, target))
 
 
 def install_deps(build, runner_repo, log, lock_dir=LOCK_DIR):
@@ -282,9 +294,7 @@ def main(argv):
     stage = os.path.join(build, "stage", package_id)
     shutil.rmtree(stage, ignore_errors=True)
     os.makedirs(stage)
-    for target, product in BINARIES:
-        os.makedirs(os.path.join(stage, os.path.dirname(target)), exist_ok=True)
-        shutil.copy2(os.path.join(build, product), os.path.join(stage, target))
+    stage_binaries(build, stage)
     shutil.copy2(os.path.join(bash_source, BASH_TOOL), os.path.join(stage, "agent-bash", "bash.ts"))
     shutil.copytree(deps, os.path.join(stage, "opencode", "deps"), symlinks=True)
     unused = {os.path.join(claude_deps, path) for path in CLAUDE_UNUSED}

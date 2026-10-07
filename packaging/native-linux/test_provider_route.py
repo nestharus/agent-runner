@@ -183,6 +183,7 @@ class RegisteredChildRoutes(unittest.TestCase):
             frontdoor.check_request(request(children={"routes": ["luna-codex"]}, child_credential={}), value, NOW)
         user = pwd.getpwuid(os.getuid())
         entry = frontdoor.entry_request("/opt/pkg", "/runs/1/r", user, checked, {}, False)
+        self.assertEqual(entry["provider"]["root_child_bin"], "/opt/pkg/bin/oulipoly-root-child")
         self.assertEqual(entry["children"], {
             "routes": {"luna-codex": {"registered": {
                 "executable": CHILD["executable"],
@@ -198,6 +199,8 @@ class RegisteredChildRoutes(unittest.TestCase):
         entry = frontdoor.entry_request("/opt/pkg", "/runs/1/r", user, mixed, {}, False)
         self.assertIn("opencode", entry["children"])
         self.assertEqual(entry["children"]["routes"]["luna-max"]["model"], "openai/gpt-6-luna")
+        self.assertEqual(entry["provider"]["root_child_bin"], "/opt/pkg/bin/oulipoly-root-child")
+        self.assertNotIn("root_child_bin", entry["children"]["routes"]["luna-codex"]["registered"])
 
     def test_admission_checks_child_executable_custody_before_any_effect(self):
         calls = []

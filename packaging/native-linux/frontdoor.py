@@ -83,6 +83,7 @@ HELLO_LIMIT = 4096
 RUNNER = "bin/oulipoly-agent-runner"
 SUPERVISOR = "bin/oulipoly-root-supervisor"
 PID1 = "bin/oulipoly-root-pid1"
+ROOT_CHILD = "bin/oulipoly-root-child"
 DEPS = "opencode/deps"
 CLAUDE_DEPS = "claude/deps"
 NODE = "claude/node/bin/node"
@@ -219,7 +220,7 @@ def package_root():
 def check_package(root):
     check_owned(root)
     check_tree(root)
-    for name in (RUNNER, SUPERVISOR, PID1, BASH_BIN, NODE, CLAUDE_EXECUTABLE):
+    for name in (RUNNER, SUPERVISOR, PID1, ROOT_CHILD, BASH_BIN, NODE, CLAUDE_EXECUTABLE):
         path = os.path.join(root, name)
         if not os.path.isfile(path) or not os.access(path, os.X_OK):
             raise Refused(f"package: no executable {name}")
@@ -803,6 +804,8 @@ def entry_request(package, run, user, checked, env, authenticated):
         }
         if "config_root" in route:
             provider["config_root"] = route["config_root"]
+        if common.get("children", {}).get("routes"):
+            provider["root_child_bin"] = os.path.join(package, ROOT_CHILD)
         return dict(common, provider=provider)
     if route.get("harness") == "claude":
         # Named only: the requester's own store, never read here.

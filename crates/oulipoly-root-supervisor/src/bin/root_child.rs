@@ -1,6 +1,6 @@
-//! Prototype requester for a root's registered children: what a parent
-//! harness's `explore` tool does, as a separate program for this crate's
-//! process tests (the native tools use `native/explore-client.mjs`).
+//! Production Linux protocol client for a root's registered children.
+//! The packaged caller supplies its absolute path when a registered parent
+//! offers child routes; the shared provider bridge executes that offered path.
 //!
 //! `oulipoly-root-child ROUTE QUESTION` asks the owner named by
 //! `OULIPOLY_ROOT_BASH_V1` for one child on ROUTE, keeps the connection
@@ -9,6 +9,9 @@
 //! stdout. Exit: 0 for a `result`, 65 for `refused`, 69 when there is no
 //! ingress or the connection failed before sending, 75 when the stream
 //! ended without a result (the child may have run). Nothing is retried.
+//! Intermediate stages (including close-not-applied) are not terminal.
+//! A result's transport success is separate from its child outcome, answer,
+//! tagged turn end and process/namespace end; inspect those reported fields.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;

@@ -1,8 +1,8 @@
 # Native-root package (Linux x86_64)
 
 A co-located native ACP v2 application payload: runner, per-root owner,
-root PID 1, agent-bash, locked OpenCode dependencies, and the native
-Claude receiver's locked dependencies (published Claude Agent SDK with its
+root PID 1, the Rust child requester, agent-bash, locked OpenCode dependencies,
+and the native Claude receiver's locked dependencies (published Claude Agent SDK with its
 unmodified Claude Code executable) with a pinned Node runtime, plus a
 privileged front door and an explicit programmatic caller. Work runs with the
 requester's normal host rights; the owner and root PID 1 run as root.
@@ -17,6 +17,7 @@ security closure. No existing workflow's route is changed.
   bin/oulipoly-agent-runner
   bin/oulipoly-root-supervisor
   bin/oulipoly-root-pid1
+  bin/oulipoly-root-child
   bin/oulipoly-native-call
   libexec/oulipoly-native-frontdoor
   agent-bash/agent-bash
@@ -57,6 +58,20 @@ file hashes/modes, toolchain and Rust binaries' dynamic dependencies.
 Sorted tar entries have 0:0 ownership and normalized timestamps/modes.
 Warm same-host repeatability is the observed reproducibility scope; archive
 ownership metadata does not establish installed root custody.
+
+`oulipoly-root-child` is the production Linux protocol client for registered
+children. Cargo builds it from the supervisor crate alongside the owner and
+PID 1. It is staged in the executable inventory, with file hash/mode and
+dynamic libraries in MANIFEST; the front door checks its executable status
+and package custody before effects. Hashes identify acquired bytes, not
+runtime provider compatibility. The client adds no Node or Claude Agent SDK
+dependency. Embedded receiver/dependency retirement is separate work.
+
+Source delivery precedes a fresh candidate qualification package build.
+ROOT then checks host-root custody drop and work-UID reachability of
+`/opt/oulipoly-native/<id>/bin/oulipoly-root-child` before native opt-in or
+installation. Source/build and synthetic staging checks alone establish
+neither a usable full package nor that reachability.
 
 ## Reviewed installation and recovery
 
@@ -472,10 +487,11 @@ provider's declared id. A provider refusal after it ran is exit 65 (Runner
 made nothing; the provider's effects are unknown); a preparation failure is
 73. Recovery runs no provider operation.
 
-Tool mediation is the provider adapter's: no adapter yet translates
-`OULIPOLY_ROOT_TOOLS_V1` into native tool configuration, so these routes are
-not yet a replacement for the embedded `claude` and OpenCode routes. The
-offline controls use a deterministic stand-in provider and ACP peer; a real
+Tool mediation is the provider adapter's: registered adapters consume the
+Runner's neutral tool policy and exploration offer through their shared
+bridge. Retirement of the embedded `claude` and OpenCode routes remains
+separate work. The offline controls use a deterministic stand-in provider
+and ACP peer; a real
 provider adapter is exercised only through describe, policy, prepare and
 resident connection (`src-tauri/tests/native_root_registered_provider.rs`).
 Its native turns inside the work PID namespace, a host-root run and any
@@ -503,9 +519,26 @@ child credential and its tool policy is the parent's. The entry prepares
 one fresh slot per possible start for it before the owner starts (its
 describe, policy and prepare run as root, like a provider parent's), and
 each admission takes one unused slot, once. A child's read-only brief is
-its task, not a write barrier. A registered parent has no exploration tool
-of its own yet; fake-provider witnesses only, unqualified with real
-adapters, host-root or installed.
+its task, not a write barrier. When a registered parent opts into child
+routes, the front door supplies its own absolute
+`<package>/bin/oulipoly-root-child` as `provider.root_child_bin`. With no
+routes it omits the field. Runner creates the offer from that caller-chosen
+path and the configured routes; it does not discover an install or map
+providers/models to requesters. The shared bridge executes that exact path.
+Delivered adapters have joined evidence with fake natives and the real
+owner in unprivileged namespaces; a fresh full package, host-root/work-UID
+reachability and real native behavior remain qualification work.
+
+The requester relays intermediate stages until a final result or refusal.
+An initial `close-not-applied:turn-end-unrecorded` is nonterminal: after the
+answer and tagged `end_turn`, close can stop and drain the namespace.
+Requester exit 0 means a result was transported; read its child outcome,
+answer, tagged end and process end separately. Normal harness stopping can
+report `signal:9` while the owner ends `closed` and Runner exits 87; this
+is separate from a Bash command's work exit. The packaged caller classifies
+the final answer/end and complete relay, and exports child results in
+`children.json`; `answered` establishes neither correctness nor native
+comprehension.
 
 `frontdoor.example.json` offers `luna-max`: **openai/gpt-6-luna** with
 model `options.reasoningEffort: "max"`, `reasoningSummary: "auto"`,
