@@ -184,8 +184,9 @@
 //! * `close` refuses new input for the whole root (`close-requested`). An
 //!   admission whose check already passed can still commit and be reported
 //!   after this request; that input remains part of the admitted work. The
-//!   close is durable: it enters the root control ladder (see Root control
-//!   face), and a later owner keeps input closed and follows it through. Each
+//!   close is durable: only a durable acknowledgment applies its effect;
+//!   pending or unknown applies no close. It enters the root control ladder
+//!   (see Root control face), and a later owner keeps input closed and follows it through. Each
 //!   worker, once every admitted input on its harness is acknowledged and
 //!   its turn ended, attempts to stop its harness through its work PID 1
 //!   (`close-stopping`, with whether the request was sent). The harness's
@@ -1291,7 +1292,7 @@ where
                                     "event": "input-hold",
                                     "control": controls,
                                     "held": held,
-                                    "meaning": "new caller input is refused while held; running turns, tools and owner completions continue; not a pause, drain or close",
+                                    "meaning": "caller input received after hold acknowledgment is refused; already in-flight input may still be admitted; running turns, tools and owner completions continue",
                                 }),
                             );
                         }
@@ -1329,13 +1330,15 @@ where
                     }
                     Some("close") => {
                         let request = face.shorthand(control::Operation::Close, controls);
-                        let (lines, _) =
+                        let (lines, effect) =
                             face.handle(request, &mut store.lock().expect("store lock"));
                         for line in &lines {
                             emit_line(&mut out, line);
                         }
                         let refused = if *root_ctx.cancel_requested {
                             Some("cancelled")
+                        } else if effect != Some(control::Effect::Close) {
+                            Some("close-not-acknowledged")
                         } else if !root_ctx.close(&mut out, controls) {
                             Some("close-already-requested")
                         } else {
@@ -1350,10 +1353,19 @@ where
                     }
                     Some("inspect") => {
                         let guard = store.lock().expect("store lock");
-                        emit_line(
-                            &mut out,
-                            &control::Record::ControlState(face.state()).encode_line(),
-                        );
+                        let state = control::Record::ControlState(face.state());
+                        // Local transport correlation; the enclosed shared records
+                        // retain their SDK meaning. No uncorrelated backlog is current.
+                        let inspection_key = command
+                            .as_ref()
+                            .and_then(|value| value.get("inspection_key"))
+                            .and_then(Value::as_str)
+                            .filter(|key| {
+                                !key.is_empty()
+                                    && key.len() <= 128
+                                    && key.bytes().all(|b| (33..=126).contains(&b))
+                            });
+                        emit_line(&mut out, &state.encode_line());
                         match guard.settlement_facts() {
                             Ok(facts) => {
                                 let (lines, summary) = face.settlement(&facts, Vec::new());
@@ -1369,6 +1381,15 @@ where
                                     event.extend(summary.clone());
                                 }
                                 emit(&mut out, &event);
+                                if let Some(key) = inspection_key {
+                                    emit(
+                                        &mut out,
+                                        &json!({
+                                            "event": "inspection", "inspection_key": key,
+                                            "control_state": state, "settlement": event,
+                                        }),
+                                    );
+                                }
                             }
                             Err(error) => emit(
                                 &mut out,

@@ -154,12 +154,13 @@ root/per-work PID1 and logical/custody ownership remain.
 
 The frontdoor does not read, convert, stage, refresh or scrub native credential
 files. Keep retains adapter state. Discard removes the package run tree with
-descriptor-safe removal after physical entry termination, but only when the
-run holds no root store or its owner's terminal described the root as
-retirement-eligible (see Root control face); the front door then marks the
-run `private/retirement-eligible`. Otherwise the run and its store are kept
-and `retire` says `retained: root-not-retirement-eligible`. A free run lock
-allows later scratch sweep under the same rule. Cleanup failure is visible.
+descriptor-safe removal after physical entry termination. The final package
+terminal retains the owner's logical account (including owed/pending work),
+or explicit unknown if unavailable, with `retry: do-not-replay`. Physical
+store removal does not claim logical retirement. Keep explicitly preserves
+`private/root-terminal.json`, the store and adapter diagnostics. A free run
+lock permits later sweep with the same reported distinction. Direct recovery
+stores remain useful until their recovery question ends. Cleanup failure is visible.
 None of this is provider credential proof.
 
 ## Programmatic caller
@@ -204,8 +205,8 @@ Owner closed/7 and Runner native87 denote physical run termination after
 close, subject to insertion/refusal guards. U112's ACK-present/end-absent case
 can retain async debt while physically closed. Neither code authorizes
 logical root retirement. The relay reads actual entry waits for scratch
-cleanup and passes owner records unchanged; discard reads only the owner's
-own described retirement eligibility, never the exit code.
+cleanup and passes owner records unchanged. Discard reports logical knowledge
+separately, including unknown when the entry died without a final owner account.
 
 ### Root control face (`session_control/v2`)
 
@@ -215,31 +216,48 @@ crate's `control` module). The front door relays, besides cancel/close/send,
 `{"cmd":"inspect"}` and v2 `request` records (at most 32768 bytes). It
 attests the requester: a request whose `requester` is not `uid:<this
 requester's uid>` is refused here (`requester-not-attested`) and never reaches
-the owner. A v2 `close` or `cancel` arms the same kill grace as the stdin
-shorthand. What the owner answers:
+the owner. Close and durable cancel arm kill grace only after the owner reports
+the accepted effect, preserving close deferral for owed async completions.
+Refused or unknown controls schedule no terminal effect. The independent
+run deadline still bounds an unresponsive owner. What the owner answers:
 
-- `input_hold` / `input_release`: refuse new caller input while held
-  (`input-held`); running turns, tools and owner completions continue. Not
-  pause, drain or close.
+- `input_hold` / `input_release`: refuse caller input received after the hold
+  acknowledgment (`input-held`); already in-flight input may still be admitted.
+  Running turns, tools and owner completions continue. No physical pause.
 - `close`: durable; it enters the claim ladder and a later owner keeps input
   closed. The stdin `{"cmd":"close"}` is the same close.
 - `cancel` (v2): the root's durable lifecycle cancel. The stdin
   `{"cmd":"cancel"}` (and this front door's deadline/abandon cancels) stays
   the owner instance's cancellation.
 - `recover`: only through `native-root --recover` (`control` field), answered
-  by the recovering owner of the same incarnation. Under this front door the
+  by the recovering owner of the same incarnation. Purposeful direct recovery
+  is separately authorized; this optional sidecar accounts for effects and
+  does not gate them. Unusable sidecars report account unavailable. Under this front door the
   entry is its namespace's init, so the root does not outlive its front door
   and no packaged recover path exists.
 - `inspect`: a `control_state` record, settlement `observation`s and a
   `settlement` event whose `retirement.eligible` is true only when every
   input reads settled or not inserted on the owner's warranted reading, no
   async completion is owed, every launch and incarnation is recorded ended by
-  its actual waiter and no control intent is pending.
+  its actual waiter and no control intent is pending. Custody is Runner
+  aggregation over recorded actors, explicitly separate from SDK one-reference
+  physical knowledge; actor completeness/native retirement remains unqualified.
 
 The caller exposes `--root FILE --inspect | --hold | --release` (exits:
 `inspected`/`acknowledged` 0, `control-refused` 18, `control-unknown` 19,
 `incomplete` 6). Hold/release first inspect, then address the authority the
-root itself reported, with a fresh request key.
+root itself reported, with a fresh request key. Each inspection carries a fresh
+`inspection_key`; the owner returns one envelope containing its shared state
+record and settlement. Only that matching envelope is current for this caller.
+No matching response means no current reading, even with unread relay backlog.
+This transport envelope does not replace SDK capability selection/correlation.
+
+**Partial source scope.** Admitted inherited intent stays honestly pending/unknown.
+A later consumer batch after the SDK control follow-up owes positive and
+attributed negative successor enactment, and full caller advertisement,
+selection, immutable correlation and fulfilled-outcome uptake. Key-conflict
+correlation, actor completeness and native qualification remain unfinished.
+Packaged owner-only restart is unestablished; entry death has no survivor.
 
 **Discovery.** Through the same sudoers `run` rule, stdin
 `{"v":1,"op":"discover"}` lists this requester's run directories that hold a
@@ -301,9 +319,10 @@ Later, independent calls by the same requester can then address that root.
   - `answered`/0 covers only this input's correlated ACK, linked text and
     tagged `end_turn`; it establishes neither semantic processing nor
     settlement of the whole root or its background obligations.
-- **Close or cancel.** Run `--root FILE --close` (or `--cancel`). This has the
-  per-call close/cancel meaning, including deferral for owed background
-  completions and the kill grace.
+- **Close or instance stop.** Run `--root FILE --close` (or `--stop`). Close
+  follows its durable acknowledgment, with deferral for owed background
+  completions. Stop ends this owner instance through stdin cancel; it is
+  distinct from the shared face's durable lifecycle `cancel`.
   - The supervisor stops listening and unlinks the socket. It retires the run
     as for a fresh call, sends the terminal record (`live` attaches,
     refusals, drops) to the attached closer, and exits with the entry's code.

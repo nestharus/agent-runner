@@ -37,7 +37,9 @@
 //! `--recover <file>` acts on an existing store: `{"store", "purpose",
 //! "env", "control"?}`, `purpose` being `cancel` or `continue-attached`;
 //! `control` is an optional `session_control/v2` `recover` request, which
-//! the owner admits and answers (`attached`, `root_absent`, ...). A new owner
+//! accounts for the separately authorized physical recovery (`attached`,
+//! `root_absent`, ...); it is not an effect gate. An unusable account is
+//! control-only unavailable, without denying recovery effects. A new owner
 //! claims the store (the next owner generation; earlier unresolved
 //! attempts become `unknown-prior-owner`) and positively attaches the
 //! recorded root PID 1 if it is still that exact process. `cancel` then

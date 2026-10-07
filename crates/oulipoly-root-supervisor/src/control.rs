@@ -41,22 +41,28 @@
 //! and is followed through, and an acknowledged cancel cancels. An
 //! acknowledgment never becomes absence after owner death. A request an
 //! earlier owner admitted but never answered stays pending; the successor
-//! cannot acknowledge it, reports `unknown` (`authority_changed`) with
-//! itself as reporter, and needs a new request addressed to it.
+//! reports `unknown` (`authority_changed`) with itself as reporter. Present
+//! successor fulfillment and attributed negative answers remain a later
+//! consumer batch; pending knowledge is an honest partial result.
 //!
 //! # Operations here
 //!
 //! * `input_hold` / `input_release`: offered together. A hold refuses new
-//!   caller input only ([`crate::conversation::InputHold`]); running turns,
+//!   caller input received after acknowledgment only
+//!   ([`crate::conversation::InputHold`]); input already in flight may still
+//!   be admitted. Running turns,
 //!   tools, Bash completions, close and cancel are unchanged.
 //! * `close`: the crate's close (input closed root-wide, harnesses stopped
 //!   after tagged turn ends). After a cancel it is refused `already_terminal`.
 //! * `cancel`: the crate's cancel; outranks close.
 //! * `recover`: answered only by a recovering owner of the same root and
-//!   incarnation, from the recover request's `control` record: acknowledged
+//!   incarnation, from the optional recover account in `control`: acknowledged
 //!   `attached` after a positive attach, refused `root_absent` when no root
 //!   PID 1 is found, `transition_failed` when it may run but could not be
-//!   attached. A live owner refuses it `owner_live` (not kept).
+//!   attached. Purposeful direct recovery is separately authorized and is
+//!   not gated by this account. An unusable sidecar reports control account
+//!   unavailable, without denying effects already performed. A live owner
+//!   refuses it `owner_live` (not kept).
 //! * Requests scoped to a child are refused `unsupported_operation`.
 //!
 //! # Inspection and settlement
@@ -67,7 +73,9 @@
 //! lineage of this owner alone. The facts come from the store every
 //! generation wrote under the generation fence: insertion from attempt
 //! outcomes and ACKs, the agent's tagged turn end, async completion debt,
-//! and physical custody of every launch and incarnation. Physical custody
+//! and aggregate recorded-actor custody of every launch and incarnation.
+//! That aggregation is named separately from SDK one-reference knowledge;
+//! no evidence-less shared physical completion is emitted. Physical custody
 //! never enters the logical reading.
 //!
 //! **Retirement** is described as eligible only when every input reads
@@ -667,12 +675,13 @@ impl Face {
             Err(diagnostic) => return vec![unavailable(&diagnostic)],
         };
         if request.requester != self.requester {
-            let refusal = self.refusal(&request, sc::RefusalReason::NotPermitted);
-            return self.answer(&request, vec![refusal], true, store).0;
+            return recover_account_unavailable("recovery account requester is not attested");
         }
         if request.addressed.root != self.root {
-            let refusal = self.refusal(&request, sc::RefusalReason::UnknownScope);
-            return self.answer(&request, vec![refusal], false, store).0;
+            return recover_account_unavailable("recovery account addresses another root");
+        }
+        if request.scope.child.is_some() {
+            return recover_account_unavailable("recovery account must address the root");
         }
         if let Some(entry) = self.entries.iter().find(|entry| {
             sc::classify_repetition(&entry.request, &request) != sc::Repetition::Distinct
@@ -680,21 +689,17 @@ impl Face {
             if sc::classify_repetition(&entry.request, &request) == sc::Repetition::SameRequest {
                 return entry.lines[1..].to_vec();
             }
-            let refusal = self.refusal(&request, sc::RefusalReason::KeyConflict);
-            return self.answer(&request, vec![refusal], false, store).0;
+            return recover_account_unavailable(
+                "recovery account key conflicts with a kept request",
+            );
         }
         if !self
             .authority()
             .succeeds_within_incarnation(&request.addressed)
         {
-            // Another incarnation, or this very owner: not answerable here.
-            let mut refusal = self.refusal(&request, sc::RefusalReason::NotPermitted);
-            if let sc::Record::Refusal(inner) = &mut refusal {
-                inner.detail = Some(sc::DisclosedText::Present {
-                    text: "addressed incarnation is not the one this owner holds".to_owned(),
-                });
-            }
-            return self.answer(&request, vec![refusal], true, store).0;
+            return recover_account_unavailable(
+                "recovery account does not address this recovered incarnation",
+            );
         }
         let answer = match found {
             Found::Attached => Ok((sc::State::Unattached, sc::State::Attached)),
@@ -917,23 +922,13 @@ impl Face {
                 physical_label(physical)
             ));
         }
-        let root_facts = [
-            observe(
-                &root_subject,
-                sc::Fact::LogicalSettlement {
-                    state: root_debt,
-                    missing_reason: None,
-                },
-            ),
-            observe(
-                &root_subject,
-                sc::Fact::PhysicalCustody {
-                    state: physical,
-                    missing_reason: (physical == sc::PhysicalCustodyState::Missing)
-                        .then_some(sc::MissingReason::NotApplicable),
-                },
-            ),
-        ];
+        let root_facts = [observe(
+            &root_subject,
+            sc::Fact::LogicalSettlement {
+                state: root_debt,
+                missing_reason: None,
+            },
+        )];
         let root_reading = sc::read_settlement(&root_subject, Some(&lineage), &root_facts);
         subjects.push(json!({ "subject": root_subject, "reading": root_reading }));
         observations.extend(root_facts);
@@ -956,14 +951,31 @@ impl Face {
             "lineage": lineage,
             "lineage_meaning": "this owner alone, reading facts every owner generation committed under the store's generation fence",
             "subjects": subjects,
+            "recorded_actor_custody": {
+                "state": physical,
+                "basis": "Runner aggregation of fenced store records for all recorded launches and incarnations; not SDK one-reference knowledge or proof of actor completeness",
+                "works_open": facts.works_open,
+                "works_unknown": facts.works_unknown,
+                "incarnations": facts.incarnations,
+                "incarnations_open": facts.incarnations_open,
+                "incarnations_observed": facts.incarnations_observed,
+                "incarnations_unknown": facts.incarnations_unknown,
+            },
             "retirement": {
                 "eligible": blocking.is_empty(),
                 "blocking": blocking,
-                "meaning": "eligible only when every input reads settled or not_inserted with warranted basis, no async completion is owed, every launch and incarnation is recorded ended by its actual waiter, and no control intent is pending; the decision to discard is the caller's",
+                "meaning": "logical retirement eligibility uses warranted per-input classification plus Runner recorded_actor_custody, no async debt and no pending control; complete actor custody remains unqualified; physical store discard after drain is a separate disposition",
             },
         });
         (lines, summary)
     }
+}
+
+fn recover_account_unavailable(detail: &str) -> Vec<String> {
+    vec![unavailable(&sc::ControlUnavailable::new(
+        sc::UnavailableReason::ProtocolViolation,
+        detail,
+    ))]
 }
 
 fn label(reading: &sc::LogicalReading) -> String {
@@ -1189,6 +1201,26 @@ mod tests {
             .unwrap();
         assert_eq!(entry.trace.outcomes().len(), 1);
         assert!(entry.trace.acknowledgment().is_none());
+    }
+
+    #[test]
+    fn unusable_recovery_account_does_not_deny_separate_physical_recovery() {
+        let dir = dir("recover-account");
+        let mut store = Store::claim(&dir.0, Some(&intent())).unwrap().store;
+        let mut face = face(&store);
+        let mut sidecar = request(&face, "account", sc::Operation::Recover);
+        sidecar.requester = "uid:other".into();
+        let lines = face.answer_recover(
+            &line(&sc::Record::Request(sidecar)),
+            Found::Attached,
+            &mut store,
+        );
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&lines[0]).unwrap()["event"],
+            "session-control-unavailable"
+        );
+        assert!(store.control_rows().unwrap().is_empty());
     }
 
     /// The describer reads a root's authority without claiming or locking

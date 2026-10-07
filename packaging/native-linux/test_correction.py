@@ -39,9 +39,6 @@ class Scratch(unittest.TestCase):
             (root/rel).write_text('fake-secret')
         (root/'private/retention').write_text('discard')
         (root/'private/lock').touch()
-        # These controls exercise removal mechanics: the root is described
-        # retirement-eligible, as its owner's terminal would mark it.
-        (root/'private'/fd.RETIREMENT_ELIGIBLE).write_text('eligible')
         return root
 
     def actor(self, code):
@@ -134,7 +131,7 @@ class Bounds(Scratch):
     def test_early_cancel_close_ignoring_entry(self):
         for cmd in ('cancel','close'):
             with self.subTest(cmd=cmd):
-                self.drive('import time;time.sleep(30)',deadline=3600,control=json.dumps({'cmd':cmd}).encode()+b'\n')
+                self.drive('import time;time.sleep(30)',deadline=.1 if cmd == 'close' else 3600,control=json.dumps({'cmd':cmd}).encode()+b'\n')
 
     def test_unterminated_admission_bound(self):
         r,w=self.pipes()

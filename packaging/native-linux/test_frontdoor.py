@@ -171,21 +171,16 @@ class Retention(Scratch):
             os.close(fd)
         return run
 
-    def mark_eligible(self, run):
-        with open(os.path.join(run, "private", frontdoor.RETIREMENT_ELIGIBLE), "w") as file:
-            file.write("eligible")
-
-    def test_discard_removes_package_run_only_for_an_eligible_root(self):
+    def test_discard_removes_drained_store_without_settling_owed_work(self):
         run = self.make_run("a", "discard", False)
-        record = frontdoor.retire(run, "discard")
-        self.assertTrue(record["ok"])
-        self.assertIs(record["run_removed"], False)
-        self.assertEqual(record["retained"], "root-not-retirement-eligible")
-        self.assertTrue(os.path.isdir(os.path.join(run, "store")))
-        self.mark_eligible(run)
+        account = {"status": "closed", "control": {"lifecycle": "open"},
+                   "session_control": {"retirement": {"eligible": False, "blocking": ["input a:0 reads owed", "1 control intent(s) pending"]}}}
+        frontdoor.write_private(os.path.join(run, "private", frontdoor.ROOT_TERMINAL), account)
         record = frontdoor.retire(run, "discard")
         self.assertTrue(record["ok"])
         self.assertTrue(record["run_removed"])
+        self.assertEqual(record["root_terminal"], account)
+        self.assertEqual(record["retry"], "do-not-replay")
         self.assertFalse(os.path.exists(run))
 
     def test_discard_without_a_root_store_removes_the_run(self):
@@ -195,7 +190,11 @@ class Retention(Scratch):
 
     def test_keep_preserves_adapter_owned_state(self):
         run = self.make_run("b", "keep", False)
+        account = {"knowledge": "unknown", "session_control": {"retirement": {"eligible": False}}}
+        frontdoor.write_private(os.path.join(run, "private", frontdoor.ROOT_TERMINAL), account)
         record = frontdoor.retire(run, "keep")
+        self.assertEqual(record["root_terminal"], account)
+        self.assertEqual(frontdoor.root_terminal(run), account)
         self.assertIsNone(record["run_removed"])
         self.assertTrue(os.path.isdir(os.path.join(run, "store")))
         for rel in ("launch/provider/adapter-state",):
@@ -204,7 +203,6 @@ class Retention(Scratch):
     def test_sweep_takes_only_runs_whose_lock_is_free(self):
         live = self.make_run("live", "discard", True)
         dead = self.make_run("dead", "discard", False)
-        self.mark_eligible(dead)
         owed = self.make_run("owed", "discard", False)
         kept = self.make_run("kept", "keep", False)
         with mock.patch.object(frontdoor, "check_owned"):
@@ -212,8 +210,8 @@ class Retention(Scratch):
         self.assertEqual(sorted(os.path.basename(r["run"]) for r in swept), ["dead", "kept", "owed"])
         self.assertTrue(os.path.exists(os.path.join(live, "launch/provider/adapter-state")))
         self.assertFalse(os.path.exists(dead))
-        # A dead front door's run whose root was never described eligible.
-        self.assertTrue(os.path.isdir(os.path.join(owed, "store")))
+        # Physical discard does not imply logical retirement.
+        self.assertFalse(os.path.exists(owed))
         self.assertTrue(os.path.isdir(kept))
         self.assertTrue(os.path.lexists(os.path.join(kept, "launch/provider/adapter-state")))
 
@@ -343,6 +341,8 @@ class RelayTest(Scratch):
             relay.entry_line(b'{"event":"async-owed","change":"owed","work":2,"owed_async":1}')
             relay.requester_line(b'{"cmd":"close"}')
             self.assertIsNone(relay.kill_at, "no kill grace while a completion is owed")
+            self.assertFalse(relay.close_waiting, "no effect before durable close")
+            relay.entry_line(b'{"event":"close-requested"}')
             self.assertTrue(relay.close_waiting)
             # A registered child's events never move the parent's count.
             relay.entry_line(b'{"event":"async-owed","change":"turn-ended","owed_async":0,"child":{"id":"c"}}')
@@ -354,9 +354,11 @@ class RelayTest(Scratch):
         # Without owed work, close arms at once as before.
         plain = frontdoor.Relay(entry, run, 60, 5, clock=lambda: 7.0)
         plain.requester_line(b'{"cmd":"close"}')
+        self.assertIsNone(plain.kill_at)
+        plain.entry_line(b'{"event":"close-requested"}')
         self.assertEqual(plain.kill_at, 12.0)
 
-    def test_session_control_requests_need_the_attested_requester_and_close_arms_like_close(self):
+    def test_session_control_refusals_never_arm_terminal_grace(self):
         relay, entry, run, (out_r, out_w), (in_r, in_w) = self.relay("ignore", 60, 5)
         relay.requester_uid = 1234
         relay.clock = lambda: 50.0
@@ -370,6 +372,13 @@ class RelayTest(Scratch):
             relay.requester_line(json.dumps(dict(base, requester="uid:1234", operation="input_hold")).encode())
             self.assertIsNone(relay.kill_at, "hold is not close or cancel")
             relay.requester_line(json.dumps(dict(base, requester="uid:1234", operation="close", request_key="k2")).encode())
+            self.assertIsNone(relay.kill_at)
+            for reason in ("stale_authority", "key_conflict", "unsupported_operation"):
+                relay.entry_line(json.dumps(dict(base, kind="refusal", operation="close", reason=reason)).encode())
+                self.assertIsNone(relay.kill_at, reason)
+            relay.entry_line(b'{"event":"close-requested","child":{"id":"c"}}')
+            self.assertIsNone(relay.kill_at)
+            relay.entry_line(b'{"event":"close-requested"}')
             self.assertEqual(relay.kill_at, 55.0)
             self.assertEqual(relay.why, "requester close")
             relay.flush()
@@ -380,22 +389,17 @@ class RelayTest(Scratch):
         self.assertEqual(relayed, [])  # already written to the entry's stdin
         self.assertFalse(any(l.get("frontdoor") == "control-undelivered" for l in lines))
 
-    def test_owner_terminal_marks_only_an_eligible_root(self):
+    def test_owner_terminal_keeps_latest_logical_account_and_ignores_child(self):
         relay, entry, run, (out_r, out_w), (in_r, in_w) = self.relay("ignore", 60, 5)
-        marker = os.path.join(run, "private", frontdoor.RETIREMENT_ELIGIBLE)
         with mock.patch.object(frontdoor, "OUT_FD", out_w):
-            relay.entry_line(json.dumps({"event": "terminal", "status": "closed",
-                                         "session_control": {"retirement": {"eligible": False, "blocking": ["input a:0 reads owed"]}}}).encode())
-            self.assertIs(relay.retirement, False)
-            self.assertFalse(os.path.exists(marker))
-            # A registered child's terminal is not the root's.
+            relay.entry_line(json.dumps({"event": "terminal", "session_control": {"retirement": {"eligible": True}}}).encode())
+            owed = {"event": "terminal", "status": "closed", "session_control": {"retirement": {
+                "eligible": False, "blocking": ["input a:0 reads owed"]}}}
+            relay.entry_line(json.dumps(owed).encode())
             relay.entry_line(json.dumps({"event": "terminal", "child": {"id": "c"},
                                          "session_control": {"retirement": {"eligible": True}}}).encode())
-            self.assertFalse(os.path.exists(marker))
-            relay.entry_line(json.dumps({"event": "terminal", "status": "closed",
-                                         "session_control": {"retirement": {"eligible": True, "blocking": []}}}).encode())
-        self.assertIs(relay.retirement, True)
-        self.assertTrue(os.path.exists(marker))
+        self.assertIs(relay.retirement, False)
+        self.assertEqual(frontdoor.root_terminal(run)["session_control"], owed["session_control"])
 
     def test_signal_is_abandonment(self):
         relay, entry, run, (out_r, out_w), (in_r, in_w) = self.relay("obey", 60, 5)

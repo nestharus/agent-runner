@@ -5356,9 +5356,10 @@ fn ack_without_tagged_end_then_waited_exit_is_not_retirement() {
         .find(|subject| subject["subject"].get("input").is_none())
         .unwrap();
     assert_eq!(
-        root["reading"]["physical_custody"]["state"], "exited_waited",
+        root["reading"]["physical_custody"]["reading"], "not_observed",
         "{root}"
     );
+    assert_eq!(summary["recorded_actor_custody"]["state"], "exited_waited");
     // The emitted observations, read again by the shared reference reader
     // under the reporter's lineage, say the same.
     let observations: Vec<sc::Observation> = seen

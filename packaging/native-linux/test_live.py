@@ -298,10 +298,12 @@ CONTROL_ENTRY = textwrap.dedent("""
     for line in sys.stdin:
         cmd = json.loads(line)
         if cmd.get("cmd") == "inspect":
-            say({"kind": "control_state", "protocol": "oulipoly.session_control/v2", "reporter": me,
+            state = {"kind": "control_state", "protocol": "oulipoly.session_control/v2", "reporter": me,
                  "scope": {"root": "r1"}, "input": {"state": held}, "lifecycle": {"state": "open"},
-                 "observed_at_unix_ms": 1})
-            say({"event": "settlement", "retirement": {"eligible": False, "blocking": ["fixture"]}})
+                 "observed_at_unix_ms": 1}
+            settlement = {"event": "settlement", "retirement": {"eligible": False, "blocking": ["fixture"]}}
+            say({"event": "inspection", "inspection_key": "old", "control_state": state, "settlement": settlement})
+            say({"event": "inspection", "inspection_key": cmd["inspection_key"], "control_state": state, "settlement": settlement})
         elif cmd.get("kind") == "request":
             ref = {k: cmd[k] for k in ("request_key", "requester", "addressed")}
             to = "input_held" if cmd["operation"] == "input_hold" else "input_open"
@@ -327,6 +329,12 @@ class LiveControl(unittest.TestCase):
 
     setUp, tearDown, open, call, handle_file = (
         LiveRoot.setUp, LiveRoot.tearDown, LiveRoot.open, LiveRoot.call, LiveRoot.handle_file)
+
+    def test_stop_names_the_owner_instance_control(self):
+        run, terminal = self.open(script=ENTRY)
+        code, result = self.call("--root", self.handle_file(terminal), "--stop")
+        self.assertEqual((code, result["class"]), (5, "cancelled"), result)
+        self.assertIn("owner-instance stop", result["control_meaning"])
 
     def test_inspect_then_hold_and_release_address_the_reported_authority(self):
         run, terminal = self.open(script=CONTROL_ENTRY)

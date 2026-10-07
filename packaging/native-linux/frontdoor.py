@@ -8,16 +8,16 @@ external adapters. Their settings/environment/credentials stay adapter-owned.
 Registered children are explicit offers with bounded starts and concurrency.
 
 Nonblocking control/output queues keep timers independent of consumers.
-Early close/cancel arms a grace-relative kill; absent controls the backstop
-is N+2G. Admission and collection are bounded; kernel/FS stalls remain outside
+Accepted owner close/durable cancel arms a grace-relative kill. Instance stop
+arms directly; absent acceptance the independent deadline is the backstop.
+Admission and collection are bounded; kernel/FS stalls remain outside
 a finite guarantee. Run discard uses descriptor-safe removal.
 Native exit status or 90 refusal, 91 setup failure, 92 kill requested,
 93 stop/collection unknown, 94 cleanup/residue failed. No replay.
-Physical entry wait permits package run cleanup only. Under `discard` the run
-(and its root store) is removed only when the owner's terminal described the
-root as retirement-eligible on its warranted settlement reading
-(session_control/v2) or no store exists; otherwise it is kept. closed/7
-(native87) alone never makes a root eligible.
+Physical entry wait permits package run cleanup only. Discard removes the
+run and store after drain, reporting the retained logical account or unknown
+with do-not-replay. Keep preserves diagnostics. Neither removal nor closed/7
+(native87) establishes logical retirement.
 Controls: cancel/close/send/inspect lines and session_control/v2 `request`
 records, whose requester must be this attested requester (`uid:<n>`).
 Stdin `{"v":1,"op":"discover"}` instead lists this requester's roots as v2
@@ -78,9 +78,8 @@ BASH_BIN = "agent-bash/agent-bash"
 # requester name the root owner answers for this front door's requester.
 CONTROL_PROTOCOL = "oulipoly.session_control/v2"
 CONTROL_RECORD_LIMIT = 32768
-# Marks a run whose owner described its root as retirement-eligible; only
-# such a run (or one without a root store) is discarded, by retire or sweep.
-RETIREMENT_ELIGIBLE = "retirement-eligible"
+# Final logical account survives in the package terminal even under discard.
+ROOT_TERMINAL = "root-terminal.json"
 
 
 def control_requester(uid):
@@ -513,23 +512,31 @@ def stale_runs(user_dir):
     return found
 
 
-def retirement_eligible(run):
-    """Whether this run's root may be discarded: its owner described it as
-    retirement-eligible (marker), or no root store was ever made."""
-    return os.path.lexists(os.path.join(run, "private", RETIREMENT_ELIGIBLE)) \
-        or not os.path.lexists(os.path.join(run, "store"))
+def root_terminal(run):
+    """Last retained owner account, or explicit unknown; no replay inference."""
+    try:
+        fd = os.open(os.path.join(run, "private", ROOT_TERMINAL),
+                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd, "r", encoding="utf-8") as file:
+            if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+                raise ValueError("not regular")
+            value = json.loads(file.read(OUTPUT_LIMIT + 1))
+            if not isinstance(value, dict):
+                raise ValueError("not an account")
+            return value
+    except (OSError, ValueError):
+        return {"knowledge": "unknown", "session_control": {"retirement": {
+            "eligible": False, "blocking": ["no final owner account available"]}}}
 
 
 def retire(run, retention):
-    """Clean package scratch after physical entry termination. Under discard
-    the run is removed only if `retirement_eligible`; otherwise it is kept,
-    and says why. Adapter-owned state is retained with the run under keep,
-    discarded with it under discard. This layer knows no adapter credential
-    paths or semantics.
+    """Remove package scratch after physical entry termination. Logical
+    retirement stays in the returned account; removal never settles it.
+    Keep preserves the store and adapter diagnostics. This layer knows no
+    adapter credential paths or semantics. Caller establishes physical drain.
     """
     removed = None
-    if retention == "discard" and not retirement_eligible(run):
-        return {"ok": True, "run_removed": False, "retained": "root-not-retirement-eligible"}
+    account = root_terminal(run)
     if retention == "discard":
         try:
             if not shutil.rmtree.avoids_symlink_attacks:
@@ -538,7 +545,9 @@ def retire(run, retention):
             removed = True
         except OSError as error:
             removed = type(error).__name__
-    return {"ok": retention != "discard" or removed is True, "run_removed": removed}
+    return {"ok": retention != "discard" or removed is True, "run_removed": removed,
+            "root_terminal": account, "retry": "do-not-replay",
+            "meaning": "physical run disposition after drain; logical retirement is separately reported"}
 
 
 def sweep(user_dir):
@@ -698,6 +707,12 @@ def control(line):
         return None
     if value in ({"cmd": "cancel"}, {"cmd": "close"}, {"cmd": "inspect"}):
         return value
+    if isinstance(value, dict) and value.get("cmd") == "inspect" \
+            and set(value) == {"cmd", "inspection_key"} \
+            and isinstance(value["inspection_key"], str) \
+            and 1 <= len(value["inspection_key"]) <= 128 \
+            and all(33 <= ord(c) <= 126 for c in value["inspection_key"]):
+        return value
     if (
         isinstance(value, dict)
         and value.get("kind") == "request"
@@ -822,10 +837,7 @@ class Relay:
             self.why = "requester close"
 
     def note_owner_terminal(self, line):
-        """Records the owner's described retirement eligibility, and marks
-        the run when it is eligible (so a later sweep may discard it)."""
-        if b'"session_control"' not in line:
-            return
+        """Keep the final logical account for diagnostics and disposition."""
         try:
             value = json.loads(line)
         except ValueError:
@@ -834,15 +846,34 @@ class Relay:
             return
         retirement = (value.get("session_control") or {}).get("retirement") or {}
         self.retirement = retirement.get("eligible") is True
-        if self.retirement:
-            try:
-                write_private(os.path.join(self.run, "private", RETIREMENT_ELIGIBLE), "eligible")
-            except OSError:
-                self.retirement = False
+        account = {key: value[key] for key in ("status", "control", "session_control") if key in value}
+        if "session_control" not in account:
+            account["knowledge"] = "unknown"
+        path = os.path.join(self.run, "private", ROOT_TERMINAL)
+        try:
+            write_private(path + ".next", account)
+            os.replace(path + ".next", path)
+        except OSError:
+            self.collection_errors.append("root-terminal-account-unavailable")
 
     def entry_line(self, line):
         self.note_owner_terminal(line)
         self.queue_output(line)
+        try:
+            value = json.loads(line)
+        except ValueError:
+            value = None
+        if isinstance(value, dict) and "child" not in value:
+            if value.get("event") == "close-requested":
+                # This is the owner effect after durable acknowledgment.
+                self.close_waiting = self.owed_async > 0
+                if not self.close_waiting:
+                    self.arm_close()
+            elif value.get("event") == "cancel-requested" and value.get("by") == "session-control":
+                if self.cancel_at is None:
+                    self.cancel_at = self.clock()
+                    self.kill_at = self.cancel_at + self.grace
+                    self.why = "requester durable cancel"
         if b'"async-owed"' in line:
             try:
                 value = json.loads(line)
@@ -864,16 +895,11 @@ class Relay:
                     self.say({"frontdoor": "control-refused", "reason": "requester-not-attested",
                               "request_key": value.get("request_key") if isinstance(value.get("request_key"), str) else None})
                     return
-                # The same close/cancel arming as the stdin shorthand.
-                command = {"close": "close", "cancel": "cancel"}.get(value.get("operation"))
+                command = None
             else:
                 command = value["cmd"]
-            if command == "close" and self.owed_async > 0:
-                # The owner keeps the harness for owed background
-                # completions (bounded by the deadline); arm once none is.
-                self.close_waiting = True
-            elif command in ("cancel", "close"):
-                # Native close/cancel may never complete. Arm before I/O.
+            if command == "cancel":
+                # Explicit owner-instance stop; no durable control claim.
                 if self.cancel_at is None:
                     self.cancel_at = self.clock()
                     self.kill_at = self.cancel_at + self.grace
@@ -1521,7 +1547,7 @@ def discover(package, site, user):
             "live": live,
             "socket": os.path.join(run, LIVE_SOCKET) if live else None,
             "front_door_holds_run": run_lock_held(run),
-            "retirement_eligible_marked": os.path.lexists(os.path.join(run, "private", RETIREMENT_ELIGIBLE)),
+            "last_root_terminal": root_terminal(run),
             "entry": entry,
             "describe_error": reason,
         })
