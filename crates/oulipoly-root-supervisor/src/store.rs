@@ -73,6 +73,12 @@
 //!   leaves an admitted one whose insertion or turn is unresolved unknown, and
 //!   records a never-admitted one undelivered once its requester work's end is
 //!   recorded. No migration: other schemas are refused.
+//! * Version 12 gives each owner claim a random `token` (the owner part of
+//!   the root's control authority, see [`crate::control`]) and keeps
+//!   `control`: every `oulipoly.session_control/v2` claim this root's owners
+//!   committed, as the exact record line, in commit order. A later owner
+//!   reads them back as durable control intent (hold, close, cancel) and
+//!   replays them unchanged; it never rewrites one. No migration.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -91,7 +97,7 @@ pub(crate) const LOCK_FILE: &str = "owner.lock";
 pub(crate) const DB_FILE: &str = "intent.sqlite3";
 /// Version of this new per-root lineage. There is no migration chain: a
 /// store of any other version is refused.
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 /// How long a write waits for a foreign SQLite lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -165,7 +171,17 @@ const SCHEMA: &str = "
 CREATE TABLE owner (
     generation INTEGER PRIMARY KEY,
     pid INTEGER NOT NULL,
-    claimed_unix INTEGER NOT NULL
+    claimed_unix INTEGER NOT NULL,
+    token TEXT NOT NULL
+);
+CREATE TABLE control (
+    seq INTEGER PRIMARY KEY,
+    request_key TEXT NOT NULL,
+    requester TEXT NOT NULL,
+    addressed TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    line TEXT NOT NULL,
+    generation INTEGER NOT NULL
 );
 CREATE TABLE intent (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -521,6 +537,8 @@ pub(crate) struct Claimed {
 pub(crate) struct Store {
     conn: Connection,
     generation: i64,
+    /// This claim's random owner identity (`owner.token`).
+    owner_token: String,
     _lock: File,
 }
 
@@ -579,9 +597,10 @@ impl Store {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| int(elapsed.as_secs()));
+        let owner_token = crate::sys::random_hex()?;
         tx.execute(
-            "INSERT INTO owner (generation, pid, claimed_unix) VALUES (?1, ?2, ?3)",
-            params![generation, std::process::id(), now],
+            "INSERT INTO owner (generation, pid, claimed_unix, token) VALUES (?1, ?2, ?3, ?4)",
+            params![generation, std::process::id(), now, owner_token],
         )?;
         let classified_unknown = tx.execute(
             "UPDATE attempt SET outcome = ?1, resolved_generation = ?2
@@ -723,6 +742,7 @@ impl Store {
             store: Store {
                 conn,
                 generation,
+                owner_token,
                 _lock: lock,
             },
             created,
@@ -748,6 +768,43 @@ impl Store {
 
     pub(crate) fn generation(&self) -> i64 {
         self.generation
+    }
+
+    pub(crate) fn owner_token(&self) -> &str {
+        &self.owner_token
+    }
+
+    /// The latest recorded root PID 1 incarnation, ended or not.
+    pub(crate) fn latest_incarnation(&self) -> rusqlite::Result<Option<i64>> {
+        self.conn
+            .query_row("SELECT max(id) FROM incarnation", [], |row| row.get(0))
+    }
+
+    /// Every committed control claim, in commit order.
+    pub(crate) fn control_rows(&self) -> rusqlite::Result<Vec<ControlRow>> {
+        control_rows(&self.conn)
+    }
+
+    /// Commits control claim lines together, under the generation fence,
+    /// before any of them is reported.
+    pub(crate) fn append_control(&mut self, rows: &[ControlRow]) -> Result<(), StoreError> {
+        let generation = self.generation;
+        self.write(|tx| {
+            for row in rows {
+                tx.execute(
+                    "INSERT INTO control (request_key, requester, addressed, kind, line, generation)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![row.request_key, row.requester, row.addressed, row.kind, row.line, generation],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// What the store says now about each logical input and the root's
+    /// physical custody (see [`SettlementFacts`]).
+    pub(crate) fn settlement_facts(&self) -> rusqlite::Result<SettlementFacts> {
+        settlement_facts(&self.conn)
     }
 
     /// Runs `write` in one transaction only while this instance is still
@@ -1533,6 +1590,169 @@ pub(crate) struct ChildAdmission<'a> {
 }
 
 /// SQLite integers are `i64`; positions, indexes and times fit.
+/// One committed control claim: its request identity and its exact line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ControlRow {
+    pub(crate) request_key: String,
+    pub(crate) requester: String,
+    /// The addressed authority, as its canonical JSON.
+    pub(crate) addressed: String,
+    pub(crate) kind: String,
+    pub(crate) line: String,
+    pub(crate) generation: i64,
+}
+
+fn control_rows(conn: &Connection) -> rusqlite::Result<Vec<ControlRow>> {
+    conn.prepare(
+        "SELECT request_key, requester, addressed, kind, line, generation FROM control ORDER BY seq",
+    )?
+    .query_map([], |row| {
+        Ok(ControlRow {
+            request_key: row.get(0)?,
+            requester: row.get(1)?,
+            addressed: row.get(2)?,
+            kind: row.get(3)?,
+            line: row.get(4)?,
+            generation: row.get(5)?,
+        })
+    })?
+    .collect()
+}
+
+/// One logical input as the store records it. These are the owner's own
+/// durable facts: insertion from attempt outcomes and ACKs, the agent's
+/// tagged turn end, nothing about native processing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InputFacts {
+    pub(crate) harness: String,
+    pub(crate) index: i64,
+    pub(crate) acknowledged: bool,
+    /// Every attempt conclusively not inserted and a durable stop.
+    pub(crate) not_inserted: bool,
+    pub(crate) turn_ended: bool,
+}
+
+/// Root-wide facts beside the inputs: async completion debt, and physical
+/// custody of every launch and incarnation as recorded (waited, only
+/// observed, or unknown).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct SettlementFacts {
+    pub(crate) inputs: Vec<InputFacts>,
+    /// Accepted async Bash completions with no recorded transport settlement.
+    pub(crate) async_owed: i64,
+    /// Launches (harness and Bash) with no recorded end.
+    pub(crate) works_open: i64,
+    /// Launches whose end is recorded without their actual waiter's report.
+    pub(crate) works_unknown: i64,
+    /// Incarnations not recorded ended.
+    pub(crate) incarnations_open: i64,
+    /// Incarnations recorded ended by an exit observation without a wait.
+    pub(crate) incarnations_observed: i64,
+    /// Incarnations recorded ended with neither wait nor exit observation.
+    pub(crate) incarnations_unknown: i64,
+    pub(crate) incarnations: i64,
+}
+
+fn settlement_facts(conn: &Connection) -> rusqlite::Result<SettlementFacts> {
+    let rows = conn
+        .prepare(
+            "SELECT h.id, m.harness, m.idx, m.ack_label IS NOT NULL, m.stop,
+                    m.turn_end_generation IS NOT NULL
+             FROM message m JOIN harness h ON h.position = m.harness
+             ORDER BY m.harness, m.idx",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, bool>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut inputs = Vec::with_capacity(rows.len());
+    for (harness, position, index, acknowledged, stop, turn_ended) in rows {
+        let account = attempt_account(conn, position, index)?;
+        let not_inserted =
+            !acknowledged && stop.is_some() && account.unresolved == 0 && account.all_not_inserted;
+        inputs.push(InputFacts {
+            harness,
+            index,
+            acknowledged,
+            not_inserted,
+            turn_ended,
+        });
+    }
+    let count = |sql: &str| conn.query_row(sql, [], |row| row.get::<_, i64>(0));
+    Ok(SettlementFacts {
+        inputs,
+        async_owed: count(
+            "SELECT count(*) FROM bash_run WHERE delivery_mode = 'async' AND completion_outcome IS NULL",
+        )?,
+        works_open: count("SELECT count(*) FROM work WHERE outcome IS NULL")?,
+        works_unknown: count(
+            "SELECT count(*) FROM work WHERE outcome IS NOT NULL
+             AND (observer IS NULL OR observer <> 'work-pid1-wait')
+             AND outcome NOT IN ('launch-refused', 'never-launched')",
+        )?,
+        incarnations_open: count("SELECT count(*) FROM incarnation WHERE ended IS NULL")?,
+        incarnations_observed: count(
+            "SELECT count(*) FROM incarnation WHERE ended LIKE '%exit-observed%'",
+        )?,
+        incarnations_unknown: count(
+            "SELECT count(*) FROM incarnation WHERE ended IS NOT NULL
+             AND ended NOT LIKE '%waited%' AND ended NOT LIKE '%exit-observed%'",
+        )?,
+        incarnations: count("SELECT count(*) FROM incarnation")?,
+    })
+}
+
+/// A root's authority as its store records it, read without claiming it:
+/// the discovery describer's read. Nothing is written or locked (not even
+/// the owner lock, so a concurrent claim is never refused because of it);
+/// the result is the store's last record, not proof that an owner is live.
+#[derive(Debug, Clone)]
+pub struct Described {
+    pub root_id: String,
+    pub generation: i64,
+    pub owner_token: String,
+    pub incarnation: Option<i64>,
+}
+
+/// Reads `dir`'s root identity, latest owner claim and latest incarnation
+/// read-only. Refuses other store versions.
+pub fn describe(dir: &Path) -> Result<Described, String> {
+    let conn = Connection::open_with_flags(
+        dir.join(DB_FILE),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("store: {error}"))?;
+    let read = || -> rusqlite::Result<Result<Described, String>> {
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version != SCHEMA_VERSION {
+            return Ok(Err(format!("unknown store version {version}")));
+        }
+        let root_id: String = conn.query_row("SELECT root_id FROM root", [], |row| row.get(0))?;
+        let (generation, owner_token): (i64, String) = conn.query_row(
+            "SELECT generation, token FROM owner ORDER BY generation DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let incarnation: Option<i64> =
+            conn.query_row("SELECT max(id) FROM incarnation", [], |row| row.get(0))?;
+        Ok(Ok(Described {
+            root_id,
+            generation,
+            owner_token,
+            incarnation,
+        }))
+    };
+    read().map_err(|error| format!("store: {error}"))?
+}
+
 fn earlier_ref(conn: &Connection, caller_ref: &str) -> rusqlite::Result<Option<EarlierRef>> {
     conn.query_row(
         "SELECT harness, idx, admitted_generation, ack_label IS NOT NULL, stop,

@@ -9,6 +9,13 @@
 //! and each worker stops its harness once its admitted inputs' turns have
 //! ended. It is not a cancel and not an end of processing.
 //!
+//! An input hold ([`InputHold`]) is narrower than close: while it holds,
+//! the caller's new input is refused (`input-held`) at receipt and at the
+//! worker's admission check, and nothing else changes. Running turns and
+//! their tools continue, the owner's own Bash completions are still owed
+//! and delivered, and close and cancel keep their meanings. A release
+//! clears it through the same root authority (see [`crate::control`]).
+//!
 //! A recovered survivor that is held rather than conversed with says why
 //! ([`Inbox::hold`]), so that a refused `send` names that state instead of
 //! a bare `not-in-conversation`. The bell also rings a second, separate
@@ -185,6 +192,22 @@ impl Closing {
     }
 
     pub(crate) fn requested(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// The root-wide input hold: refuse new caller input while set. Not a
+/// pause: running work and owner completions continue. Set and cleared only
+/// by acknowledged control transitions.
+#[derive(Default)]
+pub(crate) struct InputHold(AtomicBool);
+
+impl InputHold {
+    pub(crate) fn set(&self, held: bool) {
+        self.0.store(held, Ordering::SeqCst);
+    }
+
+    pub(crate) fn held(&self) -> bool {
         self.0.load(Ordering::SeqCst)
     }
 }

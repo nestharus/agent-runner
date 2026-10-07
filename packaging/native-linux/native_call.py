@@ -7,7 +7,8 @@
         [--child-route NAME ... [--child-max-starts N] [--child-max-concurrent N]]
         [--live-handle NEWFILE]
     oulipoly-native-call --root HANDLE --out DIR
-        (--prompt-file FILE | --close | --cancel) [--wait SECONDS]
+        (--prompt-file FILE | --close | --stop | --inspect | --hold | --release)
+        [--wait SECONDS]
 
 --live-handle opens a live root: its supervisor outlives this call; --root
 addresses it later (same requester), see share/README.md "Live roots".
@@ -602,7 +603,36 @@ LIVE_EXITS = {
     "cleanup-failed": 7, "ended-otherwise": 9, "root-absent": 11, "root-dead": 12, "root-foreign": 13,
     "root-refused": 14, "follow-up-refused": 15, "root-ended": 16,
     "root-unavailable": 17, "async-undelivered": 10,
+    "inspected": 0, "acknowledged": 0, "control-refused": 18, "control-unknown": 19,
 }
+
+CONTROL_PROTOCOL = "oulipoly.session_control/v2"
+
+
+def read_private(path):
+    """The caller's own regular file (its live handle), read without
+    following a final symlink or blocking on a FIFO, bounded."""
+    st = os.lstat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise LocalRefusal("live handle is not a regular file")
+    if st.st_uid != os.getuid():
+        raise LocalRefusal("live handle is not the caller's own file")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.getuid():
+            raise LocalRefusal("live handle changed or is not the caller's own regular file")
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if sum(map(len, chunks)) > 1024 * 1024:
+                raise LocalRefusal("live handle is too large")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
 
 
 def read_handle(path):
@@ -919,7 +949,12 @@ def parse_live_args(argv):
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--prompt-file", help="deliver one more input and wait for its own turn")
     action.add_argument("--close", action="store_true", help="close the root: drain and end its tree")
-    action.add_argument("--cancel", action="store_true", help="cancel the root")
+    action.add_argument("--stop", action="store_true", help="stop this owner instance; distinct from durable session-control cancel")
+    action.add_argument("--inspect", action="store_true",
+                        help="report the root's control state and settlement reading (session_control/v2)")
+    action.add_argument("--hold", action="store_true",
+                        help="hold new input (admission only; running work continues)")
+    action.add_argument("--release", action="store_true", help="release an input hold")
     parser.add_argument("--wait", type=int, default=1800, help="this call's own bound; the root is unaffected by it")
     args = parser.parse_args(argv)
     if not 1 <= args.wait <= MAX_DEADLINE_S:
@@ -966,6 +1001,8 @@ def main_live(argv):
                 **base, "turn": account,
                 "transport": {"errors": attached.errors, "attached": attached.events[0] if attached.events else None},
                 "root": "ended" if account["root_ended"] else "live (detached; this exit is not the root's end)"})
+        if args.inspect or args.hold or args.release:
+            return live_control(args, attached, base, until)
         cmd = "close" if args.close else "cancel"
         attached.write({"cmd": cmd})
         attached.log(action="send", cmd=cmd)
@@ -987,6 +1024,7 @@ def main_live(argv):
             "transport": {"attached": attached.events[0] if attached.events else None,
                           "loss": terminal.get("live") if terminal else None},
             "physical_close": bool(terminal and terminal.get("entry_status") is not None),
+            "control_meaning": "durable root close" if args.close else "owner-instance stop; durable intent remains for direct recovery",
             "root": "ended" if terminal else "unknown (no terminal record; stop not observed)"})
     except OSError as error:
         attached.close()
@@ -994,6 +1032,69 @@ def main_live(argv):
     finally:
         for sig, handler in old.items():
             signal.signal(sig, handler)
+
+
+def inspected(attached, until):
+    """Return only this encounter's correlated inspection, else no reading."""
+    key = "i" + os.urandom(16).hex()
+    attached.write({"cmd": "inspect", "inspection_key": key})
+    attached.log(action="send", cmd="inspect", inspection_key=key)
+    while True:
+        event = attached.next_event(until)
+        if event is None or event.get("frontdoor") == "terminal":
+            break
+        if event.get("event") == "inspection" and event.get("inspection_key") == key:
+            state, settlement = event.get("control_state"), event.get("settlement")
+            if isinstance(state, dict) and state.get("kind") == "control_state" \
+                    and state.get("protocol") == CONTROL_PROTOCOL \
+                    and isinstance(state.get("reporter"), dict) \
+                    and isinstance(settlement, dict) and settlement.get("event") == "settlement":
+                return state, settlement
+            break
+    return None, None
+
+
+def live_control(args, attached, base, until):
+    """`--inspect`, or one `session_control/v2` hold/release request addressed
+    to the authority the root's own inspection reports. The answer is the
+    owner's claims for this request; this caller attests nothing itself."""
+    state, settlement = inspected(attached, until)
+    fields = {**base, "control_state": state, "settlement": settlement}
+    if state is None or settlement is None:
+        attached.detach()
+        return live_result(args.out, "incomplete", {**fields, "reason": "no inspection within the wait bound"})
+    if args.inspect:
+        attached.detach()
+        return live_result(args.out, "inspected", fields)
+    key = "c" + os.urandom(8).hex()
+    request = {
+        "kind": "request", "protocol": CONTROL_PROTOCOL, "request_key": key,
+        "requester": f"uid:{os.getuid()}", "addressed": state["reporter"],
+        "operation": "input_hold" if args.hold else "input_release",
+        "scope": {"root": state["reporter"]["root"]},
+    }
+    attached.write(request)
+    attached.log(action="send", control=request["operation"], request_key=key)
+    claims, refusal = [], None
+    while True:
+        event = attached.next_event(until)
+        if event is None or event.get("frontdoor") == "terminal":
+            break
+        if event.get("frontdoor") == "control-refused" or event.get("event") == "session-control-unavailable":
+            refusal = event
+            break
+        if event.get("request_key") == key and isinstance(event.get("kind"), str):
+            claims.append(event)
+            if event["kind"] == "outcome" or (event["kind"] == "refusal" and event.get("reason") == "key_conflict"):
+                break
+    attached.detach()
+    outcome = next((c for c in reversed(claims) if c["kind"] == "outcome"), None)
+    cls = "control-refused" if refusal is not None else \
+        "acknowledged" if outcome and outcome.get("result") == "acknowledged" else \
+        "control-refused" if outcome and outcome.get("result") == "refused" else \
+        "control-unknown" if outcome else "incomplete"
+    return live_result(args.out, cls, {**fields, "request": request, "claims": claims, "refusal": refusal,
+                                       "meaning": "hold refuses input received after acknowledgment; already in-flight input may still be admitted; running work continues"})
 
 
 def main(argv):

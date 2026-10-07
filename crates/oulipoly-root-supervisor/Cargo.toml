@@ -39,6 +39,10 @@ path = "src/bin/deterministic_peer.rs"
 test = false
 
 [dependencies]
+# Shared root control vocabulary (`session_control`): the owner speaks it at
+# its control face. Declared versions/capabilities govern; the lock records
+# the resolved source as provenance only.
+agent-provider-contract = { git = "https://github.com/nestharus/agent-provider-sdk.git" }
 libc.workspace = true
 oulipoly-acp = { path = "../oulipoly-acp" }
 rusqlite.workspace = true

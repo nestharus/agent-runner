@@ -144,10 +144,13 @@
 //! `root-absent` ([`EXIT_ROOT_ABSENT`]) with what the store still owes.
 //! Later stdin lines are control commands, numbered from 1 in arrival order
 //! (`control`, every line counted): `{"cmd":"cancel"}`, `{"cmd":"send",
-//! "text":..., "harness"?:..., "ref"?:...}` and `{"cmd":"close"}` (see
-//! Live conversation). Anything else is `control-refused`. Stdin EOF is
-//! neither a cancel nor a close. Stdout carries one JSON object per line:
-//! progress events, then exactly one `"event":"terminal"` report. Exit
+//! "text":..., "harness"?:..., "ref"?:...}`, `{"cmd":"close"}` (see
+//! Live conversation), `{"cmd":"inspect"}`, and `oulipoly.session_control/v2`
+//! `request` records (see Root control face). Anything else is
+//! `control-refused`. Stdin EOF is neither a cancel nor a close. Stdout
+//! carries one JSON object per line: progress events and `session_control`
+//! records (a `kind` key, no `event`), then exactly one `"event":"terminal"`
+//! report. Exit
 //! codes: [`EXIT_ENDED`], [`EXIT_ENDED_OWED`], [`EXIT_CANCELLED`],
 //! [`EXIT_INCOMPLETE`], [`EXIT_STORE_LOST`], [`EXIT_ROOT_ABSENT`],
 //! [`EXIT_CLOSED`], [`EXIT_SPEC_REFUSED`], [`EXIT_STORE_REFUSED`].
@@ -180,7 +183,10 @@
 //!   `input`, and a later recovery resubmits it with its original key.
 //! * `close` refuses new input for the whole root (`close-requested`). An
 //!   admission whose check already passed can still commit and be reported
-//!   after this request; that input remains part of the admitted work. Each
+//!   after this request; that input remains part of the admitted work. The
+//!   close is durable: only a durable acknowledgment applies its effect;
+//!   pending or unknown applies no close. It enters the root control ladder
+//!   (see Root control face), and a later owner keeps input closed and follows it through. Each
 //!   worker, once every admitted input on its harness is acknowledged and
 //!   its turn ended, attempts to stop its harness through its work PID 1
 //!   (`close-stopping`, with whether the request was sent). The harness's
@@ -188,7 +194,6 @@
 //!   An input without a tagged turn end holds this stop attempt while the
 //!   harness lives. A harness that ends naturally and is waited can also
 //!   close with no owed insertion, without a tagged idle or owner stop.
-//!   A close is not durable: a recovery after owner death knows nothing of it.
 //! * `rejected` with `durable: true` reports a conclusive refusal only after
 //!   the attempt outcome and message stop commit together without an ACK.
 //!   It stops further resubmission of that logical input, but an earlier
@@ -198,7 +203,25 @@
 //!   unresolved and publishes no conclusive rejection; existing capped recovery
 //!   may resubmit the same key with its prior history unknown. Commit followed
 //!   by owner loss before publication can leave a durable stop without an event.
-//! * `cancel` stays what it was, and outranks a close.
+//! * `cancel` stays what it was, and outranks a close: this owner instance's
+//!   cancellation, after which a later recovery still owes the root's work.
+//!   The root's durable lifecycle cancel is the control face's `cancel`.
+//!
+//! # Root control face
+//!
+//! This owner speaks the shared root control vocabulary
+//! `oulipoly.session_control/v2` (`agent-provider-contract`) as the root
+//! authority it addresses: input hold/release, close, cancel and a
+//! purposeful recovery's `recover`, on one durable claim ladder, plus
+//! `control_state` inspection and settlement `observation`s with a
+//! warranted reading. `session-control` announces its advertisement,
+//! authority and inherited state; requests from another requester or for
+//! another authority are refused, kept claims are replayed unchanged, and
+//! acknowledged intent survives owner death. A malformed record is only a
+//! `session-control-unavailable` diagnostic. The terminal adds `control`
+//! (current input/lifecycle) and `session_control` (settlement subjects and
+//! described `retirement` eligibility; `closed`/7 alone never makes a root
+//! eligible). See the `control` module for the exact rules and limits.
 //!
 //! None of this observes processing: a turn's end is the agent's tag, and
 //! `completion` stays `not-observed`. Queued but unadmitted input exists
@@ -541,6 +564,10 @@
 //! * Root PID 1 keeps every receipt for its lifetime, and a root PID 1 whose
 //!   owner lost its connection to it mid-run is not restarted by that owner.
 //!   Losing that connection does not stop harness reads already blocked.
+//! * The control face's requester attestation is the stdin channel itself;
+//!   its warrant for settlement is this owner alone over fenced store facts,
+//!   not an independent observer. Child-scoped controls are refused.
+//!   Inspection and settlement are reports at the time asked, not effects.
 //! * Nothing current supersedes a live owner: the store lock refuses a
 //!   second normal claim. (The Runner entry ties its owner's life to its
 //!   own, so a dead entry leaves no live owner behind.) Supersession is
@@ -582,6 +609,7 @@
 
 pub mod bash;
 pub mod children;
+pub mod control;
 mod conversation;
 mod custody;
 mod harness;
@@ -603,7 +631,9 @@ use std::thread;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub use control::describe_entry;
 pub use harness::{HarnessRecord, MessageRecord, SOCKET_ENV};
+pub use store::{Described, describe};
 pub use transport::MAX_LINE_BYTES;
 pub use workload::Workload;
 
@@ -648,6 +678,11 @@ pub struct Request {
     /// new incarnation when the recorded one is gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recover: Option<Recover>,
+    /// A purposeful recovery's `oulipoly.session_control/v2` `recover`
+    /// request record, answered once this owner knows what it found (see
+    /// the `control` module). Only with `recover`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<Value>,
 }
 
 /// What a recovery is for. Both act only on a surviving root PID 1 this
@@ -768,6 +803,9 @@ impl Request {
         if self.recover.is_some() && self.intent.is_some() {
             return Err("recover names a recovery's purpose; an intent creates a root".to_owned());
         }
+        if self.control.is_some() && self.recover.is_none() {
+            return Err("control answers a purposeful recovery only".to_owned());
+        }
         let Some(intent) = &self.intent else {
             return Ok(());
         };
@@ -880,6 +918,15 @@ where
     let claimed = match store::Store::claim(Path::new(&request.store), request.intent.as_ref()) {
         Ok(claimed) => claimed,
         Err(error) => {
+            let owner_live = matches!(error, store::ClaimError::OwnerLive);
+            if let Some(refusal) = request
+                .control
+                .as_ref()
+                .filter(|_| owner_live)
+                .and_then(|record| control::refuse_owner_live(&record.to_string()))
+            {
+                emit_line(&mut out, &refusal);
+            }
             emit(
                 &mut out,
                 &json!({ "event": "terminal", "status": "store-refused", "reason": error.reason() }),
@@ -964,6 +1011,44 @@ where
         &stop,
     );
     emit(&mut out, &recovery.report(&claimed.root_id, isolation));
+    // The root's control face: its kept claims, read back as durable
+    // control intent before anything is attached or launched.
+    let hold = Arc::new(conversation::InputHold::default());
+    let incarnation = recovery
+        .incarnation
+        .or_else(|| store.latest_incarnation().ok().flatten());
+    let mut face = match control::Face::load(
+        &store,
+        &claimed.root_id,
+        &format!("uid:{}", resolved.peer_uid()),
+        incarnation,
+        Arc::clone(&hold),
+    ) {
+        Ok(face) => face,
+        Err(error) => {
+            emit(
+                &mut out,
+                &json!({ "event": "terminal", "status": "store-failed", "reason": format!("control records: {error}") }),
+            );
+            return EXIT_STORE_LOST;
+        }
+    };
+    emit(&mut out, &face.announcement());
+    if let Some(record) = &request.control {
+        let found = if recovery.unattached.is_some() {
+            control::Found::Unattached
+        } else if recovery.root.is_some() {
+            control::Found::Attached
+        } else {
+            control::Found::Absent
+        };
+        for line in face.answer_recover(&record.to_string(), found, &mut store) {
+            emit_line(&mut out, &line);
+        }
+    }
+    for line in face.report_inherited(&mut store) {
+        emit_line(&mut out, &line);
+    }
     if let Some(reason) = recovery.unattached {
         let (report, code) = unattached_report(&claimed.harnesses, &reason);
         emit(&mut out, &report);
@@ -1034,6 +1119,34 @@ where
                 }),
             );
         }
+    }
+    // Durable control intent an earlier owner acknowledged holds for this
+    // one: an acknowledged cancel cancels, an acknowledged close keeps input
+    // closed and is followed through. The hold was restored with the face.
+    match face.lifecycle_state() {
+        control::State::Cancelling if !cancel_requested => {
+            cancel_requested = true;
+            let signalled = custody.lock().expect("custody lock").cancel();
+            registry.stop_all("cancelled");
+            emit(
+                &mut out,
+                &json!({ "event": "cancel-requested", "signalled": signalled, "by": "inherited-control-intent" }),
+            );
+        }
+        control::State::Closing => {
+            closing.request();
+            registry.stop_all("root-closing");
+            emit(
+                &mut out,
+                &json!({
+                    "event": "close-requested",
+                    "by": "inherited-control-intent",
+                    "input": "closed",
+                    "meaning": "an earlier owner acknowledged this close; it stays in force",
+                }),
+            );
+        }
+        _ => {}
     }
     let store = Arc::new(Mutex::new(store));
     let (tx, rx) = mpsc::channel();
@@ -1129,6 +1242,7 @@ where
             views: Arc::clone(&views),
             inbox: Arc::clone(&inboxes[position]),
             closing: Arc::clone(&closing),
+            hold: Arc::clone(&hold),
             children: Arc::clone(&registry),
             continue_attached: request.recover == Some(Recover::ContinueAttached),
         };
@@ -1153,74 +1267,134 @@ where
             }
             Event::Control(line) => {
                 controls += 1;
+                face.set_incarnation(slot.current().map(|root| root.incarnation).or(incarnation));
                 let command = serde_json::from_str::<Value>(line.trim()).ok();
+                let mut root_ctx = RootControl {
+                    custody: &custody,
+                    registry: &registry,
+                    inboxes: &inboxes,
+                    closing: &closing,
+                    cancel_requested: &mut cancel_requested,
+                };
+                if command.as_ref().is_some_and(control::is_record) {
+                    let (lines, effect) =
+                        face.handle_line(line.trim(), &mut store.lock().expect("store lock"));
+                    for line in &lines {
+                        emit_line(&mut out, line);
+                    }
+                    match effect {
+                        Some(control::Effect::Hold) | Some(control::Effect::Release) => {
+                            let held = effect == Some(control::Effect::Hold);
+                            hold.set(held);
+                            emit(
+                                &mut out,
+                                &json!({
+                                    "event": "input-hold",
+                                    "control": controls,
+                                    "held": held,
+                                    "meaning": "caller input received after hold acknowledgment is refused; already in-flight input may still be admitted; running turns, tools and owner completions continue",
+                                }),
+                            );
+                        }
+                        Some(control::Effect::Cancel) => {
+                            root_ctx.cancel(&mut out, "session-control")
+                        }
+                        Some(control::Effect::Close) => {
+                            root_ctx.close(&mut out, controls);
+                        }
+                        None => {}
+                    }
+                    continue;
+                }
                 match command
                     .as_ref()
                     .and_then(|value| value.get("cmd"))
                     .and_then(Value::as_str)
                 {
-                    Some("cancel") => {
-                        if !cancel_requested {
-                            cancel_requested = true;
-                            let signalled = custody.lock().expect("custody lock").cancel();
-                            // Already killed with every registered work;
-                            // marked so admission and results say why.
-                            registry.stop_all("cancelled");
-                            emit(
-                                &mut out,
-                                &json!({ "event": "cancel-requested", "signalled": signalled }),
-                            );
-                            // Wake workers between turns so that queued
-                            // follow-ups are answered as not admitted.
-                            inboxes.iter().for_each(|inbox| inbox.ring());
-                        }
-                    }
+                    // This owner instance's cancellation, as before: not a
+                    // root lifecycle transition, so a later recovery still
+                    // owes the root's work. The durable root cancel is the
+                    // `session_control` `cancel` operation.
+                    Some("cancel") => root_ctx.cancel(&mut out, "stdin"),
                     Some("send") => {
                         let control = Control {
                             number: controls,
                             command: command.as_ref().expect("parsed"),
                             cancelled: cancel_requested,
                             closing: &closing,
+                            held: hold.held(),
                             harnesses: &expected,
                             inboxes: &inboxes,
                         };
                         emit(&mut out, &control.send());
                     }
                     Some("close") => {
-                        let refused = if cancel_requested {
+                        let request = face.shorthand(control::Operation::Close, controls);
+                        let (lines, effect) =
+                            face.handle(request, &mut store.lock().expect("store lock"));
+                        for line in &lines {
+                            emit_line(&mut out, line);
+                        }
+                        let refused = if *root_ctx.cancel_requested {
                             Some("cancelled")
-                        } else if !closing.request() {
+                        } else if effect != Some(control::Effect::Close) {
+                            Some("close-not-acknowledged")
+                        } else if !root_ctx.close(&mut out, controls) {
                             Some("close-already-requested")
                         } else {
                             None
                         };
-                        match refused {
-                            Some(reason) => emit(
+                        if let Some(reason) = refused {
+                            emit(
                                 &mut out,
                                 &json!({ "event": "control-refused", "control": controls, "cmd": "close", "reason": reason }),
-                            ),
-                            None => {
-                                // Close ends input for the whole root: no
-                                // child is admitted after it, and children
-                                // still running are stopped.
-                                let stopped = registry.stop_all("root-closing");
-                                if stopped > 0 {
+                            );
+                        }
+                    }
+                    Some("inspect") => {
+                        let guard = store.lock().expect("store lock");
+                        let state = control::Record::ControlState(face.state());
+                        // Local transport correlation; the enclosed shared records
+                        // retain their SDK meaning. No uncorrelated backlog is current.
+                        let inspection_key = command
+                            .as_ref()
+                            .and_then(|value| value.get("inspection_key"))
+                            .and_then(Value::as_str)
+                            .filter(|key| {
+                                !key.is_empty()
+                                    && key.len() <= 128
+                                    && key.bytes().all(|b| (33..=126).contains(&b))
+                            });
+                        emit_line(&mut out, &state.encode_line());
+                        match guard.settlement_facts() {
+                            Ok(facts) => {
+                                let (lines, summary) = face.settlement(&facts, Vec::new());
+                                drop(guard);
+                                for line in &lines {
+                                    emit_line(&mut out, line);
+                                }
+                                let mut event =
+                                    json!({ "event": "settlement", "control": controls });
+                                if let (Some(event), Some(summary)) =
+                                    (event.as_object_mut(), summary.as_object())
+                                {
+                                    event.extend(summary.clone());
+                                }
+                                emit(&mut out, &event);
+                                if let Some(key) = inspection_key {
                                     emit(
                                         &mut out,
-                                        &json!({ "event": "children-stopping", "reason": "root-closing", "signalled": stopped }),
+                                        &json!({
+                                            "event": "inspection", "inspection_key": key,
+                                            "control_state": state, "settlement": event,
+                                        }),
                                     );
                                 }
-                                emit(
-                                    &mut out,
-                                    &json!({
-                                        "event": "close-requested",
-                                        "control": controls,
-                                        "input": "closed",
-                                        "meaning": "new input is refused; an admission already past its check may still commit; live harness stop is attempted after admitted turns end, with request and waited exit reported separately; a naturally ending harness may close without tagged idle; not a cancel or processing success",
-                                    }),
-                                );
-                                inboxes.iter().for_each(|inbox| inbox.ring());
                             }
+                            Err(error) => emit(
+                                &mut out,
+                                &json!({ "event": "settlement", "control": controls, "evidence": "unavailable", "reason": error.to_string() }),
+                            ),
                         }
                     }
                     _ => emit(
@@ -1281,6 +1455,30 @@ where
         // A child may have run and its end is not known.
         report["status"] = json!("incomplete");
         code = EXIT_INCOMPLETE;
+    }
+    face.set_incarnation(slot.current().map(|root| root.incarnation).or(incarnation));
+    report["control"] = json!({ "input": face.input_state(), "lifecycle": face.lifecycle_state() });
+    let mut blocking = Vec::new();
+    if let Some(lost) = store_lost {
+        blocking.push(format!("this owner's store authority: {lost}"));
+    }
+    if root_absent {
+        blocking.push("root-absent: earlier ends unknown".to_owned());
+    }
+    let facts = store.lock().expect("store lock").settlement_facts();
+    match facts {
+        Ok(facts) => {
+            let (lines, summary) = face.settlement(&facts, blocking);
+            for line in &lines {
+                emit_line(&mut out, line);
+            }
+            report["session_control"] = summary;
+        }
+        Err(error) => {
+            report["session_control"] = json!({
+                "retirement": { "eligible": false, "blocking": [format!("settlement evidence unavailable: {error}")] },
+            });
+        }
     }
     report["bash"] = ingress.summary();
     report["async"] = bash::async_summary(&views);
@@ -1722,6 +1920,8 @@ struct Control<'a> {
     command: &'a Value,
     cancelled: bool,
     closing: &'a conversation::Closing,
+    /// The root's input hold, as acknowledged.
+    held: bool,
     harnesses: &'a [(String, usize)],
     inboxes: &'a [Arc<conversation::Inbox>],
 }
@@ -1747,6 +1947,9 @@ impl Control<'_> {
         }
         if self.closing.requested() {
             return refused("input-closed", harness);
+        }
+        if self.held {
+            return refused("input-held", harness);
         }
         let position = match harness {
             Some(id) => self.harnesses.iter().position(|(known, _)| known == id),
@@ -1808,6 +2011,68 @@ impl Control<'_> {
         optional("ref")?;
         Some((text, harness))
     }
+}
+
+/// The root-wide close and cancel transitions, whichever control carried
+/// them (stdin shorthand, a `session_control` request, inherited intent).
+struct RootControl<'a> {
+    custody: &'a Mutex<live::Custody>,
+    registry: &'a children::Registry,
+    inboxes: &'a [Arc<conversation::Inbox>],
+    closing: &'a conversation::Closing,
+    cancel_requested: &'a mut bool,
+}
+
+impl RootControl<'_> {
+    fn cancel<W: Write>(&mut self, out: &mut W, by: &str) {
+        if *self.cancel_requested {
+            return;
+        }
+        *self.cancel_requested = true;
+        let signalled = self.custody.lock().expect("custody lock").cancel();
+        // Already killed with every registered work; marked so admission
+        // and results say why.
+        self.registry.stop_all("cancelled");
+        emit(
+            out,
+            &json!({ "event": "cancel-requested", "signalled": signalled, "by": by }),
+        );
+        // Wake workers between turns so that queued follow-ups are answered
+        // as not admitted.
+        self.inboxes.iter().for_each(|inbox| inbox.ring());
+    }
+
+    /// Requests the root-wide close; false if it was already requested.
+    fn close<W: Write>(&mut self, out: &mut W, control: u64) -> bool {
+        if *self.cancel_requested || !self.closing.request() {
+            return false;
+        }
+        // Close ends input for the whole root: no child is admitted after
+        // it, and children still running are stopped.
+        let stopped = self.registry.stop_all("root-closing");
+        if stopped > 0 {
+            emit(
+                out,
+                &json!({ "event": "children-stopping", "reason": "root-closing", "signalled": stopped }),
+            );
+        }
+        emit(
+            out,
+            &json!({
+                "event": "close-requested",
+                "control": control,
+                "input": "closed",
+                "meaning": "new input is refused; an admission already past its check may still commit; live harness stop is attempted after admitted turns end, with request and waited exit reported separately; a naturally ending harness may close without tagged idle; not a cancel or processing success",
+            }),
+        );
+        self.inboxes.iter().for_each(|inbox| inbox.ring());
+        true
+    }
+}
+
+/// Writes one already serialized JSON line (a `session_control` record).
+fn emit_line<W: Write>(out: &mut W, line: &str) {
+    let _ = writeln!(out, "{line}").and_then(|()| out.flush());
 }
 
 fn emit<W: Write>(out: &mut W, value: &Value) {
