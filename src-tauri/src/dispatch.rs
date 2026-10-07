@@ -66,8 +66,7 @@ use crate::cli::inputs::{
 };
 use crate::resume_cli::format_resume_error;
 use crate::usage::cli::{
-    Cli, DiagnosticsSubcommands, MailboxSubcommands, MaintenanceSubcommands, NotifySubcommands,
-    SessionSubcommands, Subcommands,
+    Cli, DiagnosticsSubcommands, MaintenanceSubcommands, SessionSubcommands, Subcommands,
 };
 use crate::{commands, run, usage, wiring};
 
@@ -95,21 +94,6 @@ pub(crate) use predicate::{
 /// runtime-service construction, and primary SQLite access.
 pub(crate) fn run_offline_entry(cli: &Cli) -> Result<Option<i32>, String> {
     let code = match &cli.command {
-        Some(Subcommands::Notify { command }) => match command {
-            NotifySubcommands::RecoveryList { session_id, cursor } => {
-                crate::commands::notify_continuation::recovery_list(
-                    session_id.as_deref(),
-                    cursor.as_deref(),
-                )
-            }
-            NotifySubcommands::RecoveryRead { event_id, output } => {
-                crate::commands::notify_continuation::recovery_read(event_id, output.as_deref())
-            }
-            NotifySubcommands::RecoveryAttempts { event_id, cursor } => {
-                crate::commands::notify_continuation::recovery_attempts(event_id, cursor)
-            }
-            _ => return Ok(None),
-        },
         Some(Subcommands::Diagnostics { command }) => match command {
             DiagnosticsSubcommands::Recent {
                 limit,
@@ -198,18 +182,6 @@ pub(crate) fn run(cli: Cli) -> Result<i32, String> {
         && let Some(result) = dispatch_inspection_only_session(command)
     {
         return result;
-    }
-
-    // Maintenance must not trigger wake recovery before it inspects or compacts storage.
-    if let Some(Subcommands::Mailbox { command }) = &cli.command
-        && matches!(
-            command,
-            MailboxSubcommands::CompactDelivered { .. }
-                | MailboxSubcommands::PruneTerminal { .. }
-                | MailboxSubcommands::RearmObservation { .. }
-        )
-    {
-        return dispatch_mailbox_subcommand(command.clone());
     }
 
     if let Err(err) = recover_pending_session_replaces() {
@@ -477,8 +449,6 @@ fn dispatch_subcommand(
         Subcommands::Session { command } => {
             dispatch_session_subcommand(command, agent_runtime_services)
         }
-        Subcommands::Notify { command } => dispatch_notify_subcommand(command),
-        Subcommands::Mailbox { command } => dispatch_mailbox_subcommand(command),
         Subcommands::Diagnostics { .. } | Subcommands::Maintenance { .. } => {
             unreachable!("offline commands must execute through run_offline_entry")
         }
@@ -532,163 +502,6 @@ fn dispatch_subcommand(
         Subcommands::MigrateConfig { models_dir } => {
             commands::config_migration::run_migrate_config(models_dir.as_deref())
         }
-    }
-}
-
-fn dispatch_notify_subcommand(command: NotifySubcommands) -> Result<i32, String> {
-    match command {
-        NotifySubcommands::RecoveryList { .. }
-        | NotifySubcommands::RecoveryRead { .. }
-        | NotifySubcommands::RecoveryAttempts { .. } => {
-            unreachable!("manual recovery runs before startup recovery")
-        }
-        NotifySubcommands::Listen {
-            registration_file,
-            session_id,
-            owner_invocation_uuid,
-            ..
-        } => crate::commands::notify_continuation::listen(
-            &registration_file,
-            &session_id,
-            &owner_invocation_uuid,
-        ),
-        NotifySubcommands::Register {
-            handle,
-            delivery_mode,
-            state_dir,
-            meta,
-            log,
-            rc,
-            repair_admitted,
-            completion_protocol,
-            registration_file,
-            accepted_intent_file,
-            json,
-        } => crate::commands::notify::run_agent_bash_register(
-            crate::commands::notify::AgentBashRegisterArgs {
-                handle: &handle,
-                delivery_mode: &delivery_mode,
-                state_dir: &state_dir,
-                meta: &meta,
-                log: &log,
-                rc: &rc,
-                repair_admitted,
-                completion_protocol: completion_protocol.as_deref(),
-                registration_file: registration_file.as_deref(),
-                accepted_intent_file: accepted_intent_file.as_deref(),
-                json,
-            },
-        ),
-        NotifySubcommands::Registration {
-            registration_file, ..
-        } => crate::commands::notify_continuation::readback(&registration_file, false),
-        NotifySubcommands::CompletionState {
-            registration_file, ..
-        } => crate::commands::notify_continuation::readback(&registration_file, true),
-        NotifySubcommands::Capability { .. } => crate::commands::notify_continuation::capability(),
-        NotifySubcommands::Activate { handle, json } => {
-            crate::commands::notify::run_agent_bash_activate(
-                crate::commands::notify::AgentBashActivateArgs {
-                    handle: &handle,
-                    json,
-                },
-            )
-        }
-        NotifySubcommands::Complete {
-            caller_ppid,
-            handle,
-            state_dir,
-            meta,
-            log,
-            rc,
-
-            completion_protocol,
-            registration_file,
-            snapshot,
-            json,
-        } => crate::commands::notify::run_agent_bash_complete(
-            crate::commands::notify::AgentBashCompleteArgs {
-                caller_ppid,
-                handle: &handle,
-                state_dir: &state_dir,
-                meta: &meta,
-                log: &log,
-                rc: &rc,
-
-                completion_protocol: completion_protocol.as_deref(),
-                registration_file: registration_file.as_deref(),
-                snapshot: snapshot.as_deref(),
-                json,
-            },
-        ),
-    }
-}
-
-fn dispatch_mailbox_subcommand(command: MailboxSubcommands) -> Result<i32, String> {
-    match command {
-        MailboxSubcommands::List {
-            session_id,
-            all,
-            json,
-        } => crate::commands::mailbox::run_list(&session_id, all, json),
-        MailboxSubcommands::Search {
-            session_id,
-            query,
-            all,
-            limit,
-            json,
-        } => crate::commands::mailbox::run_search(&session_id, &query, all, limit, json),
-        MailboxSubcommands::Show {
-            session_id,
-            seq,
-            handle,
-            include_artifacts,
-            max_bytes,
-            json,
-        } => crate::commands::mailbox::run_show(
-            &session_id,
-            seq,
-            handle.as_deref(),
-            include_artifacts,
-            max_bytes,
-            json,
-        ),
-        MailboxSubcommands::Status { session_id, json } => {
-            crate::commands::mailbox::run_status(&session_id, json)
-        }
-        MailboxSubcommands::RearmObservation {
-            session_id,
-            stop_id,
-            cause_resolved,
-            json,
-        } => crate::commands::mailbox::run_rearm_observation(
-            &session_id,
-            &stop_id,
-            &cause_resolved,
-            json,
-        ),
-        MailboxSubcommands::Pause { session_id, json } => {
-            crate::commands::mailbox::run_pause(&session_id, true, json)
-        }
-        MailboxSubcommands::Resume { session_id, json } => {
-            crate::commands::mailbox::run_pause(&session_id, false, json)
-        }
-        MailboxSubcommands::Ack {
-            session_id,
-            from_seq,
-            to_seq,
-            delivered_by,
-            json,
-        } => crate::commands::mailbox::run_ack(&session_id, from_seq, to_seq, &delivered_by, json),
-        MailboxSubcommands::CompactDelivered { limit, apply, json } => {
-            crate::commands::mailbox::run_compact_delivered(limit, apply, json)
-        }
-        MailboxSubcommands::PruneTerminal {
-            limit,
-            apply,
-            vacuum,
-            json,
-        } => crate::commands::mailbox::run_prune_terminal(limit, apply, vacuum, json),
     }
 }
 
@@ -975,30 +788,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_bash_registration_skips_startup_wake_reclaim_sweep() {
-        let cli = Cli::try_parse_from([
-            "oulipoly-agent-runner",
-            "notify",
-            "agent-bash-register",
-            "--handle",
-            "ab_test",
-            "--delivery-mode",
-            "sync",
-            "--state-dir",
-            "/tmp/ab_test",
-            "--meta",
-            "/tmp/ab_test/meta.json",
-            "--log",
-            "/tmp/ab_test/log",
-            "--rc",
-            "/tmp/ab_test/rc",
-        ])
-        .unwrap();
-
-        assert!(!startup_wake_reclaim_sweep_enabled(&cli));
-    }
-
-    #[test]
     fn diagnostics_commands_are_claimed_by_the_offline_entry() {
         let cli = Cli::try_parse_from([
             "oulipoly-agent-runner",
@@ -1020,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_launch_schedules_startup_recovery_but_mailbox_inspection_does_not() {
+    fn provider_launch_schedules_startup_recovery() {
         let launch = Cli::try_parse_from([
             "oulipoly-agent-runner",
             "-m",
@@ -1028,17 +817,7 @@ mod tests {
             "fixture prompt",
         ])
         .unwrap();
-        let mailbox = Cli::try_parse_from([
-            "oulipoly-agent-runner",
-            "mailbox",
-            "list",
-            "--session-id",
-            "fixture-session",
-        ])
-        .unwrap();
-
         assert!(provider_launch_schedules_startup_wake_reclaim(&launch));
-        assert!(!provider_launch_schedules_startup_wake_reclaim(&mailbox));
     }
 
     fn assert_resume_debug_contains_option_field(

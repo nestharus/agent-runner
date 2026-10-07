@@ -189,33 +189,6 @@ pub(super) fn private_discovery_probe(
     if protocol::discover_owner_at(&owner_broker_socket(), &request, wrong.as_raw_fd()).is_ok() {
         return Err("unconnected guardian FD returned discovery".into());
     }
-    let outsider = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
-        .args(["notify", "agent-bash-capability", "--json"])
-        .env_remove("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1")
-        .env_remove("OULIPOLY_KERNEL_CHILD_JOIN_FD_V1")
-        .env_remove("OULIPOLY_KERNEL_V30_PRIVATE_CHILD_V1")
-        .output()
-        .map_err(|e| e.to_string())?;
-    let outsider_error = String::from_utf8_lossy(&outsider.stderr);
-    if outsider.status.success() || !outsider_error.contains("outside consumed work") {
-        return Err(format!(
-            "helper outside consumed H/K work did not receive broker V refusal: {outsider_error}"
-        ));
-    }
-    let stripped = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
-        .args(["notify", "agent-bash-capability", "--json"])
-        .env_remove("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1")
-        .env_remove("OULIPOLY_KERNEL_CHILD_JOIN_FD_V1")
-        .env_remove(super::V30_OWNER_ENDPOINT_ENV)
-        .env_remove(ENDPOINT_ENV)
-        .output()
-        .map_err(|e| e.to_string())?;
-    if stripped.status.success()
-        || !String::from_utf8_lossy(&stripped.stderr)
-            .contains("pinned completion endpoint was not inherited")
-    {
-        return Err("stripped v30 endpoint fell back to retired owner copy".into());
-    }
     std::fs::write(
         gate.join("owner-discovery"),
         serde_json::to_vec(&exact).map_err(|e| e.to_string())?,

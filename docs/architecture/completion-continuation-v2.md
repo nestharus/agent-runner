@@ -1,4 +1,10 @@
-# Native completion continuation v2
+# Internal completion continuation v2
+
+The ordinary `notify` CLI, including completion-continuation-v2 registration,
+publication and recovery commands, has been retired. The shared driver, custody
+and delivery internals described below remain for a later removal slice; they
+are separate from the selected native-root ACP v2 route. This document supplies
+no replacement operator command or activation authority.
 
 The current guardian also hosts the separate
 [`original-work-v1`](root-original-work-v1.md) lane. Sharing the guardian,
@@ -172,41 +178,11 @@ Boundaries:
 | `wake-child-before-claim-admission` | Automatic receiver has the inherited claim token but has not opened the sidecar to validate/admit it |
 | `manual-after-claim-coordination-NativeBusy` | Real manual resume completed State-first sidecar coordination and observed native custody while that receiver is held |
 
-`src-tauri/tests/age360_completion_continuation.rs` uses private user/network/PID/
-mount namespaces and an external-process local provider. `native_` cases do not
-claim Bash/source pairing. Paired cases require explicit
-`AGE360_AGENT_BASH_BIN`, reject a missing executable, and never select an installed
-or simulated fallback. The early-exit and artifact cases discriminate early exit and
-complete artifact output. The full root-owned paired fault matrix remains larger
-than these cases; no fixture or feature flag proves that matrix ran.
-
-The feature-gated paired manual-overlap case holds the automatic receiver before
-claim admission, settles an unrelated completed-turn tail through the real CLI,
-then holds a real manual resume after its State-first sidecar coordination returns
-`NativeBusy`. It checks the accepted source and exact activation claim before
-either hold is released, then checks one recipient, its byte receipt and ACK,
-retained claim during live descendant custody, and both source and activation
-physical integration. A manual retry may later refuse a newly pending completed
-turn; the test does not treat that refusal as its overlap witness.
-
-`fixtures/age360/custody_faults.rs` discriminates those native pre-attachment and
-combined attempt-owner loss orders. Tests named `observes_unresolved_*` are
-explicit **gap characterizations**, not recovery acceptance tests: a passing test
-means unresolved debt was observed. In particular, observing original CD adopt
-and reap descendants without producing an attempt receipt must not be reported
-as completed recovery. Namespace teardown contains remaining test processes; it
-is never product drain evidence.
-
-Native State-token cancellation tests require an actual logical launch joined to
-the activation's runtime generation and invocation before calling
-`StateDb::request_cancel`, then require the exact token in the AC/adopter receipt.
-They do not insert synthetic launch rows or send terminal signals. **Currently
-both tests fail at the real State join**: the native streaming fixture creates
-no `provider_launch_attempts` row. The observer's logical-launch cancellation
-query is implemented but has no native producer link in this candidate. Actual
-State-linked cancellation is therefore unverified and unfulfilled here, not
-covered by the passing terminal-signal cancellation tests. These red tests are
-retained requirements, not ignored tests or a completed cancellation matrix.
+The historical AGE360 and paired CLI fixtures used the retired `notify` and
+`mailbox` CLI. Their registration, publication, overlap and cancellation narratives
+are no longer executable coverage of this candidate. Retained fault hooks and
+old fixture results do not qualify the remaining internal functions or native-root
+ACP v2. Broader fixture disposition belongs to later work.
 
 ### Paired test executable provisioning (Linux)
 
@@ -226,10 +202,3 @@ execution; the native namespace re-exec forwards `LLVM_PROFILE_FILE`. Local
 instrumentation/report checks do not establish a hosted coverage run, full suite
 coverage, or signed production artifact equivalence. This fixture transform does
 not apply to release publication or installed executables.
-
-The three proactive async tests run their inner assertions as a synthetic provider
-of a real outer Runner entry. Registration uses that live entry's inherited
-invocation authority and owner endpoint, with a distinct outer session listener.
-Removing the inherited endpoint must still reject managed ancestry. The outer
-entry stays live through the inner initial/delivery relationship checks; fixture
-rows no longer impersonate the test process as an independently bootstrapped owner.

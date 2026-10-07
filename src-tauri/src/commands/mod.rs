@@ -3,15 +3,12 @@ pub(crate) mod config_migration;
 pub(crate) mod diagnostics;
 pub(crate) mod direct_model;
 pub(crate) mod handshake;
-pub(crate) mod mailbox;
 pub(crate) mod maintenance_control;
 pub(crate) mod migrate;
 #[cfg(target_os = "linux")]
 pub(crate) mod native_entry;
 #[cfg(target_os = "linux")]
 pub(crate) mod native_root;
-pub(crate) mod notify;
-pub(crate) mod notify_continuation;
 pub(crate) mod offline_diagnostics;
 pub(crate) mod pid_session;
 pub(crate) mod resume_list;
