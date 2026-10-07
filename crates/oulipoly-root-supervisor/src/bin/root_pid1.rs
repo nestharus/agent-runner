@@ -18,6 +18,16 @@
 //! root PID 1 and the work PID 1s stay as they were started. Nothing sets
 //! `no_new_privs`, so the identity keeps its host setuid/sudo capability.
 //! A drop that fails is reported as the work's exec error; nothing runs.
+//!
+//! Each harness and Bash run, before that drop, gets a mount namespace of
+//! its own with a fresh `/proc` of its work's PID namespace, so that it and
+//! everything it starts see their own processes by their own pids (see
+//! `private_proc`); under either isolation. Where that cannot be set up
+//! and checked, the start fails with a `workload-proc:` exec error and
+//! nothing of the work runs. Root PID 1 and the work PID 1s keep the
+//! host's mounts and `/proc`, and the owner's attribution and custody use
+//! host pids and namespace identities as before.
+//!
 //! Later
 //! owners connect to `pid1-<incarnation>.sock` in the store directory and
 //! must first send `{"op":"hello","token","generation"}`.
@@ -734,6 +744,89 @@ fn kill_namespace() -> bool {
     unsafe { libc::kill(-1, libc::SIGKILL) == 0 }
 }
 
+/// Where starting a work's harness or Bash run failed: nothing of the work
+/// ran. Reported by the started process with its `errno`.
+const FAILED_EXEC: i32 = 0;
+const FAILED_IDENTITY: i32 = 1;
+const FAILED_PROC_NAMESPACE: i32 = 2;
+const FAILED_PROC_PROPAGATION: i32 = 3;
+const FAILED_PROC_MOUNT: i32 = 4;
+const FAILED_PROC_VIEW: i32 = 5;
+
+/// The `exec_error` of a failed start (the exec's own error text unchanged).
+fn launch_failure(stage: i32, errno: i32) -> String {
+    let error = io::Error::from_raw_os_error(errno);
+    match stage {
+        FAILED_IDENTITY => format!("workload-identity: {error}"),
+        FAILED_PROC_NAMESPACE => format!("workload-proc: mount namespace: {error}"),
+        FAILED_PROC_PROPAGATION => format!("workload-proc: mount propagation: {error}"),
+        FAILED_PROC_MOUNT => format!("workload-proc: proc mount: {error}"),
+        FAILED_PROC_VIEW => {
+            "workload-proc: /proc does not name this process in its PID namespace".to_owned()
+        }
+        _ => error.to_string(),
+    }
+}
+
+/// Gives the calling process, and everything it starts, a `/proc` of its
+/// own PID namespace: a new mount namespace whose copied mounts are made
+/// slaves (host mounts still reach the work; nothing mounted in the work
+/// reaches the host), a fresh `proc` on `/proc`, and a check that
+/// `/proc/self` names this process by its pid here. Called in a work's
+/// harness or Bash run just after its work PID 1 forked it, before the
+/// identity drop and before anything of the work runs; the work PID 1
+/// itself keeps the host's view, through which it reports host pids.
+/// `Err(stage)`, with `errno` set, on the first failure: the work must not
+/// run, with a view naming other processes.
+///
+/// # Safety
+/// Only in a fresh child of a single-threaded process: raw calls only.
+unsafe fn private_proc() -> Result<(), i32> {
+    // SAFETY: plain syscalls on static C strings and a local buffer.
+    unsafe {
+        if libc::unshare(libc::CLONE_NEWNS) != 0 {
+            return Err(FAILED_PROC_NAMESPACE);
+        }
+        if libc::mount(
+            std::ptr::null(),
+            c"/".as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_SLAVE,
+            std::ptr::null(),
+        ) != 0
+        {
+            return Err(FAILED_PROC_PROPAGATION);
+        }
+        if libc::mount(
+            c"proc".as_ptr(),
+            c"/proc".as_ptr(),
+            c"proc".as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            std::ptr::null(),
+        ) != 0
+        {
+            return Err(FAILED_PROC_MOUNT);
+        }
+        let mut link = [0u8; 16];
+        let len = libc::readlink(c"/proc/self".as_ptr(), link.as_mut_ptr().cast(), link.len());
+        let named = usize::try_from(len)
+            .ok()
+            .filter(|&len| (1..link.len()).contains(&len))
+            .and_then(|len| {
+                link[..len].iter().try_fold(0i32, |pid, &byte| {
+                    byte.is_ascii_digit()
+                        .then(|| pid.checked_mul(10)?.checked_add(i32::from(byte - b'0')))
+                        .flatten()
+                })
+            });
+        if named != Some(libc::getpid()) {
+            *libc::__errno_location() = 0;
+            return Err(FAILED_PROC_VIEW);
+        }
+    }
+    Ok(())
+}
+
 /// PID 1 of one work's PID namespace: the actual parent of its harness.
 /// Reports the harness's host pid, then the harness's own wait status,
 /// then reaps any other process left in the namespace before exiting.
@@ -814,16 +907,23 @@ fn work_pid1(
                 u32::MAX,
                 libc::CLOSE_RANGE_CLOEXEC,
             );
+            let failed = |stage: i32| -> ! {
+                let report = [stage, *libc::__errno_location()];
+                libc::write(error_w.as_raw_fd(), report.as_ptr().cast(), 8);
+                libc::_exit(127);
+            };
+            // The work's own proc view, while this process still has the
+            // capability to mount it.
+            if let Err(stage) = private_proc() {
+                failed(stage);
+            }
             // The work identity, before anything of the work's own runs.
-            // A failure is reported negated, apart from an exec error.
             if let Some(identity) = &identity
                 && (libc::setgroups(identity.groups.len(), identity.groups.as_ptr()) != 0
                     || libc::setresgid(identity.gid, identity.gid, identity.gid) != 0
                     || libc::setresuid(identity.uid, identity.uid, identity.uid) != 0)
             {
-                let errno = -*libc::__errno_location();
-                libc::write(error_w.as_raw_fd(), (&raw const errno).cast(), 4);
-                libc::_exit(127);
+                failed(FAILED_IDENTITY);
             }
             if cwd
                 .as_ref()
@@ -831,9 +931,7 @@ fn work_pid1(
             {
                 libc::execvpe(pointers[0], pointers.as_ptr(), env_pointers.as_ptr());
             }
-            let errno = *libc::__errno_location();
-            libc::write(error_w.as_raw_fd(), (&raw const errno).cast(), 4);
-            libc::_exit(127);
+            failed(FAILED_EXEC);
         }
     }
     drop(error_w);
@@ -842,17 +940,11 @@ fn work_pid1(
         libc::close(stdin.as_raw_fd());
         libc::close(stdout.as_raw_fd());
     }
-    let mut errno = [0u8; 4];
-    let exec_error = (File::from(error_r).read(&mut errno).unwrap_or(0) == 4).then(|| {
-        let errno = i32::from_ne_bytes(errno);
-        if errno < 0 {
-            format!(
-                "workload-identity: {}",
-                io::Error::from_raw_os_error(-errno)
-            )
-        } else {
-            io::Error::from_raw_os_error(errno).to_string()
-        }
+    let mut report = [0u8; 8];
+    let exec_error = (File::from(error_r).read(&mut report).unwrap_or(0) == 8).then(|| {
+        let stage = i32::from_ne_bytes(report[..4].try_into().expect("4 bytes"));
+        let errno = i32::from_ne_bytes(report[4..].try_into().expect("4 bytes"));
+        launch_failure(stage, errno)
     });
     let pidfd = (harness > 0)
         .then(|| sys::pidfd_open(harness).ok())
