@@ -19,12 +19,12 @@ mod turns;
 mod types;
 mod worker;
 
-pub(crate) use dispatch::capture_live_report_with_client;
 pub(crate) use dispatch::locate_transcript_with_raw_metadata_with_cancellation;
 pub use dispatch::{
     capture, capture_for_lifecycle, capture_live_report, enumerate_sessions, locate_transcript,
-    locate_transcript_with_raw_metadata, read_turn_page,
+    locate_transcript_with_raw_metadata, read_turn_page, read_turn_page_from_endpoint,
 };
+pub(crate) use dispatch::{capture_for_lifecycle_from_endpoint, capture_live_report_with_client};
 pub use ingest::{canonical_stream_key, ingest_one_canonical_turn_page};
 pub use lifecycle_proof::dispatch_aware_no_ref_lifecycle_proof;
 pub(crate) use provider_client::validate_endpoint_identity;

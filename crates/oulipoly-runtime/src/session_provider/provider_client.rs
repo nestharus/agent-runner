@@ -29,7 +29,16 @@ fn session_client_inner(
     let endpoint = registry
         .preflight_account(&identity.provider_name)
         .map_err(map_registry_error)?;
-    validate_endpoint_identity(endpoint.as_ref(), identity)?;
+    session_client_from_endpoint(registry, endpoint.as_ref(), identity, cancellation)
+}
+
+pub(super) fn session_client_from_endpoint(
+    registry: &ProviderRegistry,
+    endpoint: &PinnedProviderEndpoint,
+    identity: &SessionProviderIdentity,
+    cancellation: Option<&CancellationToken>,
+) -> Result<ProviderClient, SessionProviderError> {
+    validate_endpoint_identity(endpoint, identity)?;
     require_session_capability(endpoint.capabilities())?;
     client_from_endpoint(registry, endpoint.client(), cancellation)
 }
@@ -56,7 +65,17 @@ pub(super) fn session_page_client(
     let endpoint = registry
         .preflight_account(&identity.provider_name)
         .map_err(map_registry_error)?;
-    validate_endpoint_identity(endpoint.as_ref(), identity)?;
+    session_page_client_from_endpoint(registry, endpoint.as_ref(), identity, cancellation, timeout)
+}
+
+pub(super) fn session_page_client_from_endpoint(
+    registry: &ProviderRegistry,
+    endpoint: &PinnedProviderEndpoint,
+    identity: &SessionProviderIdentity,
+    cancellation: &CancellationToken,
+    timeout: Duration,
+) -> Result<ProviderClient, SessionProviderError> {
+    validate_endpoint_identity(endpoint, identity)?;
     require_session_capability(endpoint.capabilities())?;
     require_session_turn_pages_capability(endpoint.capabilities())?;
     registry

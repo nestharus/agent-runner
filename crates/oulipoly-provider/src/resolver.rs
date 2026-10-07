@@ -226,15 +226,22 @@ fn ensure_candidate_within_root(root: &Path, candidate: &Path) -> Result<(), Pro
 pub struct ResolvedProviderCommand {
     pub(crate) executable: PathBuf,
     pinned_executable: Arc<File>,
+    /// Metadata stamp of the pinned file taken when it was opened, before any
+    /// invocation could describe it. `None` if stamping fails or is unsupported.
+    revision: Option<Arc<[u8]>>,
     is_script: bool,
     uses_shell_wrapper: bool,
 }
 
 impl ResolvedProviderCommand {
     fn pinned(executable: PathBuf, pinned_executable: File, is_script: bool) -> Self {
+        let revision = crate::executable_identity::stamp(&pinned_executable)
+            .ok()
+            .map(Arc::from);
         Self {
             executable,
             pinned_executable: Arc::new(pinned_executable),
+            revision,
             is_script,
             uses_shell_wrapper: false,
         }
@@ -261,6 +268,15 @@ impl ResolvedProviderCommand {
 
     pub(crate) fn is_script(&self) -> bool {
         self.is_script
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forget_revision_for_test(&mut self) {
+        self.revision = None;
+    }
+
+    pub(crate) fn revision(&self) -> Option<&[u8]> {
+        self.revision.as_deref()
     }
 }
 
