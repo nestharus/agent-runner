@@ -1310,11 +1310,7 @@ impl Worker {
                         self.report_turn(client, &mut seen);
                         continue;
                     }
-                    DeliveryOutcome::Rejected { code, .. } => {
-                        self.tracked[index].label = Some("rejected".to_owned());
-                        self.report(json!({ "event": "rejected", "index": index, "code": code }));
-                        ("rejected", None)
-                    }
+                    DeliveryOutcome::Rejected { .. } => ("rejected", None),
                     DeliveryOutcome::NotAcknowledged(NoAckCause::PeerGone) => {
                         ("no-ack:transport-closed", Some(ConnEnd::Gone))
                     }
@@ -1343,7 +1339,14 @@ impl Worker {
                 {
                     return ConnEnd::Stop;
                 }
-                if matches!(outcome, DeliveryOutcome::Rejected { .. }) {
+                if let DeliveryOutcome::Rejected { code, .. } = outcome {
+                    // A public conclusive rejection must survive owner loss.
+                    // A failed resolution leaves this attempt unknown, just as
+                    // owner death before commit does; neither publishes rejection.
+                    self.tracked[index].label = Some("rejected".to_owned());
+                    self.report(json!({
+                        "event": "rejected", "index": index, "code": code, "durable": true,
+                    }));
                     // Conclusive rejection ends this logical input without an
                     // ACK or turn end. Release it only after durable resolution;
                     // unknown delivery remains open and never licenses replay.

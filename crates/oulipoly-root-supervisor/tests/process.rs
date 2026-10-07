@@ -2660,7 +2660,26 @@ fn rejected_ordinary_input_progresses(follow_up: bool) {
             }]),
         ),
     );
-    assert_eq!(run.event("a", "rejected")["code"], -32011);
+    let rejection = run.event("a", "rejected");
+    assert_eq!(rejection["code"], -32011);
+    assert_eq!(rejection["durable"], true);
+    // At the public outcome, both resolution facts already exist without ACK.
+    let conn = db(&dir);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM attempt WHERE idx = 0 AND outcome = 'rejected' AND resolved_generation = 1"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM message WHERE idx = 0 AND stop = 'rejected' AND ack_label IS NULL"
+        ),
+        1
+    );
+    drop(conn);
     if follow_up {
         run.control(r#"{"cmd":"send","text":"echo:NEXT"}"#);
         let decision = run.until("next admission decision", |v| {

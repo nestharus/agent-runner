@@ -191,6 +191,14 @@
 //!   harness lives. A harness that ends naturally and is waited can also
 //!   close with no owed insertion, without a tagged idle or owner stop.
 //!   A close is not durable: a recovery after owner death knows nothing of it.
+//! * `rejected` with `durable: true` reports a conclusive refusal only after
+//!   the attempt outcome and message stop commit together without an ACK.
+//!   That logical input no longer holds close or later eligible input. The
+//!   event describes this attempt, not every historical attempt or recipient
+//!   processing. Before commit, owner loss or a failed write leaves delivery
+//!   unresolved and publishes no conclusive rejection; existing capped recovery
+//!   may resubmit the same key with its prior history unknown. Commit followed
+//!   by owner loss before publication can leave a durable stop without an event.
 //! * `cancel` stays what it was, and outranks a close.
 //!
 //! None of this observes processing: a turn's end is the agent's tag, and
