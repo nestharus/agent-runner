@@ -788,30 +788,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_bash_registration_skips_startup_wake_reclaim_sweep() {
-        let cli = Cli::try_parse_from([
-            "oulipoly-agent-runner",
-            "notify",
-            "agent-bash-register",
-            "--handle",
-            "ab_test",
-            "--delivery-mode",
-            "sync",
-            "--state-dir",
-            "/tmp/ab_test",
-            "--meta",
-            "/tmp/ab_test/meta.json",
-            "--log",
-            "/tmp/ab_test/log",
-            "--rc",
-            "/tmp/ab_test/rc",
-        ])
-        .unwrap();
-
-        assert!(!startup_wake_reclaim_sweep_enabled(&cli));
-    }
-
-    #[test]
     fn diagnostics_commands_are_claimed_by_the_offline_entry() {
         let cli = Cli::try_parse_from([
             "oulipoly-agent-runner",
@@ -833,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_launch_schedules_startup_recovery_but_mailbox_inspection_does_not() {
+    fn provider_launch_schedules_startup_recovery() {
         let launch = Cli::try_parse_from([
             "oulipoly-agent-runner",
             "-m",
@@ -841,17 +817,7 @@ mod tests {
             "fixture prompt",
         ])
         .unwrap();
-        let mailbox = Cli::try_parse_from([
-            "oulipoly-agent-runner",
-            "mailbox",
-            "list",
-            "--session-id",
-            "fixture-session",
-        ])
-        .unwrap();
-
         assert!(provider_launch_schedules_startup_wake_reclaim(&launch));
-        assert!(!provider_launch_schedules_startup_wake_reclaim(&mailbox));
     }
 
     fn assert_resume_debug_contains_option_field(

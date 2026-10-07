@@ -498,7 +498,7 @@ impl StateDb {
             .map_err(|e| e.to_string())
     }
 
-    /// Private direct fixture endpoint. Production always uses the fixed socket.
+    /// Private fixture entry for admission through an explicit broker socket.
     #[cfg(feature = "age319-private-broker-fixture")]
     pub fn register_completion_continuation_with_broker_decision_at(
         &mut self,
@@ -1133,8 +1133,8 @@ impl StateDb {
     }
 
     /// Historical admissions without v2 bindings cannot authorize source-image
-    /// recovery. This says nothing about pending delivery or whether a legacy
-    /// supervisor can still submit its original completion through notify.
+    /// recovery. This query does not describe pending delivery or completion
+    /// publication through retained internal callers.
     pub fn has_legacy_completion_admissions(&self) -> Result<bool, String> {
         self.conn
             .query_row(LEGACY_COMPLETION_ADMISSION_SQL, [], |row| row.get(0))
