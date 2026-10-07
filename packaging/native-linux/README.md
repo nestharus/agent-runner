@@ -441,6 +441,46 @@ SDK wiring, owner contract and package path, not Claude Code, a login, a
 subscription or a model. A real native Claude run remains ROOT's separate
 witness.
 
+## Registered provider routes
+
+A route with `"harness": "provider"` names a registered external provider:
+its absolute `executable`, its `settings` (the provider/v1
+`policy.evaluate` params `settings_id`, `mode`, `model` and optional
+`launch`, opaque here), an optional absolute `config_root`, an optional
+`env` for the provider's own operations (no `OULIPOLY_*` names) and
+`"credential": "none"`. It may offer named `children` (their separate
+grant, below). The front door checks root custody of the executable and
+every directory above it at each admission, before any effect, and emits
+the request's `provider` with the requester's Bash policy and the packaged
+`agent-bash`. The admitted line reports the executable and a digest of the
+settings, not a model. No provider name selects anything here.
+
+The entry walks that path again by descriptor, never following a link, and
+runs only the object it pinned, refusing one replaced since its check
+(exit 64, nothing run). As root it then runs the provider's `describe`
+(offering `OULIPOLY_HOST_RESIDENT_SESSION_V1`, admitted and chosen through
+the provider contract crate), `policy.evaluate` of the settings and
+`resident.prepare` of that template. Runner adds only its tool policy as
+`OULIPOLY_ROOT_TOOLS_V1` (Bash allow list or `trusted-task`, the requester,
+the Bash ingress variable, `other_native_tools: deny`, the `explore`
+offer), for the provider to translate. The provider keeps its resident
+configuration and state under the launch directory's private `provider`
+data root, which is then handed by descriptor to the requester (directories
+and singly linked files only). The owner runs the prepared `resident.serve`
+argv on stdio as the requester, in the work namespaces, labelled with the
+provider's declared id. A provider refusal after it ran is exit 65 (Runner
+made nothing; the provider's effects are unknown); a preparation failure is
+73. Recovery runs no provider operation.
+
+Tool mediation is the provider adapter's: no adapter yet translates
+`OULIPOLY_ROOT_TOOLS_V1` into native tool configuration, so these routes are
+not yet a replacement for the embedded `claude` and OpenCode routes. The
+offline controls use a deterministic stand-in provider and ACP peer; a real
+provider adapter is exercised only through describe, policy, prepare and
+resident connection (`src-tauri/tests/native_root_registered_provider.rs`).
+Its native turns inside the work PID namespace, a host-root run and any
+installed route remain unqualified.
+
 ## Registered orientation explorers (explicit opt-in)
 
 The site owns `child_routes`, each parent route's `children` offer list,
