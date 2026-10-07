@@ -197,11 +197,19 @@ caps = {"launch": True, "policy": True, "quota": False, "session": False, "termi
         "discovery": False, "settings": False, "setup_brain": False, "setup": False, "migration": False}
 if RESIDENT and request is not None and request["host"].get("env", {}).get("OULIPOLY_HOST_RESIDENT_SESSION_V1") == "1":
     caps["resident_session_v1"] = True
+mediation_env = request and request["params"].get("launch", {}).get("env", {}).get("OULIPOLY_TOOL_MEDIATION_V1")
+mediation = json.loads(mediation_env) if mediation_env else None
+marker = dict(mediation or {})
+marker.pop("requester", None)
+marker.update(tool="fake_mediated_bash", native_tools=["fake_mediated_bash"])
+markers = [{"name": "oulipoly.tool_mediation/v1", "value": marker}]
+if request and request["host"].get("env", {}).get("OULIPOLY_HOST_TOOL_MEDIATION_V1") == "1":
+    caps["tool_mediation_v1"] = True
 if op == "describe":
     answer({"provider_id": "stand-in-external", "display_name": "Stand-in", "contract_versions": ["oulipoly.provider/v1"],
             "preferred_contract": "oulipoly.provider/v1", "capabilities": caps})
 elif op == "policy.evaluate":
-    answer({"accepted": True, "argv": ["native"], "env": {}, "stdin": None, "prompt": None, "diagnostics": [], "markers": []})
+    answer({"accepted": True, "argv": ["native"], "env": {"OULIPOLY_TOOL_MEDIATION_V1": mediation_env}, "stdin": None, "prompt": None, "diagnostics": [], "markers": markers})
 elif op == "resident.prepare":
     data = request["host"]["data_root"]
     config = json.dumps(request["params"]["launch"], sort_keys=True).encode()

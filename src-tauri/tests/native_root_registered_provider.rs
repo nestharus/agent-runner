@@ -60,6 +60,14 @@ caps = {{"launch": True, "policy": True, "quota": False, "session": False, "term
         "setup": False, "migration": False}}
 if selected:
     caps["resident_session_v1"] = True
+mediation_env = request and request["params"].get("launch", {{}}).get("env", {{}}).get("OULIPOLY_TOOL_MEDIATION_V1")
+mediation = json.loads(mediation_env) if mediation_env else None
+marker = dict(mediation or {{}})
+marker.pop("requester", None)
+marker.update(tool="fake_mediated_bash", native_tools=["fake_mediated_bash"])
+markers = [{{"name": "oulipoly.tool_mediation/v1", "value": marker}}]
+if request and request["host"].get("env", {{}}).get("OULIPOLY_HOST_TOOL_MEDIATION_V1") == "1":
+    caps["tool_mediation_v1"] = True
 {edit}
 if op == "describe":
     answer({{"provider_id": "stand-in-external", "display_name": "Stand-in external provider",
@@ -67,8 +75,8 @@ if op == "describe":
             "capabilities": caps}})
 elif op == "policy.evaluate":
     flags = request["params"]["launch"].get("peer_flags", [])
-    answer({{"accepted": True, "argv": ["native", "--peer"] + flags, "env": {{"NATIVE_POLICY": "1"}},
-            "stdin": None, "prompt": None, "diagnostics": [], "markers": []}})
+    answer({{"accepted": True, "argv": ["native", "--peer"] + flags, "env": {{"NATIVE_POLICY": "1", "OULIPOLY_TOOL_MEDIATION_V1": mediation_env}},
+            "stdin": None, "prompt": None, "diagnostics": [], "markers": markers}})
 elif op == "resident.prepare":
     data = request["host"]["data_root"]
     config = json.dumps(request["params"]["launch"], sort_keys=True).encode()
@@ -301,7 +309,7 @@ fn registered_provider_root_runs_its_prepared_harness_through_the_owner() {
     assert_eq!(launch["tools"]["ingress_env"], "OULIPOLY_ROOT_BASH_V1");
     assert_eq!(
         launch["template_env"],
-        json!(["NATIVE_POLICY", "OULIPOLY_ROOT_TOOLS_V1"])
+        json!(["NATIVE_POLICY", "OULIPOLY_TOOL_MEDIATION_V1"])
     );
     assert!(
         launch["data_root_handed_over"]
@@ -392,8 +400,12 @@ fn registered_provider_root_runs_its_prepared_harness_through_the_owner() {
     // The policy's argv and env, plus Runner's tool policy, are the template.
     let template = &calls[2]["request"]["params"]["launch"];
     assert_eq!(template["argv"], json!(["native", "--peer"]));
-    let tools: Value =
-        serde_json::from_str(template["env"]["OULIPOLY_ROOT_TOOLS_V1"].as_str().unwrap()).unwrap();
+    let tools: Value = serde_json::from_str(
+        template["env"]["OULIPOLY_TOOL_MEDIATION_V1"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(tools["bash"], json!({ "authority": "trusted-task" }));
     // The harness runs in the intent's cwd with the root's environment and
     // ingress, never the provider's own operation environment.
@@ -415,6 +427,34 @@ fn registered_provider_root_runs_its_prepared_harness_through_the_owner() {
         .collect();
     assert!(env.contains(&"OULIPOLY_ROOT_BASH_V1"), "{env:?}");
     assert!(!env.contains(&"PROVIDER_ONLY"), "{env:?}");
+    assert!(
+        !env.contains(&"OULIPOLY_ACP_V2_SOCKET"),
+        "stdio endpoint: {env:?}"
+    );
+    assert_eq!(
+        setup["env"]["native_host"]["set_by_owner"],
+        json!(["OULIPOLY_ROOT_BASH_V1"])
+    );
+    assert_eq!(launch["tool_mediation"], 1);
+    assert_eq!(launch["effective_mediation"]["tool"], "fake_mediated_bash");
+    assert_eq!(
+        launch["effective_mediation"]["bash"],
+        launch["tools"]["bash"]
+    );
+    assert_eq!(
+        launch["effective_mediation"]["native_tools"],
+        json!(["fake_mediated_bash"])
+    );
+    for call in &calls[..3] {
+        assert_eq!(
+            call["request"]["host"]["env"]["OULIPOLY_HOST_TOOL_MEDIATION_V1"],
+            "1"
+        );
+    }
+    assert_eq!(
+        calls[1]["request"]["params"]["launch"]["env"]["OULIPOLY_TOOL_MEDIATION_V1"],
+        template["env"]["OULIPOLY_TOOL_MEDIATION_V1"]
+    );
     let peer: Value = serde_json::from_str(
         &std::fs::read_to_string(dir.path().join("launch/provider/peer-state.json")).unwrap(),
     )
@@ -591,6 +631,39 @@ fn registered_provider_root_survives_its_entry_and_is_cancelled_by_recovery() {
     );
 }
 
+/// Selected tool authority never admits an accepted but unmediated policy.
+#[test]
+#[ignore = "needs owner binaries beside Runner"]
+fn missing_or_contradictory_mediation_refuses_without_setup_or_owner() {
+    for edit in [
+        "caps.pop('tool_mediation_v1', None)",
+        "caps['tool_mediation_v1'] = False",
+        "caps.pop('tool_mediation_v1', None); caps['tool_mediation_v2'] = True",
+        "if op == 'policy.evaluate':\n    markers = []",
+        "if op == 'policy.evaluate':\n    marker['bash'] = {'allow': ['other-command']}",
+        "if op == 'policy.evaluate':\n    marker['ingress_env'] = 'OTHER_INGRESS'",
+        "if op == 'policy.evaluate':\n    marker['native_tools'] = []",
+        "if op == 'policy.evaluate':\n    mediation_env = None",
+    ] {
+        let dir = scratch();
+        let executable = provider(dir.path(), edit);
+        let (terminal, code, _) =
+            Run::start(dir.path(), &request(dir.path(), &executable, &[], "first")).end();
+        assert_eq!(code, Some(65), "{edit}: {terminal}");
+        assert_eq!(terminal["stage"], "provider-refused");
+        assert_eq!(terminal["effects"]["runner_setup"], "none");
+        assert_eq!(terminal["effects"]["provider"], "unknown: it ran");
+        assert_eq!(terminal["retry"], "do-not-replay-as-unrun");
+        assert!(!dir.path().join("launch").exists(), "{edit}");
+        assert!(!dir.path().join("store").exists(), "{edit}");
+        let seen = ops(dir.path());
+        assert!(
+            seen == ["describe"] || seen == ["describe", "policy.evaluate"],
+            "{edit}: {seen:?}"
+        );
+    }
+}
+
 /// A described provider that does not advertise the resident session is
 /// the provider's refusal (65): it ran; this entry made nothing.
 #[test]
@@ -684,7 +757,7 @@ import json, os, sys
 args = sys.argv[1:]
 line = sys.stdin.readline()
 with open(os.environ['CALLS'], 'a') as f:
-    f.write(json.dumps({'argv': args, 'tools': os.environ.get('OULIPOLY_ROOT_TOOLS_V1')}) + '\n')
+    f.write(json.dumps({'argv': args, 'tools': os.environ.get('OULIPOLY_TOOL_MEDIATION_V1')}) + '\n')
 message = json.loads(line)
 options, i = {}, 0
 while i < len(args):
@@ -755,7 +828,7 @@ fn real_claude_adapter_is_prepared_and_served_as_a_registered_root() {
     assert_eq!(launch["acp"]["protocol_version"], 2);
     assert_eq!(
         launch["template_env"],
-        json!(["CALLS", "OULIPOLY_ROOT_TOOLS_V1"])
+        json!(["CALLS", "OULIPOLY_TOOL_MEDIATION_V1"])
     );
     // The prepared configuration is private to the serving identity through
     // its directories: the data root (this entry's, 0700) and the adapter's
@@ -770,7 +843,7 @@ fn real_claude_adapter_is_prepared_and_served_as_a_registered_root() {
     assert_eq!(mode(Path::new(config).parent().unwrap()), 0o700, "{config}");
     let recorded: Value = serde_json::from_str(&std::fs::read_to_string(config).unwrap()).unwrap();
     let tools: Value = serde_json::from_str(
-        recorded["launch"]["env"]["OULIPOLY_ROOT_TOOLS_V1"]
+        recorded["launch"]["env"]["OULIPOLY_TOOL_MEDIATION_V1"]
             .as_str()
             .unwrap(),
     )

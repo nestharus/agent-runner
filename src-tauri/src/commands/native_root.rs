@@ -39,9 +39,9 @@
 //! (`executable`, `settings`, optional `config_root` and `env`,
 //! `agent_bash_bin`, `bash_allow` or `bash_authority`): the provider's own
 //! resident ACP v2 harness on stdio, resolved through what it declares and
-//! prepares, as the [`registered`] module docs describe. Its `settings` and
-//! `env` are the provider's, never read here; its tool policy reaches the
-//! provider as [`registered::TOOLS_ENV`] in its launch template, for the
+//! prepares, as the [`registered`] module docs describe. Provider settings
+//! stay opaque apart from neutral launch-env mediation. Runner supplies its
+//! tool policy during policy evaluation through the SDK extension, for the
 //! provider to translate. The owner labels the harness with the provider's
 //! declared id. `claude` (`deps`, `node`, `agent_bash_bin`, `bash_allow` or
 //! `bash_authority`, `model`, `effort`, `config_dir`): one native Claude
@@ -441,7 +441,12 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
         }
     };
     let set: Vec<&str> = provisioned.set.iter().map(String::as_str).collect();
-    let mut reach = env_reach(&request.env, &set, &provisioned.removed);
+    let mut reach = env_reach(
+        &request.env,
+        &set,
+        &provisioned.removed,
+        harness_kind(&request).1,
+    );
     if request.claude.is_some() {
         reach["claude_code"] = claude_code_reach(&request.env);
     }
@@ -485,7 +490,7 @@ fn run_registered(
         };
     let prepared = admitted.describe().and_then(|declared| {
         out.entry(declared.entry());
-        let template = admitted.template(&tools(request))?;
+        let template = admitted.template()?;
         let prepared = admitted.prepare(Path::new(&request.launch_dir), template)?;
         let handed = match &workload.identity {
             Some(identity) => registered::hand_over(
@@ -525,13 +530,16 @@ fn run_registered(
         "data_root": prepared.data_root,
         "data_root_handed_over": handed,
         "template_env": prepared.template_env,
-        "tools": tools(request),
+        "tools": registration.mediation(),
+        "tool_mediation": declared.tool_mediation,
+        "effective_mediation": prepared.effective_mediation,
+        "mediation_evidence": "provider-reported configuration; live native efficacy unqualified",
         "identity": {
             "describe_policy_prepare": "this entry's",
             "resident_serve": "the work identity, in the root's work namespaces",
         },
     });
-    let reach = env_reach(&request.env, &[], &[]);
+    let reach = env_reach(&request.env, &[], &[], Endpoint::Stdio);
     out.entry(json!({
         "entry": "setup-completed",
         "harness": "registered-provider",
@@ -582,24 +590,6 @@ fn registered_failure(out: &Out, request: &NativeRootRequest, failure: registere
             out.exit(EXIT_SETUP_FAILED)
         }
     }
-}
-
-/// Runner's policy for the root's tools, for a registered provider to
-/// translate (see [`registered::TOOLS_ENV`]).
-fn tools(request: &NativeRootRequest) -> Value {
-    let (bash_allow, bash_authority) = bash_policy(request);
-    let bash = match bash_authority {
-        Some(authority) => json!({ "authority": authority }),
-        None => json!({ "allow": bash_allow }),
-    };
-    json!({
-        "v": 1,
-        "bash": bash,
-        "requester": request.provider.as_ref().map(|provider| &provider.agent_bash_bin),
-        "ingress_env": oulipoly_root_supervisor::bash::BASH_ENV,
-        "other_native_tools": "deny",
-        "explore": explore_tool(request),
-    })
 }
 
 /// Provisions the request's one harness. `Err((false, _))`: refused before
@@ -1063,7 +1053,16 @@ fn owner_request(
 }
 
 /// Which declared names reach where: names only, never values.
-fn env_reach(declared: &BTreeMap<String, String>, launch: &[&str], removal: &[&str]) -> Value {
+fn env_reach(
+    declared: &BTreeMap<String, String>,
+    launch: &[&str],
+    removal: &[&str],
+    endpoint: Endpoint,
+) -> Value {
+    let mut owner_set = vec![oulipoly_root_supervisor::bash::BASH_ENV];
+    if endpoint == Endpoint::UnixSocket {
+        owner_set.push(oulipoly_root_supervisor::SOCKET_ENV);
+    }
     let names: Vec<&str> = declared.keys().map(String::as_str).collect();
     let removed: Vec<&str> = names
         .iter()
@@ -1089,10 +1088,7 @@ fn env_reach(declared: &BTreeMap<String, String>, launch: &[&str], removal: &[&s
             "removed_by_launch": removed,
             "overridden_by_launch": overridden,
             "set_by_launch": launch,
-            "set_by_owner": [
-                oulipoly_root_supervisor::bash::BASH_ENV,
-                oulipoly_root_supervisor::SOCKET_ENV,
-            ],
+            "set_by_owner": owner_set,
         },
     })
 }
@@ -1280,7 +1276,12 @@ mod tests {
             ("OPENCODE_CONFIG_CONTENT".to_owned(), "{}".to_owned()),
             ("TOKEN".to_owned(), "secret-value".to_owned()),
         ]);
-        let reach = env_reach(&declared, &["HOME", "XDG_CONFIG_HOME"], &REMOVED_ENV);
+        let reach = env_reach(
+            &declared,
+            &["HOME", "XDG_CONFIG_HOME"],
+            &REMOVED_ENV,
+            Endpoint::UnixSocket,
+        );
         assert_eq!(
             reach["declared"],
             json!(["HOME", "OPENCODE_CONFIG_CONTENT", "TOKEN"])
@@ -1296,6 +1297,29 @@ mod tests {
         );
         let text = reach.to_string();
         assert!(!text.contains("secret"), "{text}");
+    }
+
+    #[test]
+    fn environment_receipt_matches_stdio_and_socket_owner_endpoints() {
+        let declared = BTreeMap::new();
+        for (endpoint, expected) in [
+            (
+                Endpoint::Stdio,
+                json!([oulipoly_root_supervisor::bash::BASH_ENV]),
+            ),
+            (
+                Endpoint::UnixSocket,
+                json!([
+                    oulipoly_root_supervisor::bash::BASH_ENV,
+                    oulipoly_root_supervisor::SOCKET_ENV
+                ]),
+            ),
+        ] {
+            assert_eq!(
+                env_reach(&declared, &[], &[], endpoint)["native_host"]["set_by_owner"],
+                expected
+            );
+        }
     }
 
     #[test]
@@ -1398,14 +1422,18 @@ mod tests {
             ("registered-provider", Endpoint::Stdio)
         );
         assert_eq!(bash_policy(&request), (vec!["git status".to_owned()], None));
-        let policy = tools(&request);
+        let policy = serde_json::to_value(request.provider.as_ref().unwrap().mediation()).unwrap();
         assert_eq!(policy["bash"], json!({ "allow": ["git status"] }));
         assert_eq!(policy["requester"], "/opt/agent-bash");
         assert_eq!(
             policy["ingress_env"],
             oulipoly_root_supervisor::bash::BASH_ENV
         );
-        assert_eq!(policy["explore"], Value::Null);
+        assert_eq!(
+            policy["protocol"],
+            agent_provider_contract::tool_mediation::PROTOCOL
+        );
+        assert!(policy.get("explore").is_none());
         let owner = owner_request(
             &request,
             ("fake-external", Endpoint::Stdio),
@@ -1430,7 +1458,7 @@ mod tests {
         });
         let request = read(children).unwrap();
         assert_eq!(
-            tools(&request)["explore"],
+            serde_json::to_value(explore_tool(&request)).unwrap(),
             json!({ "routes": ["luna"], "max_starts": 2, "max_concurrent": 1 })
         );
     }
@@ -1508,7 +1536,7 @@ mod tests {
             json!(["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"])
         );
         assert_eq!(reach["inherited"], json!(["PATH"]));
-        let full = env_reach(&declared, &[], &native_claude::REMOVED_ENV);
+        let full = env_reach(&declared, &[], &native_claude::REMOVED_ENV, Endpoint::Stdio);
         assert_eq!(
             full["native_host"]["removed_by_launch"],
             json!(["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"])

@@ -21,16 +21,18 @@
 //!    the assessed one's; otherwise nothing runs. Every operation below runs
 //!    that one pinned object. The digest is reported for audit only; it is
 //!    never compared with an earlier root's.
-//! 2. **`describe`**, offering the `resident_session` extension's versions
+//! 2. **`describe`**, offering the resident-session and tool-mediation versions
 //!    this entry supports through `host.env`. The response is admitted by
 //!    the provider contract crate's own registry and typed decoding, which
 //!    tolerate advertisements this entry does not know (newer contract
 //!    versions, capabilities) and require the preferred version to be a
-//!    declared one. The contract version and the resident-session version
+//!    declared one. The contract, resident-session and tool-mediation versions
 //!    are then chosen by that crate's selection, from what the provider
 //!    declared.
-//! 3. **`policy.evaluate`** of `settings`, unchanged. Its accepted `argv`
-//!    and `env`, with [`TOOLS_ENV`] added, are the resident launch template.
+//! 3. **`policy.evaluate`** of opaque `settings`, with Runner's selected
+//!    mediation policy inserted in `launch.env`. The evaluated env must
+//!    preserve it and exactly one schema-valid effective marker must agree.
+//!    Its accepted argv and env are the resident launch template.
 //! 4. **`resident.prepare`** of that template, with `host.data_root` the
 //!    root's fresh `<launch_dir>/provider`. Its arguments, appended to the
 //!    registered executable, are the root's harness on stdio.
@@ -74,6 +76,9 @@ use agent_provider_contract::resident_session::{
     self, PREPARE_SUBCOMMAND, PROTOCOL, ResidentLaunchTemplate, ResidentPrepareParams,
     ResidentPrepareResult,
 };
+use agent_provider_contract::tool_mediation::{
+    self, BashPolicy, EffectiveMediation, ToolMediation,
+};
 use oulipoly_provider::client::{ProviderClient, ProviderClientOptions};
 use oulipoly_provider::generated::{
     CONTRACT_VERSION, EmptyParams, HostContext, PolicyEvaluateResult, RequestEnvelope,
@@ -92,16 +97,6 @@ const SUPPORTED_CONTRACTS: &[&str] = &[CONTRACT_VERSION];
 /// Resident-session extension versions this entry supports.
 const RESIDENT_VERSIONS: &[u32] = &[1];
 
-/// The launch-template variable naming Runner's policy for the root's tools,
-/// for the provider to translate into its native tool configuration:
-/// `{"v":1,"bash":{"allow":[...]}|{"authority":"trusted-task"},
-/// "requester":PATH,"ingress_env":NAME,"other_native_tools":"deny",
-/// "explore":null|{"routes":[...],"max_starts":N,"max_concurrent":N}}`.
-/// The requester, run inside the root, reaches the root's Bash ingress
-/// through the socket the owner names in `ingress_env`; `explore` asks the
-/// owner for registered children over the same ingress.
-pub(super) const TOOLS_ENV: &str = "OULIPOLY_ROOT_TOOLS_V1";
-
 /// Where `resident.prepare` keeps the root's resident configuration and
 /// state, under the launch directory.
 const DATA_ROOT: &str = "provider";
@@ -112,7 +107,7 @@ const DATA_ROOT: &str = "provider";
 pub(super) struct Registration {
     /// Absolute path of the provider's executable.
     pub(super) executable: String,
-    /// The `policy.evaluate` params, passed unchanged.
+    /// Opaque `policy.evaluate` params; Runner supplies selected launch.env mediation.
     pub(super) settings: Map<String, Value>,
     /// `host.config_root` of the provider's operations, unread here.
     #[serde(default)]
@@ -174,8 +169,13 @@ pub(super) fn check(registration: &Registration) -> Result<(), String> {
                 "provider: env name {name:?} is not an environment name"
             ));
         }
-        if name.starts_with("OULIPOLY_HOST_") || name == TOOLS_ENV {
+        if name.starts_with("OULIPOLY_HOST_") || name == tool_mediation::ENV {
             return Err(format!("provider: env {name} is this entry's to set"));
+        }
+        if name == oulipoly_root_supervisor::bash::BASH_ENV
+            || name == oulipoly_root_supervisor::SOCKET_ENV
+        {
+            return Err(format!("provider: env {name} is the owner's to set"));
         }
     }
     if registration.env.values().any(|value| value.contains('\0')) {
@@ -382,6 +382,7 @@ pub(super) struct Declared {
     preferred_contract: String,
     pub(super) contract: String,
     pub(super) resident_session: u32,
+    pub(super) tool_mediation: u32,
 }
 
 impl Declared {
@@ -395,6 +396,7 @@ impl Declared {
             "preferred_contract": self.preferred_contract,
             "agreed_contract": self.contract,
             "resident_session": self.resident_session,
+            "tool_mediation": self.tool_mediation,
         })
     }
 }
@@ -406,6 +408,33 @@ pub(super) struct Prepared {
     pub(super) result: ResidentPrepareResult,
     pub(super) data_root: PathBuf,
     pub(super) template_env: Vec<String>,
+    pub(super) effective_mediation: EffectiveMediation,
+}
+
+/// The provider's evaluated template and its reported configuration.
+/// This marker is not evidence that a live native CLI enforces it.
+#[derive(Debug)]
+pub(super) struct Evaluated {
+    pub(super) launch: ResidentLaunchTemplate,
+    pub(super) effective: EffectiveMediation,
+}
+
+impl Registration {
+    pub(super) fn mediation(&self) -> ToolMediation {
+        ToolMediation {
+            protocol: tool_mediation::PROTOCOL.to_owned(),
+            bash: match self.bash_authority {
+                Some(BashAuthority::TrustedTask) => BashPolicy::Authority {
+                    authority: tool_mediation::TRUSTED_TASK.to_owned(),
+                },
+                None => BashPolicy::Allow {
+                    allow: self.bash_allow.clone(),
+                },
+            },
+            requester: self.agent_bash_bin.clone(),
+            ingress_env: oulipoly_root_supervisor::bash::BASH_ENV.to_owned(),
+        }
+    }
 }
 
 impl Admitted<'_> {
@@ -413,6 +442,7 @@ impl Admitted<'_> {
         let mut env = self.registration.env.clone();
         if selectors {
             env.extend(resident_session::FAMILY.host_selectors(RESIDENT_VERSIONS));
+            env.extend(tool_mediation::FAMILY.host_selectors(tool_mediation::SUPPORTED_VERSIONS));
         }
         HostContext {
             app: "oulipoly-agent-runner".to_owned(),
@@ -502,6 +532,11 @@ impl Admitted<'_> {
                     described.provider_id
                 ))
             })?;
+        let tool_mediation = tool_mediation::select(tool_mediation::SUPPORTED_VERSIONS, &capabilities)
+            .map_err(|error| failed(format!(
+                "provider: {} declares no tool mediation this entry supports ({error}); tool authority refused",
+                described.provider_id
+            )))?;
         Ok(Declared {
             provider_id: described.provider_id,
             display_name: described.display_name,
@@ -509,22 +544,40 @@ impl Admitted<'_> {
             preferred_contract: described.preferred_contract,
             contract,
             resident_session,
+            tool_mediation,
         })
     }
 
-    /// Evaluates `settings` and returns the resident launch template, with
-    /// Runner's tool policy added under [`TOOLS_ENV`].
-    pub(super) fn template(&self, tools: &Value) -> Result<ResidentLaunchTemplate, Failure> {
+    /// Evaluates opaque settings with requester-owned mediation in launch.env.
+    /// Accepted settings alone never establish effective tool configuration.
+    pub(super) fn template(&self) -> Result<Evaluated, Failure> {
         let failed = |reason| Failure::Provider {
             operation: "policy.evaluate",
             reason,
         };
+        let tools = self.registration.mediation();
+        let mut settings = Value::Object(self.registration.settings.clone());
+        let launch = settings
+            .get_mut("launch")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| failed("provider: settings launch must be an object".to_owned()))?;
+        let env = launch.entry("env").or_insert_with(|| json!({}));
+        if env.is_null() {
+            *env = json!({});
+        }
+        let env = env
+            .as_object_mut()
+            .ok_or_else(|| failed("provider: settings launch.env must be an object".to_owned()))?;
+        // The registration's tool authority owns this variable, not opaque settings.
+        if env.contains_key(tool_mediation::ENV) {
+            return Err(failed(format!(
+                "provider: settings sets {}, this entry's to set",
+                tool_mediation::ENV
+            )));
+        }
+        env.insert(tool_mediation::ENV.to_owned(), json!(tools.encode()));
         let result = self
-            .invoke(
-                "policy.evaluate",
-                self.host(None, false),
-                Value::Object(self.registration.settings.clone()),
-            )
+            .invoke("policy.evaluate", self.host(None, true), settings)
             .map_err(failed)?;
         let policy: PolicyEvaluateResult = serde_json::from_value(result)
             .map_err(|error| failed(format!("provider: policy result: {error}")))?;
@@ -542,13 +595,42 @@ impl Admitted<'_> {
         let argv = policy
             .argv
             .ok_or_else(|| failed("provider: policy named no argv".to_owned()))?;
-        let mut env = policy.env.unwrap_or_default();
-        if env.contains_key(TOOLS_ENV) {
-            return Err(failed(format!(
-                "provider: policy sets {TOOLS_ENV}, this entry's to set"
-            )));
+        let env = policy.env.unwrap_or_default();
+        let echoed = ToolMediation::from_env(Some(&env))
+            .map_err(|error| failed(format!("provider: evaluated mediation: {error}")))?;
+        if echoed.as_ref() != Some(&tools) {
+            return Err(failed(
+                "provider: evaluated env omits or changes requester-owned mediation".to_owned(),
+            ));
         }
-        env.insert(TOOLS_ENV.to_owned(), tools.to_string());
+        if env.contains_key(&tools.ingress_env)
+            || env.contains_key(oulipoly_root_supervisor::SOCKET_ENV)
+        {
+            return Err(failed(
+                "provider: evaluated env overrides an owner endpoint".to_owned(),
+            ));
+        }
+        let markers: Vec<_> = policy
+            .markers
+            .iter()
+            .filter(|marker| marker.name == tool_mediation::MARKER)
+            .collect();
+        if markers.len() != 1 {
+            return Err(failed(
+                "provider: policy must report exactly one effective mediation marker".to_owned(),
+            ));
+        }
+        tool_mediation::validate("EffectiveMediation", &markers[0].value)
+            .map_err(|error| failed(format!("provider: effective mediation marker: {error}")))?;
+        let effective: EffectiveMediation = serde_json::from_value(markers[0].value.clone())
+            .map_err(|error| failed(format!("provider: effective mediation marker: {error}")))?;
+        if effective.protocol != tools.protocol
+            || effective.bash != tools.bash
+            || effective.ingress_env != tools.ingress_env
+            || !effective.native_tools.contains(&effective.tool)
+        {
+            return Err(failed("provider: effective mediation contradicts requester-owned policy or its tool inventory".to_owned()));
+        }
         let settings = &self.registration.settings;
         let template = json!({
             "settings_id": settings.get("settings_id"),
@@ -559,7 +641,10 @@ impl Admitted<'_> {
         });
         let params = json!({ "protocol": PROTOCOL, "launch": template });
         resident_session::decode_prepare_params(&params)
-            .map(|params| params.launch)
+            .map(|params| Evaluated {
+                launch: params.launch,
+                effective,
+            })
             .map_err(|error| failed(format!("provider: resident launch template: {error}")))
     }
 
@@ -568,8 +653,9 @@ impl Admitted<'_> {
     pub(super) fn prepare(
         &self,
         launch_dir: &Path,
-        template: ResidentLaunchTemplate,
+        evaluated: Evaluated,
     ) -> Result<Prepared, Failure> {
+        let template = evaluated.launch;
         let data_root = make_launch(launch_dir).map_err(|reason| Failure::Setup {
             provider: true,
             reason,
@@ -602,6 +688,7 @@ impl Admitted<'_> {
             result,
             data_root,
             template_env,
+            effective_mediation: evaluated.effective,
         })
     }
 }
@@ -742,6 +829,14 @@ caps = {{"launch": True, "policy": True, "quota": False, "session": False, "term
         "setup": False, "migration": False}}
 if selected:
     caps["resident_session_v1"] = True
+mediation_env = request and request["params"].get("launch", {{}}).get("env", {{}}).get("OULIPOLY_TOOL_MEDIATION_V1")
+mediation = json.loads(mediation_env) if mediation_env else None
+marker = dict(mediation or {{}})
+marker.pop("requester", None)
+marker.update(tool="fake_mediated_bash", native_tools=["fake_mediated_bash"])
+markers = [{{"name": "oulipoly.tool_mediation/v1", "value": marker}}]
+if request and request["host"].get("env", {{}}).get("OULIPOLY_HOST_TOOL_MEDIATION_V1") == "1":
+    caps["tool_mediation_v1"] = True
 {script}
 if op == "describe":
     answer({{"provider_id": "fake-external", "display_name": "Fake external provider",
@@ -749,7 +844,7 @@ if op == "describe":
             "capabilities": caps}})
 elif op == "policy.evaluate":
     answer({{"accepted": True, "argv": ["fake-native", "--model", request["params"]["model"]["name"]],
-            "env": {{"FAKE_POLICY": "1"}}, "stdin": None, "prompt": None, "diagnostics": [], "markers": []}})
+            "env": {{"FAKE_POLICY": "1", "OULIPOLY_TOOL_MEDIATION_V1": mediation_env}}, "stdin": None, "prompt": None, "diagnostics": [], "markers": markers}})
 elif op == "resident.prepare":
     data = request["host"]["data_root"]
     config = json.dumps(request["params"]["launch"], sort_keys=True).encode()
@@ -921,7 +1016,19 @@ else:
             &|v| v["env"] = json!({ "OULIPOLY_HOST_RESIDENT_SESSION_V1": "1" }),
             "this entry's",
         );
-        refuse(&|v| v["env"] = json!({ TOOLS_ENV: "{}" }), "this entry's");
+        refuse(
+            &|v| v["env"] = json!({ tool_mediation::ENV: "{}" }),
+            "this entry's",
+        );
+        for name in [
+            oulipoly_root_supervisor::bash::BASH_ENV,
+            oulipoly_root_supervisor::SOCKET_ENV,
+        ] {
+            refuse(
+                &|v| v["env"] = json!({ name: "/wrong-endpoint" }),
+                "owner's to set",
+            );
+        }
         refuse(&|v| v["config_root"] = json!("relative"), "config_root");
     }
 
@@ -1034,13 +1141,16 @@ else:
         let registered = registration(dir.path(), &fake);
         let admitted = admit(&registered).unwrap();
         admitted.describe().unwrap();
-        let tools = json!({ "v": 1, "bash": { "authority": "trusted-task" } });
-        let template = admitted.template(&tools).unwrap();
-        assert_eq!(template.argv, ["fake-native", "--model", "fake-model"]);
-        let env = template.env.clone().unwrap();
+        let tools = serde_json::to_value(registered.mediation()).unwrap();
+        let template = admitted.template().unwrap();
+        assert_eq!(
+            template.launch.argv,
+            ["fake-native", "--model", "fake-model"]
+        );
+        let env = template.launch.env.clone().unwrap();
         assert_eq!(env["FAKE_POLICY"], "1");
         assert_eq!(
-            serde_json::from_str::<Value>(&env[TOOLS_ENV]).unwrap(),
+            serde_json::from_str::<Value>(&env[tool_mediation::ENV]).unwrap(),
             tools
         );
         let launch = dir.path().join("launch");
@@ -1058,11 +1168,11 @@ else:
             launch.join("provider").to_string_lossy().as_ref()
         );
         assert_eq!(
-            seen[2]["request"]["params"]["launch"]["env"][TOOLS_ENV],
-            tools.to_string()
+            seen[2]["request"]["params"]["launch"]["env"][tool_mediation::ENV],
+            registered.mediation().encode()
         );
         // A second prepare cannot reuse the launch directory.
-        let again = admitted.template(&tools).unwrap();
+        let again = admitted.template().unwrap();
         assert!(matches!(
             admitted.prepare(&launch, again),
             Err(Failure::Setup { provider: true, .. })
@@ -1080,7 +1190,7 @@ else:
         let registered = registration(dir.path(), &fake);
         let admitted = admit(&registered).unwrap();
         admitted.describe().unwrap();
-        let failure = admitted.template(&json!({})).unwrap_err();
+        let failure = admitted.template().unwrap_err();
         assert!(
             matches!(&failure, Failure::Provider { operation: "policy.evaluate", reason } if reason.contains("no such route")),
             "{failure:?}"
@@ -1094,7 +1204,7 @@ else:
         let registered = registration(dir.path(), &fake);
         let admitted = admit(&registered).unwrap();
         admitted.describe().unwrap();
-        let template = admitted.template(&json!({})).unwrap();
+        let template = admitted.template().unwrap();
         let failure = admitted
             .prepare(&dir.path().join("launch"), template)
             .unwrap_err();
@@ -1102,6 +1212,261 @@ else:
             matches!(&failure, Failure::Setup { provider: true, reason } if reason.contains("resident.prepare result")),
             "{failure:?}"
         );
+    }
+
+    #[test]
+    fn mediation_negotiation_refuses_absent_false_wrong_type_or_future_only() {
+        for edit in [
+            "caps.pop('tool_mediation_v1')",
+            "caps['tool_mediation_v1'] = False",
+            "caps['tool_mediation_v1'] = 'true'",
+            "caps.pop('tool_mediation_v1'); caps['tool_mediation_v2'] = True",
+        ] {
+            let dir = scratch();
+            let fake = fake_provider(dir.path(), edit);
+            let registered = registration(dir.path(), &fake);
+            let failure = admit(&registered).unwrap().describe().unwrap_err();
+            assert!(
+                matches!(
+                    failure,
+                    Failure::Provider {
+                        operation: "describe",
+                        ..
+                    }
+                ),
+                "{edit}: {failure:?}"
+            );
+            assert_eq!(
+                calls(dir.path()).len(),
+                1,
+                "no policy or prepare after refusal"
+            );
+            assert!(!dir.path().join("launch").exists());
+        }
+        let dir = scratch();
+        let fake = fake_provider(dir.path(), "caps['tool_mediation_v2'] = True");
+        let registered = registration(dir.path(), &fake);
+        let declared = admit(&registered).unwrap().describe().unwrap();
+        assert_eq!(declared.tool_mediation, 1);
+        assert_eq!(
+            calls(dir.path())[0]["request"]["host"]["env"]["OULIPOLY_HOST_TOOL_MEDIATION_V1"],
+            "1"
+        );
+    }
+
+    #[test]
+    fn accepted_policy_without_matching_mediation_is_refused_before_setup() {
+        for edit in [
+            "markers = []",
+            "markers.append(markers[0])",
+            "marker['protocol'] = 'oulipoly.tool_mediation/v2'",
+            "marker['bash'] = {'allow': ['other-command']}",
+            "marker['ingress_env'] = 'OTHER_INGRESS'",
+            "marker['native_tools'] = []",
+            "marker['native_tools'] = ['unrelated-tool']",
+            "marker['tool'] = ''",
+            "marker['extra'] = True",
+            "mediation_env = None",
+            "mediation['requester'] = '/other-requester'; mediation_env = json.dumps(mediation)",
+            "mediation['bash'] = {'allow': ['other-command']}; mediation_env = json.dumps(mediation)",
+        ] {
+            let dir = scratch();
+            let fake = fake_provider(
+                dir.path(),
+                &format!("if op == 'policy.evaluate':\n    {edit}"),
+            );
+            let registered = registration(dir.path(), &fake);
+            let admitted = admit(&registered).unwrap();
+            admitted.describe().unwrap();
+            let failure = admitted.template().unwrap_err();
+            assert!(
+                matches!(
+                    failure,
+                    Failure::Provider {
+                        operation: "policy.evaluate",
+                        ..
+                    }
+                ),
+                "{edit}: {failure:?}"
+            );
+            assert_eq!(calls(dir.path()).len(), 2, "{edit}: no prepare");
+            assert!(!dir.path().join("launch").exists());
+        }
+    }
+
+    #[test]
+    fn requester_policy_precedes_evaluation_and_marker_preserves_provider_inventory() {
+        for bash in [
+            BashPolicy::Allow {
+                allow: vec!["printf allowed".to_owned()],
+            },
+            BashPolicy::Authority {
+                authority: tool_mediation::TRUSTED_TASK.to_owned(),
+            },
+        ] {
+            let dir = scratch();
+            let fake = fake_provider(
+                dir.path(),
+                "marker['native_tools'].append('provider-file-tool')",
+            );
+            let mut registered = registration(dir.path(), &fake);
+            match &bash {
+                BashPolicy::Allow { allow } => {
+                    registered.bash_authority = None;
+                    registered.bash_allow = allow.clone();
+                }
+                BashPolicy::Authority { .. } => {}
+            }
+            let original = registered.settings.clone();
+            let admitted = admit(&registered).unwrap();
+            admitted.describe().unwrap();
+            let evaluated = admitted.template().unwrap();
+            assert_eq!(evaluated.effective.bash, bash);
+            assert_eq!(
+                evaluated.effective.native_tools,
+                ["fake_mediated_bash", "provider-file-tool"]
+            );
+            let prepared = admitted
+                .prepare(&dir.path().join("launch"), evaluated)
+                .unwrap();
+            assert_eq!(prepared.effective_mediation.bash, bash);
+            assert_eq!(
+                registered.settings, original,
+                "opaque settings are not mutated"
+            );
+            let seen = calls(dir.path());
+            for call in &seen {
+                assert_eq!(
+                    call["request"]["host"]["env"]["OULIPOLY_HOST_TOOL_MEDIATION_V1"],
+                    "1"
+                );
+            }
+            let input = &seen[1]["request"]["params"];
+            let supplied = ToolMediation::decode(
+                input["launch"]["env"][tool_mediation::ENV]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(supplied, registered.mediation());
+            assert_eq!(
+                seen[2]["request"]["params"]["launch"]["env"][tool_mediation::ENV],
+                input["launch"]["env"][tool_mediation::ENV]
+            );
+            assert!(supplied.ingress_env == oulipoly_root_supervisor::bash::BASH_ENV);
+        }
+    }
+
+    #[test]
+    fn evaluated_environment_cannot_replace_owner_endpoint_values() {
+        for name in [
+            oulipoly_root_supervisor::bash::BASH_ENV,
+            oulipoly_root_supervisor::SOCKET_ENV,
+        ] {
+            let dir = scratch();
+            let fake = fake_provider(
+                dir.path(),
+                &format!(
+                    "if op == 'policy.evaluate':\n    answer({{'accepted': True, 'argv': ['native'], 'env': {{'OULIPOLY_TOOL_MEDIATION_V1': mediation_env, {name:?}: '/wrong-endpoint'}}, 'stdin': None, 'prompt': None, 'diagnostics': [], 'markers': markers}})\n    sys.exit(0)"
+                ),
+            );
+            let registered = registration(dir.path(), &fake);
+            let admitted = admit(&registered).unwrap();
+            admitted.describe().unwrap();
+            let failure = admitted.template().unwrap_err();
+            assert!(
+                matches!(failure, Failure::Provider { operation: "policy.evaluate", ref reason } if reason.contains("owner endpoint")),
+                "{failure:?}"
+            );
+            assert_eq!(calls(dir.path()).len(), 2);
+            assert!(!dir.path().join("launch").exists());
+        }
+    }
+
+    /// Published adapters, administrative operations only: no native CLI starts.
+    #[test]
+    #[ignore = "needs published OULIPOLY_REAL_{CLAUDE,CODEX}_ADAPTER and OULIPOLY_REAL_CODEX_MODELS"]
+    fn real_published_adapters_evaluate_and_prepare_selected_requester_policy() {
+        for (variable, id) in [
+            ("OULIPOLY_REAL_CLAUDE_ADAPTER", "claude"),
+            ("OULIPOLY_REAL_CODEX_ADAPTER", "codex"),
+        ] {
+            let adapter = PathBuf::from(std::env::var(variable).expect(variable));
+            for allow in [false, true] {
+                let dir = scratch();
+                let native = dir.path().join("never-native");
+                std::fs::write(&native, "#!/bin/sh\nexit 99\n").unwrap();
+                std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let mut registered = registration(dir.path(), &adapter);
+                if allow {
+                    registered.bash_authority = None;
+                    registered.bash_allow = vec!["printf allowed".to_owned()];
+                }
+                registered.env = BTreeMap::from([(
+                    "HOME".to_owned(),
+                    dir.path().to_string_lossy().into_owned(),
+                )]);
+                let settings = if id == "claude" {
+                    json!({"settings_id": "claude-witness", "mode": "headless",
+                        "model": {"name": "claude-opus", "provider_args": ["--model", "opus"], "inputs": {"prompt": null, "named": {}}},
+                        "launch": {"command": native, "prompt_mode": "stdin", "env": {"SENTINEL": "opaque-env"}}})
+                } else {
+                    let config = dir.path().join("config/agent-runner-codex");
+                    std::fs::create_dir_all(&config).unwrap();
+                    let mcp = dir.path().join("mcp.ts");
+                    std::fs::write(&mcp, "// never started\n").unwrap();
+                    let prompt = dir.path().join("system.md");
+                    std::fs::write(&prompt, "system sentinel\n").unwrap();
+                    std::fs::copy(
+                        std::env::var("OULIPOLY_REAL_CODEX_MODELS").unwrap(),
+                        dir.path().join("models.json"),
+                    )
+                    .unwrap();
+                    let b = native.to_string_lossy();
+                    std::fs::write(config.join("config.toml"), format!(
+                        "codex_bin = {b:?}\nbun_bin = {b:?}\nbash_mcp_path = {:?}\nsystem_prompt_file = {:?}\nagent_bash_bin = {b:?}\nagent_runner_bin = {b:?}\n", mcp.to_string_lossy(), prompt.to_string_lossy())).unwrap();
+                    registered.config_root =
+                        Some(dir.path().join("config").to_string_lossy().into_owned());
+                    json!({"settings_id": "codex2", "mode": "stdin",
+                        "model": {"name": "gpt-astra-high", "provider_args": ["-m", "gpt-6-astra", "-c", "model_reasoning_effort=\"high\""], "inputs": {"prompt": "prepare sentinel", "named": {}}},
+                        "launch": {"argv": ["codex2", "exec", "--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-6-astra", "-c", "model_reasoning_effort=\"high\""], "env": {"SENTINEL": "opaque-env"}}})
+                };
+                registered.settings = settings.as_object().unwrap().clone();
+                check(&registered).unwrap();
+                let admitted = admit(&registered).unwrap();
+                let declared = admitted.describe().unwrap();
+                assert_eq!(declared.provider_id, id);
+                assert_eq!(declared.tool_mediation, 1);
+                let evaluated = admitted.template().unwrap();
+                assert_eq!(evaluated.effective.bash, registered.mediation().bash);
+                assert_eq!(
+                    evaluated.launch.env.as_ref().unwrap()["SENTINEL"],
+                    "opaque-env"
+                );
+                let prepared = admitted
+                    .prepare(&dir.path().join("launch"), evaluated)
+                    .unwrap();
+                assert_eq!(prepared.result.invocation.endpoint, "stdio");
+                let config_path = &prepared.argv[3];
+                let config: Value =
+                    serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+                assert_eq!(
+                    ToolMediation::decode(
+                        config["launch"]["env"][tool_mediation::ENV]
+                            .as_str()
+                            .unwrap()
+                    )
+                    .unwrap(),
+                    registered.mediation()
+                );
+                println!(
+                    "published adapter={id} allow={allow} declared={} marker={} prepared={}",
+                    declared.entry(),
+                    serde_json::to_value(prepared.effective_mediation).unwrap(),
+                    serde_json::to_value(prepared.result).unwrap()
+                );
+            }
+        }
     }
 
     /// Hand-over to oneself needs no privilege, so the walk itself is
