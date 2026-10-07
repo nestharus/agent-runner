@@ -1,5 +1,5 @@
 """Offline checks of the package archive and the installer, on a small
-stand-in stage (no cargo, npm, root or sudoers effect): deterministic
+stand-in stage (no cargo, root or sudoers effect): deterministic
 archive, manifest verification, refused archive shapes and prefixes, the
 rendered sudoers rule, the site config, and record-driven uninstall into a
 scratch destination root."""
@@ -33,18 +33,14 @@ class Scratch(unittest.TestCase):
             ("bin/oulipoly-agent-runner", b"runner", 0o755),
             ("bin/oulipoly-root-supervisor", b"owner", 0o755),
             ("bin/oulipoly-root-pid1", b"pid1", 0o755),
+            ("bin/oulipoly-root-child", b"child", 0o755),
             ("agent-bash/agent-bash", b"bash", 0o755),
-            ("agent-bash/bash.ts", b"tool", 0o644),
-            ("opencode/deps/package-lock.json", b"{}", 0o664),
-            ("opencode/deps/node_modules/x/cli.js", b"x", 0o775),
         ):
             path = os.path.join(stage, rel)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "wb") as file:
                 file.write(data)
             os.chmod(path, mode)
-        os.makedirs(os.path.join(stage, "opencode/deps/node_modules/.bin"))
-        os.symlink("../x/cli.js", os.path.join(stage, "opencode/deps/node_modules/.bin/x"))
         for target, source, mode in build_package.ASSETS:
             path = os.path.join(stage, target)
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -84,8 +80,8 @@ class Archive(Scratch):
             self.assertEqual(members[0].name, PACKAGE_ID)
             self.assertTrue(all(m.uid == 0 and m.gid == 0 and m.mtime == 1_700_000_000 for m in members))
             modes = {m.name.split("/", 1)[-1]: m.mode for m in members}
-            self.assertEqual(modes["opencode/deps/package-lock.json"], 0o644)
-            self.assertEqual(modes["opencode/deps/node_modules/x/cli.js"], 0o755)
+            self.assertEqual(modes["share/frontdoor.example.json"], 0o644)
+            self.assertEqual(modes["bin/oulipoly-root-child"], 0o755)
             self.assertEqual(modes["libexec/oulipoly-native-frontdoor"], 0o755)
             self.assertEqual(sorted(m.name for m in members), [m.name for m in members])
 
@@ -97,7 +93,7 @@ class Install(Scratch):
         self.assertEqual(code, 0)
         package = os.path.join(dest, "opt/oulipoly-native", PACKAGE_ID)
         self.assertTrue(os.path.isfile(os.path.join(package, "libexec/oulipoly-native-frontdoor")))
-        self.assertEqual(os.readlink(os.path.join(package, "opencode/deps/node_modules/.bin/x")), "../x/cli.js")
+        self.assertFalse(os.path.exists(os.path.join(package, "opencode")))
         with open(os.path.join(dest, "etc/sudoers.d/oulipoly-native")) as file:
             rule = file.read()
         frontdoor = f"/opt/oulipoly-native/{PACKAGE_ID}/libexec/oulipoly-native-frontdoor"

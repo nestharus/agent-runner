@@ -23,7 +23,7 @@ if os.environ.get('CORRECTION_SOURCE'):
 import frontdoor as fd
 import native_call as caller
 import install_package as installer
-from test_frontdoor import SITE, NOW, request, credential
+from test_frontdoor import SITE, NOW, request
 from test_build_install import Scratch as InstallScratch, PACKAGE_ID
 
 class Scratch(unittest.TestCase):
@@ -33,9 +33,9 @@ class Scratch(unittest.TestCase):
 
     def run_tree(self, name='run'):
         root = self.root/(name+'-'+str(time.monotonic_ns()))
-        for sub in ('private', 'launch/xdg/data/opencode', 'launch/secret', 'store'):
+        for sub in ('private', 'launch/provider', 'store'):
             (root/sub).mkdir(parents=True)
-        for rel in fd.CREDENTIAL_FILES:
+        for rel in ('launch/provider/adapter-state',):
             (root/rel).write_text('fake-secret')
         (root/'private/retention').write_text('discard')
         (root/'private/lock').touch()
@@ -67,7 +67,7 @@ class OwnedCleanup(Scratch):
         (outside/'auth.json').write_text('must survive')
         for mode in ('keep','discard','sweep'):
             run = self.run_tree(mode)
-            ancestor = run/'launch/xdg/data/opencode'
+            ancestor = run/'launch/provider'
             shutil.rmtree(ancestor)
             ancestor.symlink_to(outside, target_is_directory=True)
             if mode == 'sweep':
@@ -77,14 +77,14 @@ class OwnedCleanup(Scratch):
             else:
                 result = fd.retire(str(run),mode)
             self.assertTrue((outside/'auth.json').exists(),mode)
-            self.assertFalse(result['ok'],mode)
-            self.assertTrue(run.exists(),mode)
+            self.assertTrue(result['ok'],mode)
+            self.assertEqual(run.exists(),mode=='keep')
 
     def test_final_symlink_unlinked_without_target_effect(self):
         run = self.run_tree()
         outside = self.root/'outside'
         outside.write_text('keep')
-        auth = run/fd.CREDENTIAL_FILES[1]
+        auth = run/'launch/provider/adapter-state'
         auth.unlink()
         auth.symlink_to(outside)
         self.assertTrue(fd.retire(str(run),'discard')['ok'])
@@ -195,16 +195,7 @@ class InputClasses(unittest.TestCase):
         with self.assertRaises(fd.Refused):
             fd.check_request(request(message='\ud800'),SITE,NOW)
 
-    def test_extreme_expiry_refused_by_both_sides(self):
-        value=credential(expires=10**100)
-        with self.assertRaises(fd.Refused):
-            fd.check_request(request(credential=value),SITE,NOW)
-        with self.assertRaises(caller.LocalRefusal):
-            caller.credential_public(value,NOW)
 
-    def test_freshness_two_graces_with_small_margin(self):
-        with self.assertRaises(fd.Refused):
-            fd.check_request(request(deadline_s=10,credential=credential(expires=(NOW+150)*1000)),dict(SITE,credential_margin_s=1,cancel_grace_s=100),NOW)
 
     def test_custody_resolved_ancestry(self):
         good=mock.Mock(st_uid=0,st_mode=0o100644)

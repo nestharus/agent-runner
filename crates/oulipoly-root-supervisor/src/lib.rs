@@ -13,15 +13,12 @@
 //! agent. It touches no Broker State, opcode, admission record, global
 //! debt or fence, guardian, driver or Bash path. Its harnesses in this
 //! crate's tests are the deterministic peer binary, not a real harness,
-//! except one ignored-by-default test (`tests/native_opencode.rs`) that owns
-//! a real, model-less OpenCode host (see Endpoints). Its one caller is the
-//! Runner's `native-root` entry (Linux), which provisions a native OpenCode
-//! host with [`native::provision_opencode`] or a native Claude Code harness
-//! with [`native_claude::provision_claude`] and starts this process for one
-//! fresh root with only the environment the request declares. In source,
-//! that entry is reached from ordinary Linux `agents` launches with native
-//! configuration, through the packaged native caller and front door
-//! (`packaging/native-linux`); this crate does not say what is installed.
+//! with deterministic owned peers for finite controls. Its caller is the
+//! Runner's Linux `native-root` entry, which resolves a registered external
+//! provider's resident stdio harness through declared schemas/capabilities.
+//! The entry starts this process with only the request's whole environment.
+//! Ordinary Linux `agents` reaches it through the packaged native caller and
+//! front door (`packaging/native-linux`); source says nothing of installation.
 //!
 //! Absorption target: later slices make this lineage the root's
 //! harness-delivery owner, replacing the resume-plus-prompt path for the
@@ -231,11 +228,6 @@
 //! owner resumes it instead of opening one; the harness decides whether it
 //! has it. `session-opened` / `session-resumed` report the session id and
 //! `ack` the harness's `messageId`, which the store also keeps.
-//!
-//! `native/opencode/acp-v2-endpoint.ts` is such an endpoint for OpenCode, as
-//! a server plugin. In OpenCode 1.18.30 only `opencode acp` loads its
-//! directory's instance, and so the plugin, at startup (`serve` does so per
-//! HTTP request); its own stdio ACP surface is then present but unused.
 //!
 //! # Durable store and ownership
 //!
@@ -560,13 +552,9 @@
 //!   pruned. Retained output lasts until the store is removed.
 //! * Exit observation waits for protocol-read progress; a descendant holding
 //!   stdout can delay it. A caller that does not drain output can delay cancel.
-//! * Bash ingress: the agent-bash tool speaks it (root v1). A native
-//!   OpenCode host loads that tool only behind
-//!   `native/opencode/bash-policy-tool.ts`, whose native permission
-//!   decides each whole command string; the [`native`] setup provisions
-//!   both with the root's deny-default policy (only named commands run,
-//!   unless the caller explicitly selects `trusted-task` Bash).
-//!   That is shown with a scripted stand-in for a model, not a model. The
+//! * Bash ingress: the Agent Bash requester speaks root v1. Registered
+//!   adapters translate the neutral named-command/trusted-task policy via
+//!   negotiated tool mediation; native tool enforcement remains theirs. The
 //!   owner grants no permission request (it answers method-not-found, a
 //!   native rejection). No completion
 //!   is delivered to a harness as a new input; one thread per connection
@@ -598,8 +586,6 @@ mod conversation;
 mod custody;
 mod harness;
 mod live;
-pub mod native;
-pub mod native_claude;
 mod retention;
 mod store;
 #[doc(hidden)]

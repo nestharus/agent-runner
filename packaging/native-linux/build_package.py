@@ -4,13 +4,12 @@
     build_package.py --build-dir B --runner-repo W
         --agent-bash-repo T --agent-bash-commit C [--allow-dirty]
 
-Everything it writes is under B (cargo home and targets, the npm cache,
-the locked dependencies, the Node runtime download, the stage and
-`dist/`); W and T are only read (T through `git archive C`). Network is
-used only by cargo, `npm ci` (locked public dependencies) and one HTTPS GET
-of the pinned official Node release, checked against its pinned sha256.
-Nothing is installed, run as root or started beyond the builds; the Claude
-Code and Node executables are copied and hashed, never run.
+Everything it writes is under B (cargo home/targets, exact Agent Bash
+source snapshot, stage and dist). W and T are read; T through git archive C.
+Only Cargo needs build dependencies. The package contains no embedded
+harness, Node/npm dependency installation, JS requester or credential setup.
+External provider executables and adapter settings are acquired separately
+by ROOT and selected by the site. Nothing here installs or activates routes.
 
 Output: `B/dist/<id>.tar.gz`, `B/dist/<id>.tar.gz.sha256` and the stage
 `B/stage/<id>/` with `MANIFEST.json` (source identities, toolchain,
@@ -30,18 +29,6 @@ import sys
 import tarfile
 
 HERE = os.path.dirname(os.path.realpath(__file__))
-LOCK_DIR = "crates/oulipoly-root-supervisor/native/opencode"
-CLAUDE_LOCK_DIR = "crates/oulipoly-root-supervisor/native/claude"
-CLAUDE_PLATFORM = "node_modules/@anthropic-ai/claude-agent-sdk-linux-x64"
-# Locked optional platform packages `npm ci` installs on Linux x64 that the
-# receiver never selects (it names the glibc executable): not staged.
-CLAUDE_UNUSED = ("node_modules/@anthropic-ai/claude-agent-sdk-linux-x64-musl",)
-# The Node runtime of the Claude receiver: an official release, pinned.
-NODE_VERSION = "v24.21.0"
-NODE_TARBALL = f"node-{NODE_VERSION}-linux-x64.tar.xz"
-NODE_URL = f"https://nodejs.org/dist/{NODE_VERSION}/{NODE_TARBALL}"
-NODE_SHA256 = "fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6"
-BASH_TOOL = "integrations/opencode/tools/bash.ts"
 
 # (stage path, build product) for the co-located binaries.
 BINARIES = (
@@ -142,61 +129,6 @@ def stage_binaries(build, stage):
         shutil.copy2(source, os.path.join(stage, target))
 
 
-def install_deps(build, runner_repo, log, lock_dir=LOCK_DIR):
-    lock = os.path.join(runner_repo, lock_dir, "package-lock.json")
-    lock_hash = sha256(lock)
-    deps = os.path.join(build, "deps-" + lock_hash[:12])
-    if not os.path.isdir(deps):
-        partial = deps + ".partial"
-        shutil.rmtree(partial, ignore_errors=True)
-        os.makedirs(partial)
-        for name in ("package.json", "package-lock.json"):
-            shutil.copy2(os.path.join(runner_repo, lock_dir, name), partial)
-        npmrc = os.path.join(build, "npmrc")
-        open(npmrc, "a").close()
-        run(["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund",
-             "--cache", os.path.join(build, "npm-cache"), "--userconfig", npmrc],
-            log, cwd=partial)
-        os.rename(partial, deps)
-    return lock_hash, deps
-
-
-def fetch_node(build, log):
-    """The pinned Node runtime: `bin/node` and its LICENSE, from the
-    official release tarball checked against NODE_SHA256."""
-    out = os.path.join(build, "node-" + NODE_SHA256[:12])
-    if os.path.isdir(out):
-        return out
-    tarball = os.path.join(build, "node-dist", NODE_TARBALL)
-    if not os.path.isfile(tarball) or sha256(tarball) != NODE_SHA256:
-        os.makedirs(os.path.dirname(tarball), exist_ok=True)
-        run(["curl", "-fsS", "--proto", "=https", "-o", tarball + ".partial", NODE_URL], log)
-        os.replace(tarball + ".partial", tarball)
-    if sha256(tarball) != NODE_SHA256:
-        raise SystemExit(f"{NODE_TARBALL} does not match its pinned sha256")
-    partial = out + ".partial"
-    shutil.rmtree(partial, ignore_errors=True)
-    os.makedirs(os.path.join(partial, "bin"))
-    prefix = f"node-{NODE_VERSION}-linux-x64/"
-    with tarfile.open(tarball) as tar:
-        for name, target in (("bin/node", "bin/node"), ("LICENSE", "LICENSE")):
-            member = tar.getmember(prefix + name)
-            if not member.isfile():
-                raise SystemExit(f"{NODE_TARBALL}: {name} is not a regular file")
-            with tar.extractfile(member) as source, open(os.path.join(partial, target), "wb") as sink:
-                shutil.copyfileobj(source, sink)
-    os.chmod(os.path.join(partial, "bin/node"), 0o755)
-    os.rename(partial, out)
-    return out
-
-
-def elf_needed(path):
-    """Dynamic dependencies read from the ELF header (`readelf -d`): the
-    file is not run, unlike `ldd`."""
-    lines = output(["readelf", "-d", path]).splitlines()
-    return sorted(line.split("[", 1)[1].rstrip("]") for line in lines if "(NEEDED)" in line)
-
-
 def normalize(stage):
     for directory, dirs, files in os.walk(stage):
         os.chmod(directory, 0o755)
@@ -231,20 +163,6 @@ def dynamic_deps(path):
     except subprocess.CalledProcessError:
         return ["not a dynamic executable"]
     return sorted(line.split("(")[0].strip() for line in lines if "linux-vdso" not in line)
-
-
-def claude_code_identity(stage):
-    """The packaged Claude Code executable as published (never run)."""
-    platform = os.path.join(stage, "claude", "deps", CLAUDE_PLATFORM)
-    with open(os.path.join(platform, "package.json"), encoding="utf-8") as file:
-        package = json.load(file)
-    return {
-        "package": package["name"],
-        "version": package["version"],
-        "executable": f"claude/deps/{CLAUDE_PLATFORM}/claude",
-        "sha256": sha256(os.path.join(platform, "claude")),
-        "modified": "no",
-    }
 
 
 def write_archive(stage, name, out, mtime):
@@ -284,10 +202,6 @@ def main(argv):
     runner = runner_identity(runner_repo, args.allow_dirty)
     bash_commit, bash_source = agent_bash_source(build, args.agent_bash_repo, args.agent_bash_commit)
     build_binaries(build, runner_repo, bash_source, log)
-    lock_hash, deps = install_deps(build, runner_repo, log)
-    claude_lock_hash, claude_deps = install_deps(build, runner_repo, log, CLAUDE_LOCK_DIR)
-    node = fetch_node(build, log)
-
     package_id = f"oulipoly-native-linux-x86_64-{runner['commit'][:12]}-{bash_commit[:12]}"
     if runner["dirty"]:
         package_id += "-dirty"
@@ -295,12 +209,6 @@ def main(argv):
     shutil.rmtree(stage, ignore_errors=True)
     os.makedirs(stage)
     stage_binaries(build, stage)
-    shutil.copy2(os.path.join(bash_source, BASH_TOOL), os.path.join(stage, "agent-bash", "bash.ts"))
-    shutil.copytree(deps, os.path.join(stage, "opencode", "deps"), symlinks=True)
-    unused = {os.path.join(claude_deps, path) for path in CLAUDE_UNUSED}
-    shutil.copytree(claude_deps, os.path.join(stage, "claude", "deps"), symlinks=True,
-                    ignore=lambda directory, names: [n for n in names if os.path.join(directory, n) in unused])
-    shutil.copytree(node, os.path.join(stage, "claude", "node"), symlinks=True)
     for target, source, mode in ASSETS:
         os.makedirs(os.path.join(stage, os.path.dirname(target)), exist_ok=True)
         shutil.copyfile(os.path.join(HERE, source), os.path.join(stage, target))
@@ -310,7 +218,6 @@ def main(argv):
     toolchain = {
         name: output(argv_) for name, argv_ in (
             ("cargo", ["cargo", "--version"]), ("rustc", ["rustc", "--version"]),
-            ("node", ["node", "--version"]), ("npm", ["npm", "--version"]),
             ("python_at_build", [sys.executable, "--version"]),
         )
     }
@@ -320,23 +227,15 @@ def main(argv):
         "platform": "linux-x86_64",
         "runner": {**runner, "repo": "nestharus/agent-runner", "profile": "release", "features": "default"},
         "agent_bash": {"commit": bash_commit, "repo": "nestharus/agent-bash-tool"},
-        "opencode_lock_sha256": lock_hash,
-        "claude_lock_sha256": claude_lock_hash,
-        "claude_code": claude_code_identity(stage),
-        "claude_deps_not_staged": list(CLAUDE_UNUSED),
-        "node": {"version": NODE_VERSION, "url": NODE_URL, "tarball_sha256": NODE_SHA256,
-                 "files": ["bin/node", "LICENSE"]},
         "toolchain": toolchain,
         "runtime_requirements": {
             "python": "/usr/bin/python3 (3.12 or newer: os.unshare) for the front door and caller",
             "sudo": "a sudoers rule from share/sudoers.template",
             "kernel": "PID and mount namespaces",
-            "claude": "the packaged Node runtime runs the receiver; Claude Code runs as the requester with its own login in the route's store",
+            "providers": "external registered executables from site routes; adapter-owned settings, environment and credentials",
         },
         "dynamic_libraries": {
             **{target: dynamic_deps(os.path.join(stage, target)) for target, _ in BINARIES},
-            **{target: elf_needed(os.path.join(stage, target))
-               for target in ("claude/node/bin/node", f"claude/deps/{CLAUDE_PLATFORM}/claude")},
         },
         "files": manifest_files(stage),
     }

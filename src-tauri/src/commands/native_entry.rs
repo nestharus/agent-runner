@@ -30,6 +30,8 @@
 //! model. Missing, unreadable or invalid configuration, and an unresolved
 //! config root, are refused before legacy bootstrap.
 //!
+//! Parent/child authentication stays with the external registered adapters;
+//! this configuration and caller have no credential-source fields.
 //! The caller is one attempt, with no replay. Its exit code is returned as
 //! is unless answer presentation fails after caller success (entry exit 6);
 //! `answered` (0) is not task correctness.
@@ -63,20 +65,16 @@ struct NativeEntryConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NativeModel {
-    /// Site route name; the site, not this file, fixes provider/model/effort.
+    /// Registered site route name; adapter settings are selected there.
     route: String,
     /// `"trusted-task"`; or omit and give `bash_allow`.
     bash: Option<String>,
     bash_allow: Option<Vec<String>>,
     deadline_s: Option<u32>,
-    credential_codex_profile: Option<PathBuf>,
-    credential_opencode_auth: Option<PathBuf>,
-    credential_provider: Option<String>,
     #[serde(default)]
     children: Vec<String>,
     child_max_starts: Option<u8>,
     child_max_concurrent: Option<u8>,
-    child_credential_codex_profile: Option<PathBuf>,
 }
 
 /// What the ordinary command line selected, before mapping.
@@ -182,16 +180,8 @@ fn check_model(model: &NativeModel) -> Result<(), String> {
         _ => return Err("exactly one of bash = \"trusted-task\" or bash_allow is required".into()),
     }
     check_deadline(model.deadline_s)?;
-    if model.credential_codex_profile.is_some() && model.credential_opencode_auth.is_some() {
-        return Err("credential_codex_profile and credential_opencode_auth are exclusive".into());
-    }
-    if model.credential_opencode_auth.is_some() != model.credential_provider.is_some() {
-        return Err("credential_opencode_auth and credential_provider go together".into());
-    }
     if model.children.is_empty()
-        && (model.child_max_starts.is_some()
-            || model.child_max_concurrent.is_some()
-            || model.child_credential_codex_profile.is_some())
+        && (model.child_max_starts.is_some() || model.child_max_concurrent.is_some())
     {
         return Err("child_* options need children".into());
     }
@@ -334,15 +324,6 @@ fn caller_argv(
         .unwrap_or(DEFAULT_DEADLINE_S)
         .to_string();
     push("--deadline", &deadline);
-    if let Some(profile) = &model.credential_codex_profile {
-        push("--credential-codex-profile", profile);
-    }
-    if let (Some(auth), Some(provider)) =
-        (&model.credential_opencode_auth, &model.credential_provider)
-    {
-        push("--credential-opencode-auth", auth);
-        push("--credential-provider", provider);
-    }
     for route in &model.children {
         push("--child-route", route);
     }
@@ -351,9 +332,6 @@ fn caller_argv(
     }
     if let Some(limit) = model.child_max_concurrent {
         push("--child-max-concurrent", &limit.to_string());
-    }
-    if let Some(profile) = &model.child_credential_codex_profile {
-        push("--child-credential-codex-profile", profile);
     }
     match allow_file {
         Some(file) => push("--allow-file", &file),
@@ -638,5 +616,28 @@ mod tests {
             std::fs::read_to_string(dir.path().join("final.md")).unwrap(),
             "retained answer"
         );
+    }
+    #[test]
+    fn embedded_credential_configuration_is_an_unknown_shape() {
+        for key in [
+            "credential_codex_profile",
+            "credential_opencode_auth",
+            "credential_provider",
+            "child_credential_codex_profile",
+        ] {
+            let text = format!(
+                r#"caller = "/opt/package/bin/oulipoly-native-call"
+runs_dir = "/tmp/caller-records"
+[models.example]
+route = "parent"
+bash = "trusted-task"
+{key} = "/unread-credential"
+"#
+            );
+            assert!(
+                parse_config(&text).unwrap_err().contains("unknown field"),
+                "{key}"
+            );
+        }
     }
 }

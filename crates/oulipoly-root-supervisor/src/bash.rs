@@ -2707,3 +2707,10 @@ mod tests {
         }
     }
 }
+
+/// Caller-selected Bash authority, translated through provider tool mediation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BashAuthority {
+    TrustedTask,
+}

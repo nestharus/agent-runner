@@ -491,7 +491,7 @@ class LiveAdmission(unittest.TestCase):
         pid = os.fork()
         if pid == 0:
             try:
-                checked = {"live": True, "credential": None, "children": None,
+                checked = {"live": True, "children": None,
                            "retention": "discard", "deadline": 30, "route_name": "fixture",
                            "route": {"model": "fixture/scripted"}, "policy": {"bash_authority": "trusted-task"}}
                 def paused_open(*args):

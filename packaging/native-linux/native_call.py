@@ -4,11 +4,7 @@
     oulipoly-native-call --route NAME --prompt-file FILE --cwd DIR --out DIR
         (--trusted-task | --allow-file FILE) [--deadline SECONDS]
         [--env NAME=VALUE ...] [--retention discard|keep]
-        [--credential-opencode-auth FILE --credential-provider ID
-         | --credential-codex-profile DIR]
-        [--child-route NAME ... [--child-max-starts N] [--child-max-concurrent N]
-         [--child-credential-codex-profile DIR
-          | --child-credential-opencode-auth FILE --child-credential-provider ID]]
+        [--child-route NAME ... [--child-max-starts N] [--child-max-concurrent N]]
         [--live-handle NEWFILE]
     oulipoly-native-call --root HANDLE --out DIR
         (--prompt-file FILE | --close | --cancel) [--wait SECONDS]
@@ -16,7 +12,8 @@
 --live-handle opens a live root: its supervisor outlives this call; --root
 addresses it later (same requester), see share/README.md "Live roots".
 
-Explicit caller-selected access-only source; no search/refresh/copyback.
+Parent and child routes are registered external providers. Adapter settings
+and environment own authentication; this caller prepares no credentials.
 Nonblocking admission/control and bounded terminal/EOF/exit collection;
 unknown stop is incomplete, without pretending a privileged child ended.
 Output is captured without a redactor and can contain arbitrary secrets.
@@ -25,13 +22,10 @@ The answer and the automatic close are the parent's only: events marked
 as a registered child's (`child`) never supply either. Child results and
 lifecycles are kept separately (children.json); they are what the owner
 reported, not proof any child or its Bash drained beyond what they say.
---child-credential-* is a Claude parent's separate access-only grant for
-the child provider; never Claude's own login.
-Exit classes and runtime/credential bounds: share/README.md.
+Exit classes and runtime bounds: share/README.md.
 """
 
 import argparse
-import base64
 import errno
 import json
 import os
@@ -47,7 +41,6 @@ EOF_GRACE_S = 30
 STOP_GRACE_S = 65
 LINE_LIMIT = 8 * 1024 * 1024
 CAPTURE_LIMIT = 64 * 1024 * 1024
-MAX_EXPIRY_MS = 253402300799000
 # The front door's default site bound; a site may admit less (it refuses).
 MAX_DEADLINE_S = 7200
 FRONTDOOR = "libexec/oulipoly-native-frontdoor"
@@ -55,101 +48,6 @@ FRONTDOOR = "libexec/oulipoly-native-frontdoor"
 
 class LocalRefusal(Exception):
     """Refused before anything was started."""
-
-
-def read_private(path):
-    """The caller's own regular file, read without following a final
-    symlink or blocking on a FIFO."""
-    st = os.lstat(path)
-    if not stat.S_ISREG(st.st_mode):
-        raise LocalRefusal("credential source is not a regular file")
-    if st.st_uid != os.getuid():
-        raise LocalRefusal("credential source is not the caller's own file")
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-    try:
-        opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.getuid():
-            raise LocalRefusal("credential source changed or is not the caller's own regular file")
-        chunks = []
-        while True:
-            chunk = os.read(fd, 65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            if sum(map(len, chunks)) > 1024 * 1024:
-                raise LocalRefusal("credential source is too large")
-        return b"".join(chunks)
-    finally:
-        os.close(fd)
-
-
-def access_only(provider, access, expires_ms, account):
-    entry = {"type": "oauth", "refresh": "", "access": access, "expires": expires_ms}
-    if account:
-        entry["accountId"] = account
-    return {provider: entry}
-
-
-def from_opencode_auth(path, provider):
-    try:
-        entries = json.loads(read_private(path))
-        entry = entries[provider]
-        if entry.get("type") != "oauth":
-            raise LocalRefusal(f"credential {provider} entry is not oauth")
-        access, expires = entry["access"], entry["expires"]
-        account = entry.get("accountId")
-        if not isinstance(access, str) or not access or type(expires) is not int:
-            raise ValueError
-    except LocalRefusal:
-        raise
-    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
-        # No message: it could quote the source.
-        raise LocalRefusal(f"credential source schema ({type(error).__name__})") from None
-    return access_only(provider, access, expires, account if isinstance(account, str) else None)
-
-
-def from_codex_profile(directory):
-    try:
-        tokens = json.loads(read_private(os.path.join(directory, "auth.json")))["tokens"]
-        access = tokens["access_token"]
-        if not isinstance(access, str) or access.count(".") != 2:
-            raise ValueError
-        payload = access.split(".")[1]
-        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-        exp = claims["exp"]
-        if type(exp) is not int or exp <= 0:
-            raise ValueError
-        account = tokens.get("account_id")
-        if not isinstance(account, str) or not account:
-            account = claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
-        if not isinstance(account, str) or not account:
-            raise ValueError
-    except LocalRefusal:
-        raise
-    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
-        raise LocalRefusal(f"credential source schema ({type(error).__name__})") from None
-    return access_only("openai", access, exp * 1000, account)
-
-
-def credential_public(credential, now):
-    if credential is None:
-        return None
-    (provider, entry), = credential.items()
-    if type(entry["expires"]) is not int or not 0 < entry["expires"] <= MAX_EXPIRY_MS:
-        raise LocalRefusal("credential expiry is out of range")
-    return {
-        "provider": provider,
-        "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(entry["expires"] // 1000)),
-        "remaining_s": entry["expires"] // 1000 - int(now),
-        "refresh": "not-sent",
-    }
-
-
-def check_fresh(credential, deadline, margin, now):
-    (_, entry), = credential.items()
-    remaining = entry["expires"] // 1000 - int(now)
-    if remaining < deadline + margin:
-        raise LocalRefusal(f"credential expires in {remaining}s; the deadline needs {deadline + margin}s")
 
 
 def parse_args(argv):
@@ -164,18 +62,9 @@ def parse_args(argv):
     parser.add_argument("--deadline", type=int, default=1800)
     parser.add_argument("--env", action="append", default=[])
     parser.add_argument("--retention", choices=("discard", "keep"), default="discard")
-    source = parser.add_mutually_exclusive_group()
-    source.add_argument("--credential-opencode-auth")
-    source.add_argument("--credential-codex-profile")
-    parser.add_argument("--credential-provider")
-    parser.add_argument("--credential-margin", type=int, default=600)
     parser.add_argument("--child-route", action="append", default=[])
     parser.add_argument("--child-max-starts", type=int)
     parser.add_argument("--child-max-concurrent", type=int)
-    child = parser.add_mutually_exclusive_group()
-    child.add_argument("--child-credential-opencode-auth")
-    child.add_argument("--child-credential-codex-profile")
-    parser.add_argument("--child-credential-provider")
     parser.add_argument("--live-handle",
                         help="open a live root: no automatic close; its handle is written to this new file")
     parser.add_argument("--frontdoor")
@@ -185,21 +74,9 @@ def parse_args(argv):
     parser.add_argument("--direct-requester-uid", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--direct-site-config", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    if args.credential_opencode_auth and not args.credential_provider:
-        parser.error("--credential-opencode-auth needs --credential-provider")
-    if args.credential_provider and not args.credential_opencode_auth:
-        parser.error("--credential-provider goes with --credential-opencode-auth")
-    if args.credential_margin < 0:
-        parser.error("--credential-margin must be nonnegative")
     if not 1 <= args.deadline <= MAX_DEADLINE_S:
         parser.error(f"--deadline must be 1..{MAX_DEADLINE_S}")
-    if args.child_credential_opencode_auth and not args.child_credential_provider:
-        parser.error("--child-credential-opencode-auth needs --child-credential-provider")
-    if args.child_credential_provider and not args.child_credential_opencode_auth:
-        parser.error("--child-credential-provider goes with --child-credential-opencode-auth")
-    child_options = (args.child_max_starts, args.child_max_concurrent,
-                     args.child_credential_opencode_auth, args.child_credential_codex_profile)
-    if not args.child_route and any(value is not None for value in child_options):
+    if not args.child_route and any(value is not None for value in (args.child_max_starts, args.child_max_concurrent)):
         parser.error("--child-* options need --child-route")
     for name in ("child_max_starts", "child_max_concurrent"):
         value = getattr(args, name)
@@ -234,20 +111,6 @@ def build_request(args, now):
         if not sep or not name:
             raise LocalRefusal("--env is not NAME=VALUE")
         env[name] = value
-    credential = None
-    if args.credential_opencode_auth:
-        credential = from_opencode_auth(args.credential_opencode_auth, args.credential_provider)
-    elif args.credential_codex_profile:
-        credential = from_codex_profile(args.credential_codex_profile)
-    if credential is not None:
-        check_fresh(credential, args.deadline, args.credential_margin, now)
-    child_credential = None
-    if args.child_credential_opencode_auth:
-        child_credential = from_opencode_auth(args.child_credential_opencode_auth, args.child_credential_provider)
-    elif args.child_credential_codex_profile:
-        child_credential = from_codex_profile(args.child_credential_codex_profile)
-    if child_credential is not None:
-        check_fresh(child_credential, args.deadline, args.credential_margin, now)
     request = {
         "v": 1,
         "route": args.route,
@@ -269,14 +132,7 @@ def build_request(args, now):
         if args.child_max_concurrent is not None:
             children["max_concurrent"] = args.child_max_concurrent
         request["children"] = children
-    public = dict(request, credential=credential_public(credential, now))
-    if args.child_route:
-        public["child_credential"] = credential_public(child_credential, now)
-    if credential is not None:
-        request["credential"] = credential
-    if child_credential is not None:
-        request["child_credential"] = child_credential
-    return request, public
+    return request, dict(request)
 
 
 def parent_event(event):

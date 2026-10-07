@@ -1,39 +1,22 @@
 #!/usr/bin/python3 -I
-"""Linux native ACP v2 bounded privileged front door. Root-owned assets,
-site routes and requester identity determine launch; stdin v1 JSON supplies
-one task, cwd/policy/env/deadline, optional inline access-only credential.
-No requester credential path or raw native-root fields are read. A Claude
-route (`harness: claude`) takes no credential: Claude Code runs as the
-requester against the route's store below the requester's home, which this
-process names but never reads. A registered provider route (`harness:
-provider`) names a root-owned provider executable and its opaque settings;
-the Runner entry resolves, prepares and starts that provider's own resident
-harness, and the requester's tool policy reaches it as Runner's neutral
-tool policy. It takes no credential here.
+"""Linux native ACP v2 bounded privileged front door.
+
+Root-owned assets, registered-provider site routes and requester identity
+determine launch; stdin v1 JSON supplies task, cwd, policy, env and deadline.
+The entry negotiates describe, policy.evaluate and resident.prepare with
+external adapters. Their settings/environment/credentials stay adapter-owned.
+Registered children are explicit offers with bounded starts and concurrency.
 
 Nonblocking control/output queues keep timers independent of consumers.
 Early close/cancel arms a grace-relative kill; absent controls the backstop
-is N+2G. Admission and collection are bounded; kernel/FS stalls remain
-outside a finite guarantee. Descriptor-relative no-follow credential
-cleanup and fd-safe discard never traverse a work-replaced symlink.
-
+is N+2G. Admission and collection are bounded; kernel/FS stalls remain outside
+a finite guarantee. Run discard uses descriptor-safe removal.
 Native exit status or 90 refusal, 91 setup failure, 92 kill requested,
 93 stop/collection unknown, 94 cleanup/residue failed. No replay.
-Registered children (opt-in): the site names child routes, which parent
-routes may offer them and the ceilings; the requester picks among them.
-An OpenCode parent's children reuse its admitted grant; a Claude parent's
-take a separate access-only child-provider grant (never Claude's login).
-That grant is staged once per root (private/child-auth.json, each child's
-launch copies it) and normal-path retirement removes staged and derived copies, including
-children's, under keep or discard when cleanup succeeds. Unknown entry
-stop skips retirement; abrupt loss can leave copies until the stale-run
-sweep. Access-only expiry bounds their intended use window, not a
-universal deletion or provider-validity guarantee.
-
-Access-only staging avoids intentional credential echo, but arbitrary
-native/task output is unredacted and can contain secrets. Requester env
-uses the accepted denylist and reaches root Rust processes too. Full
-contract, limits and prepared ROOT operations: share/README.md.
+Physical entry wait permits package run cleanup; it does not establish logical
+settlement or root retirement eligibility. closed/7 (native87) retains the
+U112 ACKed-without-tagged-end boundary for later R3 controls.
+Task output is unredacted. Full contract and limits: share/README.md.
 """
 
 import ctypes
@@ -62,7 +45,6 @@ MESSAGE_LIMIT = 1024 * 1024
 ADMISSION_S = 30
 COLLECTION_S = 2
 OUTPUT_LIMIT = 8 * 1024 * 1024
-MAX_EXPIRY_MS = 253402300799000
 
 EXIT_REFUSED = 90
 EXIT_RUN_FAILED = 91
@@ -84,13 +66,6 @@ RUNNER = "bin/oulipoly-agent-runner"
 SUPERVISOR = "bin/oulipoly-root-supervisor"
 PID1 = "bin/oulipoly-root-pid1"
 ROOT_CHILD = "bin/oulipoly-root-child"
-DEPS = "opencode/deps"
-CLAUDE_DEPS = "claude/deps"
-NODE = "claude/node/bin/node"
-CLAUDE_EXECUTABLE = CLAUDE_DEPS + "/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude"
-CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
-CLAUDE_MODEL = re.compile(r"[A-Za-z0-9._\[\]-]{1,128}")
-BASH_TOOL = "agent-bash/bash.ts"
 BASH_BIN = "agent-bash/agent-bash"
 
 # Names a requester may not put in the root environment: it reaches the
@@ -102,21 +77,11 @@ UNSAFE_ENV = frozenset(
     MALLOC_TRACE NIS_PATH NLSPATH RESOLV_HOST_CONF RES_OPTIONS TMPDIR TZDIR
     HOME USER LOGNAME SHELL""".split()
 )
-UNSAFE_PREFIXES = ("LD_", "MALLOC_", "GLIBC_", "OULIPOLY_", "OPENCODE_", "AGENT_BASH_", "SUDO_")
+UNSAFE_PREFIXES = ("LD_", "MALLOC_", "GLIBC_", "OULIPOLY_", "AGENT_BASH_", "SUDO_")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 ENV_LIMIT = 64
 ENV_VALUE_LIMIT = 32 * 1024
 
-CREDENTIAL_FIELDS = frozenset({"type", "refresh", "access", "expires", "accountId"})
-CREDENTIAL_FILES = (
-    "private/auth.json",
-    "private/child-auth.json",
-    "launch/xdg/data/opencode/auth.json",
-    "launch/secret/server-password",
-)
-# Below each child's launch directory (`launch/children/c<N>`).
-CHILD_CREDENTIAL_FILES = ("xdg/data/opencode/auth.json", "secret/server-password")
-CHILD_LAUNCH = re.compile(r"c[0-9]{1,9}")
 # The owner's ceilings for this first child capability.
 CHILD_MAX_STARTS = 4
 CHILD_MAX_CONCURRENT = 2
@@ -220,15 +185,10 @@ def package_root():
 def check_package(root):
     check_owned(root)
     check_tree(root)
-    for name in (RUNNER, SUPERVISOR, PID1, ROOT_CHILD, BASH_BIN, NODE, CLAUDE_EXECUTABLE):
+    for name in (RUNNER, SUPERVISOR, PID1, ROOT_CHILD, BASH_BIN):
         path = os.path.join(root, name)
         if not os.path.isfile(path) or not os.access(path, os.X_OK):
             raise Refused(f"package: no executable {name}")
-    for name in (BASH_TOOL, DEPS + "/package-lock.json", CLAUDE_DEPS + "/package-lock.json"):
-        if not os.path.isfile(os.path.join(root, name)):
-            raise Refused(f"package: no {name}")
-
-
 # Site configuration: the administrator's, root-owned.
 
 
@@ -243,7 +203,7 @@ def load_site(path):
         raise Refused(f"site config {path}: {type(error).__name__}") from None
     known = {
         "v", "allowed_users", "run_base", "max_deadline_s", "cancel_grace_s",
-        "credential_margin_s", "allow_keep", "default_path", "routes",
+        "allow_keep", "default_path", "routes",
         "child_routes", "child_limits",
     }
     if not isinstance(site, dict) or site.get("v") != 1 or set(site) - known:
@@ -253,7 +213,7 @@ def load_site(path):
         raise Refused("site config: allowed_users")
     if not isinstance(site.get("run_base"), str) or not site["run_base"].startswith("/"):
         raise Refused("site config: run_base")
-    for name, default in (("max_deadline_s", 7200), ("cancel_grace_s", 30), ("credential_margin_s", 300)):
+    for name, default in (("max_deadline_s", 7200), ("cancel_grace_s", 30)):
         value = site.setdefault(name, default)
         if type(value) is not int or value < 1:
             raise Refused(f"site config: {name}")
@@ -265,14 +225,14 @@ def load_site(path):
     if not isinstance(routes, dict) or not routes:
         raise Refused("site config: routes")
     for name, route in routes.items():
-        if not (opencode_route(route) or claude_route(route) or provider_route(route)):
-            raise Refused(f"site config: route {name}")
+        if not provider_route(route):
+            raise Refused(f"site config: route {name}: expected registered provider shape")
     check_site_children(site)
     return site
 
 
 def check_site_children(site):
-    """`child_routes` (OpenCode or registered-provider routes a child may
+    """`child_routes` (registered-provider routes a child may
     run on), each parent route's `children` (the child routes it may offer)
     and `child_limits` (at most the owner's ceilings)."""
     child_routes = site.setdefault("child_routes", {})
@@ -282,7 +242,7 @@ def check_site_children(site):
         if (
             not isinstance(name, str)
             or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name)
-            or not (opencode_route(route) or provider_route(route))
+            or not provider_route(route)
             or "children" in route
         ):
             raise Refused(f"site config: child route {name}")
@@ -299,39 +259,6 @@ def check_site_children(site):
             raise Refused(f"site config: route {name} children")
 
 
-def opencode_route(route):
-    return (
-        isinstance(route, dict)
-        and not set(route) - {"model", "provider", "credential", "children"}
-        and isinstance(route.get("model"), str)
-        and "/" in route["model"]
-        and isinstance(route.get("provider"), dict)
-        and route["model"].split("/", 1)[0] in route["provider"]
-        and route.get("credential") in ("required", "none")
-    )
-
-
-def claude_route(route):
-    """A native Claude Code route: model, effort, and the requester's own
-    Claude configuration directory relative to its home. No credential."""
-    store = route.get("config_dir") if isinstance(route, dict) else None
-    return (
-        isinstance(route, dict)
-        and set(route) - {"children"} == {"harness", "model", "effort", "config_dir", "credential"}
-        and route["harness"] == "claude"
-        and isinstance(route["model"], str)
-        and CLAUDE_MODEL.fullmatch(route["model"]) is not None
-        and route["effort"] in CLAUDE_EFFORTS
-        and route["credential"] == "none"
-        and isinstance(store, str)
-        and store
-        and "\0" not in store
-        and not store.startswith("/")
-        and not os.path.normpath(store).startswith("..")
-        and os.path.normpath(store) != "."
-    )
-
-
 def provider_route(route):
     """A registered external provider route: the provider's absolute
     executable (root-owned custody is checked at each admission), its
@@ -345,9 +272,8 @@ def provider_route(route):
     env = route.get("env", {})
     config_root = route.get("config_root", "/")
     return (
-        not set(route) - {"harness", "executable", "settings", "config_root", "env", "credential", "children"}
-        and {"harness", "executable", "settings", "credential"} <= set(route)
-        and route["credential"] == "none"
+        not set(route) - {"harness", "executable", "settings", "config_root", "env", "children"}
+        and {"harness", "executable", "settings"} <= set(route)
         and isinstance(executable, str)
         and executable.startswith("/")
         and "\0" not in executable
@@ -407,8 +333,8 @@ def check_request(request, site, now):
     """Returns the checked request; refuses anything outside its shape."""
     if not isinstance(request, dict):
         raise Refused("request is not an object")
-    known = {"v", "route", "message", "cwd", "bash", "env", "deadline_s", "credential", "retention",
-             "children", "child_credential", "live"}
+    known = {"v", "route", "message", "cwd", "bash", "env", "deadline_s", "retention",
+             "children", "live"}
     if request.get("v") != 1:
         raise Refused("request: v must be 1")
     unknown = set(request) - known
@@ -450,8 +376,7 @@ def check_request(request, site, now):
     live = request.get("live", False)
     if type(live) is not bool:
         raise Refused("request: live must be true or false")
-    credential = check_credential(route, request.get("credential"), deadline, site, now)
-    children = check_children(route, request, credential, deadline, site, now)
+    children = check_children(route, request, site)
     return {
         "route_name": route_name,
         "route": route,
@@ -461,21 +386,15 @@ def check_request(request, site, now):
         "extra_env": request.get("env", {}),
         "deadline": deadline,
         "retention": retention,
-        "credential": credential,
         "children": children,
         "live": live,
     }
 
 
-def check_children(route, request, credential, deadline, site, now):
-    """The requester's opt-in to registered children, within what the site
-    lets this parent route offer, and the children's one grant; or None.
-    `credential` is the parent's checked one (an OpenCode parent's
-    children reuse it). Never Claude's login."""
+def check_children(route, request, site):
+    """Requester opt-in within the registered child offers and ceilings."""
     asked = request.get("children")
     if asked is None:
-        if "child_credential" in request:
-            raise Refused("request: child_credential without children")
         return None
     if not isinstance(asked, dict) or set(asked) - {"routes", "max_starts", "max_concurrent"}:
         raise Refused("request: children must be {routes, max_starts?, max_concurrent?}")
@@ -496,67 +415,7 @@ def check_children(route, request, credential, deadline, site, now):
             raise Refused(f"request: children.{key} must be 1..{ceiling}")
         limits[key] = value
     child_routes = {name: site["child_routes"][name] for name in names}
-    needs = {name: child["credential"] == "required" for name, child in child_routes.items()}
-    providers = {child["model"].split("/", 1)[0] for name, child in child_routes.items() if needs[name]}
-    if len(providers) > 1:
-        raise Refused("request: children's credential-requiring routes must share one provider")
-    grant = None
-    if providers:
-        (provider,) = providers
-        if route.get("harness") in ("claude", "provider"):
-            # A parent with no grant of its own: its children take a separate one.
-            if "child_credential" not in request:
-                raise Refused("request: this parent's children need child_credential (access-only, the child provider's)")
-            pseudo = {"model": provider + "/child", "credential": "required"}
-            grant = check_credential(pseudo, request["child_credential"], deadline, site, now)
-            grant = (grant[0], dict(grant[1], source="separate-child-grant"))
-        else:
-            if "child_credential" in request:
-                raise Refused("request: an OpenCode parent's children reuse its own grant; no child_credential")
-            if credential is None or set(credential[0]) != {provider}:
-                raise Refused(f"request: children need this route's own {provider} grant to reuse")
-            grant = (credential[0], dict(credential[1], source="reused-parent-grant"))
-    elif "child_credential" in request:
-        raise Refused("request: these child routes take no credential")
-    return {"routes": child_routes, **limits, "grant": grant}
-
-
-def check_credential(route, credential, deadline, site, now):
-    """An access-only OAuth entry for the route's provider, fresh enough
-    for the deadline and the site margin, or None. Reasons never carry any
-    part of it."""
-    if route["credential"] == "none":
-        if credential is not None:
-            raise Refused("request: this route takes no credential")
-        return None
-    provider = route["model"].split("/", 1)[0]
-    if not isinstance(credential, dict) or set(credential) != {provider}:
-        raise Refused(f"request: credential must be one {provider} entry")
-    entry = credential[provider]
-    if not isinstance(entry, dict) or set(entry) - CREDENTIAL_FIELDS:
-        raise Refused("request: credential has unknown fields")
-    if entry.get("type") != "oauth":
-        raise Refused("request: credential must be oauth")
-    if entry.get("refresh") != "":
-        raise Refused("request: credential carries a refresh grant; only access-only is accepted")
-    access = entry.get("access")
-    if not isinstance(access, str) or not access or len(access) > 16384 or any(c.isspace() for c in access):
-        raise Refused("request: credential access")
-    expires = entry.get("expires")
-    if type(expires) is not int or not 0 < expires <= MAX_EXPIRY_MS:
-        raise Refused("request: credential expires")
-    if "accountId" in entry and (not isinstance(entry["accountId"], str) or not entry["accountId"]):
-        raise Refused("request: credential accountId")
-    remaining = expires // 1000 - int(now)
-    needed = deadline + 2 * site["cancel_grace_s"] + COLLECTION_S + site["credential_margin_s"]
-    if remaining < needed:
-        raise Refused(f"request: credential expires in {remaining}s, needs {needed}s")
-    return {provider: dict(entry)}, {
-        "provider": provider,
-        "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(expires // 1000)),
-        "remaining_s": remaining,
-        "refresh": "absent",
-    }
+    return {"routes": child_routes, **limits}
 
 
 def root_env(user, site, extra):
@@ -635,64 +494,13 @@ def stale_runs(user_dir):
     return found
 
 
-def unlink_beneath(run, relative):
-    """No privileged traversal through work-replaceable symlinks. Each
-    directory is pinned by an fd; unlink affects only its own directory."""
-    fd = os.open(run, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    try:
-        parts = relative.split("/")
-        for part in parts[:-1]:
-            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
-            os.close(fd)
-            fd = child
-        os.unlink(parts[-1], dir_fd=fd)
-    finally:
-        os.close(fd)
-
-
-def child_credential_files(run):
-    """Each child launch's credential files (relative), found without
-    following a symlink; an unlistable children directory is a failure."""
-    names, failed = [], []
-    try:
-        fd = os.open(run, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        try:
-            for part in ("launch", "children"):
-                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
-                os.close(fd)
-                fd = child
-            entries = os.listdir(fd)
-        finally:
-            os.close(fd)
-    except FileNotFoundError:
-        return names, failed
-    except OSError as error:
-        return names, [{"path": os.path.join(run, "launch/children"), "result": "FAILED", "error": type(error).__name__}]
-    for entry in sorted(entries):
-        if CHILD_LAUNCH.fullmatch(entry):
-            names += [f"launch/children/{entry}/{name}" for name in CHILD_CREDENTIAL_FILES]
-    return names, failed
-
-
-def remove_credentials(run):
-    child_files, records = child_credential_files(run)
-    for name in CREDENTIAL_FILES + tuple(child_files):
-        path = os.path.join(run, name)
-        try:
-            unlink_beneath(run, name)
-            records.append({"path": path, "result": "removed"})
-        except FileNotFoundError:
-            records.append({"path": path, "result": "absent"})
-        except OSError as error:
-            records.append({"path": path, "result": "FAILED", "error": type(error).__name__})
-    return {"ok": all(record["result"] != "FAILED" for record in records), "files": records}
-
-
 def retire(run, retention):
-    """Removes credential files, then the run if it is discarded."""
-    credentials = remove_credentials(run)
+    """Clean package scratch after physical entry termination, not logical settlement.
+    Adapter-owned state is retained with the run under keep, discarded with it
+    under discard. This layer knows no adapter credential paths or semantics.
+    """
     removed = None
-    if retention == "discard" and credentials["ok"]:
+    if retention == "discard":
         try:
             if not shutil.rmtree.avoids_symlink_attacks:
                 raise OSError("descriptor-safe tree removal unavailable")
@@ -700,8 +508,7 @@ def retire(run, retention):
             removed = True
         except OSError as error:
             removed = type(error).__name__
-    return {"ok": credentials["ok"] and (retention != "discard" or removed is True),
-            "credentials": credentials, "run_removed": removed}
+    return {"ok": retention != "discard" or removed is True, "run_removed": removed}
 
 
 def sweep(user_dir):
@@ -745,11 +552,7 @@ def write_private(path, value):
 
 
 def child_route_request(package, child):
-    """A child route as the entry takes it: an OpenCode model and provider,
-    or a registered provider (opaque settings and environment, the
-    package's Bash requester; its tool policy is always the parent's)."""
-    if child.get("harness") != "provider":
-        return {"model": child["model"], "provider": child["provider"]}
+    """Registered child with opaque settings/env and the generic Bash requester."""
     registered = {
         "executable": child["executable"],
         "settings": child["settings"],
@@ -770,18 +573,10 @@ def children_request(package, run, checked):
         "max_starts": children["max_starts"],
         "max_concurrent": children["max_concurrent"],
     }
-    if any(child.get("harness") != "provider" for child in children["routes"].values()):
-        value["opencode"] = {
-            "deps": os.path.join(package, DEPS),
-            "agent_bash_tool": os.path.join(package, BASH_TOOL),
-            "agent_bash_bin": os.path.join(package, BASH_BIN),
-        }
-    if children["grant"] is not None:
-        value["auth"] = os.path.join(run, "private", "child-auth.json")
     return {"children": value}
 
 
-def entry_request(package, run, user, checked, env, authenticated):
+def entry_request(package, run, user, checked, env):
     route = checked["route"]
     common = {
         "store": os.path.join(run, "store"),
@@ -794,41 +589,18 @@ def entry_request(package, run, user, checked, env, authenticated):
         "workload": {"isolation": "host-root", "user": user.pw_name},
         **children_request(package, run, checked),
     }
-    if route.get("harness") == "provider":
-        provider = {
-            "executable": route["executable"],
-            "settings": route["settings"],
-            "env": route.get("env", {}),
-            "agent_bash_bin": os.path.join(package, BASH_BIN),
-            **checked["policy"],
-        }
-        if "config_root" in route:
-            provider["config_root"] = route["config_root"]
-        if common.get("children", {}).get("routes"):
-            provider["root_child_bin"] = os.path.join(package, ROOT_CHILD)
-        return dict(common, provider=provider)
-    if route.get("harness") == "claude":
-        # Named only: the requester's own store, never read here.
-        return dict(common, claude={
-            "deps": os.path.join(package, CLAUDE_DEPS),
-            "node": os.path.join(package, NODE),
-            "agent_bash_bin": os.path.join(package, BASH_BIN),
-            "model": route["model"],
-            "effort": route["effort"],
-            "config_dir": os.path.normpath(os.path.join(user.pw_dir, route["config_dir"])),
-            **checked["policy"],
-        })
-    opencode = {
-        "deps": os.path.join(package, DEPS),
-        "agent_bash_tool": os.path.join(package, BASH_TOOL),
+    provider = {
+        "executable": route["executable"],
+        "settings": route["settings"],
+        "env": route.get("env", {}),
         "agent_bash_bin": os.path.join(package, BASH_BIN),
-        "model": route["model"],
-        "provider": route["provider"],
         **checked["policy"],
     }
-    if authenticated:
-        opencode["auth"] = os.path.join(run, "private", "auth.json")
-    return dict(common, opencode=opencode)
+    if "config_root" in route:
+        provider["config_root"] = route["config_root"]
+    if common.get("children", {}).get("routes"):
+        provider["root_child_bin"] = os.path.join(package, ROOT_CHILD)
+    return dict(common, provider=provider)
 
 
 # Containment: the entry is PID 1 of a fresh PID and mount namespace.
@@ -933,7 +705,6 @@ class Relay:
         self.stdin_buffer = b""
         self.out_buffer = b""
         self.out_eof = False
-        self.staged_removed = None
         self.signals = []
         self.output = b""
         self.controls = b""
@@ -1020,25 +791,6 @@ class Relay:
                 if self.owed_async == 0 and self.close_waiting:
                     self.close_waiting = False
                     self.arm_close()
-        if self.staged_removed is None and b'"setup-completed"' in line:
-            try:
-                value = json.loads(line)
-            except ValueError:
-                value = None
-            if isinstance(value, dict) and value.get("entry") == "setup-completed":
-                self.remove_staged()
-
-    def remove_staged(self):
-        path = os.path.join(self.run, CREDENTIAL_FILES[0])
-        try:
-            unlink_beneath(self.run, CREDENTIAL_FILES[0])
-            self.staged_removed = "removed"
-        except FileNotFoundError:
-            self.staged_removed = "absent"
-        except OSError as error:
-            self.staged_removed = type(error).__name__
-        self.say({"frontdoor": "staged-credential", "result": self.staged_removed})
-
     def requester_line(self, line):
         value = control(line)
         if value is None:
@@ -1562,7 +1314,6 @@ def live_daemon(package, site, checked, run_id, run_dir, request_path, user, lis
         "entry_status": status,
         "killed": relay.killed,
         "cancel": relay.why,
-        "staged_credential": relay.staged_removed,
         "retire": retired,
         "collection_errors": relay.collection_errors,
         "exit": code,
@@ -1689,23 +1440,17 @@ def admit(argv, environ, stdin_fd, now):
         check_provider_executable(child)
     env = root_env(user, site, checked["extra_env"])
     check_cwd_as(user, checked["cwd"])
-    if checked["credential"] is not None:
-        checked["credential"] = check_credential(checked["route"], checked["credential"][0], checked["deadline"], site, time.time())
     return package, site, user, checked, env, rest
 
 
 def harness_report(route):
-    """The admitted line's harness fields: a provider route's executable and
-    the digest of its opaque settings, else the embedded harness's model."""
-    harness = route.get("harness", "opencode")
-    if harness == "provider":
-        settings = json.dumps(route["settings"], sort_keys=True, separators=(",", ":")).encode()
-        return {"harness": harness, "model": None, "provider": {
-            "executable": route["executable"],
-            "settings_sha256": hashlib.sha256(settings).hexdigest(),
-            "resolved_by": "the entry: provider describe, policy.evaluate, resident.prepare",
-        }}
-    return {"harness": harness, "model": route["model"]}
+    """Executable and opaque settings digest for build/audit provenance only."""
+    settings = json.dumps(route["settings"], sort_keys=True, separators=(",", ":")).encode()
+    return {"harness": "provider", "provider": {
+        "executable": route["executable"],
+        "settings_sha256": hashlib.sha256(settings).hexdigest(),
+        "resolved_by": "the entry: provider describe, policy.evaluate, resident.prepare",
+    }}
 
 
 def run_locked(argv, environ, stdin_fd=0):
@@ -1718,12 +1463,7 @@ def run_locked(argv, environ, stdin_fd=0):
         emit({"frontdoor": "terminal", "stage": "refused", "reason": type(error).__name__, "effects": "none"})
         return EXIT_REFUSED
 
-    credential, credential_public = checked["credential"] or (None, None)
-    checked["credential"] = None
     children = checked["children"]
-    child_grant, child_public = (children or {}).get("grant") or (None, None)
-    if children is not None:
-        children["grant"] = (None, child_public) if child_grant is not None else None
     try:
         allocate = make_live_run if checked["live"] else make_run
         run_id, run_dir, lock, swept = allocate(site, user)
@@ -1743,15 +1483,8 @@ def run_locked(argv, environ, stdin_fd=0):
     try:
         try:
             write_private(os.path.join(run_dir, "private", "retention"), checked["retention"])
-            if credential is not None:
-                write_private(os.path.join(run_dir, "private", "auth.json"), credential)
-            if child_grant is not None:
-                # One snapshot for the root's life; retired with the run.
-                write_private(os.path.join(run_dir, "private", "child-auth.json"), child_grant)
-                child_grant = None
             request_path = os.path.join(run_dir, "private", "request.json")
-            write_private(request_path, entry_request(package, run_dir, user, checked, env, credential is not None))
-            credential = None
+            write_private(request_path, entry_request(package, run_dir, user, checked, env))
         except OSError as error:
             raise RunFailed(f"run setup: {type(error).__name__}") from None
         emit({
@@ -1763,17 +1496,13 @@ def run_locked(argv, environ, stdin_fd=0):
             **harness_report(checked["route"]),
             "bash": "trusted-task" if "bash_authority" in checked["policy"] else {"allow": checked["policy"]["bash_allow"]},
             "env_names": sorted(env),
-            "credential": credential_public,
             "children": None if children is None else {
                 "routes": sorted(children["routes"]),
-                "models": {name: child["model"] for name, child in children["routes"].items() if "model" in child},
                 "providers": {name: harness_report(child)["provider"] for name, child in children["routes"].items()
                               if child.get("harness") == "provider"},
                 "max_starts": children["max_starts"],
                 "max_concurrent": children["max_concurrent"],
                 "depth": 1,
-                "credential": child_public,
-                "credential_copies": "private/child-auth.json once; each child's launch copies it; normal-path cleanup on known entry end; unknown stop or abrupt loss defers to sweep",
             },
             "deadline_s": checked["deadline"],
             "cancel_grace_s": site["cancel_grace_s"],
@@ -1782,14 +1511,6 @@ def run_locked(argv, environ, stdin_fd=0):
                            + ("; live: this process detaches as the root's owning supervisor" if checked["live"] else ""),
             "live": checked["live"],
         })
-        if credential_public is not None:
-            # Setup elapsed since admission; recheck just before native launch.
-            with open(os.path.join(run_dir, "private", "auth.json")) as file:
-                check_credential(checked["route"], json.load(file), checked["deadline"], site, time.time())
-        if child_public is not None:
-            with open(os.path.join(run_dir, "private", "child-auth.json")) as file:
-                staged = json.load(file)
-            check_credential({"model": child_public["provider"] + "/child", "credential": "required"}, staged, checked["deadline"], site, time.time())
         if checked["live"]:
             return open_live(package, site, checked, run_id, run_dir, request_path, user)
         try:
@@ -1815,8 +1536,7 @@ def run_locked(argv, environ, stdin_fd=0):
             "entry_status": status,
             "killed": relay.killed,
             "cancel": relay.why,
-            "staged_credential": relay.staged_removed,
-            "retire": retired,
+                "retire": retired,
             "swept": swept,
             "collection_errors": relay.collection_errors,
             "exit": code,
