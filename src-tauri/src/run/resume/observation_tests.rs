@@ -1368,3 +1368,203 @@ fn native_receipt_survives_projection_fault_and_recovers_without_replay() {
     );
     assert!(row.delivered_at.is_some());
 }
+
+// Offline providers replace their configured artifact at the exact producer /
+// consumer window identified in the independent source trace. No timing race.
+#[cfg(target_os = "linux")]
+fn refresh_receipt_fixture(
+    rewrite_during_page: bool,
+) -> (
+    Fixture,
+    oulipoly_runtime::provider_registry::ProviderRegistry,
+    std::path::PathBuf,
+    oulipoly_provider::client::ProviderClient,
+) {
+    use oulipoly_config::{ProviderEndpointConfig, ProviderEntry, ProvidersConfig};
+    use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = Fixture::new();
+    f.anchor.provider_instance_id = "fixture-instance".into();
+    f.anchored_submit();
+    let path = f.root.path().join("reader");
+    let staged = f.root.path().join("replacement");
+    let log = f.root.path().join("reader.log");
+    let body = |generation: &str, fault: &str| {
+        format!(
+            r#"#!/usr/bin/env python3
+import json, os, sys
+r = json.load(sys.stdin)
+sub = sys.argv[1]
+with open({log}, 'a') as f: f.write('{generation} ' + sub + '\n')
+if sub == 'describe':
+    {describe_fault}
+    result = {{'provider_id':'fixture','display_name':'Fixture', 'contract_versions':[r['contract']], 'preferred_contract':r['contract'], 'capabilities':{{'launch':False,'policy':False,'quota':False,'session':True,'session_turn_pages_v1':True,'terminal':False,'rotation':False,'discovery':False,'settings':False,'setup_brain':False,'setup':False,'migration':False}}}}
+else:
+    assert sub == 'session.read_turns'
+    {page_fault}
+    p = r['params']
+    result = {{'read_protocol':'oulipoly.session_turn_pages/v1','provider_instance_id':r['provider_instance_id'],'settings_id':p['settings_id'],'session_id':p['session_id'],'turn_projection':'user_observation','snapshot_id':'fixture-snapshot','page_index':0,'page_start_sequence':0,'turns':[],'page_turn_count':0,'source_bytes_examined':0,'scan_progress':False,'snapshot_complete':True,'next_page_token':None,'resume_token':'fixture-tail','source_final':False,'warnings':[]}}
+print(json.dumps({{'contract':r['contract'],'request_id':r['request_id'],'ok':True,'result':result}}))
+"#,
+            log = serde_json::to_string(&log).unwrap(),
+            describe_fault = if fault == "atomic" {
+                format!(
+                    "os.replace({}, {})",
+                    serde_json::to_string(&staged).unwrap(),
+                    serde_json::to_string(&path).unwrap()
+                )
+            } else {
+                "pass".into()
+            },
+            page_fault = if fault == "rewrite" {
+                format!(
+                    "open({}, 'wb').write(open({}, 'rb').read())",
+                    serde_json::to_string(&path).unwrap(),
+                    serde_json::to_string(&staged).unwrap()
+                )
+            } else {
+                "pass".into()
+            },
+        )
+    };
+    std::fs::write(&staged, body("B", "none")).unwrap();
+    std::fs::write(
+        &path,
+        body(
+            "A",
+            if rewrite_during_page {
+                "rewrite"
+            } else {
+                "atomic"
+            },
+        ),
+    )
+    .unwrap();
+    for file in [&path, &staged] {
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // An independent retained pin lets the oracle compare the persisted label
+    // with A's actual file after rename, including its post-rename metadata.
+    let forensic = oulipoly_provider::client::ProviderClient::new(
+        oulipoly_provider::resolver::ProviderArtifactRef::Path { path: path.clone() },
+        oulipoly_provider::client::ProviderClientOptions::default(),
+    );
+    let held = forensic
+        .fork_from_pinned(forensic.options().clone())
+        .unwrap();
+    let registry = ProviderRegistry::from_configs(
+        &[],
+        &ProvidersConfig {
+            entries: std::collections::HashMap::from([(
+                "account".into(),
+                ProviderEntry {
+                    implementation: Some(ProviderEndpointConfig {
+                        family: "fixture".into(),
+                        executable: path.display().to_string(),
+                    }),
+                    settings_id: Some("settings".into()),
+                    ..Default::default()
+                },
+            )]),
+        },
+        ProviderRegistryOptions::default(),
+    )
+    .unwrap();
+    (f, registry, log, held)
+}
+
+#[cfg(target_os = "linux")]
+fn refresh_receipt_visit(
+    f: &Fixture,
+    registry: &oulipoly_runtime::provider_registry::ProviderRegistry,
+) -> Result<bool, String> {
+    crate::native_receipt::confirm_delivery_observation_bounded(
+        &f.db,
+        &f.attempt,
+        registry,
+        SessionProviderIdentity {
+            model_name: "fixture".into(),
+            provider_name: "account".into(),
+            provider_instance_id: Some("fixture-instance".into()),
+            settings_id: "settings".into(),
+        },
+        f.root.path(),
+        &f.anchor,
+        1,
+        Duration::from_secs(5),
+    )
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn refresh_receipt_page_executes_the_reader_that_labels_this_visit() {
+    let (f, registry, log, held) = refresh_receipt_fixture(false);
+    assert!(!refresh_receipt_visit(&f, &registry).unwrap());
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "A describe\nA session.read_turns\n"
+    );
+    let first: serde_json::Value = serde_json::from_str(
+        &f.db
+            .delivery_observation_progress(&f.attempt)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first["complete"], true);
+    assert_eq!(
+        first["reader_identity"],
+        held.pinned_executable_identity_sha256().unwrap()
+    );
+    assert!(!refresh_receipt_visit(&f, &registry).unwrap());
+    let next: serde_json::Value = serde_json::from_str(
+        &f.db
+            .delivery_observation_progress(&f.attempt)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_ne!(first["reader_identity"], next["reader_identity"]);
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "A describe\nA session.read_turns\nB describe\nB session.read_turns\n"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn refresh_receipt_same_inode_rewrite_does_not_advance_old_reader_evidence() {
+    let (f, registry, log, _held) = refresh_receipt_fixture(true);
+    let error = refresh_receipt_visit(&f, &registry).unwrap_err();
+    assert!(error.contains("receipt_reader_changed"), "{error}");
+    let stored: serde_json::Value = serde_json::from_str(
+        &f.db
+            .delivery_observation_progress(&f.attempt)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stored["complete"], false);
+    assert_eq!(stored["page_index"], 0);
+    assert_eq!(stored["matching_turns"], 0);
+    assert!(
+        f.db.delivery_observation_confirmation(&f.attempt)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!refresh_receipt_visit(&f, &registry).unwrap());
+    let next: serde_json::Value = serde_json::from_str(
+        &f.db
+            .delivery_observation_progress(&f.attempt)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_ne!(stored["reader_identity"], next["reader_identity"]);
+    assert_eq!(next["complete"], true);
+    assert!(
+        std::fs::read_to_string(log)
+            .unwrap()
+            .ends_with("B describe\nB session.read_turns\n")
+    );
+}

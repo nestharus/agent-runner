@@ -1,8 +1,9 @@
 use super::enumerate;
 use super::locate;
 use super::provider_client::{
-    invoke_session, provider_client, session_client, session_client_with_cancellation,
-    session_enumerate_client, session_page_client,
+    invoke_session, provider_client, session_client, session_client_from_endpoint,
+    session_client_with_cancellation, session_enumerate_client, session_page_client,
+    session_page_client_from_endpoint,
 };
 use super::request::{
     base_request, capture_extra, enumerate_request, lifecycle_extra, live_capture_extra,
@@ -16,7 +17,7 @@ use super::types::{
     SessionProviderLocateRequest, SessionProviderLocatedTranscript, SessionProviderReadPageRequest,
     SessionProviderReadPageResult,
 };
-use crate::provider_registry::DescribeHostOptions;
+use crate::provider_registry::{DescribeHostOptions, PinnedProviderEndpoint};
 use crate::session_metadata::LocatedTranscript;
 use oulipoly_provider::client::CancellationToken;
 use oulipoly_provider::client::ProviderClient;
@@ -85,9 +86,32 @@ pub fn read_turn_page(
         request.cancellation,
         request.timeout,
     )?;
+    read_turn_page_with_client(&client, request)
+}
+
+/// Read a page using the endpoint acquired for this bounded operation.
+/// Long-lived registry-backed paging continues to use `read_turn_page`.
+pub fn read_turn_page_from_endpoint(
+    endpoint: &PinnedProviderEndpoint,
+    request: SessionProviderReadPageRequest<'_>,
+) -> Result<SessionProviderReadPageResult, SessionProviderError> {
+    let client = session_page_client_from_endpoint(
+        request.registry,
+        endpoint,
+        &request.identity,
+        request.cancellation,
+        request.timeout,
+    )?;
+    read_turn_page_with_client(&client, request)
+}
+
+fn read_turn_page_with_client(
+    client: &ProviderClient,
+    request: SessionProviderReadPageRequest<'_>,
+) -> Result<SessionProviderReadPageResult, SessionProviderError> {
     let built = page_request(&request)?;
     let result =
-        invoke_session::<SessionReadTurnsResult>(&client, "session.read_turns", built.value)?;
+        invoke_session::<SessionReadTurnsResult>(client, "session.read_turns", built.value)?;
     let captured_response_bytes = client.last_diagnostics().stdout.captured_len;
     turns::map_read_page_result(
         result,
@@ -146,8 +170,23 @@ pub fn capture_for_lifecycle(
     context: &SessionProviderLifecycleContext<'_>,
 ) -> Result<SessionProviderCaptureResult, SessionProviderError> {
     let client = session_client(context.registry, &context.identity)?;
+    capture_for_lifecycle_with_client(&client, context)
+}
+
+pub(crate) fn capture_for_lifecycle_from_endpoint(
+    endpoint: &PinnedProviderEndpoint,
+    context: &SessionProviderLifecycleContext<'_>,
+) -> Result<SessionProviderCaptureResult, SessionProviderError> {
+    let client = session_client_from_endpoint(context.registry, endpoint, &context.identity, None)?;
+    capture_for_lifecycle_with_client(&client, context)
+}
+
+fn capture_for_lifecycle_with_client(
+    client: &ProviderClient,
+    context: &SessionProviderLifecycleContext<'_>,
+) -> Result<SessionProviderCaptureResult, SessionProviderError> {
     capture_with_client(
-        &client,
+        client,
         &context.identity,
         context.effective_cwd,
         context.registry.host_options(),

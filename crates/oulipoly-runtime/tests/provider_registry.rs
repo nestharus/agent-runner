@@ -1836,7 +1836,7 @@ fn assert_lifecycle_provider_registry_refs_are_s7a_only(lifecycle_source: &str) 
             ".provider_registry",
             ".ok_or_else(external_provider_registry_unavailable)?",
             "registry: &'a crate::provider_registry::ProviderRegistry,",
-            "registry: &crate::provider_registry::ProviderRegistry,",
+            "endpoint: &crate::provider_registry::PinnedProviderEndpoint,",
             ".map_err(|error| external_provider_registry_error(error.to_string()))?;",
             "fn external_provider_registry_error(message: String) -> ServiceError {",
             "fn external_provider_registry_unavailable() -> ServiceError {",

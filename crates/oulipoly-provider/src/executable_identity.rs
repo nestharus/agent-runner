@@ -20,6 +20,16 @@ impl IdentityCache {
             .is_some_and(|(previous, _)| *previous == stamp))
     }
 
+    pub fn unchanged_for_identity(&self, file: &File, identity: &str) -> Result<bool, String> {
+        let current = stamp(file)?;
+        Ok(self
+            .0
+            .lock()
+            .map_err(|e| e.to_string())?
+            .as_ref()
+            .is_some_and(|(previous, digest)| *previous == current && digest == identity))
+    }
+
     pub fn digest(&self, pinned: &File) -> Result<String, String> {
         let before = stamp(pinned)?;
         let mut cache = self.0.lock().map_err(|e| e.to_string())?;
@@ -177,10 +187,12 @@ mod tests {
         let cache = IdentityCache::default();
         let initial = cache.digest(&file).unwrap();
         assert!(cache.unchanged(&file).unwrap());
+        assert!(cache.unchanged_for_identity(&file, &initial).unwrap());
         assert_eq!(initial, cache.digest(&file).unwrap());
         // A hit is actually cached, not an equal fresh hash: poison only the
         // cached result, then require that hit. Never used by production code.
         cache.0.lock().unwrap().as_mut().unwrap().1 = "cache-hit".into();
+        assert!(!cache.unchanged_for_identity(&file, &initial).unwrap());
         assert_eq!(cache.digest(&file).unwrap(), "cache-hit");
         file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(b"different-version-and-length").unwrap();

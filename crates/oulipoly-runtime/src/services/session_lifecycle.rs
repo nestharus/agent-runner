@@ -163,10 +163,14 @@ fn capture_external_provider_session(
         .provider_registry
         .ok_or_else(external_provider_registry_unavailable)?
         .current();
-    let identity = authenticated_external_provider_identity(registry.as_ref(), request.identity)?;
+    let endpoint = registry
+        .preflight_account(&request.identity.provider_name)
+        .map_err(|error| external_provider_registry_error(error.to_string()))?;
+    let identity = authenticated_external_provider_identity(endpoint.as_ref(), request.identity)?;
     let context = external_provider_context(&request, registry.as_ref(), identity.clone());
-    let capture = session_provider::capture_for_lifecycle(&context)
-        .map_err(|error| external_provider_service_error(S7A_CAPTURE_SUBCOMMAND, error))?;
+    let capture =
+        session_provider::capture_for_lifecycle_from_endpoint(endpoint.as_ref(), &context)
+            .map_err(|error| external_provider_service_error(S7A_CAPTURE_SUBCOMMAND, error))?;
     Ok(ExternalProviderCapture {
         provider_session_id: capture.provider_session_id,
         identity,
@@ -240,12 +244,9 @@ fn external_provider_context<'a>(
 }
 
 fn authenticated_external_provider_identity(
-    registry: &crate::provider_registry::ProviderRegistry,
+    endpoint: &crate::provider_registry::PinnedProviderEndpoint,
     requested: &SessionServiceExternalProviderIdentity,
 ) -> Result<SessionProviderIdentity, ServiceError> {
-    let endpoint = registry
-        .preflight_account(&requested.provider_name)
-        .map_err(|error| external_provider_registry_error(error.to_string()))?;
     let settings_id = endpoint
         .settings_id()
         .map_err(|error| external_provider_registry_error(error.to_string()))?;

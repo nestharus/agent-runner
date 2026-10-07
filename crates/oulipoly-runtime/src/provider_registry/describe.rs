@@ -1,4 +1,4 @@
-use super::{ProviderClientFactory, ProviderRegistryError};
+use super::ProviderRegistryError;
 use oulipoly_provider::client::{ProviderClient, ProviderEnv};
 use oulipoly_provider::error::ProviderClientError;
 use oulipoly_provider::generated::{
@@ -7,7 +7,6 @@ use oulipoly_provider::generated::{
     HOST_PROMPT_ACCEPTANCE_V1_ENV_VALUE, HOST_SESSION_TURN_PAGES_V1_ENV,
     HOST_SESSION_TURN_PAGES_V1_ENV_VALUE, HostContext,
 };
-use oulipoly_provider::resolver::ProviderArtifactRef;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -16,15 +15,6 @@ use std::path::PathBuf;
 pub struct DescribeHostOptions {
     pub config_root: Option<PathBuf>,
     pub data_root: Option<PathBuf>,
-}
-
-pub fn describe_provider(
-    factory: &ProviderClientFactory,
-    artifact: ProviderArtifactRef,
-    host_options: &DescribeHostOptions,
-) -> Result<DescribeResult, ProviderRegistryError> {
-    let client = factory.client_for(artifact);
-    describe_provider_client(&client, host_options)
 }
 
 pub(crate) fn describe_provider_client(

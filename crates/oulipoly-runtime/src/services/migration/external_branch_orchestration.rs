@@ -4,12 +4,14 @@
 use super::error_formatter;
 use super::external_identity_accessor;
 use crate::provider_registry::ProviderRegistryHandle;
-use crate::rotation_domain::ExternalRotationIdentity;
+use crate::rotation_external_provider::ExternalRotationProviderOperation;
 use crate::services::{MigrationServiceRequest, ServiceError};
 
 pub(super) enum MigrationBranch {
     BuiltIn,
-    External { identity: ExternalRotationIdentity },
+    External {
+        identity: ExternalRotationProviderOperation,
+    },
 }
 
 pub(super) fn model_declares_external_provider(

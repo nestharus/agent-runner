@@ -6,7 +6,7 @@
 use oulipoly_provider::client::CancellationToken;
 use oulipoly_runtime::session_provider::{
     SessionProviderIdentity, SessionProviderPageCursor, SessionProviderReadPageRequest,
-    SessionProviderTurnProjection, read_turn_page,
+    SessionProviderTurnProjection, read_turn_page_from_endpoint,
 };
 use oulipoly_state::mailbox::{MailboxDb, MailboxDeliveryObservationAnchor};
 use std::time::{Duration, Instant};
@@ -129,6 +129,9 @@ pub(crate) fn confirm_delivery_observation_bounded(
     }
     // Existing pinned-client identity, not a provider version-string claim. A
     // changed adapter cannot inherit weaker cached matches or later cursors.
+    // The held endpoint binds atomic replacement. Metadata checks below refuse
+    // detectable in-place rewrites; they cannot prove byte immutability across
+    // arbitrary concurrent writers or external dependencies of a wrapper.
     let reader_identity = endpoint.client().pinned_executable_identity_sha256()?;
     let cancellation = CancellationToken::new();
     observe_delivery_for_revision_typed_with(
@@ -141,24 +144,37 @@ pub(crate) fn confirm_delivery_observation_bounded(
         // page opportunity. This is a page budget, not an end-to-end deadline.
         budget,
         &reader_identity,
+        || {
+            if endpoint
+                .client()
+                .pinned_executable_identity_unchanged(&reader_identity)?
+            {
+                Ok(())
+            } else {
+                Err("receipt_reader_changed: retained executable was rewritten; checkpoint not advanced".into())
+            }
+        },
         |cursor, page_index, turn_sequence, remaining| {
-            read_turn_page(SessionProviderReadPageRequest {
-                registry,
-                identity: identity.clone(),
-                session_id: &anchor.provider_session_id,
-                effective_cwd: Some(effective_cwd),
-                projection: SessionProviderTurnProjection::UserObservation,
-                expected_delivery_nonce: Some(attempt_id),
-                cursor,
-                expected_page_index: page_index,
-                expected_turn_sequence: turn_sequence,
-                max_turns: OBSERVATION_MAX_TURNS,
-                max_response_bytes: OBSERVATION_MAX_RESPONSE_BYTES,
-                max_source_bytes: OBSERVATION_MAX_SOURCE_BYTES,
-                max_inline_body_bytes: DELIVERY_OBSERVATION_MAX_INLINE_BODY_BYTES,
-                cancellation: &cancellation,
-                timeout: remaining.min(OBSERVATION_TIMEOUT),
-            })
+            read_turn_page_from_endpoint(
+                endpoint.as_ref(),
+                SessionProviderReadPageRequest {
+                    registry,
+                    identity: identity.clone(),
+                    session_id: &anchor.provider_session_id,
+                    effective_cwd: Some(effective_cwd),
+                    projection: SessionProviderTurnProjection::UserObservation,
+                    expected_delivery_nonce: Some(attempt_id),
+                    cursor,
+                    expected_page_index: page_index,
+                    expected_turn_sequence: turn_sequence,
+                    max_turns: OBSERVATION_MAX_TURNS,
+                    max_response_bytes: OBSERVATION_MAX_RESPONSE_BYTES,
+                    max_source_bytes: OBSERVATION_MAX_SOURCE_BYTES,
+                    max_inline_body_bytes: DELIVERY_OBSERVATION_MAX_INLINE_BODY_BYTES,
+                    cancellation: &cancellation,
+                    timeout: remaining.min(OBSERVATION_TIMEOUT),
+                },
+            )
             .map_err(|error| {
                 classify_observation_failure(db, &anchor.provider_session_id, attempt_id, error)
             })
@@ -244,6 +260,7 @@ pub(crate) fn observe_delivery_stale_fixture_with(
         OBSERVATION_MAX_PAGES,
         OBSERVATION_DEADLINE,
         "offline-fixture-v1",
+        || Ok(()),
         move |cursor, page_index, turn_sequence, remaining| {
             read(cursor, page_index, turn_sequence, remaining).map_err(|stale| {
                 if stale {
@@ -285,6 +302,7 @@ pub(crate) fn observe_delivery_for_revision_with(
         max_pages,
         budget,
         reader_identity,
+        || Ok(()),
         move |cursor, page_index, turn_sequence, remaining| {
             read(cursor, page_index, turn_sequence, remaining)
                 .map_err(ObservationReadFailure::other)
@@ -300,6 +318,7 @@ fn observe_delivery_for_revision_typed_with(
     max_pages: usize,
     budget: Duration,
     reader_identity: &str,
+    validate_reader: impl Fn() -> Result<(), String>,
     mut read: impl FnMut(
         SessionProviderPageCursor,
         u64,
@@ -311,6 +330,7 @@ fn observe_delivery_for_revision_typed_with(
     >,
 ) -> Result<bool, String> {
     ensure_observation_not_stopped(db, &anchor.provider_session_id)?;
+    validate_reader()?;
     if db.delivery_observation_confirmation(attempt_id)?.is_some() {
         return Ok(true);
     }
@@ -340,16 +360,19 @@ fn observe_delivery_for_revision_typed_with(
             ..Default::default()
         };
         let next = serde_json::to_string(&progress).map_err(|e| e.to_string())?;
+        validate_reader()?;
         db.advance_delivery_observation_progress(attempt_id, stored.as_deref(), &next)?;
         stored = Some(next);
     }
     let mut pages_read = 0usize;
     while pages_read < max_pages {
+        validate_reader()?;
         if progress.matching_turns > 1 {
             return Ok(false);
         }
         if progress.complete {
             if progress.matching_turns == 1 {
+                validate_reader()?;
                 return db.confirm_native_delivery_receipt(
                     attempt_id,
                     &owner,
@@ -437,6 +460,10 @@ fn observe_delivery_for_revision_typed_with(
                 return Err(error.diagnostic);
             }
         };
+        validate_reader().map_err(|error| {
+            let _ = db.record_delivery_observation_error(attempt_id, &error);
+            error
+        })?;
         pages_read += 1;
         if page.provider_instance_id != anchor.provider_instance_id
             || page.settings_id != anchor.settings_id
@@ -483,10 +510,12 @@ fn observe_delivery_for_revision_typed_with(
             );
         }
         let next = serde_json::to_string(&progress).map_err(|err| err.to_string())?;
+        validate_reader()?;
         db.advance_delivery_observation_progress(attempt_id, stored.as_deref(), &next)?;
         stored = Some(next);
         if progress.complete {
             if progress.matching_turns == 1 {
+                validate_reader()?;
                 return db.confirm_native_delivery_receipt(
                     attempt_id,
                     &owner,
