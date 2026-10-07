@@ -141,6 +141,7 @@ pub(crate) fn owe_async(views: &Views, tx: &Sender<Event>, position: usize, work
         "work": work,
         "harness": harness,
         "owed_async": owed,
+        "scope": "current-owner-generation",
         "meaning": "a background Bash run's completion is owed to this live harness; the task stays open for it within its deadline",
     })));
 }
@@ -150,6 +151,7 @@ pub(crate) fn owe_async(views: &Views, tx: &Sender<Event>, position: usize, work
 /// `undelivered` with its reason. False if it was not owed (already ended).
 pub(crate) fn settle_async(
     views: &Views,
+    store: &Arc<Mutex<Store>>,
     tx: &Sender<Event>,
     position: usize,
     work: i64,
@@ -163,6 +165,16 @@ pub(crate) fn settle_async(
     let Some(at) = view.owed_async.iter().position(|owed| *owed == work) else {
         return false;
     };
+    if let Err(error) = store
+        .lock()
+        .expect("store lock")
+        .resolve_completion(work, resolution, reason)
+    {
+        let _ = tx.send(Event::Report(
+            json!({ "event": error.label(), "reason": format!("{error:?}"), "work": work }),
+        ));
+        return false;
+    }
     view.owed_async.remove(at);
     if resolution == "turn-ended" {
         view.async_turn_ended += 1;
@@ -179,11 +191,29 @@ pub(crate) fn settle_async(
         "harness": harness,
         "reason": reason,
         "owed_async": owed,
+        "scope": "current-owner-generation",
     })));
     true
 }
 
-/// The root's background-completion account for the terminal report.
+/// Prior-generation recipient facts, separate from the current view counters.
+pub(crate) fn inherited_summary(store: &Arc<Mutex<Store>>, harness: Option<usize>) -> Value {
+    match store
+        .lock()
+        .expect("store lock")
+        .inherited_completions(harness)
+    {
+        Ok(records) => json!({
+            "scope": "prior-owner-generations", "records": records,
+            "meaning": "async records retain a promised completion; unknown mode retains requester lineage without inferring a promise; delivery-unknown is unresolved, even after run end; recipient delivery is not reconstructed; turn-ended is transport evidence, not processing",
+        }),
+        Err(error) => {
+            json!({ "scope": "prior-owner-generations", "state": "unknown", "reason": format!("store-unread: {error}") })
+        }
+    }
+}
+
+/// The current owner's background-completion account for the terminal report.
 pub(crate) fn async_summary(views: &Views) -> Value {
     let views = views.lock().expect("views");
     let undelivered: Vec<Value> = views
@@ -195,6 +225,7 @@ pub(crate) fn async_summary(views: &Views) -> Value {
         })
         .collect();
     json!({
+        "scope": "current-owner-generation",
         "accepted": views.iter().map(|view| view.async_accepted).sum::<u64>(),
         "turn_ended": views.iter().map(|view| view.async_turn_ended).sum::<u64>(),
         "undelivered": undelivered,
@@ -650,6 +681,7 @@ impl Ingress {
             &inputs_open,
             &request.argv,
             &request.cwd,
+            request.background,
         );
         let work = match begun {
             Ok(work) => work,
@@ -863,6 +895,9 @@ impl Ingress {
         owner["work"] = json!(work);
         owner["output_bytes"] = json!(bytes);
         owner["requester"] = json!(caller);
+        if completion.is_none() {
+            owner["inherited_async"] = inherited_summary(&self.store, None);
+        }
         self.report(owner);
         if let Some(completion) = completion {
             self.offer_completion(work, &completion, &end);
@@ -881,6 +916,7 @@ impl Ingress {
         let undelivered = |reason: &str| {
             settle_async(
                 &self.views,
+                &self.store,
                 &self.tx,
                 position,
                 work,
@@ -948,9 +984,8 @@ impl Ingress {
                     "pid": adopted.harness_host_pid,
                 }));
                 let retainer = ingress.resume_retainer(adopted.work);
-                // A background run's completion was owed to a harness of
-                // the earlier owner's live conversation; it is not carried
-                // across owners (no durable async record, no resume).
+                // Recipient facts are durable and reported separately; this
+                // path still does not reconstruct delivery to that recipient.
                 ingress.finish(
                     &root,
                     adopted.work,
@@ -981,6 +1016,7 @@ impl Ingress {
                     "status": status,
                     "meaning": if status.is_some() { "exit-reported-by-its-waiter" } else { "ended-with-work-namespace-status-unknown" },
                 }));
+                ingress.report(json!({ "event": "inherited-completion-account", "inherited_async": inherited_summary(&ingress.store, Some(harness)) }));
                 ingress.leave(if status.is_some() {
                     Outcome::Ended
                 } else {
@@ -1001,6 +1037,7 @@ impl Ingress {
                     "status": Value::Null,
                     "meaning": "ended-with-root-namespace-status-unknown",
                 }));
+                ingress.report(json!({ "event": "inherited-completion-account", "inherited_async": inherited_summary(&ingress.store, Some(harness)) }));
                 ingress.leave(Outcome::Unknown);
             }
         });
@@ -1804,7 +1841,7 @@ mod tests {
             .store
             .lock()
             .unwrap()
-            .begin_bash(0, parent, 1, 1, "[]", &["fixture".into()], "/")
+            .begin_bash(0, parent, 1, 1, "[]", &["fixture".into()], "/", false)
             .unwrap();
         assert!(ingress.enter());
         let token = ingress
@@ -1881,7 +1918,7 @@ mod tests {
             .store
             .lock()
             .unwrap()
-            .begin_bash(0, parent, 1, 1, "[]", &["fixture".into()], "/")
+            .begin_bash(0, parent, 1, 1, "[]", &["fixture".into()], "/", false)
             .unwrap();
         assert!(ingress.enter());
         let token = ingress
@@ -2196,7 +2233,7 @@ mod tests {
             .store
             .lock()
             .unwrap()
-            .begin_bash(0, parent, 1, 1, "[]", &["fixture".into()], "/")
+            .begin_bash(0, parent, 1, 1, "[]", &["fixture".into()], "/", false)
             .unwrap();
         std::fs::create_dir_all(dir.0.join("store").join(retention::DIR)).unwrap();
         std::fs::write(retention::path(&dir.0.join("store"), orphan), &data[..1234]).unwrap();
@@ -2284,7 +2321,7 @@ mod tests {
             .store
             .lock()
             .unwrap()
-            .begin_bash(0, parent, 1, 1, "[]", &["fixture".into()], "/")
+            .begin_bash(0, parent, 1, 1, "[]", &["fixture".into()], "/", false)
             .unwrap();
         let mut retainer = Retainer::start(&dir.0.join("store"), work, &ingress.budget);
         retainer.take(b"abc");
@@ -2331,7 +2368,7 @@ mod tests {
             .store
             .lock()
             .unwrap()
-            .begin_bash(0, parent, 1, 1, "[]", &["fixture".into()], "/")
+            .begin_bash(0, parent, 1, 1, "[]", &["fixture".into()], "/", false)
             .unwrap();
         let mut retainer = Retainer::start(&dir.0.join("store"), work, &ingress.budget);
         retainer.take(b"orphan-prefix");
@@ -2368,7 +2405,7 @@ mod tests {
             .store
             .lock()
             .unwrap()
-            .begin_bash(0, parent, 1, 1, "[]", &["fixture".into()], "/")
+            .begin_bash(0, parent, 1, 1, "[]", &["fixture".into()], "/", false)
             .unwrap();
         let mut retainer = Retainer::start(&dir.0.join("store"), new, &next.budget);
         retainer.take(b"abcdefghij");
@@ -2411,7 +2448,7 @@ mod tests {
             .store
             .lock()
             .unwrap()
-            .begin_bash(0, parent, 1, 1, "[]", &["fixture".into()], "/")
+            .begin_bash(0, parent, 1, 1, "[]", &["fixture".into()], "/", false)
             .unwrap();
         // This is the same unknown-budget denial the production start applies.
         let mut retainer = Retainer::start(&dir.0.join("store"), work, &next.budget);

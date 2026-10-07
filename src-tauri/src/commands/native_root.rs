@@ -109,7 +109,12 @@
 //! has the root's live work killed by its own waiters, connecting to
 //! nothing and delivering nothing; `continue-attached` reattaches the
 //! survivors and resubmits what is owed with its original keys (at best
-//! `duplicate-unknown`: not proof the native conversation continued).
+//! `duplicate-unknown`: not proof the native conversation continued). A
+//! survivor with nothing owed takes new input only if its harness declared
+//! the live reattachment contract and every turn is recorded ended;
+//! otherwise the owner reports it `unavailable` or `unknown`, refuses
+//! `send` naming that, and a close ends it or says why not (the owner
+//! crate's Settled survivors).
 //! Neither starts a new root incarnation: with no root to attach, the
 //! owner reports `root-absent` and what the store still owes. `env` is the
 //! recovering owner's whole environment; attached work keeps the original

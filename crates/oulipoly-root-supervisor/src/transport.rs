@@ -140,6 +140,27 @@ fn ready(stop: &StopSignal, file: &File, bell: Option<&OwnedFd>) -> io::Result<R
     })
 }
 
+/// Blocks until `bell` is readable (`Ok(true)`) or the run detached
+/// (`Ok(false)`).
+pub(crate) fn rung(stop: &StopSignal, bell: &OwnedFd) -> io::Result<bool> {
+    let pollfd = |fd: i32| libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let mut polls = [pollfd(stop.read.as_raw_fd()), pollfd(bell.as_raw_fd())];
+    loop {
+        // SAFETY: poll over two valid pollfds.
+        if unsafe { libc::poll(polls.as_mut_ptr(), 2, -1) } >= 0 {
+            return Ok(polls[0].revents == 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 /// Whether the run detached, without blocking.
 pub(crate) fn detached(stop: &StopSignal) -> bool {
     let mut poll = libc::pollfd {

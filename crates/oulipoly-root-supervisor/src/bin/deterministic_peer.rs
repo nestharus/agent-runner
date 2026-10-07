@@ -39,6 +39,12 @@
 //! `--reject-completion-once` conclusively rejects the first background
 //! completion with -32001 before insertion, then stays alive for later inputs.
 //!
+//! `--live-reattach` declares the live reattachment contract in every
+//! `initialize` response (a later owner may converse with this live
+//! process again); `--live-reattach-first` declares it only to the first
+//! `initialize` of this process. Its sessions and ascending message ids
+//! already persist in its state file.
+//!
 //! `--no-dedup` disables the local dedup contract. `--exit-after-acks N`
 //! exits normally after the Nth acknowledgement and its idle update;
 //! otherwise the peer stays alive until stdin ends.
@@ -81,7 +87,8 @@ use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
 use oulipoly_acp::{
-    DEDUP_CONTRACT_META, DUPLICATE_META, MESSAGE_KEY_META, PARENT_MESSAGE_META, TURN_INPUT_META,
+    DEDUP_CONTRACT_META, DUPLICATE_META, LIVE_REATTACH_META, MESSAGE_KEY_META, PARENT_MESSAGE_META,
+    TURN_INPUT_META,
 };
 use serde_json::{Value, json};
 
@@ -90,6 +97,8 @@ struct Args {
     mode: String,
     launch_modes: String,
     dedup: bool,
+    /// `None`, `"always"` or `"first"`.
+    live_reattach: Option<&'static str>,
     exit_after_acks: Option<u64>,
     on_reinit: Option<String>,
     exit_when_file: Option<PathBuf>,
@@ -110,6 +119,7 @@ fn parse_args() -> Args {
         mode: "normal".to_owned(),
         launch_modes: String::new(),
         dedup: true,
+        live_reattach: None,
         exit_after_acks: None,
         on_reinit: None,
         exit_when_file: None,
@@ -130,6 +140,8 @@ fn parse_args() -> Args {
             "--mode" => args.mode = iter.next().expect("--mode value"),
             "--launch-modes" => args.launch_modes = iter.next().expect("--launch-modes value"),
             "--no-dedup" => args.dedup = false,
+            "--live-reattach" => args.live_reattach = Some("always"),
+            "--live-reattach-first" => args.live_reattach = Some("first"),
             "--reject-prompt-once" => args.reject_prompt_once = true,
             "--reject-completion-once" => args.reject_completion_once = true,
             "--untagged" => args.tagged = false,
@@ -287,8 +299,17 @@ impl Peer {
                         "info": { "name": "deterministic-peer", "version": "1" },
                         "capabilities": { "session": {} },
                     });
+                    let mut meta = serde_json::Map::new();
                     if args.dedup {
-                        result["_meta"] = json!({ DEDUP_CONTRACT_META: { "version": 1 } });
+                        meta.insert(DEDUP_CONTRACT_META.to_owned(), json!({ "version": 1 }));
+                    }
+                    if args.live_reattach == Some("always")
+                        || (args.live_reattach == Some("first") && *initializations == 1)
+                    {
+                        meta.insert(LIVE_REATTACH_META.to_owned(), json!({ "version": 1 }));
+                    }
+                    if !meta.is_empty() {
+                        result["_meta"] = Value::Object(meta);
                     }
                     send(
                         out,

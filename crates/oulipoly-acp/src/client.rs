@@ -8,7 +8,8 @@ use serde_json::{Map, Value, json};
 use crate::transport::{Incoming, Transport};
 use crate::wire::{self, method};
 use crate::{
-    DEDUP_CONTRACT_META, DEDUP_CONTRACT_VERSION, DUPLICATE_META, MESSAGE_KEY_META, PROTOCOL_VERSION,
+    DEDUP_CONTRACT_META, DEDUP_CONTRACT_VERSION, DUPLICATE_META, LIVE_REATTACH_META,
+    LIVE_REATTACH_VERSION, MESSAGE_KEY_META, PROTOCOL_VERSION,
 };
 
 /// Identity this client reports in `initialize`.
@@ -26,6 +27,9 @@ pub struct NegotiatedPeer {
     pub agent_version: String,
     /// The agent advertised the local dedup contract (version 1).
     pub dedup_contract: bool,
+    /// The agent declared the live reattachment contract (version 1) on
+    /// this connection.
+    pub live_reattach: bool,
 }
 
 /// Why `initialize` did not produce a usable v2 peer. None of these is a
@@ -393,11 +397,19 @@ impl<T: Transport> AcpClient<T> {
             .and_then(|contract| contract.get("version"))
             .and_then(Value::as_u64)
             == Some(DEDUP_CONTRACT_VERSION);
+        let live_reattach = response
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get(LIVE_REATTACH_META))
+            .and_then(|contract| contract.get("version"))
+            .and_then(Value::as_u64)
+            == Some(LIVE_REATTACH_VERSION);
         let peer = NegotiatedPeer {
             protocol_version: response.protocol_version,
             agent_name: response.info.name,
             agent_version: response.info.version,
             dedup_contract,
+            live_reattach,
         };
         self.peer = Some(peer.clone());
         Ok(peer)
@@ -537,6 +549,18 @@ impl<T: Transport> AcpClient<T> {
         } else {
             DeliveryOutcome::DuplicateUnknown(acceptance)
         }
+    }
+
+    /// Starts readiness observation for `session_id` without an attempt:
+    /// for a session this client resumed on a live process (see the live
+    /// reattachment contract), so that a wait between turns can begin
+    /// before the first new prompt. Idles from then on are readiness only.
+    /// An existing cursor is kept.
+    pub fn observe_session(&mut self, session_id: &str) {
+        let start = self.events.len();
+        self.idle_cursor
+            .entry(session_id.to_owned())
+            .or_insert(start);
     }
 
     /// Observe the next unconsumed idle since this session's first tracked

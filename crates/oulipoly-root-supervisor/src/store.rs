@@ -50,6 +50,20 @@
 //!   it, under which owner generation, when. Local only: not an insertion
 //!   acknowledgement, processing, remote settlement or a drain. Version 8
 //!   added both (no migration).
+//! * A message's `turn_end_generation` records that a tagged idle covered
+//!   its acknowledged insertion (`turn-end`), under which generation: the
+//!   agent's tag, not processing. A `work`'s `live_reattach` records what
+//!   the harness of that work declared about the live reattachment
+//!   contract when an owner negotiated with it (`NULL`: no negotiation
+//!   recorded). A recovered owner reads both before it may converse with a
+//!   surviving harness again. A follow-up's caller `ref` names one logical
+//!   input across owners: a second admission with the same `ref` in the
+//!   root is refused as a duplicate. Version 9 added these (no migration).
+//! * Version 10 separates follow-up producer scope (`caller` / `owner`) and
+//!   records Bash delivery mode before admission plus completion transport
+//!   settlement. Earlier unresolved recipient obligations remain explicitly
+//!   unknown across owner churn, including after run end. No recipient is
+//!   reconstructed. Other schemas are refused, not migrated.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -68,7 +82,7 @@ pub(crate) const LOCK_FILE: &str = "owner.lock";
 pub(crate) const DB_FILE: &str = "intent.sqlite3";
 /// Version of this new per-root lineage. There is no migration chain: a
 /// store of any other version is refused.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 10;
 /// How long a write waits for a foreign SQLite lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -131,7 +145,9 @@ CREATE TABLE message (
     origin TEXT NOT NULL DEFAULT 'intent' CHECK (origin IN ('intent', 'follow-up')),
     control INTEGER,
     caller_ref TEXT,
+    producer TEXT CHECK (producer IN ('caller', 'owner')),
     admitted_generation INTEGER,
+    turn_end_generation INTEGER,
     PRIMARY KEY (harness, idx)
 );
 CREATE TABLE root (
@@ -158,7 +174,8 @@ CREATE TABLE work (
     outcome TEXT,
     observer TEXT,
     resolved_generation INTEGER,
-    kind TEXT NOT NULL DEFAULT 'harness' CHECK (kind IN ('harness', 'bash'))
+    kind TEXT NOT NULL DEFAULT 'harness' CHECK (kind IN ('harness', 'bash')),
+    live_reattach INTEGER
 );
 CREATE TABLE bash_run (
     work INTEGER PRIMARY KEY REFERENCES work(id),
@@ -166,7 +183,11 @@ CREATE TABLE bash_run (
     requester_pid INTEGER NOT NULL,
     inputs_open TEXT NOT NULL,
     argv TEXT NOT NULL,
-    cwd TEXT NOT NULL
+    cwd TEXT NOT NULL,
+    delivery_mode TEXT CHECK (delivery_mode IN ('async', 'stream')),
+    completion_outcome TEXT CHECK (completion_outcome IN ('turn-ended', 'undelivered')),
+    completion_reason TEXT,
+    completion_generation INTEGER
 );
 CREATE TABLE bash_output (
     work INTEGER PRIMARY KEY REFERENCES bash_run(work),
@@ -282,6 +303,29 @@ pub(crate) struct DurableMessage {
     pub(crate) attempts: u32,
     /// Earlier attempts this instance classified as unknown.
     pub(crate) prior_unknown: u32,
+    /// Attempts of any generation whose outcome is unknown or unrecorded.
+    pub(crate) unknown_attempts: u32,
+    /// A tagged idle covered its acknowledged insertion (durably recorded).
+    pub(crate) turn_ended: bool,
+}
+
+/// An earlier admission of the same caller `ref` in this root.
+#[derive(Debug, Clone)]
+pub(crate) struct EarlierRef {
+    pub(crate) harness: usize,
+    pub(crate) input: usize,
+    pub(crate) admitted_generation: Option<i64>,
+    pub(crate) acknowledged: bool,
+    pub(crate) stop: Option<String>,
+    pub(crate) turn_ended: bool,
+}
+
+/// What a follow-up admission committed.
+pub(crate) enum Admission {
+    /// A new owed message: its index and the message to deliver.
+    Admitted(usize, OutboundMessage),
+    /// The same caller `ref` was already admitted: nothing was written.
+    Duplicate(EarlierRef),
 }
 
 pub(crate) struct DurableHarness {
@@ -712,16 +756,27 @@ impl Store {
 
     /// Commits a caller's follow-up as the harness's next owed message,
     /// with a freshly minted key, before anything reports it admitted.
-    /// Returns its index and the message to deliver.
+    /// Returns its index and the message to deliver, or, for a caller's
+    /// input (`by_ref`) whose `ref` was already admitted in this root (by
+    /// any generation), that earlier admission, writing nothing.
     pub(crate) fn admit_follow_up(
         &mut self,
         harness: usize,
         control: u64,
         caller_ref: Option<&str>,
         text: &str,
-    ) -> Result<(usize, OutboundMessage), StoreError> {
+        by_ref: bool,
+    ) -> Result<Admission, StoreError> {
         let generation = self.generation;
         self.write(|tx| {
+            if let Some(earlier) = caller_ref
+                .filter(|_| by_ref)
+                .map(|caller_ref| earlier_ref(tx, caller_ref))
+                .transpose()?
+                .flatten()
+            {
+                return Ok(Admission::Duplicate(earlier));
+            }
             let idx: i64 = tx.query_row(
                 "SELECT coalesce(max(idx) + 1, 0) FROM message WHERE harness = ?1",
                 params![int(harness)],
@@ -730,8 +785,8 @@ impl Store {
             let message = OutboundMessage::fresh_recorded(text, |key: &MessageKey| {
                 tx.execute(
                     "INSERT INTO message (harness, idx, key, text, origin, control, caller_ref,
-                                          admitted_generation)
-                     VALUES (?1, ?2, ?3, ?4, 'follow-up', ?5, ?6, ?7)",
+                                          admitted_generation, producer)
+                     VALUES (?1, ?2, ?3, ?4, 'follow-up', ?5, ?6, ?7, ?8)",
                     params![
                         int(harness),
                         idx,
@@ -739,15 +794,68 @@ impl Store {
                         text,
                         int(control),
                         caller_ref,
-                        generation
+                        generation,
+                        if by_ref { "caller" } else { "owner" }
                     ],
                 )
                 .map(drop)
                 .map_err(|error| io::Error::other(error.to_string()))
             })
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-            Ok((usize::try_from(idx).unwrap_or(usize::MAX), message))
+            Ok(Admission::Admitted(
+                usize::try_from(idx).unwrap_or(usize::MAX),
+                message,
+            ))
         })
+    }
+
+    /// The earlier admission of `caller_ref` in this root, if any. A read:
+    /// it answers a retry without writing.
+    pub(crate) fn earlier_ref(&self, caller_ref: &str) -> rusqlite::Result<Option<EarlierRef>> {
+        earlier_ref(&self.conn, caller_ref)
+    }
+
+    /// Records that a tagged idle covered input `idx`'s acknowledged
+    /// insertion (the agent's tag, not processing).
+    pub(crate) fn record_turn_end(&mut self, harness: usize, idx: usize) -> Result<(), StoreError> {
+        let generation = self.generation;
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE message SET turn_end_generation = ?3
+                 WHERE harness = ?1 AND idx = ?2 AND turn_end_generation IS NULL",
+                params![int(harness), int(idx), generation],
+            )
+            .map(drop)
+        })
+    }
+
+    /// Records what the harness of `work` declared about the live
+    /// reattachment contract when this owner negotiated with it.
+    pub(crate) fn record_negotiation(
+        &mut self,
+        work: i64,
+        live_reattach: bool,
+    ) -> Result<(), StoreError> {
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE work SET live_reattach = ?2 WHERE id = ?1",
+                params![work, live_reattach],
+            )
+            .map(drop)
+        })
+    }
+
+    /// The live reattachment declaration last recorded for `work`, or
+    /// `None` when no negotiation with it was recorded.
+    pub(crate) fn work_negotiation(&self, work: i64) -> rusqlite::Result<Option<bool>> {
+        self.conn
+            .query_row(
+                "SELECT live_reattach FROM work WHERE id = ?1",
+                params![work],
+                |row| row.get::<_, Option<bool>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
     }
 
     /// Records a root PID 1 incarnation before it is started, so that a
@@ -826,6 +934,7 @@ impl Store {
         inputs_open: &str,
         argv: &[String],
         cwd: &str,
+        background: bool,
     ) -> Result<i64, StoreError> {
         let generation = self.generation;
         let argv = serde_json::to_string(argv).expect("argv serializes");
@@ -837,12 +946,64 @@ impl Store {
             )?;
             let work = tx.last_insert_rowid();
             tx.execute(
-                "INSERT INTO bash_run (work, requester_work, requester_pid, inputs_open, argv, cwd)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![work, requester_work, requester_pid, inputs_open, argv, cwd],
+                "INSERT INTO bash_run (work, requester_work, requester_pid, inputs_open, argv, cwd, delivery_mode)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![work, requester_work, requester_pid, inputs_open, argv, cwd, if background { "async" } else { "stream" }],
             )?;
             Ok(work)
         })
+    }
+
+    /// Records transport settlement of a current owner's completion. This
+    /// preserves the fact across churn; it is not recipient reconstruction.
+    pub(crate) fn resolve_completion(
+        &mut self,
+        work: i64,
+        outcome: &str,
+        reason: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let generation = self.generation;
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE bash_run SET completion_outcome = ?2, completion_reason = ?3,
+                                 completion_generation = ?4
+             WHERE work = ?1 AND delivery_mode = 'async' AND completion_outcome IS NULL",
+                params![work, outcome, reason, generation],
+            )
+            .map(drop)
+        })
+    }
+
+    /// All earlier-generation recipient facts, including ended runs and
+    /// previously recorded losses. NULL mode stays unknown; no legacy guess.
+    pub(crate) fn inherited_completions(
+        &self,
+        harness: Option<usize>,
+    ) -> rusqlite::Result<Vec<serde_json::Value>> {
+        self.conn.prepare(
+            "SELECT w.id, w.harness, h.id, w.generation, b.requester_work,
+                    b.delivery_mode, b.completion_outcome, b.completion_reason,
+                    b.completion_generation, w.outcome
+             FROM bash_run b JOIN work w ON w.id = b.work
+             JOIN harness h ON h.position = w.harness
+             WHERE w.generation < ?1 AND b.requester_work IS NOT NULL
+               AND (b.delivery_mode = 'async' OR b.delivery_mode IS NULL)
+               AND (?2 IS NULL OR w.harness = ?2) ORDER BY w.id"
+        )?.query_map(params![self.generation, harness.map(int)], |row| {
+            let mode: Option<String> = row.get(5)?;
+            let outcome: Option<String> = row.get(6)?;
+            Ok(serde_json::json!({
+                "work": row.get::<_, i64>(0)?, "harness_position": row.get::<_, i64>(1)?,
+                "harness": row.get::<_, String>(2)?, "accepted_generation": row.get::<_, i64>(3)?,
+                "requester_work": row.get::<_, i64>(4)?,
+                "delivery_mode": mode.as_deref().unwrap_or("unknown"),
+                "completion": outcome.as_deref().unwrap_or("delivery-unknown"),
+                "reason": row.get::<_, Option<String>>(7)?,
+                "resolved_generation": row.get::<_, Option<i64>>(8)?,
+                "run_outcome": row.get::<_, Option<String>>(9)?,
+                "recipient_reconstructed": false,
+            }))
+        })?.collect()
     }
 
     /// Commits a registered child in one transaction: its harness row (the
@@ -1133,6 +1294,27 @@ pub(crate) struct ChildAdmission<'a> {
 }
 
 /// SQLite integers are `i64`; positions, indexes and times fit.
+fn earlier_ref(conn: &Connection, caller_ref: &str) -> rusqlite::Result<Option<EarlierRef>> {
+    conn.query_row(
+        "SELECT harness, idx, admitted_generation, ack_label IS NOT NULL, stop,
+                turn_end_generation IS NOT NULL
+         FROM message WHERE origin = 'follow-up' AND producer = 'caller' AND caller_ref = ?1
+         ORDER BY harness, idx LIMIT 1",
+        params![caller_ref],
+        |row| {
+            Ok(EarlierRef {
+                harness: usize::try_from(row.get::<_, i64>(0)?).unwrap_or(usize::MAX),
+                input: usize::try_from(row.get::<_, i64>(1)?).unwrap_or(usize::MAX),
+                admitted_generation: row.get(2)?,
+                acknowledged: row.get(3)?,
+                stop: row.get(4)?,
+                turn_ended: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+}
+
 fn int<N: TryInto<i64>>(value: N) -> i64 {
     value.try_into().unwrap_or(i64::MAX)
 }
@@ -1224,6 +1406,8 @@ fn create_intent(
                 ack: None,
                 attempts: 0,
                 prior_unknown: 0,
+                unknown_attempts: 0,
+                turn_ended: false,
             });
         }
         harnesses.push(DurableHarness {
@@ -1260,7 +1444,10 @@ fn load_intent(tx: &Transaction<'_>, generation: i64) -> Result<Vec<DurableHarne
                 (SELECT count(*) FROM attempt a WHERE a.harness = m.harness AND a.idx = m.idx),
                 (SELECT count(*) FROM attempt a WHERE a.harness = m.harness AND a.idx = m.idx
                     AND a.outcome = ?2 AND a.resolved_generation = ?3),
-                m.origin
+                m.origin,
+                (SELECT count(*) FROM attempt a WHERE a.harness = m.harness AND a.idx = m.idx
+                    AND (a.outcome IS NULL OR a.outcome = ?2)),
+                m.turn_end_generation IS NOT NULL
          FROM message m WHERE m.harness = ?1 ORDER BY m.idx",
     )?;
     let mut work_rows = tx.prepare(
@@ -1302,6 +1489,8 @@ fn load_intent(tx: &Transaction<'_>, generation: i64) -> Result<Vec<DurableHarne
                     },
                     attempts: row.get(9)?,
                     prior_unknown: row.get(10)?,
+                    unknown_attempts: row.get(12)?,
+                    turn_ended: row.get(13)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1445,7 +1634,12 @@ mod tests {
     fn follow_up_is_durable_owed_debt_with_its_origin() {
         let dir = Dir::new("follow");
         let mut store = Store::claim(&dir.0, Some(&intent())).unwrap().store;
-        let (idx, mut message) = store.admit_follow_up(0, 4, Some("r1"), "again").unwrap();
+        let Admission::Admitted(idx, mut message) = store
+            .admit_follow_up(0, 4, Some("r1"), "again", true)
+            .unwrap()
+        else {
+            panic!("first admission of r1");
+        };
         assert_eq!(idx, 1);
         assert!(message.is_owed());
         let key = message.key().as_str().to_owned();
@@ -1478,6 +1672,142 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, (key, "follow-up".into(), 4, "r1".into(), 1));
+    }
+
+    /// A caller `ref` names one logical input across owners: once admitted
+    /// by one generation, a later generation's admission of the same `ref`
+    /// writes nothing and names the earlier input. A recorded turn end and
+    /// negotiation are loaded with the store.
+    #[test]
+    fn caller_ref_is_admitted_once_across_generations() {
+        let dir = Dir::new("ref");
+        let mut store = Store::claim(&dir.0, Some(&intent())).unwrap().store;
+        assert!(matches!(
+            store
+                .admit_follow_up(0, 2, Some("r1"), "once", true)
+                .unwrap(),
+            Admission::Admitted(1, _)
+        ));
+        store.record_turn_end(0, 0).unwrap();
+        drop(store);
+        let claimed = Store::claim(&dir.0, None).unwrap();
+        let messages = &claimed.harnesses[0].messages;
+        assert!(messages[0].turn_ended);
+        assert!(!messages[1].turn_ended);
+        let mut store = claimed.store;
+        let Admission::Duplicate(earlier) = store
+            .admit_follow_up(0, 7, Some("r1"), "again", true)
+            .unwrap()
+        else {
+            panic!("second admission of r1");
+        };
+        assert_eq!((earlier.harness, earlier.input), (0, 1));
+        assert_eq!(earlier.admitted_generation, Some(1));
+        assert!(!earlier.acknowledged && !earlier.turn_ended);
+        assert_eq!(store.earlier_ref("r1").unwrap().unwrap().input, 1);
+        assert!(store.earlier_ref("r2").unwrap().is_none());
+        assert!(matches!(
+            store.admit_follow_up(0, 8, None, "unnamed", true).unwrap(),
+            Admission::Admitted(2, _)
+        ));
+        let conn = Connection::open(dir.0.join(DB_FILE)).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM message", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 3, "the duplicate wrote nothing");
+    }
+
+    #[test]
+    fn caller_ref_does_not_alias_an_owner_completion() {
+        let dir = Dir::new("producer-ref");
+        let mut store = Store::claim(&dir.0, Some(&intent())).unwrap().store;
+        assert!(matches!(
+            store
+                .admit_follow_up(0, 0, Some("bash-completion:2"), "owner", false)
+                .unwrap(),
+            Admission::Admitted(1, _)
+        ));
+        drop(store);
+        let mut store = Store::claim(&dir.0, None).unwrap().store;
+        assert!(store.earlier_ref("bash-completion:2").unwrap().is_none());
+        assert!(matches!(
+            store
+                .admit_follow_up(0, 1, Some("bash-completion:2"), "caller", true)
+                .unwrap(),
+            Admission::Admitted(2, _)
+        ));
+        drop(store);
+        let mut store = Store::claim(&dir.0, None).unwrap().store;
+        let Admission::Duplicate(prior) = store
+            .admit_follow_up(0, 2, Some("bash-completion:2"), "different-body", true)
+            .unwrap()
+        else {
+            panic!("caller retry must deduplicate");
+        };
+        assert_eq!(prior.input, 2);
+        assert_eq!(prior.admitted_generation, Some(2));
+    }
+
+    #[test]
+    fn inherited_recipient_facts_survive_run_end_and_owner_churn() {
+        let dir = Dir::new("recipient-facts");
+        let mut store = Store::claim(&dir.0, Some(&intent())).unwrap().store;
+        let incarnation = store
+            .begin_incarnation("token", "unprivileged-userns")
+            .unwrap();
+        let parent = store.begin_work(0, incarnation).unwrap();
+        let run = |store: &mut Store, background| {
+            store
+                .begin_bash(
+                    0,
+                    parent,
+                    incarnation,
+                    1,
+                    "[]",
+                    &["fixture".into()],
+                    "/",
+                    background,
+                )
+                .unwrap()
+        };
+        let pending = run(&mut store, true);
+        let lost = run(&mut store, true);
+        let delivered = run(&mut store, true);
+        let unknown = run(&mut store, false);
+        store
+            .resolve_completion(lost, "undelivered", Some("recipient-not-in-conversation"))
+            .unwrap();
+        store
+            .resolve_completion(delivered, "turn-ended", None)
+            .unwrap();
+        // Current-schema fixture with missing mode: never infer an async promise.
+        store
+            .conn
+            .execute(
+                "UPDATE bash_run SET delivery_mode = NULL WHERE work = ?1",
+                [unknown],
+            )
+            .unwrap();
+        drop(store);
+        let mut store = Store::claim(&dir.0, None).unwrap().store;
+        let records = store.inherited_completions(Some(0)).unwrap();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0]["delivery_mode"], "async");
+        assert_eq!(records[0]["completion"], "delivery-unknown");
+        assert_eq!(records[1]["completion"], "undelivered");
+        assert_eq!(records[2]["completion"], "turn-ended");
+        assert_eq!(records[3]["delivery_mode"], "unknown");
+        store
+            .resolve_work(pending, "code:0", Some("work-pid1-wait"))
+            .unwrap();
+        drop(store);
+        let store = Store::claim(&dir.0, None).unwrap().store;
+        let records = store.inherited_completions(None).unwrap();
+        assert_eq!(records[0]["completion"], "delivery-unknown");
+        assert_eq!(records[0]["run_outcome"], "code:0");
+        assert_eq!(records[0]["accepted_generation"], 1);
+        assert_eq!(records[1]["reason"], "recipient-not-in-conversation");
+        assert_eq!(records[3]["delivery_mode"], "unknown");
     }
 
     /// Fresh-only schema: a store of the previous version is refused, not

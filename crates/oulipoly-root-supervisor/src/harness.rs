@@ -8,6 +8,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -24,7 +25,7 @@ use crate::children::{ChildLink, Registry};
 use crate::conversation::{Closing, FollowUp, Inbox};
 use crate::custody::{self, Adopted, PidNs, ReceiptWait, Root, RootSlot, SpawnError, WorkStdio};
 use crate::live::Custody;
-use crate::store::{DurableAck, DurableHarness, Store, StoreError};
+use crate::store::{Admission, DurableAck, DurableHarness, EarlierRef, Store, StoreError};
 use crate::transport::{self, HarnessTransport, Observed};
 use crate::{Endpoint, Event};
 
@@ -73,6 +74,9 @@ pub struct MessageRecord {
     pub closures: u32,
     /// A caller's follow-up to the live conversation, not part of the intent.
     pub follow_up: bool,
+    /// A tagged idle covering its insertion was durably recorded, by any
+    /// generation (the agent's tag, not processing).
+    pub turn_ended: bool,
 }
 
 /// What one harness worker owned and how it ended.
@@ -101,6 +105,9 @@ pub struct HarnessRecord {
     /// turn ends. Request delivery and the actual waited exit are separate
     /// observations (`close-stopping.signalled` and `exits`).
     pub close_stop_attempted: bool,
+    /// What a recovered owner found about conversing with this harness's
+    /// surviving work when every input was settled (`None` otherwise).
+    pub recovered_conversation: Option<Value>,
     pub messages: Vec<MessageRecord>,
 }
 
@@ -117,6 +124,7 @@ impl HarnessRecord {
             wait_failures: Vec::new(),
             detached: 0,
             close_stop_attempted: false,
+            recovered_conversation: None,
             messages: Vec::new(),
         }
     }
@@ -132,6 +140,7 @@ impl HarnessRecord {
             "wait_failures": self.wait_failures,
             "detached": self.detached,
             "close": if self.close_stop_attempted { "owner-stop-attempted-after-turns-ended" } else { "not-stopped-by-close" },
+            "recovered_conversation": self.recovered_conversation,
             "messages": self.messages.iter().map(|message| json!({
                 "index": message.index,
                 "origin": if message.follow_up { "follow-up" } else { "intent" },
@@ -144,6 +153,7 @@ impl HarnessRecord {
                 "attempts": message.attempts,
                 "prior_unknown": message.prior_unknown,
                 "closures": message.closures,
+                "turn_end": if message.turn_ended { "tagged-idle-recorded" } else { "not-recorded" },
                 "completion": "not-observed",
             })).collect::<Vec<_>>(),
         })
@@ -159,6 +169,10 @@ struct Tracked {
     closures: u32,
     attempts: u32,
     prior_unknown: u32,
+    /// Attempts of any generation whose outcome is unknown or unrecorded.
+    unknown_attempts: u32,
+    /// A tagged idle covering its insertion is durably recorded.
+    turn_ended: bool,
     follow_up: bool,
 }
 
@@ -232,6 +246,11 @@ struct Worker {
     pending_completions: std::collections::VecDeque<FollowUp>,
     /// Admitted completion inputs: message index to background work.
     completion_of: std::collections::HashMap<usize, i64>,
+    /// The caller's recovery asked to continue the attached root's work
+    /// (`continue-attached`): a settled survivor may be conversed with
+    /// again if its harness declared it can be.
+    continue_attached: bool,
+    recovered_conversation: Option<Value>,
 }
 
 /// What one worker is given: its durable harness record and shared state.
@@ -250,6 +269,7 @@ pub(crate) struct Assignment {
     pub(crate) inbox: Arc<Inbox>,
     pub(crate) closing: Arc<Closing>,
     pub(crate) children: Arc<Registry>,
+    pub(crate) continue_attached: bool,
 }
 
 /// What a registered child's worker is given (see [`crate::children`]).
@@ -308,6 +328,7 @@ pub(crate) fn run_child(assignment: ChildAssignment) -> HarnessRecord {
             inbox,
             closing,
             children,
+            continue_attached: false,
         },
         Some(link),
     );
@@ -343,6 +364,7 @@ impl Worker {
             inbox,
             closing,
             children,
+            continue_attached,
         } = assignment;
         let tracked = harness
             .messages
@@ -356,6 +378,8 @@ impl Worker {
                 closures: durable.closures,
                 attempts: durable.attempts,
                 prior_unknown: durable.prior_unknown,
+                unknown_attempts: durable.unknown_attempts,
+                turn_ended: durable.turn_ended,
                 follow_up: durable.follow_up,
             })
             .collect();
@@ -390,6 +414,8 @@ impl Worker {
             child,
             pending_completions: std::collections::VecDeque::new(),
             completion_of: std::collections::HashMap::new(),
+            continue_attached,
+            recovered_conversation: None,
         }
     }
 
@@ -406,6 +432,7 @@ impl Worker {
     fn settle_async(&self, work: i64, resolution: &str, reason: Option<&str>) {
         bash::settle_async(
             &self.views,
+            &self.store,
             &self.tx,
             self.position,
             work,
@@ -449,9 +476,10 @@ impl Worker {
                 follow_up.control,
                 follow_up.caller_ref.as_deref(),
                 &follow_up.text,
+                false,
             )
         });
-        let Some((index, message)) = admitted else {
+        let Some(Admission::Admitted(index, message)) = admitted else {
             self.settle_async(work, "undelivered", Some("store-lost"));
             return false;
         };
@@ -463,6 +491,8 @@ impl Worker {
             closures: 0,
             attempts: 0,
             prior_unknown: 0,
+            unknown_attempts: 0,
+            turn_ended: false,
             follow_up: true,
         });
         self.completion_of.insert(index, work);
@@ -571,25 +601,30 @@ impl Worker {
         if self.head().is_none() && !self.tracked.is_empty() {
             // Recovered with every message acknowledged or durably stopped
             // (`outage`, `attempts-exhausted`): nothing to launch. A
-            // surviving harness is still held until its end is reported or
-            // the caller cancels; it is never dropped as gone.
+            // surviving harness is never dropped as gone: it is conversed
+            // with again or held (see `settled_survivor`).
             self.report(json!({ "event": "nothing-deliverable" }));
-            match prior {
+            match prior.take() {
                 Some(Prior::Live(adopted)) => {
                     let Some(live) = self.adopt(adopted) else {
                         return;
                     };
-                    self.report(json!({ "event": "holding-survivor", "work": live.work }));
-                    let (end, observed) = self.finish_live(live, ConnEnd::Stop, "");
-                    let _ = (end, observed);
+                    // A reopened conversation whose harness then closed with
+                    // a new input owed continues as any closure does.
+                    if !self.settled_survivor(live) {
+                        return;
+                    }
                 }
                 Some(Prior::Exited { work, receipt }) => {
                     let _ = self.observe_prior_exit(work, &receipt);
+                    return;
                 }
-                Some(Prior::Unknown { work }) => self.observe_prior_unknown(work),
-                None => {}
+                Some(Prior::Unknown { work }) => {
+                    self.observe_prior_unknown(work);
+                    return;
+                }
+                None => return,
             }
-            return;
         }
         loop {
             let live = match prior.take() {
@@ -633,6 +668,218 @@ impl Worker {
                 return;
             }
         }
+    }
+
+    /// A surviving harness recovered with every input settled. Under an
+    /// explicit `continue-attached` recovery it is conversed with again
+    /// only when every input's turn is durably known to have ended (or the
+    /// input conclusively ended without one), and the harness of this very
+    /// work declared the live reattachment contract when it was negotiated
+    /// with; then the owner negotiates on the same live process again, and
+    /// that harness must declare it again. Nothing settled is resubmitted.
+    /// Otherwise the survivor is held, with why, and a close ends it when
+    /// its turns are known to have ended (see [`Self::hold`]).
+    /// Returns whether a relaunch is authorized (see [`Self::after_drive`]).
+    fn settled_survivor(&mut self, live: Live) -> bool {
+        let turns = self.settled_turns();
+        let declared = self
+            .store
+            .lock()
+            .expect("store lock")
+            .work_negotiation(live.work);
+        let capability = match &declared {
+            Ok(Some(true)) => "declared",
+            Ok(Some(false)) => "absent",
+            Ok(None) => "unrecorded",
+            Err(_) => "unread",
+        };
+        let decision = if self.cancelled() {
+            Err(("unavailable", self.stop_reason().to_owned()))
+        } else if !self.continue_attached {
+            Err(("unavailable", "not-requested".to_owned()))
+        } else if self.closing.requested() {
+            Err(("unavailable", "input-closed".to_owned()))
+        } else if let Err(reason) = turns {
+            Err(("unknown", reason.to_owned()))
+        } else if self.session.is_none() {
+            Err(("unavailable", "no-recorded-session".to_owned()))
+        } else {
+            match declared {
+                Ok(Some(true)) => Ok(()),
+                Ok(Some(false)) => Err(("unavailable", "capability-absent".to_owned())),
+                Ok(None) => Err(("unknown", "capability-unrecorded".to_owned())),
+                Err(_) => Err(("unknown", "capability-unread".to_owned())),
+            }
+        };
+        let facts = json!({
+            "work": live.work,
+            "purpose": if self.continue_attached { "continue-attached" } else { "not-continue-attached" },
+            "turns": if turns.is_ok() { "settled" } else { "unknown" },
+            "turns_reason": turns.err(),
+            "capability": capability,
+            "session": self.session,
+            "inherited_async": bash::inherited_summary(&self.store, Some(self.position)),
+        });
+        match decision {
+            Ok(()) => {
+                let (end, observed) = self.reopen(live, facts);
+                self.after_drive(end, observed)
+            }
+            Err((state, reason)) => {
+                self.unconversed(&facts, state, &reason);
+                self.report(json!({ "event": "holding-survivor", "work": live.work, "conversation": state }));
+                let _ = self.hold(live, turns.is_ok(), ConnEnd::Stop, "");
+                false
+            }
+        }
+    }
+
+    /// Whether every input's turn is durably settled: acknowledged with a
+    /// recorded tagged turn end, or conclusively stopped with no attempt
+    /// whose outcome is unknown (which may have been inserted and still be
+    /// in a turn).
+    fn settled_turns(&self) -> Result<(), &'static str> {
+        for tracked in &self.tracked {
+            match (&tracked.ack, tracked.label.as_deref()) {
+                (Some(_), _) if !tracked.turn_ended => return Err("turn-end-unrecorded"),
+                (Some(_), _) => {}
+                (None, _) if tracked.unknown_attempts > 0 => return Err("delivery-unresolved"),
+                (None, _) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Reports, and keeps for a refused `send` and the terminal record,
+    /// that this survivor is not conversed with and why.
+    fn unconversed(&mut self, facts: &Value, state: &str, reason: &str) {
+        let mut conversation = facts.clone();
+        conversation["state"] = json!(state);
+        conversation["reason"] = json!(reason);
+        conversation["meaning"] = json!(match state {
+            "unknown" =>
+                "not conversed with: what the harness would do with new input is not known; never treated as usable",
+            _ => "not conversed with: no new input reaches this harness under this owner",
+        });
+        self.inbox.hold(conversation.clone());
+        self.recovered_conversation = Some(conversation.clone());
+        conversation["event"] = json!("recovered-conversation");
+        self.report(conversation);
+    }
+
+    /// Negotiates again with a settled survivor that declared the live
+    /// reattachment contract, resumes its recorded session and, if both
+    /// succeed, takes the caller's new input in that conversation. A close
+    /// or cancel can interrupt an unanswered negotiation.
+    fn reopen(&mut self, live: Live, facts: Value) -> (ConnEnd, &'static str) {
+        let session = self.session.clone().expect("session checked");
+        self.report(json!({ "event": "reopen-attempt", "work": live.work, "session": session, "replay": "none" }));
+        let observed = Rc::new(Observed::default());
+        let (reader, writer) = match self.streams(&live) {
+            Ok(streams) => streams,
+            Err(Unconnected::Detached) => return self.finish_live(live, ConnEnd::Stop, ""),
+            Err(Unconnected::Ended) => {
+                self.unconversed(&facts, "unavailable", "ended-before-endpoint");
+                return self.finish_live(live, ConnEnd::Stop, "");
+            }
+            Err(Unconnected::Failed(reason)) => {
+                self.unconversed(&facts, "unavailable", &format!("endpoint-failed: {reason}"));
+                return self.hold(live, true, ConnEnd::Stop, "");
+            }
+        };
+        let mut client = self.client(reader, writer, &observed);
+        // A pending wake from before the attempt is not an interruption.
+        let _ = self.inbox.take();
+        observed.wake_armed.set(true);
+        let failure = match client.initialize() {
+            Ok(peer) => {
+                let work = live.work;
+                if self
+                    .durable(|store| store.record_negotiation(work, peer.live_reattach))
+                    .is_none()
+                {
+                    Some(("unknown", "store-lost".to_owned()))
+                } else if !peer.live_reattach {
+                    Some(("unavailable", "capability-withdrawn".to_owned()))
+                } else {
+                    self.report(json!({
+                        "event": "negotiated",
+                        "work": work,
+                        "dedup_contract": peer.dedup_contract,
+                        "live_reattach": true,
+                    }));
+                    match client.resume_session(&session, &self.cwd) {
+                        Ok(()) => None,
+                        Err(RequestFailure::PeerGone) => {
+                            Some(interrupted(&observed, "session-resume"))
+                        }
+                        Err(RequestFailure::Rejected { code, .. }) => {
+                            Some(("unavailable", format!("session-resume-rejected-{code}")))
+                        }
+                        Err(_) => Some(("unknown", "session-resume-protocol-violation".to_owned())),
+                    }
+                }
+            }
+            Err(NegotiationFailure::PeerGone) => Some(interrupted(&observed, "negotiation")),
+            Err(NegotiationFailure::Rejected { code, .. }) => {
+                Some(("unavailable", format!("negotiation-rejected-{code}")))
+            }
+            Err(NegotiationFailure::UnsupportedVersion { agent_version }) => Some((
+                "unavailable",
+                format!("not-negotiated:unsupported-version-{agent_version}"),
+            )),
+            Err(NegotiationFailure::NoSessionSurface) => Some((
+                "unavailable",
+                "not-negotiated:no-session-surface".to_owned(),
+            )),
+            Err(NegotiationFailure::ProtocolViolation(_)) => {
+                Some(("unknown", "negotiation-protocol-violation".to_owned()))
+            }
+        };
+        observed.wake_armed.set(false);
+        observed.woken.set(false);
+        if let Some((state, reason)) = failure {
+            drop(client);
+            if observed.detached.get() {
+                return self.finish_live(live, ConnEnd::Stop, "");
+            }
+            self.unconversed(&facts, state, &reason);
+            return self.hold(live, true, ConnEnd::Stop, "");
+        }
+        let mut conversation = facts;
+        conversation["state"] = json!("live-usable");
+        conversation["basis"] =
+            json!("harness-declared-live-reattach-at-first-and-current-negotiation");
+        conversation["meaning"] = json!(
+            "new input is admitted durably under this owner generation, then delivered on the resumed session; continuity is the harness's declaration, not observed; nothing settled is resubmitted; inherited_async qualifies recipient obligations separately from transport usability"
+        );
+        self.recovered_conversation = Some(conversation.clone());
+        conversation["event"] = json!("recovered-conversation");
+        self.report(conversation);
+        client.observe_session(&session);
+        let end = self.conversation(&mut client, &observed, &live, &session);
+        self.left_conversation(client, &observed, end, live, true)
+    }
+
+    /// Holds a survivor not (or no longer) in conversation until its end is
+    /// reported, the caller cancels, or this owner detaches. A close ends it
+    /// through its work PID 1 when `settled` (every input's turn known to
+    /// have ended), as a close ends a first owner's harness; otherwise the
+    /// close is not applied to it, and says so: a close never cuts a turn
+    /// that may be open.
+    fn hold(
+        &mut self,
+        live: Live,
+        settled: bool,
+        end: ConnEnd,
+        cause: &'static str,
+    ) -> (ConnEnd, &'static str) {
+        let watch = HoldWatch::start(self, &live, settled);
+        let result = self.finish_live(live, end, cause);
+        if watch.finish() {
+            self.close_stop_attempted = true;
+        }
+        result
     }
 
     /// Takes custody of a surviving harness from an earlier owner.
@@ -970,50 +1217,83 @@ impl Worker {
     /// connection end as possible closure/relaunch evidence.
     fn drive(&mut self, live: Live) -> (ConnEnd, &'static str) {
         let observed = Rc::new(Observed::default());
-        let (reader, writer) = match self.endpoint {
-            Endpoint::Stdio => (
-                live.stdio.stdout.try_clone().expect("stdout descriptor"),
-                live.stdio.stdin.try_clone().expect("stdin descriptor"),
-            ),
-            Endpoint::UnixSocket => match self.connect(&live) {
-                Ok(stream) => {
-                    self.report(json!({ "event": "endpoint-connected", "work": live.work }));
-                    let reader = stream.try_clone().expect("socket descriptor");
-                    (
-                        File::from(OwnedFd::from(reader)),
-                        File::from(OwnedFd::from(stream)),
-                    )
-                }
-                Err(Unconnected::Detached) => return self.finish_live(live, ConnEnd::Stop, ""),
-                Err(Unconnected::Ended) => {
+        let (reader, writer) = match self.streams(&live) {
+            Ok(streams) => streams,
+            Err(unconnected) => match unconnected {
+                Unconnected::Detached => return self.finish_live(live, ConnEnd::Stop, ""),
+                Unconnected::Ended => {
                     // Nothing was sent: like a stdio harness that ended
                     // before answering, a closure once its exit is reported.
                     self.report(json!({ "event": "ended-before-endpoint", "work": live.work }));
                     let end = self.gone_or_drained();
                     return self.finish_live(live, end, "exit-before-endpoint");
                 }
-                Err(Unconnected::Failed(reason)) => {
+                Unconnected::Failed(reason) => {
                     self.report(json!({ "event": "endpoint-failed", "reason": reason }));
                     self.label_remaining("endpoint-failed");
                     return self.finish_live(live, ConnEnd::Stop, "");
                 }
             },
         };
+        let mut client = self.client(reader, writer, &observed);
+        let end = self.converse(&mut client, &observed, &live);
+        self.left_conversation(client, &observed, end, live, false)
+    }
+
+    /// The protocol streams to `live`'s harness: its stdio from root PID 1,
+    /// or a new connection to the socket it listens on.
+    fn streams(&self, live: &Live) -> Result<(File, File), Unconnected> {
+        match self.endpoint {
+            Endpoint::Stdio => Ok((
+                live.stdio.stdout.try_clone().expect("stdout descriptor"),
+                live.stdio.stdin.try_clone().expect("stdin descriptor"),
+            )),
+            Endpoint::UnixSocket => {
+                let stream = self.connect(live)?;
+                self.report(json!({ "event": "endpoint-connected", "work": live.work }));
+                let reader = stream.try_clone().expect("socket descriptor");
+                Ok((
+                    File::from(OwnedFd::from(reader)),
+                    File::from(OwnedFd::from(stream)),
+                ))
+            }
+        }
+    }
+
+    fn client(
+        &self,
+        reader: File,
+        writer: File,
+        observed: &Rc<Observed>,
+    ) -> AcpClient<HarnessTransport> {
         let transport = HarnessTransport::new(
             reader,
             writer,
-            Rc::clone(&observed),
+            Rc::clone(observed),
             Arc::clone(&self.slot.stop),
             Some(Arc::clone(&self.inbox)),
         );
-        let mut client = AcpClient::new(
+        AcpClient::new(
             transport,
             ClientInfo {
                 name: "oulipoly-root-supervisor".to_owned(),
                 version: env!("CARGO_PKG_VERSION").to_owned(),
             },
-        );
-        let end = self.converse(&mut client, &observed, &live);
+        )
+    }
+
+    /// After a conversation on `live` ended: refuses what was queued but
+    /// not taken, then waits for the harness's end. `held` keeps a close
+    /// able to end a recovered survivor whose conversation ended while it
+    /// lives (see [`Self::hold`]).
+    fn left_conversation(
+        &mut self,
+        client: AcpClient<HarnessTransport>,
+        observed: &Observed,
+        end: ConnEnd,
+        live: Live,
+        held: bool,
+    ) -> (ConnEnd, &'static str) {
         // Out of conversation: nothing more is taken, and what the caller
         // queued but this worker never took is not admitted.
         let (completions, follow_ups): (Vec<_>, Vec<_>) = self
@@ -1052,6 +1332,10 @@ impl Worker {
             }
             _ => "",
         };
+        if held && !self.close_stop_attempted {
+            let settled = self.head().is_none() && self.no_open_input();
+            return self.hold(live, settled, end, cause);
+        }
         self.finish_live(live, end, cause)
     }
 
@@ -1173,11 +1457,23 @@ impl Worker {
         live: &Live,
     ) -> ConnEnd {
         match client.initialize() {
-            Ok(peer) => self.report(json!({
-                "event": "negotiated",
-                "launch": self.launches,
-                "dedup_contract": peer.dedup_contract,
-            })),
+            Ok(peer) => {
+                self.report(json!({
+                    "event": "negotiated",
+                    "launch": self.launches,
+                    "dedup_contract": peer.dedup_contract,
+                    "live_reattach": peer.live_reattach,
+                }));
+                // What this work's harness declared, for a successor that
+                // finds it alive with nothing owed.
+                let work = live.work;
+                if self
+                    .durable(|store| store.record_negotiation(work, peer.live_reattach))
+                    .is_none()
+                {
+                    return ConnEnd::Stop;
+                }
+            }
             Err(NegotiationFailure::PeerGone) => return self.gone_or_drained(),
             Err(failure) => {
                 let label = match failure {
@@ -1239,6 +1535,19 @@ impl Worker {
             }
         }
         let session = self.session.clone().expect("session id");
+        self.conversation(client, observed, live, &session)
+    }
+
+    /// Delivers what is owed on `session`, then takes the caller's further
+    /// input between turns until the conversation ends.
+    fn conversation(
+        &mut self,
+        client: &mut AcpClient<HarnessTransport>,
+        observed: &Observed,
+        live: &Live,
+        session: &str,
+    ) -> ConnEnd {
+        let session = session.to_owned();
         let position = self.position;
         let mut seen = client.events().len();
         self.inbox.open();
@@ -1478,6 +1787,10 @@ impl Worker {
                 }
                 continue;
             }
+            if let Some(earlier) = self.earlier(&follow_up) {
+                self.duplicate(&follow_up, &earlier);
+                continue;
+            }
             let refused = if self.cancelled() {
                 Some(self.stop_reason())
             } else if self.closing.requested() {
@@ -1498,11 +1811,19 @@ impl Worker {
                     follow_up.control,
                     follow_up.caller_ref.as_deref(),
                     &follow_up.text,
+                    true,
                 )
             });
-            let Some((index, message)) = admitted else {
-                self.refuse(&follow_up, "store-lost");
-                return false;
+            let (index, message) = match admitted {
+                Some(Admission::Admitted(index, message)) => (index, message),
+                Some(Admission::Duplicate(earlier)) => {
+                    self.duplicate(&follow_up, &earlier);
+                    continue;
+                }
+                None => {
+                    self.refuse(&follow_up, "store-lost");
+                    return false;
+                }
             };
             debug_assert_eq!(index, self.tracked.len());
             self.tracked.push(Tracked {
@@ -1512,6 +1833,8 @@ impl Worker {
                 closures: 0,
                 attempts: 0,
                 prior_unknown: 0,
+                unknown_attempts: 0,
+                turn_ended: false,
                 follow_up: true,
             });
             let _ = self.tx.send(Event::Admitted(self.position));
@@ -1525,6 +1848,38 @@ impl Worker {
             }));
         }
         true
+    }
+
+    /// The earlier admission of this follow-up's caller `ref`, by any
+    /// generation of this root.
+    fn earlier(&self, follow_up: &FollowUp) -> Option<EarlierRef> {
+        let caller_ref = follow_up.caller_ref.as_deref()?;
+        self.store
+            .lock()
+            .expect("store lock")
+            .earlier_ref(caller_ref)
+            .ok()
+            .flatten()
+    }
+
+    /// A retry of an already admitted logical input: nothing is admitted
+    /// or delivered again; the earlier input's durable state is reported.
+    fn duplicate(&self, follow_up: &FollowUp, earlier: &EarlierRef) {
+        self.report(json!({
+            "event": "follow-up-duplicate",
+            "control": follow_up.control,
+            "ref": follow_up.caller_ref,
+            "admitted": false,
+            "earlier": {
+                "harness_position": earlier.harness,
+                "input": earlier.input,
+                "admitted_generation": earlier.admitted_generation,
+                "acknowledged": earlier.acknowledged,
+                "stop": earlier.stop,
+                "turn_end": if earlier.turn_ended { "tagged-idle-recorded" } else { "not-recorded" },
+            },
+            "meaning": "this ref was already admitted in this root; it is not admitted or delivered again",
+        }));
     }
 
     /// The owner input whose acknowledged `messageId` is `message_id`.
@@ -1594,6 +1949,16 @@ impl Worker {
                         });
                     });
                     for (index, message_id) in covered {
+                        // Durable, so that a successor knows this input's
+                        // turn ended (the agent's tag, not processing).
+                        let position = self.position;
+                        if !self.tracked[index].turn_ended
+                            && self
+                                .durable(|store| store.record_turn_end(position, index))
+                                .is_some()
+                        {
+                            self.tracked[index].turn_ended = true;
+                        }
                         self.report(json!({
                             "event": "turn-end",
                             "session": session_id,
@@ -1666,6 +2031,7 @@ impl Worker {
                     prior_unknown: tracked.prior_unknown,
                     closures: tracked.closures,
                     follow_up: tracked.follow_up,
+                    turn_ended: tracked.turn_ended,
                 }
             })
             .collect();
@@ -1679,8 +2045,104 @@ impl Worker {
             wait_failures: self.wait_failures.clone(),
             detached: self.detached,
             close_stop_attempted: self.close_stop_attempted,
+            recovered_conversation: self.recovered_conversation.clone(),
             messages,
         }
+    }
+}
+
+/// A reopen read that ended without a reply: interrupted by a close or
+/// cancel (unknown: the harness may still answer), or the stream closed.
+fn interrupted(observed: &Observed, stage: &str) -> (&'static str, String) {
+    if observed.woken.get() {
+        ("unknown", format!("{stage}-interrupted"))
+    } else {
+        ("unavailable", format!("{stage}-transport-closed"))
+    }
+}
+
+/// Watches for a close while a recovered survivor is held without a
+/// conversation, on its own thread, since the worker is blocked waiting
+/// for the survivor's end.
+struct HoldWatch {
+    done: Arc<AtomicBool>,
+    stopped: Arc<AtomicBool>,
+    inbox: Arc<Inbox>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl HoldWatch {
+    fn start(worker: &Worker, live: &Live, settled: bool) -> Self {
+        let done = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (id, tx, inbox, closing) = (
+            worker.id.clone(),
+            worker.tx.clone(),
+            Arc::clone(&worker.inbox),
+            Arc::clone(&worker.closing),
+        );
+        let (stop, root, work) = (
+            Arc::clone(&worker.slot.stop),
+            Arc::clone(&live.root),
+            live.work,
+        );
+        let thread = {
+            let (done, stopped, inbox) =
+                (Arc::clone(&done), Arc::clone(&stopped), Arc::clone(&inbox));
+            thread::spawn(move || {
+                let report = |mut value: Value| {
+                    value["harness"] = Value::String(id.clone());
+                    let _ = tx.send(Event::Report(value));
+                };
+                loop {
+                    if done.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if closing.requested() {
+                        if settled {
+                            let signalled = root.kill(work);
+                            stopped.store(true, Ordering::SeqCst);
+                            report(json!({
+                                "event": "close-stopping",
+                                "work": work,
+                                "signalled": signalled,
+                                "by": "work-pid1-kill",
+                                "held": true,
+                                "meaning": "recovered survivor held without a conversation, every input's turn recorded ended: owner stop attempted for the close; signalled records request delivery, actual host end is reported separately; not processing success",
+                            }));
+                        } else {
+                            report(json!({
+                                "event": "close-not-applied",
+                                "work": work,
+                                "reason": "turn-state-unknown",
+                                "meaning": "a close never cuts a turn that may be open: this recovered survivor stays held until its end is reported or the caller cancels",
+                            }));
+                        }
+                        return;
+                    }
+                    if !transport::rung(&stop, inbox.hold_bell()).unwrap_or(false) {
+                        return;
+                    }
+                    inbox.drain_hold();
+                }
+            })
+        };
+        Self {
+            done,
+            stopped,
+            inbox,
+            thread: Some(thread),
+        }
+    }
+
+    /// Ends the watch; returns whether it attempted a stop for a close.
+    fn finish(mut self) -> bool {
+        self.done.store(true, Ordering::SeqCst);
+        self.inbox.ring();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        self.stopped.load(Ordering::SeqCst)
     }
 }
 
@@ -1757,6 +2219,8 @@ mod tests {
                         closures: 0,
                         attempts: 0,
                         prior_unknown: 0,
+                        unknown_attempts: 0,
+                        turn_ended: false,
                         follow_up: false,
                     })
                     .collect(),
@@ -1784,6 +2248,8 @@ mod tests {
                 child: None,
                 pending_completions: std::collections::VecDeque::new(),
                 completion_of: std::collections::HashMap::new(),
+                continue_attached: false,
+                recovered_conversation: None,
             },
             rx,
             dir,
@@ -1795,6 +2261,16 @@ mod tests {
     /// effects: reported `launch-unknown`, the work row stays unresolved,
     /// the run cannot read as reaped, and nothing is relaunched. Only a
     /// positive no-start reply resolves the work as never started.
+    #[test]
+    fn current_rejection_cannot_settle_an_unknown_prior_attempt() {
+        let (mut worker, _rx, _dir) = worker();
+        worker.tracked[0].label = Some("rejected".into());
+        worker.tracked[0].unknown_attempts = 1;
+        assert_eq!(worker.settled_turns(), Err("delivery-unresolved"));
+        worker.tracked[0].unknown_attempts = 0;
+        assert_eq!(worker.settled_turns(), Ok(()));
+    }
+
     #[test]
     fn lost_or_unproven_spawn_reply_is_launch_unknown_not_refused() {
         for mode in ["lost", "unproven", "refused"] {

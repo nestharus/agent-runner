@@ -4141,3 +4141,359 @@ fn real_provider_adapter_records_its_own_native_incarnation_through_the_owner() 
         assert_ne!(Path::new(&bash["ns"]), harness_ns, "{call}");
     }
 }
+
+/// Starts a root whose one harness answers `echo:first`, waits until that
+/// input's tagged turn end, then kills the owner. Returns the survivor's
+/// host pid; the root PID 1 and the peer outlive the owner.
+fn settled_then_owner_killed(dir: &Scratch, extra: &[&str]) -> u64 {
+    let mut first = Run::start(
+        dir,
+        &spec(
+            dir,
+            3,
+            json!([{ "id": "h", "argv": peer(&dir.state("h"), extra), "messages": ["echo:first"] }]),
+        ),
+    );
+    let pid = first.event("h", "launched")["pid"].as_u64().unwrap();
+    let negotiated = first.event("h", "negotiated");
+    assert_eq!(
+        negotiated["live_reattach"],
+        extra.contains(&"--live-reattach") || extra.contains(&"--live-reattach-first"),
+        "{negotiated}"
+    );
+    if !extra.contains(&"--no-idle") {
+        first.event("h", "turn-end");
+    } else {
+        first.event("h", "ack");
+    }
+    first.kill();
+    assert!(alive(pid), "owner death kills nothing");
+    pid
+}
+
+fn prompts(dir: &Scratch) -> usize {
+    read_state(&dir.state("h"))["prompts"]
+        .as_array()
+        .unwrap()
+        .len()
+}
+
+/// R1, B2: an explicit `continue-attached` recovery of a live parent whose
+/// one input is settled (acknowledged, tagged turn end recorded), whose
+/// harness declared the live reattachment contract, negotiates with the
+/// same live process again and resumes its recorded session without
+/// resubmitting anything. A new caller input is durably admitted under the
+/// new generation before it is delivered, and answered in the same native
+/// session. After a further owner death, the same caller `ref` retried
+/// against a third owner is reported as the earlier admission and is not
+/// delivered again. Close then ends the survivor like a first owner's close.
+#[test]
+fn continue_attached_reopens_a_settled_survivor_that_declared_live_reattach() {
+    let dir = Scratch::new("reopen");
+    let pid = settled_then_owner_killed(&dir, &["--live-reattach"]);
+    assert_eq!(prompts(&dir), 1);
+
+    let mut second = Run::start(&dir, &recover_for(&dir, "continue-attached"));
+    assert_eq!(
+        second.until("custody", |value| value["event"] == "custody")["outcome"],
+        "attached"
+    );
+    assert_eq!(second.event("h", "reattached")["pid"].as_u64(), Some(pid));
+    let reopened = second.event("h", "recovered-conversation");
+    assert_eq!(reopened["state"], "live-usable", "{reopened}");
+    assert_eq!(reopened["turns"], "settled");
+    assert_eq!(reopened["capability"], "declared");
+    assert_eq!(reopened["session"], "sess-1");
+    assert_eq!(prompts(&dir), 1, "nothing settled is resubmitted");
+    second.control(&json!({ "cmd": "send", "text": "echo:second", "ref": "r-2" }).to_string());
+    let admitted = second.event("h", "follow-up-admitted");
+    assert_eq!(admitted["input"], 1, "{admitted}");
+    assert_eq!(admitted["durable"], true);
+    let reply = second.until("reply to input 1", |value| {
+        value["event"] == "agent-message" && value["input"] == 1
+    });
+    assert_eq!(reply["text"], "second", "{reply}");
+    assert_eq!(reply["session"], "sess-1");
+    second.until("turn-end of input 1", |value| {
+        value["event"] == "turn-end" && value["input"] == 1
+    });
+    let seen = second.kill();
+    assert!(events(&seen, "h", "launched").is_empty());
+    assert!(events(&seen, "h", "session-opened").is_empty());
+    assert!(alive(pid));
+    assert_eq!(prompts(&dir), 2);
+    let conn = db(&dir);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM message WHERE idx = 1 AND caller_ref = 'r-2'
+             AND admitted_generation = 2 AND ack_generation = 2
+             AND turn_end_generation = 2"
+        ),
+        1
+    );
+    drop(conn);
+
+    let mut third = Run::start(&dir, &recover_for(&dir, "continue-attached"));
+    let reopened = third.event("h", "recovered-conversation");
+    assert_eq!(reopened["state"], "live-usable", "{reopened}");
+    third.control(&json!({ "cmd": "send", "text": "echo:second", "ref": "r-2" }).to_string());
+    let duplicate = third.event("h", "follow-up-duplicate");
+    assert_eq!(duplicate["earlier"]["input"], 1, "{duplicate}");
+    assert_eq!(duplicate["earlier"]["admitted_generation"], 2);
+    assert_eq!(duplicate["earlier"]["acknowledged"], true);
+    assert_eq!(duplicate["earlier"]["turn_end"], "tagged-idle-recorded");
+    third.control(r#"{"cmd":"close"}"#);
+    let (terminal, status, seen) = third.terminal();
+    assert!(events(&seen, "h", "follow-up-admitted").is_empty());
+    assert_eq!(events(&seen, "h", "close-stopping").len(), 1);
+    assert_eq!(terminal["status"], "closed", "{terminal}");
+    assert_eq!(status.code(), Some(7));
+    assert_eq!(terminal["owed"], 0);
+    let record = harness(&terminal, "h");
+    assert_eq!(record["exits"], json!(["signal:9"]), "{record}");
+    assert_eq!(record["launches"], 0);
+    assert_eq!(record["reattached"], 1);
+    assert_eq!(record["recovered_conversation"]["state"], "live-usable");
+    assert_eq!(record["messages"].as_array().unwrap().len(), 2);
+    assert!(!alive(pid));
+    let peer = read_state(&dir.state("h"));
+    assert_eq!(peer["prompts"].as_array().unwrap().len(), 2, "{peer}");
+    assert_eq!(peer["sessions"], json!(["sess-1"]));
+    assert_eq!(
+        peer["launches"].as_array().unwrap().len(),
+        1,
+        "same process"
+    );
+}
+
+/// R1, B1 floor (the reported failure: follow-up refused as
+/// `not-in-conversation`, close holding the survivor until cancel): a
+/// settled survivor whose harness never declared live reattachment is not
+/// connected to. The recovery says so, a `send` is refused naming that
+/// state, and a close ends the survivor through its work PID 1 and the run
+/// closes, without a cancel.
+#[test]
+fn continue_attached_without_declared_reattach_is_unavailable_and_close_ends_it() {
+    let dir = Scratch::new("floor");
+    let pid = settled_then_owner_killed(&dir, &[]);
+    let mut second = Run::start(&dir, &recover_for(&dir, "continue-attached"));
+    let found = second.event("h", "recovered-conversation");
+    assert_eq!(found["state"], "unavailable", "{found}");
+    assert_eq!(found["reason"], "capability-absent");
+    assert_eq!(found["turns"], "settled");
+    second.event("h", "holding-survivor");
+    second.control(&json!({ "cmd": "send", "text": "echo:second", "ref": "r-2" }).to_string());
+    let refused = second.until("follow-up-refused", |value| {
+        value["event"] == "follow-up-refused"
+    });
+    assert_eq!(refused["reason"], "conversation-unavailable", "{refused}");
+    assert_eq!(refused["conversation"]["reason"], "capability-absent");
+    second.control(r#"{"cmd":"close"}"#);
+    let (terminal, status, seen) = second.terminal();
+    let stopping = events(&seen, "h", "close-stopping");
+    assert_eq!(stopping.len(), 1, "{seen:#?}");
+    assert_eq!(stopping[0]["held"], true);
+    for nothing in [
+        "reopen-attempt",
+        "negotiated",
+        "session-resumed",
+        "ack",
+        "launched",
+    ] {
+        assert!(events(&seen, "h", nothing).is_empty(), "{nothing}");
+    }
+    assert!(
+        seen.iter()
+            .all(|value| value["event"] != "cancel-requested")
+    );
+    assert_eq!(terminal["status"], "closed", "{terminal}");
+    assert_eq!(status.code(), Some(7));
+    let record = harness(&terminal, "h");
+    assert_eq!(record["exits"], json!(["signal:9"]), "{record}");
+    assert_eq!(record["close"], "owner-stop-attempted-after-turns-ended");
+    assert_eq!(record["recovered_conversation"]["state"], "unavailable");
+    assert_eq!(prompts(&dir), 1);
+    assert!(!alive(pid));
+}
+
+/// An acknowledged input whose turn end was never tagged leaves the
+/// survivor's turn state unknown: even with the contract declared, no
+/// conversation is attempted, a `send` is refused naming that state, and
+/// a close is not applied to it (a close never cuts a turn that may be
+/// open). Only cancel ends it.
+#[test]
+fn continue_attached_with_an_unended_turn_is_unknown_and_close_is_not_applied() {
+    let dir = Scratch::new("unknownturn");
+    let pid = settled_then_owner_killed(&dir, &["--live-reattach", "--no-idle"]);
+    let mut second = Run::start(&dir, &recover_for(&dir, "continue-attached"));
+    let found = second.event("h", "recovered-conversation");
+    assert_eq!(found["state"], "unknown", "{found}");
+    assert_eq!(found["reason"], "turn-end-unrecorded");
+    assert_eq!(found["capability"], "declared");
+    second.control(&json!({ "cmd": "send", "text": "echo:second" }).to_string());
+    let refused = second.until("follow-up-refused", |value| {
+        value["event"] == "follow-up-refused"
+    });
+    assert_eq!(refused["conversation"]["state"], "unknown", "{refused}");
+    second.control(r#"{"cmd":"close"}"#);
+    let not_applied = second.event("h", "close-not-applied");
+    assert_eq!(not_applied["reason"], "turn-state-unknown");
+    std::thread::sleep(QUIET_WINDOW);
+    assert!(alive(pid), "close does not cut a possibly open turn");
+    second.cancel();
+    let (terminal, status, seen) = second.terminal();
+    assert!(events(&seen, "h", "reopen-attempt").is_empty());
+    assert!(events(&seen, "h", "close-stopping").is_empty());
+    assert_eq!(terminal["status"], "cancelled", "{terminal}");
+    assert_eq!(status.code(), Some(2));
+    assert_eq!(harness(&terminal, "h")["exits"], json!(["signal:9"]));
+    assert_eq!(prompts(&dir), 1);
+}
+
+/// The declaration recorded at the first negotiation is necessary, not
+/// sufficient: a harness that does not declare it again when the new owner
+/// negotiates is not conversed with (`capability-withdrawn`), and its
+/// recovery falls back to the held floor that a close ends.
+#[test]
+fn reattachment_not_declared_again_falls_back_to_the_held_floor() {
+    let dir = Scratch::new("withdrawn");
+    let pid = settled_then_owner_killed(&dir, &["--live-reattach-first"]);
+    let mut second = Run::start(&dir, &recover_for(&dir, "continue-attached"));
+    second.event("h", "reopen-attempt");
+    let found = second.event("h", "recovered-conversation");
+    assert_eq!(found["state"], "unavailable", "{found}");
+    assert_eq!(found["reason"], "capability-withdrawn");
+    second.control(r#"{"cmd":"close"}"#);
+    let (terminal, status, seen) = second.terminal();
+    assert!(events(&seen, "h", "session-resumed").is_empty());
+    assert_eq!(events(&seen, "h", "close-stopping").len(), 1);
+    assert_eq!(terminal["status"], "closed", "{terminal}");
+    assert_eq!(status.code(), Some(7));
+    assert_eq!(prompts(&dir), 1);
+    assert!(!alive(pid));
+    let conn = db(&dir);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT live_reattach FROM work WHERE kind = 'harness'"
+        ),
+        0,
+        "the current negotiation's declaration is recorded"
+    );
+}
+
+/// After owner loss, a reopened parent asks for a registered child from a
+/// new input admitted under the new generation (not from a descendant
+/// that predates the loss): the child is admitted by the new owner with
+/// lineage to the same surviving parent work, answers, and its answer
+/// reaches the parent's turn.
+#[test]
+fn reopened_parent_requests_a_child_from_new_input() {
+    let dir = Scratch::new("reopen-child");
+    let mut first = Run::start(
+        &dir,
+        &child_spec(
+            &dir,
+            json!([{ "id": "parent", "argv": peer(&dir.state("parent"), &["--live-reattach"]), "messages": ["echo:first"] }]),
+            json!({ "echo": peer_route(&dir, "child", &[]) }),
+            4,
+            2,
+        ),
+    );
+    let work = first.event("parent", "launched")["work"].clone();
+    first.event("parent", "turn-end");
+    first.kill();
+
+    let mut second = Run::start(&dir, &recover_for(&dir, "continue-attached"));
+    let reopened = second.event("parent", "recovered-conversation");
+    assert_eq!(reopened["state"], "live-usable", "{reopened}");
+    second.control(
+        &json!({ "cmd": "send", "text": "explore:echo:echo:after owner loss", "ref": "c-1" })
+            .to_string(),
+    );
+    assert_eq!(second.event("parent", "follow-up-admitted")["input"], 1);
+    let accepted = second.until("child accepted", |value| value["event"] == "child-accepted");
+    assert_eq!(accepted["parent_work"], work, "{accepted}");
+    second.until("parent turn end of input 1", |value| {
+        value["harness"] == "parent" && value["event"] == "turn-end" && value["input"] == 1
+    });
+    second.control(r#"{"cmd":"close"}"#);
+    let (terminal, status, seen) = second.terminal();
+    assert_eq!(status.code(), Some(7), "{terminal}");
+    let result = child_result(&seen)[0];
+    assert_eq!(result["outcome"], "answered", "{result}");
+    assert_eq!(result["answer"], "after owner loss");
+    let answer = events(&seen, "parent", "agent-message")
+        .into_iter()
+        .find(|value| value["input"] == 1)
+        .unwrap();
+    assert!(
+        answer["text"]
+            .as_str()
+            .unwrap()
+            .contains("after owner loss"),
+        "{answer}"
+    );
+    let conn = db(&dir);
+    let (admitted, parent_work): (i64, i64) = conn
+        .query_row(
+            "SELECT admitted_generation, parent_work FROM child",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(admitted, 2);
+    assert_eq!(Some(parent_work), work.as_i64());
+    assert_eq!(
+        read_state(&dir.state("parent"))["launches"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// A reopened survivor that ends after inserting a new input without
+/// acknowledging it leaves that input owed: its observed exit is a
+/// closure, and the input is relaunched with the same key like any owed
+/// input, in the recorded session (the peer's dedup returns the earlier
+/// insertion). It is never dropped because the conversation was a reopened
+/// one.
+#[test]
+fn reopened_conversation_closed_with_new_input_owed_relaunches_it_with_the_same_key() {
+    let dir = Scratch::new("reopen-closure");
+    let pid = settled_then_owner_killed(
+        &dir,
+        &["--live-reattach", "--on-reinit", "exit-before-ack-once"],
+    );
+    let mut second = Run::start(&dir, &recover_for(&dir, "continue-attached"));
+    assert_eq!(
+        second.event("h", "recovered-conversation")["state"],
+        "live-usable"
+    );
+    second.control(&json!({ "cmd": "send", "text": "echo:second", "ref": "r-2" }).to_string());
+    assert_eq!(second.event("h", "follow-up-admitted")["input"], 1);
+    let closure = second.event("h", "closure-observed");
+    assert_eq!(closure["index"], 1, "{closure}");
+    let relaunch = second.event("h", "relaunch");
+    assert_eq!(relaunch["same_key"], true);
+    let launched = second.event("h", "launched");
+    assert_ne!(launched["pid"].as_u64(), Some(pid));
+    let ack = second.until("ack of input 1", |value| {
+        value["event"] == "ack" && value["index"] == 1
+    });
+    assert_eq!(ack["recovered"], true, "{ack}");
+    second.until("turn-end of input 1", |value| {
+        value["event"] == "turn-end" && value["input"] == 1
+    });
+    second.control(r#"{"cmd":"close"}"#);
+    let (terminal, status, _) = second.terminal();
+    assert_eq!(terminal["status"], "closed", "{terminal}");
+    assert_eq!(status.code(), Some(7));
+    let record = harness(&terminal, "h");
+    assert_eq!(record["messages"][1]["closures"], 1, "{record}");
+    let peer = read_state(&dir.state("h"));
+    assert_eq!(peer["insertions"].as_array().unwrap().len(), 2, "{peer}");
+    assert_eq!(peer["sessions"], json!(["sess-1"]));
+}
