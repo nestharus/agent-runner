@@ -64,15 +64,35 @@
 //! source file and the launch directory's copy after the root ends.
 //!
 //! `children` (opt-in, any harness) lets the root's harness ask the owner for registered
-//! read-only children: `{"routes": {NAME: {"model", "provider"}},
-//! "opencode": {"deps", "agent_bash_tool", "agent_bash_bin"}, "auth"?,
-//! "max_starts", "max_concurrent"}`. Each child is a native OpenCode host
-//! the owner provisions at its admission under `<launch_dir>/children`,
-//! with the parent's `bash` policy and `auth` (a private access-only
-//! OpenCode `auth.json`, read again for each child; absent for a
-//! credential-free route). The harness gets an `explore` tool naming the
-//! routes. Everything named is checked before any effect; the owner
-//! enforces route, depth, budget and lineage. The caller owns `auth` and
+//! read-only children: `{"routes": {NAME: ROUTE}, "opencode"?: {"deps",
+//! "agent_bash_tool", "agent_bash_bin"}, "auth"?, "max_starts",
+//! "max_concurrent"}`. An OpenCode ROUTE is `{"model", "provider"}` (and
+//! needs `opencode`): a native OpenCode host the owner provisions at its
+//! admission under `<launch_dir>/children`, with the parent's `bash` policy
+//! and `auth` (a private access-only OpenCode `auth.json`, read again for
+//! each child; absent for a credential-free route). A registered ROUTE is
+//! `{"registered": {"executable", "settings", "config_root"?, "env"?,
+//! "agent_bash_bin"}, "slots"?}`: a registered provider, opaque to this
+//! entry as for a root, whose tool policy is always the parent's `bash`
+//! policy (it cannot name its own). Its executable's custody is checked and
+//! pinned with the root's, before anything runs. After the root's own
+//! harness setup, this entry describes and evaluates it and prepares
+//! `slots` (1 to `max_starts`, default `max_starts`) fresh slots under
+//! `<launch_dir>/child-slots/NAME/K`, each with its own data root handed to
+//! the work identity, as for a registered root; any failure there is a
+//! setup failure (73), the owner never started. The owner gives the route's
+//! k-th admission (every owner generation counted) slot k, once, and
+//! refuses the route once its slots are used; it runs that slot's
+//! `resident.serve` as the child's harness in the child's own work
+//! namespaces. An unused slot is setup, not a start or admission; this
+//! entry starts no preparer at run time. A child is offered no routes and
+//! the owner refuses its own child requests (depth 1). The parent's
+//! `bash` policy is the child's configuration, not a write barrier: the
+//! read-only brief is the child's task, not an enforced restriction. An
+//! embedded harness gets an `explore` tool naming the routes; a registered
+//! parent gets no exploration tool from this entry. Everything named is
+//! checked before any effect; the owner enforces route, slot, depth,
+//! budget and lineage. The caller owns `auth` and
 //! the children's launch copies after the root ends, as for `opencode.auth`.
 //! The packaged front door passes `children` only as its site allows a
 //! parent route to offer them, stages `auth` once per root (an OpenCode
@@ -152,7 +172,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use oulipoly_root_supervisor::children::{ChildPolicy, ChildRoute};
+use oulipoly_root_supervisor::children::{ChildPolicy, ChildRoute, PreparedSlot};
 use oulipoly_root_supervisor::native::{
     BashAuthority, ExploreTool, OpenCodeSetup, OpenCodeSetupError, REMOVED_ENV, check_opencode,
     provision_opencode,
@@ -167,6 +187,10 @@ use serde_json::{Map, Value, json};
 mod registered;
 
 const OWNER_BINARY: &str = "oulipoly-root-supervisor";
+
+/// Where registered child routes' slots are prepared, under the launch
+/// directory.
+const CHILD_SLOTS: &str = "child-slots";
 
 const EXIT_REFUSED: i32 = 64;
 const EXIT_PROVIDER_REFUSED: i32 = 65;
@@ -218,18 +242,35 @@ pub(crate) struct NativeRootRequest {
 #[serde(deny_unknown_fields)]
 struct ChildrenRequest {
     routes: BTreeMap<String, ChildRouteRequest>,
-    opencode: ChildOpenCode,
+    /// The OpenCode child launch inputs; required by an OpenCode route only.
+    #[serde(default)]
+    opencode: Option<ChildOpenCode>,
     #[serde(default)]
     auth: Option<String>,
     max_starts: u32,
     max_concurrent: u32,
 }
 
+/// One child route: an OpenCode `model` and `provider`, or a `registered`
+/// provider with how many fresh `slots` to prepare (default `max_starts`).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChildRouteRequest {
-    model: String,
-    provider: Map<String, Value>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    provider: Option<Map<String, Value>>,
+    #[serde(default)]
+    registered: Option<registered::ChildRegistration>,
+    #[serde(default)]
+    slots: Option<u32>,
+}
+
+impl ChildRouteRequest {
+    /// The OpenCode route's model and provider, if it is one.
+    fn opencode(&self) -> Option<(&String, &Map<String, Value>)> {
+        self.model.as_ref().zip(self.provider.as_ref())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -385,6 +426,7 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
         &request,
         harness_kind(&request),
         vec!["/usr/bin/env".to_owned()],
+        None,
     );
     if let Err(reason) = checked.validate() {
         return Ok(refused(&out, format!("owner request: {reason}")));
@@ -416,11 +458,29 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
         Ok(workload) => workload,
         Err(reason) => return Ok(refused(&out, format!("owner request: {reason}"))),
     };
-    if let Some(registration) = &request.provider {
+    // Every provider executable's custody and pin, the root's then each
+    // registered child route's, before any of them runs.
+    let root_admitted = match &request.provider {
+        Some(registration) => {
+            match registered::check(registration).and_then(|()| registered::admit(registration)) {
+                Ok(admitted) => Some((registration, admitted)),
+                Err(reason) => return Ok(refused(&out, reason)),
+            }
+        }
+        None => None,
+    };
+    let child_registrations = child_registrations(&request);
+    let children = match admit_children(&child_registrations) {
+        Ok(children) => children,
+        Err(reason) => return Ok(refused(&out, reason)),
+    };
+    if let Some((registration, admitted)) = root_admitted {
         return Ok(run_registered(
             &out,
             &request,
             registration,
+            admitted,
+            children,
             &owner,
             &workload,
         ));
@@ -440,6 +500,20 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
             return Ok(out.exit(EXIT_SETUP_FAILED));
         }
     };
+    let (child_routes, child_receipt) =
+        match prepare_children(&out, &request, children, workload.identity.as_ref()) {
+            Ok(prepared) => prepared,
+            Err(reason) => {
+                return Ok(registered_failure(
+                    &out,
+                    &request,
+                    registered::Failure::Setup {
+                        provider: true,
+                        reason,
+                    },
+                ));
+            }
+        };
     let set: Vec<&str> = provisioned.set.iter().map(String::as_str).collect();
     let mut reach = env_reach(
         &request.env,
@@ -454,6 +528,7 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
         "entry": "setup-completed",
         "harness": harness_kind(&request).0,
         "launch": provisioned.receipt,
+        "children": child_receipt,
         "owner": owner,
         "env": reach,
         "workload": workload_report(&workload),
@@ -464,7 +539,12 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
         "setup": "retained",
         "retry": "do-not-replay",
     });
-    let owner_request = owner_request(&request, harness_kind(&request), provisioned.argv);
+    let owner_request = owner_request(
+        &request,
+        harness_kind(&request),
+        provisioned.argv,
+        Some(&child_routes),
+    );
     Ok(start_owner(
         &out,
         &owner,
@@ -480,14 +560,11 @@ fn run_registered(
     out: &Out,
     request: &NativeRootRequest,
     registration: &registered::Registration,
+    admitted: registered::Admitted<'_>,
+    children: Vec<ChildProvider<'_>>,
     owner: &Path,
     workload: &oulipoly_root_supervisor::workload::Resolved,
 ) -> i32 {
-    let admitted =
-        match registered::check(registration).and_then(|()| registered::admit(registration)) {
-            Ok(admitted) => admitted,
-            Err(reason) => return refused(out, reason),
-        };
     let prepared = admitted.describe().and_then(|declared| {
         out.entry(declared.entry());
         let template = admitted.template()?;
@@ -516,6 +593,20 @@ fn run_registered(
         Ok(prepared) => prepared,
         Err(failure) => return registered_failure(out, request, failure),
     };
+    let (child_routes, child_receipt) =
+        match prepare_children(out, request, children, workload.identity.as_ref()) {
+            Ok(prepared) => prepared,
+            Err(reason) => {
+                return registered_failure(
+                    out,
+                    request,
+                    registered::Failure::Setup {
+                        provider: true,
+                        reason,
+                    },
+                );
+            }
+        };
     let receipt = json!({
         "provider_id": declared.provider_id,
         "agreed_contract": declared.contract,
@@ -544,6 +635,7 @@ fn run_registered(
         "entry": "setup-completed",
         "harness": "registered-provider",
         "launch": receipt,
+        "children": child_receipt,
         "owner": owner,
         "env": reach,
         "workload": workload_report(workload),
@@ -558,6 +650,7 @@ fn run_registered(
         request,
         (declared.provider_id.as_str(), Endpoint::Stdio),
         prepared.argv,
+        Some(&child_routes),
     );
     start_owner(out, owner, &request.env, &owner_request, &context)
 }
@@ -678,8 +771,13 @@ fn bash_policy(request: &NativeRootRequest) -> (Vec<String>, Option<BashAuthorit
     }
 }
 
-/// The intent's child policy, from the request's `children`.
-fn child_policy(request: &NativeRootRequest) -> Option<ChildPolicy> {
+/// The intent's child policy, from the request's `children`. A registered
+/// route is its `prepared` slots; before they are prepared (the owner's
+/// checks before any effect), the slots planned for it.
+fn child_policy(
+    request: &NativeRootRequest,
+    prepared: Option<&BTreeMap<String, ChildRoute>>,
+) -> Option<ChildPolicy> {
     let children = request.children.as_ref()?;
     let (bash_allow, bash_authority) = bash_policy(request);
     Some(ChildPolicy {
@@ -687,19 +785,35 @@ fn child_policy(request: &NativeRootRequest) -> Option<ChildPolicy> {
             .routes
             .iter()
             .map(|(name, route)| {
-                (
-                    name.clone(),
-                    ChildRoute::Opencode {
-                        deps: children.opencode.deps.clone(),
-                        agent_bash_tool: children.opencode.agent_bash_tool.clone(),
-                        agent_bash_bin: children.opencode.agent_bash_bin.clone(),
+                let launch = match (route.opencode(), &children.opencode) {
+                    (Some((model, provider)), Some(opencode)) => ChildRoute::Opencode {
+                        deps: opencode.deps.clone(),
+                        agent_bash_tool: opencode.agent_bash_tool.clone(),
+                        agent_bash_bin: opencode.agent_bash_bin.clone(),
                         bash_allow: bash_allow.clone(),
                         bash_authority,
-                        model: route.model.clone(),
-                        provider: route.provider.clone(),
+                        model: model.clone(),
+                        provider: provider.clone(),
                         auth: children.auth.clone(),
                     },
-                )
+                    _ => match prepared.and_then(|prepared| prepared.get(name)) {
+                        Some(prepared) => prepared.clone(),
+                        None => ChildRoute::Prepared {
+                            provider: "registered-provider".to_owned(),
+                            slots: (0..slot_count(children, route))
+                                .map(|index| PreparedSlot {
+                                    argv: vec!["/usr/bin/env".to_owned()],
+                                    data_root: slot_dir(request, name, index)
+                                        .join("provider")
+                                        .to_string_lossy()
+                                        .into_owned(),
+                                })
+                                .collect(),
+                            endpoint: Endpoint::Stdio,
+                        },
+                    },
+                };
+                (name.clone(), launch)
             })
             .collect(),
         max_starts: children.max_starts,
@@ -709,6 +823,174 @@ fn child_policy(request: &NativeRootRequest) -> Option<ChildPolicy> {
             .to_string_lossy()
             .into_owned(),
     })
+}
+
+/// How many slots a registered child route has prepared.
+fn slot_count(children: &ChildrenRequest, route: &ChildRouteRequest) -> u32 {
+    route.slots.unwrap_or(children.max_starts)
+}
+
+/// Where a registered child route's slot `index` is prepared.
+fn slot_dir(request: &NativeRootRequest, route: &str, index: u32) -> PathBuf {
+    Path::new(&request.launch_dir)
+        .join(CHILD_SLOTS)
+        .join(route)
+        .join(index.to_string())
+}
+
+/// The request's registered child routes, each with its slot count and the
+/// parent's tool policy, which a child inherits.
+fn child_registrations(
+    request: &NativeRootRequest,
+) -> Vec<(String, u32, registered::Registration)> {
+    let Some(children) = &request.children else {
+        return Vec::new();
+    };
+    let (bash_allow, bash_authority) = bash_policy(request);
+    children
+        .routes
+        .iter()
+        .filter_map(|(name, route)| {
+            route.registered.as_ref().map(|registration| {
+                (
+                    name.clone(),
+                    slot_count(children, route),
+                    registration.with_policy(bash_allow.clone(), bash_authority),
+                )
+            })
+        })
+        .collect()
+}
+
+/// A registered child route after its custody check and pin, before any
+/// of its operations ran.
+struct ChildProvider<'a> {
+    name: &'a str,
+    slots: u32,
+    registration: &'a registered::Registration,
+    admitted: registered::Admitted<'a>,
+}
+
+/// Checks and pins every registered child route's executable, running
+/// nothing.
+fn admit_children(
+    registrations: &[(String, u32, registered::Registration)],
+) -> Result<Vec<ChildProvider<'_>>, String> {
+    registrations
+        .iter()
+        .map(|(name, slots, registration)| {
+            registered::check(registration)
+                .and_then(|()| registered::admit(registration))
+                .map(|admitted| ChildProvider {
+                    name,
+                    slots: *slots,
+                    registration,
+                    admitted,
+                })
+                .map_err(|reason| format!("children: route {name}: {reason}"))
+        })
+        .collect()
+}
+
+/// Describes, evaluates and prepares every registered child route, after
+/// the root's own harness setup: each of its slots under
+/// `<launch_dir>/child-slots/<route>/<index>` with its own fresh provider
+/// data root, handed to the work identity. Any failure is a setup failure
+/// (the root's setup and some provider operations had run). Returns the
+/// owner's routes and the setup receipt.
+fn prepare_children(
+    out: &Out,
+    request: &NativeRootRequest,
+    children: Vec<ChildProvider<'_>>,
+    identity: Option<&oulipoly_root_supervisor::workload::Identity>,
+) -> Result<(BTreeMap<String, ChildRoute>, Value), String> {
+    let mut routes = BTreeMap::new();
+    let mut receipt = Map::new();
+    if children.is_empty() {
+        return Ok((routes, Value::Null));
+    }
+    let base = Path::new(&request.launch_dir).join(CHILD_SLOTS);
+    registered::make_slot_base(&base, identity).map_err(|reason| format!("children: {reason}"))?;
+    for child in children {
+        let name = child.name;
+        let failed = |failure: registered::Failure| match failure {
+            registered::Failure::Provider { operation, reason } => {
+                format!("children: route {name}: {operation}: {reason}")
+            }
+            registered::Failure::Setup { reason, .. } => {
+                format!("children: route {name}: {reason}")
+            }
+        };
+        let declared = child.admitted.describe().map_err(failed)?;
+        let mut entry = declared.entry();
+        entry["child_route"] = json!(name);
+        out.entry(entry);
+        let evaluated = child.admitted.template().map_err(failed)?;
+        registered::make_slot_base(&base.join(name), identity)
+            .map_err(|reason| format!("children: route {name}: {reason}"))?;
+        let mut slots = Vec::new();
+        let mut slot_receipts = Vec::new();
+        for index in 0..child.slots {
+            let dir = slot_dir(request, name, index);
+            let prepared = child
+                .admitted
+                .prepare(&dir, evaluated.clone())
+                .map_err(failed)?;
+            let handed = match identity {
+                Some(identity) => registered::hand_over(&dir, &prepared.data_root, identity)
+                    .map(|count| {
+                        json!({
+                            "to": { "user": identity.user, "uid": identity.uid, "gid": identity.gid },
+                            "entries": count,
+                        })
+                    })
+                    .map_err(|reason| format!("children: route {name}: {reason}"))?,
+                None => json!("none: the work runs as this entry's user"),
+            };
+            slot_receipts.push(json!({
+                "index": index,
+                "argv": prepared.argv,
+                "data_root": prepared.data_root,
+                "config_sha256": prepared.result.config_sha256,
+                "data_root_handed_over": handed,
+            }));
+            slots.push(PreparedSlot {
+                argv: prepared.argv,
+                data_root: prepared.data_root.to_string_lossy().into_owned(),
+            });
+        }
+        receipt.insert(
+            name.to_owned(),
+            json!({
+                "provider_id": declared.provider_id,
+                "agreed_contract": declared.contract,
+                "resident_session": declared.resident_session,
+                "tool_mediation": declared.tool_mediation,
+                "executable": child.registration.executable,
+                "executable_identity_sha256": child.admitted.identity,
+                "tools": child.registration.mediation(),
+                "tools_source": "the parent's bash policy, inherited; read-only exploration is the child's brief, not a write barrier",
+                "effective_mediation": evaluated.effective,
+                "mediation_evidence": "provider-reported configuration; live native efficacy unqualified",
+                "exploration": "none offered to the child; the owner refuses a child's own child request (depth 1)",
+                "slots": slot_receipts,
+                "slots_meaning": "prepared before the owner started, each with its own fresh data root; the k-th admission on this route takes slot k, once; unused slots are setup, not starts or admissions",
+                "identity": {
+                    "describe_policy_prepare": "this entry's",
+                    "resident_serve": "the work identity, in the child's own work namespaces",
+                },
+            }),
+        );
+        routes.insert(
+            name.to_owned(),
+            ChildRoute::Prepared {
+                provider: declared.provider_id.clone(),
+                slots,
+                endpoint: Endpoint::Stdio,
+            },
+        );
+    }
+    Ok((routes, Value::Object(receipt)))
 }
 
 /// The harness id and endpoint of the request's one harness. A registered
@@ -979,7 +1261,44 @@ fn read_request(path: &Path) -> Result<NativeRootRequest, String> {
     if harnesses.into_iter().filter(|named| *named).count() != 1 {
         return Err("request names exactly one of opencode, claude and provider".to_owned());
     }
+    if let Some(children) = &request.children {
+        check_child_routes(children)?;
+    }
     Ok(request)
+}
+
+/// Each child route is either OpenCode-shaped (`model` and `provider`,
+/// with `children.opencode`) or `registered` (with at most `max_starts`
+/// slots), never both.
+fn check_child_routes(children: &ChildrenRequest) -> Result<(), String> {
+    for (name, route) in &children.routes {
+        let opencode = route.model.is_some() || route.provider.is_some();
+        match (route.opencode(), &route.registered) {
+            (Some(_), None) if route.slots.is_none() => {
+                if children.opencode.is_none() {
+                    return Err(format!(
+                        "children: route {name}: an OpenCode route needs children.opencode"
+                    ));
+                }
+            }
+            (None, Some(_)) if !opencode => {
+                if route
+                    .slots
+                    .is_some_and(|slots| !(1..=children.max_starts).contains(&slots))
+                {
+                    return Err(format!(
+                        "children: route {name}: slots must be 1..=max_starts"
+                    ));
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "children: route {name}: name model and provider (OpenCode) or registered (with optional slots)"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read_recover_request(path: &Path) -> Result<NativeRecoverRequest, String> {
@@ -1022,6 +1341,7 @@ fn owner_request(
     request: &NativeRootRequest,
     (id, endpoint): (&str, Endpoint),
     argv: Vec<String>,
+    children: Option<&BTreeMap<String, ChildRoute>>,
 ) -> Request {
     Request {
         store: request.store.clone(),
@@ -1046,7 +1366,7 @@ fn owner_request(
                 },
                 RequestWorkload::UnprivilegedUserns {} => Workload::UnprivilegedUserns {},
             },
-            children: child_policy(request),
+            children: child_policy(request, children),
         }),
         recover: None,
     }
@@ -1380,6 +1700,7 @@ mod tests {
             &request,
             harness_kind(&request),
             vec!["/usr/bin/env".to_owned()],
+            None,
         );
         let spec = &owner.intent.as_ref().unwrap().harnesses[0];
         assert_eq!(
@@ -1438,6 +1759,7 @@ mod tests {
             &request,
             ("fake-external", Endpoint::Stdio),
             vec!["/p".to_owned()],
+            None,
         );
         let spec = &owner.intent.as_ref().unwrap().harnesses[0];
         assert_eq!(
@@ -1460,6 +1782,131 @@ mod tests {
         assert_eq!(
             serde_json::to_value(explore_tool(&request)).unwrap(),
             json!({ "routes": ["luna"], "max_starts": 2, "max_concurrent": 1 })
+        );
+    }
+
+    /// A child route is OpenCode-shaped or registered, never both; a
+    /// registered child takes the parent's tool policy (it cannot name its
+    /// own) and its slots are planned under the launch directory, at most
+    /// the start budget, before anything runs.
+    #[test]
+    fn registered_child_routes_inherit_policy_and_plan_bounded_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let read = |value: Value| {
+            let path = dir.path().join("request.json");
+            std::fs::write(&path, value.to_string()).unwrap();
+            read_request(&path)
+        };
+        let registered = json!({
+            "executable": "/opt/provider/bin/provider",
+            "settings": { "settings_id": "child" },
+            "env": { "ACCOUNT_CHOICE": "site-supplied" },
+            "agent_bash_bin": "/opt/agent-bash",
+        });
+        let base = json!({
+            "store": dir.path().join("store"),
+            "launch_dir": dir.path().join("launch"),
+            "cwd": "/", "env": {}, "messages": ["m"],
+            "outage_closure_cap": 1, "delivery_attempt_cap": 1,
+            "claude": claude_setup(),
+            "children": {
+                "routes": { "luna": { "registered": registered, "slots": 2 } },
+                "max_starts": 3, "max_concurrent": 1,
+            },
+            "workload": { "isolation": "unprivileged-userns" },
+        });
+        let request = read(base.clone()).unwrap();
+        let registrations = child_registrations(&request);
+        assert_eq!(registrations.len(), 1);
+        let (name, slots, registration) = &registrations[0];
+        assert_eq!((name.as_str(), *slots), ("luna", 2));
+        // The Claude parent's trusted-task authority, inherited.
+        assert_eq!(
+            serde_json::to_value(registration.mediation()).unwrap()["bash"],
+            json!({ "authority": "trusted-task" })
+        );
+        let policy = child_policy(&request, None).unwrap();
+        match &policy.routes["luna"] {
+            ChildRoute::Prepared {
+                slots, endpoint, ..
+            } => {
+                assert_eq!(*endpoint, Endpoint::Stdio);
+                let roots: Vec<_> = slots.iter().map(|slot| slot.data_root.as_str()).collect();
+                let launch = dir.path().join("launch/child-slots/luna");
+                assert_eq!(
+                    roots,
+                    [
+                        launch.join("0/provider").to_string_lossy(),
+                        launch.join("1/provider").to_string_lossy()
+                    ]
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // The parent gets the route offered; the owner's checks pass.
+        assert_eq!(
+            explore_tool(&request).unwrap().routes,
+            vec!["luna".to_owned()]
+        );
+        owner_request(
+            &request,
+            harness_kind(&request),
+            vec!["/usr/bin/env".to_owned()],
+            None,
+        )
+        .validate()
+        .unwrap();
+        // Defaults to one slot per possible start.
+        let mut default_slots = base.clone();
+        default_slots["children"]["routes"]["luna"]
+            .as_object_mut()
+            .unwrap()
+            .remove("slots");
+        let request = read(default_slots).unwrap();
+        assert_eq!(child_registrations(&request)[0].1, 3);
+        let refuse = |edit: &dyn Fn(&mut Value), fragment: &str| {
+            let mut value = base.clone();
+            edit(&mut value);
+            let error = read(value).unwrap_err();
+            assert!(error.contains(fragment), "{fragment}: {error}");
+        };
+        // A child cannot be given its own tool policy.
+        refuse(
+            &|v| {
+                v["children"]["routes"]["luna"]["registered"]["bash_authority"] =
+                    json!("trusted-task")
+            },
+            "unknown field",
+        );
+        refuse(
+            &|v| v["children"]["routes"]["luna"]["registered"]["bash_allow"] = json!(["true"]),
+            "unknown field",
+        );
+        refuse(
+            &|v| v["children"]["routes"]["luna"]["slots"] = json!(4),
+            "slots must be 1..=max_starts",
+        );
+        refuse(
+            &|v| v["children"]["routes"]["luna"]["slots"] = json!(0),
+            "slots must be 1..=max_starts",
+        );
+        refuse(
+            &|v| v["children"]["routes"]["luna"]["model"] = json!("openai/luna"),
+            "name model and provider (OpenCode) or registered",
+        );
+        refuse(
+            &|v| {
+                v["children"]["routes"]["oc"] =
+                    json!({ "model": "openai/luna", "provider": { "openai": {} } })
+            },
+            "an OpenCode route needs children.opencode",
+        );
+        refuse(
+            &|v| {
+                v["children"]["routes"]["oc"] =
+                    json!({ "model": "openai/luna", "provider": { "openai": {} }, "slots": 1 })
+            },
+            "name model and provider",
         );
     }
 
@@ -1582,7 +2029,12 @@ mod tests {
         assert!(request(Some(json!({ "isolation": "host-root" }))).is_err());
         // These tests run unprivileged.
         let host = request(Some(json!({ "isolation": "host-root", "user": "nobody" }))).unwrap();
-        let checked = owner_request(&host, harness_kind(&host), vec!["/usr/bin/env".to_owned()]);
+        let checked = owner_request(
+            &host,
+            harness_kind(&host),
+            vec!["/usr/bin/env".to_owned()],
+            None,
+        );
         let refused = checked.validate().unwrap_err();
         assert!(
             refused.contains("workload-refused: host-root declared but the owner is euid"),
@@ -1600,6 +2052,7 @@ mod tests {
             &unprivileged,
             harness_kind(&unprivileged),
             vec!["/usr/bin/env".to_owned()],
+            None,
         )
         .validate()
         .unwrap();

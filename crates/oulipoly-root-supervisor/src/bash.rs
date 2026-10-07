@@ -1667,7 +1667,7 @@ mod tests {
         ));
         let (tx, _rx) = channel();
         let custody = Arc::new(Mutex::new(Custody::new(stop)));
-        let children = Registry::new(None, 2, 0, Arc::clone(&custody));
+        let children = Registry::new(None, 2, 0, Default::default(), Arc::clone(&custody));
         let ingress = Ingress::new(
             claimed.root_id,
             slot,

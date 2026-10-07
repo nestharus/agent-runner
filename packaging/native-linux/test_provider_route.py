@@ -153,6 +153,73 @@ class Admission(unittest.TestCase):
         cwd.assert_not_called()
 
 
+CHILD = {k: v for k, v in PROVIDER.items() if k != "env"}
+CHILD = dict(CHILD, executable="/opt/oulipoly-providers/codex/bin/agent-runner-codex",
+             settings=dict(PROVIDER["settings"], settings_id="codex-luna"), env={"CODEX_ACCOUNT_HINT": "site-choice"})
+
+
+def child_site():
+    value = site(**{"codex-sol": dict(PROVIDER, children=["luna-codex", "luna-max"])})
+    value["child_routes"]["luna-codex"] = CHILD
+    return value
+
+
+class RegisteredChildRoutes(unittest.TestCase):
+    def test_site_child_route_may_be_a_registered_provider(self):
+        loaded(child_site())
+        bad = child_site()
+        bad["child_routes"]["luna-codex"] = dict(CHILD, children=["luna-max"])
+        with self.assertRaisesRegex(frontdoor.Refused, "child route luna-codex"):
+            loaded(bad)
+        bad["child_routes"]["luna-codex"] = dict(CHILD, credential="required")
+        with self.assertRaisesRegex(frontdoor.Refused, "child route luna-codex"):
+            loaded(bad)
+
+    def test_registered_child_takes_no_grant_and_reaches_the_entry_as_registered(self):
+        value = loaded(child_site())
+        checked = frontdoor.check_request(request(children={"routes": ["luna-codex"]}), value, NOW)
+        self.assertIsNone(checked["children"]["grant"])
+        with self.assertRaisesRegex(frontdoor.Refused, "take no credential"):
+            frontdoor.check_request(request(children={"routes": ["luna-codex"]}, child_credential={}), value, NOW)
+        user = pwd.getpwuid(os.getuid())
+        entry = frontdoor.entry_request("/opt/pkg", "/runs/1/r", user, checked, {}, False)
+        self.assertEqual(entry["children"], {
+            "routes": {"luna-codex": {"registered": {
+                "executable": CHILD["executable"],
+                "settings": CHILD["settings"],
+                "env": CHILD["env"],
+                "agent_bash_bin": "/opt/pkg/agent-bash/agent-bash",
+            }}},
+            "max_starts": 4, "max_concurrent": 2,
+        })
+        # With an OpenCode child beside it, the OpenCode inputs come too.
+        grant = {"openai": {"type": "oauth", "refresh": "", "access": "a", "expires": (NOW + 7200) * 1000}}
+        mixed = frontdoor.check_request(request(children={"routes": ["luna-codex", "luna-max"]}, child_credential=grant), value, NOW)
+        entry = frontdoor.entry_request("/opt/pkg", "/runs/1/r", user, mixed, {}, False)
+        self.assertIn("opencode", entry["children"])
+        self.assertEqual(entry["children"]["routes"]["luna-max"]["model"], "openai/gpt-6-luna")
+
+    def test_admission_checks_child_executable_custody_before_any_effect(self):
+        calls = []
+
+        def custody(route):
+            calls.append(route)
+            if route is not None and route.get("settings", {}).get("settings_id") == "codex-luna":
+                raise frontdoor.Refused("provider: child custody")
+
+        asked = request(children={"routes": ["luna-codex"]})
+        with mock.patch.object(frontdoor, "check_provider_executable", side_effect=custody), \
+             mock.patch.object(frontdoor, "check_package"), \
+             mock.patch.object(frontdoor, "load_site", return_value=loaded(child_site())), \
+             mock.patch.object(frontdoor, "requester", return_value=pwd.getpwuid(os.getuid())), \
+             mock.patch.object(frontdoor, "read_first_line", return_value=(json.dumps(asked).encode(), b"")), \
+             mock.patch.object(frontdoor, "check_cwd_as") as cwd:
+            with self.assertRaisesRegex(frontdoor.Refused, "child custody"):
+                frontdoor.admit(["frontdoor", "run"], {}, 0, NOW)
+        self.assertEqual([route["settings"]["settings_id"] for route in calls], ["codex-sol", "codex-luna"])
+        cwd.assert_not_called()
+
+
 class EntryRequest(unittest.TestCase):
     def test_provider_route_emits_the_provider_and_no_embedded_harness(self):
         user = pwd.getpwuid(os.getuid())
