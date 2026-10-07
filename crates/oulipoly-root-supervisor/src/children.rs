@@ -833,6 +833,8 @@ pub(crate) fn serve(
                     ack: None,
                     attempts: 0,
                     prior_unknown: 0,
+                    unknown_attempts: 0,
+                    turn_ended: false,
                 }],
                 open_works: Vec::new(),
             };

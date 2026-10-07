@@ -565,3 +565,34 @@ fn correlation_tags_are_reported_only_when_the_agent_sent_them() {
         .collect();
     assert_eq!(parents, [Some("m-user"), None]);
 }
+
+// Live reattachment is the agent's declaration on this connection, never a
+// default: only `{"version": 1}` under its key counts.
+#[test]
+fn live_reattach_is_read_only_from_the_declared_contract() {
+    let negotiate = |meta: Value| {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": 2,
+                "info": { "name": "scripted", "version": "0" },
+                "capabilities": { "session": {} },
+                "_meta": meta,
+            },
+        });
+        let input = Cursor::new(format!("{response}\n").into_bytes());
+        let mut client = AcpClient::new(LineTransport::new(input, Vec::new()), info());
+        client.initialize().expect("v2 negotiation").live_reattach
+    };
+    assert!(negotiate(
+        json!({ oulipoly_acp::LIVE_REATTACH_META: { "version": 1 } })
+    ));
+    assert!(!negotiate(json!({})));
+    assert!(!negotiate(
+        json!({ oulipoly_acp::LIVE_REATTACH_META: { "version": 2 } })
+    ));
+    assert!(!negotiate(
+        json!({ oulipoly_acp::LIVE_REATTACH_META: true })
+    ));
+}

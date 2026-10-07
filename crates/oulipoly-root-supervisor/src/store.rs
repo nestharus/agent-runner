@@ -50,6 +50,15 @@
 //!   it, under which owner generation, when. Local only: not an insertion
 //!   acknowledgement, processing, remote settlement or a drain. Version 8
 //!   added both (no migration).
+//! * A message's `turn_end_generation` records that a tagged idle covered
+//!   its acknowledged insertion (`turn-end`), under which generation: the
+//!   agent's tag, not processing. A `work`'s `live_reattach` records what
+//!   the harness of that work declared about the live reattachment
+//!   contract when an owner negotiated with it (`NULL`: no negotiation
+//!   recorded). A recovered owner reads both before it may converse with a
+//!   surviving harness again. A follow-up's caller `ref` names one logical
+//!   input across owners: a second admission with the same `ref` in the
+//!   root is refused as a duplicate. Version 9 added these (no migration).
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -68,7 +77,7 @@ pub(crate) const LOCK_FILE: &str = "owner.lock";
 pub(crate) const DB_FILE: &str = "intent.sqlite3";
 /// Version of this new per-root lineage. There is no migration chain: a
 /// store of any other version is refused.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 /// How long a write waits for a foreign SQLite lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -132,6 +141,7 @@ CREATE TABLE message (
     control INTEGER,
     caller_ref TEXT,
     admitted_generation INTEGER,
+    turn_end_generation INTEGER,
     PRIMARY KEY (harness, idx)
 );
 CREATE TABLE root (
@@ -158,7 +168,8 @@ CREATE TABLE work (
     outcome TEXT,
     observer TEXT,
     resolved_generation INTEGER,
-    kind TEXT NOT NULL DEFAULT 'harness' CHECK (kind IN ('harness', 'bash'))
+    kind TEXT NOT NULL DEFAULT 'harness' CHECK (kind IN ('harness', 'bash')),
+    live_reattach INTEGER
 );
 CREATE TABLE bash_run (
     work INTEGER PRIMARY KEY REFERENCES work(id),
@@ -282,6 +293,29 @@ pub(crate) struct DurableMessage {
     pub(crate) attempts: u32,
     /// Earlier attempts this instance classified as unknown.
     pub(crate) prior_unknown: u32,
+    /// Attempts of any generation whose outcome is unknown or unrecorded.
+    pub(crate) unknown_attempts: u32,
+    /// A tagged idle covered its acknowledged insertion (durably recorded).
+    pub(crate) turn_ended: bool,
+}
+
+/// An earlier admission of the same caller `ref` in this root.
+#[derive(Debug, Clone)]
+pub(crate) struct EarlierRef {
+    pub(crate) harness: usize,
+    pub(crate) input: usize,
+    pub(crate) admitted_generation: Option<i64>,
+    pub(crate) acknowledged: bool,
+    pub(crate) stop: Option<String>,
+    pub(crate) turn_ended: bool,
+}
+
+/// What a follow-up admission committed.
+pub(crate) enum Admission {
+    /// A new owed message: its index and the message to deliver.
+    Admitted(usize, OutboundMessage),
+    /// The same caller `ref` was already admitted: nothing was written.
+    Duplicate(EarlierRef),
 }
 
 pub(crate) struct DurableHarness {
@@ -712,16 +746,27 @@ impl Store {
 
     /// Commits a caller's follow-up as the harness's next owed message,
     /// with a freshly minted key, before anything reports it admitted.
-    /// Returns its index and the message to deliver.
+    /// Returns its index and the message to deliver, or, for a caller's
+    /// input (`by_ref`) whose `ref` was already admitted in this root (by
+    /// any generation), that earlier admission, writing nothing.
     pub(crate) fn admit_follow_up(
         &mut self,
         harness: usize,
         control: u64,
         caller_ref: Option<&str>,
         text: &str,
-    ) -> Result<(usize, OutboundMessage), StoreError> {
+        by_ref: bool,
+    ) -> Result<Admission, StoreError> {
         let generation = self.generation;
         self.write(|tx| {
+            if let Some(earlier) = caller_ref
+                .filter(|_| by_ref)
+                .map(|caller_ref| earlier_ref(tx, caller_ref))
+                .transpose()?
+                .flatten()
+            {
+                return Ok(Admission::Duplicate(earlier));
+            }
             let idx: i64 = tx.query_row(
                 "SELECT coalesce(max(idx) + 1, 0) FROM message WHERE harness = ?1",
                 params![int(harness)],
@@ -746,8 +791,60 @@ impl Store {
                 .map_err(|error| io::Error::other(error.to_string()))
             })
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-            Ok((usize::try_from(idx).unwrap_or(usize::MAX), message))
+            Ok(Admission::Admitted(
+                usize::try_from(idx).unwrap_or(usize::MAX),
+                message,
+            ))
         })
+    }
+
+    /// The earlier admission of `caller_ref` in this root, if any. A read:
+    /// it answers a retry without writing.
+    pub(crate) fn earlier_ref(&self, caller_ref: &str) -> rusqlite::Result<Option<EarlierRef>> {
+        earlier_ref(&self.conn, caller_ref)
+    }
+
+    /// Records that a tagged idle covered input `idx`'s acknowledged
+    /// insertion (the agent's tag, not processing).
+    pub(crate) fn record_turn_end(&mut self, harness: usize, idx: usize) -> Result<(), StoreError> {
+        let generation = self.generation;
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE message SET turn_end_generation = ?3
+                 WHERE harness = ?1 AND idx = ?2 AND turn_end_generation IS NULL",
+                params![int(harness), int(idx), generation],
+            )
+            .map(drop)
+        })
+    }
+
+    /// Records what the harness of `work` declared about the live
+    /// reattachment contract when this owner negotiated with it.
+    pub(crate) fn record_negotiation(
+        &mut self,
+        work: i64,
+        live_reattach: bool,
+    ) -> Result<(), StoreError> {
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE work SET live_reattach = ?2 WHERE id = ?1",
+                params![work, live_reattach],
+            )
+            .map(drop)
+        })
+    }
+
+    /// The live reattachment declaration last recorded for `work`, or
+    /// `None` when no negotiation with it was recorded.
+    pub(crate) fn work_negotiation(&self, work: i64) -> rusqlite::Result<Option<bool>> {
+        self.conn
+            .query_row(
+                "SELECT live_reattach FROM work WHERE id = ?1",
+                params![work],
+                |row| row.get::<_, Option<bool>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
     }
 
     /// Records a root PID 1 incarnation before it is started, so that a
@@ -1133,6 +1230,27 @@ pub(crate) struct ChildAdmission<'a> {
 }
 
 /// SQLite integers are `i64`; positions, indexes and times fit.
+fn earlier_ref(conn: &Connection, caller_ref: &str) -> rusqlite::Result<Option<EarlierRef>> {
+    conn.query_row(
+        "SELECT harness, idx, admitted_generation, ack_label IS NOT NULL, stop,
+                turn_end_generation IS NOT NULL
+         FROM message WHERE origin = 'follow-up' AND caller_ref = ?1
+         ORDER BY harness, idx LIMIT 1",
+        params![caller_ref],
+        |row| {
+            Ok(EarlierRef {
+                harness: usize::try_from(row.get::<_, i64>(0)?).unwrap_or(usize::MAX),
+                input: usize::try_from(row.get::<_, i64>(1)?).unwrap_or(usize::MAX),
+                admitted_generation: row.get(2)?,
+                acknowledged: row.get(3)?,
+                stop: row.get(4)?,
+                turn_ended: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+}
+
 fn int<N: TryInto<i64>>(value: N) -> i64 {
     value.try_into().unwrap_or(i64::MAX)
 }
@@ -1224,6 +1342,8 @@ fn create_intent(
                 ack: None,
                 attempts: 0,
                 prior_unknown: 0,
+                unknown_attempts: 0,
+                turn_ended: false,
             });
         }
         harnesses.push(DurableHarness {
@@ -1260,7 +1380,10 @@ fn load_intent(tx: &Transaction<'_>, generation: i64) -> Result<Vec<DurableHarne
                 (SELECT count(*) FROM attempt a WHERE a.harness = m.harness AND a.idx = m.idx),
                 (SELECT count(*) FROM attempt a WHERE a.harness = m.harness AND a.idx = m.idx
                     AND a.outcome = ?2 AND a.resolved_generation = ?3),
-                m.origin
+                m.origin,
+                (SELECT count(*) FROM attempt a WHERE a.harness = m.harness AND a.idx = m.idx
+                    AND (a.outcome IS NULL OR a.outcome = ?2)),
+                m.turn_end_generation IS NOT NULL
          FROM message m WHERE m.harness = ?1 ORDER BY m.idx",
     )?;
     let mut work_rows = tx.prepare(
@@ -1302,6 +1425,8 @@ fn load_intent(tx: &Transaction<'_>, generation: i64) -> Result<Vec<DurableHarne
                     },
                     attempts: row.get(9)?,
                     prior_unknown: row.get(10)?,
+                    unknown_attempts: row.get(12)?,
+                    turn_ended: row.get(13)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1445,7 +1570,12 @@ mod tests {
     fn follow_up_is_durable_owed_debt_with_its_origin() {
         let dir = Dir::new("follow");
         let mut store = Store::claim(&dir.0, Some(&intent())).unwrap().store;
-        let (idx, mut message) = store.admit_follow_up(0, 4, Some("r1"), "again").unwrap();
+        let Admission::Admitted(idx, mut message) = store
+            .admit_follow_up(0, 4, Some("r1"), "again", true)
+            .unwrap()
+        else {
+            panic!("first admission of r1");
+        };
         assert_eq!(idx, 1);
         assert!(message.is_owed());
         let key = message.key().as_str().to_owned();
@@ -1478,6 +1608,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, (key, "follow-up".into(), 4, "r1".into(), 1));
+    }
+
+    /// A caller `ref` names one logical input across owners: once admitted
+    /// by one generation, a later generation's admission of the same `ref`
+    /// writes nothing and names the earlier input. A recorded turn end and
+    /// negotiation are loaded with the store.
+    #[test]
+    fn caller_ref_is_admitted_once_across_generations() {
+        let dir = Dir::new("ref");
+        let mut store = Store::claim(&dir.0, Some(&intent())).unwrap().store;
+        assert!(matches!(
+            store
+                .admit_follow_up(0, 2, Some("r1"), "once", true)
+                .unwrap(),
+            Admission::Admitted(1, _)
+        ));
+        store.record_turn_end(0, 0).unwrap();
+        drop(store);
+        let claimed = Store::claim(&dir.0, None).unwrap();
+        let messages = &claimed.harnesses[0].messages;
+        assert!(messages[0].turn_ended);
+        assert!(!messages[1].turn_ended);
+        let mut store = claimed.store;
+        let Admission::Duplicate(earlier) = store
+            .admit_follow_up(0, 7, Some("r1"), "again", true)
+            .unwrap()
+        else {
+            panic!("second admission of r1");
+        };
+        assert_eq!((earlier.harness, earlier.input), (0, 1));
+        assert_eq!(earlier.admitted_generation, Some(1));
+        assert!(!earlier.acknowledged && !earlier.turn_ended);
+        assert_eq!(store.earlier_ref("r1").unwrap().unwrap().input, 1);
+        assert!(store.earlier_ref("r2").unwrap().is_none());
+        assert!(matches!(
+            store.admit_follow_up(0, 8, None, "unnamed", true).unwrap(),
+            Admission::Admitted(2, _)
+        ));
+        let conn = Connection::open(dir.0.join(DB_FILE)).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM message", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 3, "the duplicate wrote nothing");
     }
 
     /// Fresh-only schema: a store of the previous version is refused, not

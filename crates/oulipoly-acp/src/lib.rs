@@ -86,6 +86,31 @@
 //! and an unbounded event Vec. Reopen these at the first real-harness process
 //! or supervisor-loop slice. Readiness evidence is retained per session.
 //!
+//! # The local live reattachment contract
+//!
+//! Whether a live agent process can converse with a later client, after
+//! the client it negotiated with went away while the process (and its
+//! connection, such as retained stdio) lived on, is the agent's semantic,
+//! never inferred by a client from a retained descriptor or a stored
+//! session string. An agent declares it, per connection, with
+//! [`LIVE_REATTACH_META`] `{"version": 1}` in its `initialize` response
+//! `_meta`. The declaration promises, for the life of this process:
+//!
+//! 1. A later client on the same live process (the same retained stream,
+//!    or a new connection to the same listener) may send `initialize`
+//!    again; the agent answers it as the start of that client's use and
+//!    keeps every session it holds.
+//! 2. `session/resume` of a session this process holds continues that same
+//!    in-process conversation: nothing is replayed to the agent or the
+//!    client, and no earlier insertion is redone.
+//! 3. Message ids keep ascending across clients, so idle tags stay
+//!    comparable.
+//!
+//! Absent or another version: a later client must not converse with the
+//! live process. The declaration is the agent's word, not measured
+//! continuity; it says nothing about another process, a relaunch or a
+//! stored session string resumed elsewhere.
+//!
 //! # Not implemented
 //!
 //! * ACP v1 is not accepted as v2 consumption. A peer that negotiates v1 gets
@@ -146,3 +171,10 @@ pub const TURN_INPUT_META: &str = "oulipoly.ai/lastUserMessageId";
 
 /// Version of the dedup contract described in the crate documentation.
 pub const DEDUP_CONTRACT_VERSION: u64 = 1;
+
+/// `_meta` key a complying agent uses in its `initialize` response to
+/// declare the live reattachment contract (see the crate documentation).
+pub const LIVE_REATTACH_META: &str = "oulipoly.ai/liveReattach";
+
+/// Version of the live reattachment contract.
+pub const LIVE_REATTACH_VERSION: u64 = 1;

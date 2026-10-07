@@ -172,9 +172,27 @@ impl Run {
     fn start(dir: &Path, request: &Value) -> Self {
         let path = dir.join("request.json");
         std::fs::write(&path, request.to_string()).unwrap();
+        Self::spawn(&["native-root", "--request"], &path)
+    }
+
+    /// `native-root --recover` of `dir`'s store for `purpose`, with the
+    /// recovering owner's controls on stdin.
+    fn recover(dir: &Path, purpose: &str) -> Self {
+        let path = dir.join(format!("recover-{purpose}.json"));
+        std::fs::write(
+            &path,
+            json!({ "store": dir.join("store"), "purpose": purpose,
+                    "env": { "PATH": "/usr/bin:/bin" } })
+            .to_string(),
+        )
+        .unwrap();
+        Self::spawn(&["native-root", "--recover"], &path)
+    }
+
+    fn spawn(args: &[&str], path: &Path) -> Self {
         let mut child = Command::new(RUNNER)
-            .args(["native-root", "--request"])
-            .arg(&path)
+            .args(args)
+            .arg(path)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .stdin(Stdio::piped())
@@ -633,6 +651,86 @@ fn registered_provider_root_survives_its_entry_and_is_cancelled_by_recovery() {
         before,
         "recovery ran no provider operation"
     );
+}
+
+/// The entry dies after its registered root's one input is settled (tagged
+/// turn end); the harness survives the owner. An explicit
+/// `continue-attached` recovery through the entry runs no provider
+/// operation. With a harness that declared live reattachment, a new input
+/// is admitted by the new owner and answered in the same native session;
+/// without it, `send` is refused naming the unavailable conversation. In
+/// both, the caller's close ends the run as `closed` (87), with no cancel.
+#[test]
+#[ignore = "needs oulipoly-root-supervisor, oulipoly-root-pid1, oulipoly-root-bash and oulipoly-acp-deterministic-peer built beside the Runner (cargo build -p oulipoly-root-supervisor --bins) and unprivileged user namespaces"]
+fn registered_provider_settled_root_is_continued_or_held_truthfully_by_recovery() {
+    for declared in [true, false] {
+        let dir = scratch();
+        let executable = provider(dir.path(), "");
+        let flags: &[&str] = if declared { &["--live-reattach"] } else { &[] };
+        let mut run = Run::start(
+            dir.path(),
+            &request(dir.path(), &executable, flags, "echo:first"),
+        );
+        let serve_pid = run.event("launched")["pid"].as_u64().unwrap();
+        run.until("turn-end 0", |value| {
+            value["event"] == "turn-end" && value["input"] == 0
+        });
+        run.child.kill().unwrap();
+        run.child.wait().unwrap();
+        run.stdin = None;
+        drop(run);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !ended(serve_pid),
+            "the harness outlives the entry and its owner"
+        );
+        let before = calls(dir.path()).len();
+
+        let mut recovery = Run::recover(dir.path(), "continue-attached");
+        let found = recovery.event("recovered-conversation");
+        recovery.control(json!({ "cmd": "send", "text": "echo:after owner loss", "ref": "r-1" }));
+        if declared {
+            assert_eq!(found["state"], "live-usable", "{found}");
+            assert_eq!(recovery.event("follow-up-admitted")["input"], 1);
+            let reply = recovery.until("reply to input 1", |value| {
+                value["event"] == "agent-message" && value["input"] == 1
+            });
+            assert_eq!(reply["text"], "after owner loss", "{reply}");
+            recovery.until("turn-end 1", |value| {
+                value["event"] == "turn-end" && value["input"] == 1
+            });
+        } else {
+            assert_eq!(found["state"], "unavailable", "{found}");
+            assert_eq!(found["reason"], "capability-absent");
+            let refused = recovery.event("follow-up-refused");
+            assert_eq!(refused["reason"], "conversation-unavailable", "{refused}");
+        }
+        recovery.control(json!({ "cmd": "close" }));
+        let (terminal, code, seen) = recovery.end();
+        assert_eq!(code, Some(87), "{terminal}\n{seen:#?}");
+        let owner = seen
+            .iter()
+            .find(|value| value["event"] == "terminal")
+            .unwrap();
+        assert_eq!(owner["status"], "closed", "{owner}");
+        assert!(
+            seen.iter()
+                .all(|value| value["event"] != "cancel-requested")
+        );
+        wait_ended(serve_pid, "resident harness");
+        assert_eq!(
+            calls(dir.path()).len(),
+            before,
+            "recovery ran no provider operation"
+        );
+        let peer: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("launch/provider/peer-state.json")).unwrap(),
+        )
+        .unwrap();
+        let prompts = peer["prompts"].as_array().unwrap().len();
+        assert_eq!(prompts, if declared { 2 } else { 1 }, "{peer}");
+        assert_eq!(peer["launches"].as_array().unwrap().len(), 1, "{peer}");
+    }
 }
 
 /// Selected tool authority never admits an accepted but unmediated policy.

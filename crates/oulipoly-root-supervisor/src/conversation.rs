@@ -8,9 +8,17 @@
 //! `close` is root-wide: it ends input for every harness ([`Closing`]),
 //! and each worker stops its harness once its admitted inputs' turns have
 //! ended. It is not a cancel and not an end of processing.
+//!
+//! A recovered survivor that is held rather than conversed with says why
+//! ([`Inbox::hold`]), so that a refused `send` names that state instead of
+//! a bare `not-in-conversation`. The bell also rings a second, separate
+//! descriptor that only a held survivor's close watcher reads, so it never
+//! takes a wake meant for a conversation.
 
 use std::collections::VecDeque;
 use std::io;
+
+use serde_json::Value;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,18 +42,23 @@ struct State {
     queue: VecDeque<FollowUp>,
     /// Whether the worker is in a conversation that can take input.
     accepting: bool,
+    /// Why a recovered survivor is held without a conversation.
+    held: Option<Value>,
 }
 
 pub(crate) struct Inbox {
     state: Mutex<State>,
     bell_read: OwnedFd,
     bell_write: OwnedFd,
+    hold_read: OwnedFd,
+    hold_write: OwnedFd,
 }
 
 impl Inbox {
     pub(crate) fn new() -> io::Result<Self> {
         let (bell_read, bell_write) = crate::sys::pipe()?;
-        for fd in [&bell_read, &bell_write] {
+        let (hold_read, hold_write) = crate::sys::pipe()?;
+        for fd in [&bell_read, &bell_write, &hold_read, &hold_write] {
             // SAFETY: fcntl on a descriptor owned here.
             let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
             // SAFETY: as above.
@@ -60,9 +73,12 @@ impl Inbox {
             state: Mutex::new(State {
                 queue: VecDeque::new(),
                 accepting: false,
+                held: None,
             }),
             bell_read,
             bell_write,
+            hold_read,
+            hold_write,
         })
     }
 
@@ -86,12 +102,15 @@ impl Inbox {
         self.state.lock().expect("inbox").accepting
     }
 
-    /// Wakes a worker waiting between turns (also used for `close`).
+    /// Wakes a worker waiting between turns (also used for `close`), and
+    /// a held survivor's close watcher.
     pub(crate) fn ring(&self) {
         // A full pipe already holds a wake; nothing else can fail here
         // that a later ring would not repeat.
-        // SAFETY: write of one byte from a valid buffer to an owned fd.
-        let _ = unsafe { libc::write(self.bell_write.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
+        for fd in [&self.bell_write, &self.hold_write] {
+            // SAFETY: write of one byte from a valid buffer to an owned fd.
+            let _ = unsafe { libc::write(fd.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
+        }
     }
 
     /// The descriptor that is readable while a wake is pending.
@@ -99,24 +118,38 @@ impl Inbox {
         &self.bell_read
     }
 
+    /// The held survivor's watcher's own wake descriptor.
+    pub(crate) fn hold_bell(&self) -> &OwnedFd {
+        &self.hold_read
+    }
+
+    /// Drains the held survivor's watcher's pending wakes.
+    pub(crate) fn drain_hold(&self) {
+        drain(&self.hold_read);
+    }
+
     /// Drains pending wakes, then takes what is queued.
     pub(crate) fn take(&self) -> Vec<FollowUp> {
-        let mut buf = [0u8; 64];
-        // SAFETY: non-blocking reads into a valid buffer from an owned fd.
-        while unsafe {
-            libc::read(
-                self.bell_read.as_raw_fd(),
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-            )
-        } > 0
-        {}
+        drain(&self.bell_read);
         self.state.lock().expect("inbox").queue.drain(..).collect()
+    }
+
+    /// Records why this recovered survivor is held without a conversation;
+    /// a refused `send` reports it.
+    pub(crate) fn hold(&self, conversation: Value) {
+        self.state.lock().expect("inbox").held = Some(conversation);
+    }
+
+    /// Why this harness is held without a conversation, if it is.
+    pub(crate) fn held(&self) -> Option<Value> {
+        self.state.lock().expect("inbox").held.clone()
     }
 
     /// Opens input (the worker entered a conversation).
     pub(crate) fn open(&self) {
-        self.state.lock().expect("inbox").accepting = true;
+        let mut state = self.state.lock().expect("inbox");
+        state.accepting = true;
+        state.held = None;
     }
 
     /// Closes input and returns what was queued but not taken: the worker
@@ -126,6 +159,13 @@ impl Inbox {
         state.accepting = false;
         state.queue.drain(..).collect()
     }
+}
+
+/// Reads every pending byte of a non-blocking wake pipe.
+fn drain(fd: &OwnedFd) {
+    let mut buf = [0u8; 64];
+    // SAFETY: non-blocking reads into a valid buffer from an owned fd.
+    while unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
 }
 
 /// The root-wide close request: refuse new input, then attempt to stop

@@ -322,8 +322,52 @@
 //! retry forever; when it is used up the message stops as
 //! `attempts-exhausted` with its unknown attempts still unknown, not as an
 //! outage, a closure or an acknowledgement. A surviving harness with
-//! nothing left to deliver is still held (`holding-survivor`) until its end
-//! is reported or the caller cancels; it is never dropped as gone.
+//! nothing left to deliver is never dropped as gone; see Settled survivors.
+//!
+//! # Settled survivors
+//!
+//! A surviving harness whose every input is settled (acknowledged or
+//! durably stopped) is not resubmitted to. The recovering owner reports
+//! `recovered-conversation` with one of three states, kept on the harness's
+//! terminal record (`recovered_conversation`) and named by a refused `send`
+//! (`conversation-unavailable`):
+//!
+//! * `live-usable`: only under an explicit `continue-attached` recovery,
+//!   when every input's turn is settled (an acknowledged input's tagged
+//!   turn end was durably recorded; an unacknowledged one was conclusively
+//!   rejected, or stopped with no attempt of unknown outcome), the store
+//!   has a session for the harness, and the harness of **this** work
+//!   declared the live reattachment contract (`oulipoly-acp`) when an owner
+//!   negotiated with it. The owner then negotiates on the same live process
+//!   again (its retained stdio, or a new socket connection); the harness
+//!   must declare the contract again, and the recorded session must
+//!   resume. New input is then a follow-up as in Live conversation: durably
+//!   admitted under this owner's generation before it is sent, with
+//!   acknowledgement and turn end as transport facts only. Continuity is
+//!   the harness's declaration, not observed. Nothing settled is replayed.
+//! * `unavailable`: no conversation under this owner: not requested (a
+//!   plain or `cancel` recovery), input already closed, no recorded
+//!   session, the declaration absent at the recorded negotiation or not
+//!   repeated now, a refused negotiation or resume, or a closed stream.
+//! * `unknown`: what the harness would do with new input is not known: an
+//!   acknowledged input's turn end is not recorded (it may still be in its
+//!   turn), a stopped input has attempts of unknown outcome, no negotiation
+//!   with this work was recorded, a reply was interrupted, or the protocol
+//!   was violated. Never promoted to usable.
+//!
+//! Retained descriptors are custody, not a usable conversation, and a
+//! stored session string is scope, not continuity: neither alone opens one.
+//! A survivor not in conversation is held (`holding-survivor`) until its
+//! end is reported, the caller cancels or this owner detaches. A `close`
+//! ends it through its work PID 1 when its turns are settled
+//! (`close-stopping`, `held: true`), as a close ends a first owner's
+//! harness; otherwise the close is not applied to it (`close-not-applied`,
+//! `turn-state-unknown`): a close never cuts a turn that may be open, and
+//! only cancel ends it. A follow-up's caller `ref` names one logical input
+//! across owners: a retry of an admitted `ref` is reported as
+//! `follow-up-duplicate`, with the earlier input's durable state, and is
+//! neither admitted nor delivered again. Without a `ref` there is no such
+//! identity.
 //!
 //! # Labels
 //!
@@ -572,7 +616,8 @@ pub enum Recover {
     /// what is owed is resubmitted with its original keys (an ACK is then
     /// at best `duplicate-unknown`, not receiver continuity). A harness
     /// that needs a relaunch is launched by the attached root PID 1, in its
-    /// original environment.
+    /// original environment. A survivor with nothing owed is conversed with
+    /// again only as the crate's Settled survivors section allows.
     ContinueAttached,
 }
 
@@ -1029,6 +1074,7 @@ where
             inbox: Arc::clone(&inboxes[position]),
             closing: Arc::clone(&closing),
             children: Arc::clone(&registry),
+            continue_attached: request.recover == Some(Recover::ContinueAttached),
         };
         thread::spawn(move || harness::run(assignment));
     }
@@ -1663,7 +1709,15 @@ impl Control<'_> {
                 "stage": "queued-not-admitted",
                 "durable": false,
             }),
-            Err(_) => refused("not-in-conversation", Some(id)),
+            Err(_) => match self.inboxes[position].held() {
+                // A recovered survivor held without a conversation: say why.
+                Some(conversation) => {
+                    let mut refusal = refused("conversation-unavailable", Some(id));
+                    refusal["conversation"] = conversation;
+                    refusal
+                }
+                None => refused("not-in-conversation", Some(id)),
+            },
         }
     }
 
@@ -1754,6 +1808,7 @@ mod tests {
             wait_failures: vec![],
             detached: 0,
             close_stop_attempted: false,
+            recovered_conversation: None,
             messages: vec![],
         }
     }
@@ -1801,6 +1856,7 @@ mod tests {
             prior_unknown: 0,
             closures: 1,
             follow_up: false,
+            turn_ended: false,
         });
         record
     }
