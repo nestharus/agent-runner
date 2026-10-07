@@ -114,8 +114,9 @@
 //! Each accepted run is its own work under root PID 1, so it is killed on
 //! cancel, survives owner death like any work, and the run does not end
 //! until its end (or why it is unknown) is reported. Delivery is in-band to
-//! the requester only: no completion is supplied to any harness as a new
-//! input. Each run's output is also retained by the owner, within bounds,
+//! the requester for stream runs; async completion is offered as a later
+//! owner input to that same requester harness. Each run's output is also
+//! retained by the owner, within bounds,
 //! and sealed (count, SHA-256, losses) before its `end`, which names that
 //! identity; the requesting harness alone can read it back past any inline
 //! prefix (`op` `output`) and record its local acceptance of exactly that
@@ -329,7 +330,8 @@
 //! A surviving harness whose every input is settled (acknowledged or
 //! durably stopped) is not resubmitted to. The recovering owner reports
 //! `recovered-conversation` with one of three states, kept on the harness's
-//! terminal record (`recovered_conversation`) and named by a refused `send`
+//! terminal record (`recovered_conversation`, a recovery-time snapshot, not
+//! final usability or completion truth) and named by a refused `send`
 //! (`conversation-unavailable`):
 //!
 //! * `live-usable`: only under an explicit `continue-attached` recovery,
@@ -363,8 +365,34 @@
 //! account labels its counters `current-owner-generation` and retains prior
 //! recipient facts separately. Known promises and unknown modes/delivery
 //! survive owner churn and run end. Healthy transport and explicit close of
-//! settled turns remain available with this qualification. Recipient delivery
-//! reconstruction is outside this path. Schema 10 refuses older stores.
+//! settled turns remain available with this qualification.
+//!
+//! Recovered completions: each owner completion input is durably linked to
+//! the Bash work it completes, at most once per root over every generation
+//! (schema 11; older stores are refused). In a `live-usable` conversation,
+//! the owner offers each known `async` completion an earlier owner accepted
+//! for **that same requester work**, whose run has ended and which no
+//! generation admitted (admission is durable before any send, so such a
+//! completion never reached the harness), once
+//! (`bash-async-completion-recovered`), through the same hold and admission
+//! as a fresh completion. One
+//! already admitted is never admitted again
+//! (`bash-async-completion-not-reoffered`): with its ACK and tagged turn end
+//! durable it is reconciled `turn-ended` (at claim, or when observed); with
+//! its insertion or turn unresolved it stays `delivery-unknown`. A
+//! never-admitted one whose requester work's end is recorded is
+//! `undelivered` (`requester-ended-before-admission`); otherwise (not
+//! continued, capability absent, turn unknown) it stays unknown for a later
+//! owner. Never another recipient, a relaunched harness, a `stream` run or
+//! an unknown mode. Continuity stays the harness's declaration, and
+//! `turn-ended` stays transport evidence.
+//! Fresh and recovered completions share the linked input's settlement
+//! premise: failed/no response or conversation end leaves an admitted
+//! completion unresolved while that input remains owed. Earlier attempt
+//! outcomes stay in the durable history. A conclusive rejection supports
+//! `undelivered` only without earlier uncertain insertion; ACK without a
+//! tagged end stays unresolved. Later exact-link ACK and tagged end reconcile
+//! transport completion without another logical admission.
 //! The inherited owed-input path still reinitializes/resubmits without a live
 //! reattachment declaration; at-most-once is unproven there. This settled
 //! survivor contract must not be read as covering that path.
@@ -377,7 +405,10 @@
 //! (`close-stopping`, `held: true`), as a close ends a first owner's
 //! harness; otherwise the close is not applied to it (`close-not-applied`,
 //! `turn-state-unknown`): a close never cuts a turn that may be open, and
-//! only cancel ends it. A follow-up's caller `ref` names one logical input
+//! only cancel ends it. In a live conversation, a close waiting for an open
+//! turn's tagged end or an owed completion is `close-deferred` (applied
+//! after); one behind an unresolved turn in durable history is
+//! `close-not-applied` (only cancel ends it under this owner). A follow-up's caller `ref` names one logical input
 //! across owners: a retry of an admitted `ref` is reported as
 //! `follow-up-duplicate`, with the earlier input's durable state, and is
 //! neither admitted nor delivered again. Without a `ref` there is no such
@@ -872,6 +903,8 @@ where
                 "event": "intent-recovered",
                 "generation": generation,
                 "prior_attempts_unknown": claimed.classified_unknown,
+                "completions_reconciled": claimed.completions_reconciled,
+                "completions_requester_ended": claimed.completions_requester_ended,
             }),
         );
     }
@@ -1721,6 +1754,7 @@ impl Control<'_> {
             caller_ref: caller_ref.map(str::to_owned),
             text: text.to_owned(),
             completion: None,
+            recovered: None,
         };
         match self.inboxes[position].offer(follow_up) {
             Ok(()) => json!({

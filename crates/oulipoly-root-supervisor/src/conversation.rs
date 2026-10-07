@@ -36,6 +36,11 @@ pub(crate) struct FollowUp {
     /// owed to the harness even after `close`, and is held (not refused)
     /// while an earlier input is open.
     pub(crate) completion: Option<i64>,
+    /// Set (to the accepting owner generation) when that completion was
+    /// accepted by an earlier owner and is being recovered: only a worker
+    /// in a recovered live-usable conversation of the same requester work
+    /// admits it, and never a second time.
+    pub(crate) recovered: Option<i64>,
 }
 
 struct State {

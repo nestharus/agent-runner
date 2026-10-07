@@ -105,8 +105,8 @@ pub struct HarnessRecord {
     /// turn ends. Request delivery and the actual waited exit are separate
     /// observations (`close-stopping.signalled` and `exits`).
     pub close_stop_attempted: bool,
-    /// What a recovered owner found about conversing with this harness's
-    /// surviving work when every input was settled (`None` otherwise).
+    /// Recovery-time snapshot of this owner's conversation decision and
+    /// inherited account, not final usability or final completion truth.
     pub recovered_conversation: Option<Value>,
     pub messages: Vec<MessageRecord>,
 }
@@ -244,8 +244,14 @@ struct Worker {
     /// Background-run completions taken from the inbox while an earlier
     /// input was open: held, in order, until nothing is open.
     pending_completions: std::collections::VecDeque<FollowUp>,
-    /// Admitted completion inputs: message index to background work.
+    /// Admitted completion inputs: message index to background work, by any
+    /// generation (restored from the durable link at recovery).
     completion_of: std::collections::HashMap<usize, i64>,
+    /// The requester work of a recovered conversation that is live-usable
+    /// now: only it may be offered completions an earlier owner accepted.
+    recovered_recipient: Option<i64>,
+    /// The last close disposition reported in the live conversation.
+    close_reported: Option<&'static str>,
     /// The caller's recovery asked to continue the attached root's work
     /// (`continue-attached`): a settled survivor may be conversed with
     /// again if its harness declared it can be.
@@ -366,6 +372,14 @@ impl Worker {
             children,
             continue_attached,
         } = assignment;
+        // Completion links durably recorded by earlier generations: each one
+        // is reconciled from its own message, never admitted again.
+        let completion_of = harness
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, durable)| durable.completion_work.map(|work| (index, work)))
+            .collect();
         let tracked = harness
             .messages
             .into_iter()
@@ -413,7 +427,9 @@ impl Worker {
             children,
             child,
             pending_completions: std::collections::VecDeque::new(),
-            completion_of: std::collections::HashMap::new(),
+            completion_of,
+            recovered_recipient: None,
+            close_reported: None,
             continue_attached,
             recovered_conversation: None,
         }
@@ -429,7 +445,7 @@ impl Worker {
             .map_or(0, |view| view.owed_async.len())
     }
 
-    fn settle_async(&self, work: i64, resolution: &str, reason: Option<&str>) {
+    fn settle_async(&self, work: i64, resolution: &str, reason: Option<&str>) -> bool {
         bash::settle_async(
             &self.views,
             &self.store,
@@ -438,17 +454,35 @@ impl Worker {
             work,
             resolution,
             reason,
-        );
+        )
     }
 
-    /// The conversation ended: every completion not yet carried through a
-    /// turn end is undelivered, with what is known of how far it got.
+    /// The conversation ended: settle only completions whose durable facts
+    /// support non-delivery. Admitted uncertainty remains owed and unresolved,
+    /// for later exact-link ACK/turn-end reconciliation, from any generation.
+    /// A recovered completion not admitted by this owner is released, not
+    /// resolved: its requester work may outlive this conversation, and its
+    /// end, once recorded, settles it (see [`Self::orphaned_completions`]).
     fn settle_unfinished_completions(&mut self, queued: Vec<FollowUp>) {
-        let held = self.pending_completions.drain(..).chain(queued);
-        let mut settled: Vec<(i64, String)> = held
-            .filter_map(|follow_up| follow_up.completion)
-            .map(|work| (work, "conversation-ended-before-admission".to_owned()))
-            .collect();
+        self.recovered_recipient = None;
+        let held: Vec<FollowUp> = self.pending_completions.drain(..).chain(queued).collect();
+        let mut settled: Vec<(i64, String)> = Vec::new();
+        for follow_up in held {
+            let Some(work) = follow_up.completion else {
+                continue;
+            };
+            if follow_up.recovered.is_some() {
+                bash::release_recovered(
+                    &self.views,
+                    &self.tx,
+                    self.position,
+                    work,
+                    "conversation-ended-before-admission",
+                );
+            } else {
+                settled.push((work, "conversation-ended-before-admission".to_owned()));
+            }
+        }
         for (&index, &work) in &self.completion_of {
             let tracked = &self.tracked[index];
             let reason = match (&tracked.ack, &tracked.label) {
@@ -470,6 +504,9 @@ impl Worker {
             return true;
         };
         let position = self.position;
+        // A recovered completion must still belong to the requester work of
+        // this recovered conversation; the store refuses a second admission.
+        let recipient = follow_up.recovered.and(self.recovered_recipient);
         let admitted = self.durable(|store| {
             store.admit_follow_up(
                 position,
@@ -477,11 +514,30 @@ impl Worker {
                 follow_up.caller_ref.as_deref(),
                 &follow_up.text,
                 false,
+                Some((work, recipient)),
             )
         });
-        let Some(Admission::Admitted(index, message)) = admitted else {
-            self.settle_async(work, "undelivered", Some("store-lost"));
-            return false;
+        let (index, message) = match admitted {
+            Some(Admission::Admitted(index, message)) => (index, message),
+            Some(Admission::NotReoffered(reason)) => {
+                self.report(json!({
+                    "event": "bash-async-completion-not-reoffered",
+                    "work": work,
+                    "reason": reason,
+                    "admitted": false,
+                    "meaning": "one logical admission per accepted completion in this root; its earlier admission or resolution stands",
+                }));
+                bash::release_recovered(&self.views, &self.tx, position, work, &reason);
+                return true;
+            }
+            Some(Admission::Duplicate(_)) | None => {
+                if follow_up.recovered.is_some() {
+                    bash::release_recovered(&self.views, &self.tx, position, work, "store-lost");
+                } else {
+                    self.settle_async(work, "undelivered", Some("store-lost"));
+                }
+                return false;
+            }
         };
         debug_assert_eq!(index, self.tracked.len());
         self.tracked.push(Tracked {
@@ -503,9 +559,105 @@ impl Worker {
             "input": index,
             "stage": "durably-committed",
             "durable": true,
+            "recovered": follow_up.recovered.map(|accepted| json!({ "accepted_generation": accepted })),
             "meaning": "owed input to this harness; not yet acknowledged",
         }));
         true
+    }
+
+    /// Takes up, for this recovered live-usable conversation, every
+    /// completion an earlier owner accepted for this same requester work,
+    /// whose run ended and which no generation admitted. Each goes through
+    /// the same hold/admission as a fresh completion.
+    fn recover_completions(&mut self, work: i64) {
+        let found = {
+            let store = self.store.lock().expect("store lock");
+            store.recoverable_completions(work).map(|found| {
+                found
+                    .iter()
+                    .map(|completion| bash::recovered_follow_up(&store, completion))
+                    .collect::<Vec<_>>()
+            })
+        };
+        match found {
+            Ok(found) => {
+                for follow_up in found {
+                    self.take_recovered(follow_up);
+                }
+            }
+            Err(error) => self.report(json!({
+                "event": "bash-async-recovery-unread",
+                "reason": format!("store-unread: {error}"),
+                "meaning": "inherited completions keep their durable state; none is offered or resolved",
+            })),
+        }
+    }
+
+    /// Queues one recovered completion behind any open input, once.
+    fn take_recovered(&mut self, follow_up: FollowUp) {
+        let Some(work) = follow_up.completion else {
+            return;
+        };
+        if self.recovered_recipient.is_none() {
+            self.report(json!({
+                "event": "bash-async-completion-not-offered",
+                "work": work,
+                "reason": "recipient-not-recovered-live-usable",
+                "completion": "unchanged",
+            }));
+            return;
+        }
+        let taken = self
+            .pending_completions
+            .iter()
+            .any(|held| held.completion == Some(work))
+            || self
+                .completion_of
+                .values()
+                .any(|admitted| *admitted == work);
+        if taken || !bash::owe_recovered(&self.views, &self.tx, self.position, work) {
+            return;
+        }
+        self.report(json!({
+            "event": "bash-async-completion-recovered",
+            "work": work,
+            "accepted_generation": follow_up.recovered,
+            "recipient_work": self.recovered_recipient,
+            "meaning": "an earlier owner's never-admitted async promise, offered once to the same requester work; admitted under this owner's generation only when no earlier input is open or unresolved",
+        }));
+        self.pending_completions.push_back(follow_up);
+    }
+
+    /// An earlier generation admitted this completion (this owner carries
+    /// it only as that same message): its ACK and tagged turn end, now
+    /// durable, settle it `turn-ended`. Nothing else here resolves it.
+    fn reconcile_completion(&mut self, work: i64, index: usize) {
+        if self.durable(|store| store.reconcile_completion(work)) == Some(true) {
+            self.report(json!({
+                "event": "bash-async-completion-reconciled",
+                "work": work,
+                "input": index,
+                "completion": "turn-ended",
+                "meaning": "the input an earlier generation admitted for this completion has a durable ACK and tagged turn end; transport only, not processing",
+            }));
+        }
+    }
+
+    /// Records undelivered the earlier owners' never-admitted completions
+    /// owed to `work`, whose end was just recorded: nothing was sent to it,
+    /// and it takes no further input.
+    fn orphaned_completions(&mut self, work: i64) {
+        if let Some(works) = self.durable(|store| store.settle_orphaned_completions(work))
+            && !works.is_empty()
+        {
+            self.report(json!({
+                "event": "inherited-completion-undelivered",
+                "requester_work": work,
+                "works": works,
+                "reason": "requester-ended-before-admission",
+                "meaning": "accepted by an earlier owner and never admitted as an input; its requester work's end is recorded",
+            }));
+        }
     }
 
     /// Admits the next held completion once no earlier input is open.
@@ -754,6 +906,7 @@ impl Worker {
     /// that this survivor is not conversed with and why.
     fn unconversed(&mut self, facts: &Value, state: &str, reason: &str) {
         let mut conversation = facts.clone();
+        conversation["scope"] = json!("recovery-time-snapshot");
         conversation["state"] = json!(state);
         conversation["reason"] = json!(reason);
         conversation["meaning"] = json!(match state {
@@ -847,6 +1000,7 @@ impl Worker {
             return self.hold(live, true, ConnEnd::Stop, "");
         }
         let mut conversation = facts;
+        conversation["scope"] = json!("recovery-time-snapshot");
         conversation["state"] = json!("live-usable");
         conversation["basis"] =
             json!("harness-declared-live-reattach-at-first-and-current-negotiation");
@@ -857,6 +1011,7 @@ impl Worker {
         conversation["event"] = json!("recovered-conversation");
         self.report(conversation);
         client.observe_session(&session);
+        self.recovered_recipient = Some(live.work);
         let end = self.conversation(&mut client, &observed, &live, &session);
         self.left_conversation(client, &observed, end, live, true)
     }
@@ -1021,6 +1176,7 @@ impl Worker {
             self.durable(|store| {
                 store.resolve_work(work, "ended-with-work-namespace-status-unknown", None)
             });
+            self.orphaned_completions(work);
             self.prior_unknown_ends += 1;
             return false;
         };
@@ -1032,6 +1188,7 @@ impl Worker {
             "work_pid1": receipt["work_pid1"],
         }));
         self.durable(|store| store.resolve_work(work, &status, Some("work-pid1-wait")));
+        self.orphaned_completions(work);
         self.prior_exits.push(status);
         true
     }
@@ -1045,6 +1202,7 @@ impl Worker {
         self.durable(|store| {
             store.resolve_work(work, "ended-with-root-namespace-status-unknown", None)
         });
+        self.orphaned_completions(work);
         self.prior_unknown_ends += 1;
     }
 
@@ -1399,6 +1557,7 @@ impl Worker {
         let work = live.work;
         if let Ok((status, _)) = &exit {
             self.durable(|store| store.resolve_work(work, status, Some("work-pid1-wait")));
+            self.orphaned_completions(work);
         }
         if self.endpoint == Endpoint::UnixSocket && exit.is_ok() {
             // Its listener ended with it; the path is never reused.
@@ -1550,8 +1709,13 @@ impl Worker {
         let session = session.to_owned();
         let position = self.position;
         let mut seen = client.events().len();
-        let mut close_unknown_reported = false;
+        self.close_reported = None;
         self.inbox.open();
+        // Opened first, so a run ending after this read is offered to the
+        // inbox instead; the same work is never taken twice.
+        if self.recovered_recipient == Some(live.work) {
+            self.recover_completions(live.work);
+        }
         'conversation: loop {
             while let Some(index) = self.head() {
                 // The attempt is durable before it is sent, so no successor can
@@ -1661,8 +1825,14 @@ impl Worker {
                     // attribution entry after durable resolution; historical
                     // uncertainty still gates admission and close below.
                     self.view(|view| view.open.retain(|input| input.index != index));
-                    if let Some(work) = self.completion_of.remove(&index) {
-                        self.settle_async(work, "undelivered", Some("not-acknowledged: rejected"));
+                    if let Some(&work) = self.completion_of.get(&index)
+                        && self.settle_async(
+                            work,
+                            "undelivered",
+                            Some("not-acknowledged: rejected"),
+                        )
+                    {
+                        self.completion_of.remove(&index);
                     }
                 }
                 if let Some(end) = end {
@@ -1687,14 +1857,8 @@ impl Worker {
                 if self.closing.requested() && !self.close_stop_attempted {
                     if self.no_open_input() && self.owed_async() == 0 {
                         self.stop_for_close(live);
-                    } else if !close_unknown_reported && let Err(reason) = self.settled_turns() {
-                        self.report(json!({
-                                "event": "close-not-applied",
-                                "work": live.work,
-                                "reason": reason,
-                                "meaning": "a close never cuts an unresolved turn; this conversation stays live until its end is reported or the caller cancels",
-                            }));
-                        close_unknown_reported = true;
+                    } else {
+                        self.report_close_wait(live);
                     }
                 }
                 observed.wake_armed.set(true);
@@ -1729,6 +1893,61 @@ impl Worker {
         }
     }
 
+    /// What an input admission or a close waits for now: an earlier input
+    /// whose insertion or turn end is unresolved in durable history (this
+    /// owner cannot see that turn end: only cancel ends the wait), an input
+    /// open on this connection (its tagged turn end ends the wait), or
+    /// nothing.
+    fn turn_wait(&self) -> Option<(&'static str, &'static str)> {
+        let views = self.views.lock().expect("views");
+        let open = views
+            .get(self.position)
+            .map(|view| {
+                view.open
+                    .iter()
+                    .map(|input| input.index)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        drop(views);
+        for (index, tracked) in self.tracked.iter().enumerate() {
+            match &tracked.ack {
+                Some(_) if !tracked.turn_ended && !open.contains(&index) => {
+                    return Some(("unresolved-history", "turn-end-unrecorded"));
+                }
+                None if tracked.unknown_attempts > 0 => {
+                    return Some(("unresolved-history", "delivery-unresolved"));
+                }
+                _ => {}
+            }
+        }
+        (!open.is_empty() || self.head().is_some()).then_some(("open-turn", "input-open"))
+    }
+
+    /// Says why a completion is held, without promising more than the
+    /// facts allow.
+    fn report_held(&self, work: i64) {
+        let (held_behind, reason, meaning) = match self.turn_wait() {
+            Some(("unresolved-history", reason)) => (
+                "unresolved-history",
+                Some(reason),
+                "an earlier input's insertion or turn end is unresolved in durable history; never admitted while that holds (a later refusal or turn cannot settle it); not a promise of later admission under this owner: cancel or the conversation's end disposes it",
+            ),
+            _ => (
+                "open-turn",
+                None,
+                "an earlier input is open or queued; admitted after its tagged turn end is recorded, never into a busy turn",
+            ),
+        };
+        self.report(json!({
+            "event": "bash-async-completion-held",
+            "work": work,
+            "held_behind": held_behind,
+            "reason": reason,
+            "meaning": meaning,
+        }));
+    }
+
     /// No input is open in this connection or unresolved in its durable
     /// history. A refusal of a retry cannot settle an earlier unknown
     /// insertion. This same floor gates caller/held-completion admission
@@ -1741,6 +1960,41 @@ impl Worker {
                 .expect("views")
                 .get(self.position)
                 .is_none_or(|view| view.open.is_empty())
+    }
+
+    /// Reports, once per change, why a requested close is not applied yet:
+    /// deferred until an open turn's tagged end or an owed completion's
+    /// settlement (then applied), or not applied while an unresolved turn
+    /// in durable history stands (only cancel ends it under this owner).
+    fn report_close_wait(&mut self, live: &Live) {
+        let (event, reason, meaning) = match self.turn_wait() {
+            Some(("unresolved-history", reason)) => (
+                "close-not-applied",
+                reason,
+                "a close never cuts an unresolved turn; this owner cannot see that turn end, so the close is not applied: the conversation stays live until its end is reported or the caller cancels",
+            ),
+            Some((_, reason)) => (
+                "close-deferred",
+                reason,
+                "an input is open: the close is applied after its tagged turn end is recorded; not a refusal",
+            ),
+            None => (
+                "close-deferred",
+                "async-completion-owed",
+                "a background completion is still owed to this harness: the close is applied once it is carried through a turn end or settled undelivered; not a refusal",
+            ),
+        };
+        if self.close_reported == Some(reason) {
+            return;
+        }
+        self.close_reported = Some(reason);
+        self.report(json!({
+            "event": event,
+            "work": live.work,
+            "reason": reason,
+            "owed_async": self.owed_async(),
+            "meaning": meaning,
+        }));
     }
 
     /// The caller closed the conversation and no logical input or async
@@ -1777,6 +2031,12 @@ impl Worker {
     /// an owed message, reported only after it. Returns false on store loss.
     fn take_follow_ups(&mut self) -> bool {
         for follow_up in self.inbox.take() {
+            if follow_up.recovered.is_some() {
+                // An earlier owner's promise offered as its run ended here:
+                // taken up only by a recovered live-usable conversation.
+                self.take_recovered(follow_up);
+                continue;
+            }
             if let Some(work) = follow_up.completion {
                 // The owner's own completion input: not refused by close or
                 // by an open input (held instead); only a stop ends it.
@@ -1787,11 +2047,7 @@ impl Worker {
                     || !self.no_open_input()
                     || !self.pending_completions.is_empty()
                 {
-                    self.report(json!({
-                        "event": "bash-async-completion-held",
-                        "work": work,
-                        "meaning": "an earlier input is open; admitted after its turn ends, never into a busy turn",
-                    }));
+                    self.report_held(work);
                     self.pending_completions.push_back(follow_up);
                 } else if !self.admit_completion(follow_up) {
                     return false;
@@ -1823,12 +2079,18 @@ impl Worker {
                     follow_up.caller_ref.as_deref(),
                     &follow_up.text,
                     true,
+                    None,
                 )
             });
             let (index, message) = match admitted {
                 Some(Admission::Admitted(index, message)) => (index, message),
                 Some(Admission::Duplicate(earlier)) => {
                     self.duplicate(&follow_up, &earlier);
+                    continue;
+                }
+                // Only for owner completions; a caller input is never one.
+                Some(Admission::NotReoffered(reason)) => {
+                    self.refuse(&follow_up, &reason);
                     continue;
                 }
                 None => {
@@ -1980,8 +2242,10 @@ impl Worker {
                             "own_output": self.answered.contains(&message_id),
                             "meaning": "agent-idle-tagged-at-or-after-this-input",
                         }));
-                        if let Some(&work) = self.completion_of.get(&index) {
-                            self.settle_async(work, "turn-ended", None);
+                        if let Some(&work) = self.completion_of.get(&index)
+                            && !self.settle_async(work, "turn-ended", None)
+                        {
+                            self.reconcile_completion(work, index);
                         }
                     }
                 }
@@ -2259,12 +2523,83 @@ mod tests {
                 child: None,
                 pending_completions: std::collections::VecDeque::new(),
                 completion_of: std::collections::HashMap::new(),
+                recovered_recipient: None,
+                close_reported: None,
                 continue_attached: false,
                 recovered_conversation: None,
             },
             rx,
             dir,
         )
+    }
+
+    #[test]
+    fn failed_completion_response_keeps_owed_account_until_durable_end() {
+        let (worker, rx, _dir) = worker();
+        let mut store = worker.store.lock().unwrap();
+        let incarnation = store
+            .begin_incarnation("token", "unprivileged-userns")
+            .unwrap();
+        let parent = store.begin_work(0, incarnation).unwrap();
+        let work = store
+            .begin_bash(0, parent, incarnation, 1, "[]", &["x".into()], "/", true)
+            .unwrap();
+        let Admission::Admitted(index, _) = store
+            .admit_follow_up(0, 0, None, "completion", false, Some((work, None)))
+            .unwrap()
+        else {
+            panic!("first admission")
+        };
+        let attempt = store.begin_attempt(0, index).unwrap();
+        store
+            .resolve_attempt(attempt, "no-ack:invalid-response")
+            .unwrap();
+        drop(store);
+        worker.views.lock().unwrap().push(bash::View {
+            id: "test".into(),
+            ..Default::default()
+        });
+        bash::owe_async(&worker.views, &worker.tx, 0, work);
+        assert!(!worker.settle_async(work, "undelivered", Some("invalid-response")));
+        assert!(!worker.settle_async(work, "turn-ended", None));
+        let summary = bash::async_summary(&worker.views);
+        assert_eq!(summary["owed"], 1);
+        assert_eq!(summary["turn_ended"], 0);
+        assert_eq!(summary["undelivered"], json!([]));
+        let mut store = worker.store.lock().unwrap();
+        let later = store.begin_attempt(0, index).unwrap();
+        let ack = DurableAck {
+            label: "duplicate-unknown".into(),
+            basis: None,
+            recovered: false,
+            generation: store.generation(),
+            message_id: Some("m".into()),
+        };
+        store.record_ack(0, index, later, &ack).unwrap();
+        drop(store);
+        assert!(!worker.settle_async(work, "turn-ended", None));
+        worker
+            .store
+            .lock()
+            .unwrap()
+            .record_turn_end(0, index)
+            .unwrap();
+        assert!(worker.settle_async(work, "turn-ended", None));
+        assert!(!worker.settle_async(work, "turn-ended", None));
+        let summary = bash::async_summary(&worker.views);
+        assert_eq!(summary["owed"], 0);
+        assert_eq!(summary["turn_ended"], 1);
+        assert_eq!(summary["undelivered"], json!([]));
+        let changes: Vec<_> = rx
+            .try_iter()
+            .filter_map(|event| match event {
+                Event::Report(value) if value["event"] == "async-owed" => {
+                    Some(value["change"].clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(changes, vec![json!("owed"), json!("turn-ended")]);
     }
 
     /// CONFIGURED SEAM (A6): a harness launch whose spawn reply is lost or

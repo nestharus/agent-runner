@@ -835,6 +835,7 @@ pub(crate) fn serve(
                     prior_unknown: 0,
                     unknown_attempts: 0,
                     turn_ended: false,
+                    completion_work: None,
                 }],
                 open_works: Vec::new(),
             };

@@ -111,6 +111,9 @@ pub(crate) struct View {
     /// Background runs accepted, completions whose linked turn ended, and
     /// completions ended undelivered (each with its reason), on this view.
     pub(crate) async_accepted: u64,
+    /// Completions an earlier owner accepted that this owner took up for a
+    /// recovered live-usable conversation of the same requester work.
+    pub(crate) async_recovered: u64,
     pub(crate) async_turn_ended: u64,
     pub(crate) async_undelivered: Vec<(i64, String)>,
 }
@@ -146,9 +149,68 @@ pub(crate) fn owe_async(views: &Views, tx: &Sender<Event>, position: usize, work
     })));
 }
 
+/// Takes up a completion an earlier owner accepted as owed by this owner to
+/// the recovered conversation at `position`. False if it is already owed.
+pub(crate) fn owe_recovered(views: &Views, tx: &Sender<Event>, position: usize, work: i64) -> bool {
+    let mut views = views.lock().expect("views");
+    let Some(view) = views.get_mut(position) else {
+        return false;
+    };
+    if view.owed_async.contains(&work) {
+        return false;
+    }
+    view.owed_async.push(work);
+    view.async_recovered += 1;
+    let harness = view.id.clone();
+    let owed = owed_total(&views);
+    let _ = tx.send(Event::Report(json!({
+        "event": "async-owed",
+        "change": "recovered",
+        "work": work,
+        "harness": harness,
+        "owed_async": owed,
+        "scope": "current-owner-generation",
+        "meaning": "a completion an earlier owner accepted and never admitted is owed again by this owner to the same requester work, whose conversation was recovered live-usable",
+    })));
+    true
+}
+
+/// Stops this owner carrying a recovered completion it did not admit,
+/// without resolving it: its durable completion stays as it was (unknown
+/// unless resolved elsewhere), for the facts or a later owner to settle.
+pub(crate) fn release_recovered(
+    views: &Views,
+    tx: &Sender<Event>,
+    position: usize,
+    work: i64,
+    reason: &str,
+) {
+    let mut views = views.lock().expect("views");
+    let Some(view) = views.get_mut(position) else {
+        return;
+    };
+    let Some(at) = view.owed_async.iter().position(|owed| *owed == work) else {
+        return;
+    };
+    view.owed_async.remove(at);
+    let harness = view.id.clone();
+    let owed = owed_total(&views);
+    let _ = tx.send(Event::Report(json!({
+        "event": "async-owed",
+        "change": "released-unresolved",
+        "work": work,
+        "harness": harness,
+        "reason": reason,
+        "owed_async": owed,
+        "scope": "current-owner-generation",
+        "meaning": "this owner no longer carries this recovered completion; its durable completion is not resolved by this release",
+    })));
+}
+
 /// Ends one owed completion: `turn-ended` (an input carrying it was
 /// acknowledged and the agent's tagged turn end covered it) or
-/// `undelivered` with its reason. False if it was not owed (already ended).
+/// `undelivered` with its reason. False if not carried by this owner or
+/// durable admission facts do not support settlement; then it stays owed.
 pub(crate) fn settle_async(
     views: &Views,
     store: &Arc<Mutex<Store>>,
@@ -165,15 +227,19 @@ pub(crate) fn settle_async(
     let Some(at) = view.owed_async.iter().position(|owed| *owed == work) else {
         return false;
     };
-    if let Err(error) = store
+    match store
         .lock()
         .expect("store lock")
         .resolve_completion(work, resolution, reason)
     {
-        let _ = tx.send(Event::Report(
-            json!({ "event": error.label(), "reason": format!("{error:?}"), "work": work }),
-        ));
-        return false;
+        Ok(true) => {}
+        Ok(false) => return false,
+        Err(error) => {
+            let _ = tx.send(Event::Report(
+                json!({ "event": error.label(), "reason": format!("{error:?}"), "work": work }),
+            ));
+            return false;
+        }
     }
     view.owed_async.remove(at);
     if resolution == "turn-ended" {
@@ -205,7 +271,7 @@ pub(crate) fn inherited_summary(store: &Arc<Mutex<Store>>, harness: Option<usize
     {
         Ok(records) => json!({
             "scope": "prior-owner-generations", "records": records,
-            "meaning": "async records retain a promised completion; unknown mode retains requester lineage without inferring a promise; delivery-unknown is unresolved, even after run end; recipient delivery is not reconstructed; turn-ended is transport evidence, not processing",
+            "meaning": "async records retain a promised completion; unknown mode retains requester lineage without inferring a promise; delivery-unknown is unresolved, even after run end; admission names the one owner input that carried it (any generation) or never-admitted; a never-admitted async completion is offered at most once, only to its same requester work in a recovered live-usable conversation; turn-ended is transport evidence, not processing",
         }),
         Err(error) => {
             json!({ "scope": "prior-owner-generations", "state": "unknown", "reason": format!("store-unread: {error}") })
@@ -227,10 +293,11 @@ pub(crate) fn async_summary(views: &Views) -> Value {
     json!({
         "scope": "current-owner-generation",
         "accepted": views.iter().map(|view| view.async_accepted).sum::<u64>(),
+        "recovered": views.iter().map(|view| view.async_recovered).sum::<u64>(),
         "turn_ended": views.iter().map(|view| view.async_turn_ended).sum::<u64>(),
         "undelivered": undelivered,
         "owed": owed_total(&views),
-        "meaning": "turn_ended: a completion input was acknowledged and a tagged turn end covered it; not proof the agent read, used or accepted the output",
+        "meaning": "turn_ended: a completion input was acknowledged and a tagged turn end covered it; not proof the agent read, used or accepted the output; recovered: cumulative earlier-generation promises this owner took up, not accepted here; released unresolved promises remain in the durable prior-generation account, so recovered is not a partition of turn_ended/undelivered/owed",
     })
 }
 
@@ -812,6 +879,7 @@ impl Ingress {
             Some(sink),
             retainer,
             completion,
+            None,
         );
     }
 
@@ -827,6 +895,7 @@ impl Ingress {
         sink: Option<&mut Sink>,
         mut retainer: Retainer<'_>,
         completion: Option<Completion>,
+        recovered: Option<usize>,
     ) {
         let mut sink = sink;
         let (bytes, output) = relay_output(&self.slot.stop, stdout, &mut sink, &mut retainer);
@@ -901,6 +970,8 @@ impl Ingress {
         self.report(owner);
         if let Some(completion) = completion {
             self.offer_completion(work, &completion, &end);
+        } else if let Some(position) = recovered {
+            self.offer_recovered(work, position, Some(&end));
         }
         // Left only after the completion is offered or settled, so the
         // owning loop cannot end between this run's end and its offer.
@@ -912,7 +983,7 @@ impl Ingress {
     /// output facts, never the output itself and never an acceptance.
     fn offer_completion(&self, work: i64, completion: &Completion, end: &Value) {
         let position = completion.position;
-        let text = completion_text(&self.root_id, work, &completion.argv, end);
+        let text = completion_text(&self.root_id, work, &completion.argv, end, None);
         let undelivered = |reason: &str| {
             settle_async(
                 &self.views,
@@ -939,6 +1010,7 @@ impl Ingress {
             caller_ref: Some(format!("bash-completion:{work}")),
             text,
             completion: Some(work),
+            recovered: None,
         };
         match inbox.offer(follow_up) {
             Ok(()) => self.report(json!({
@@ -949,6 +1021,54 @@ impl Ingress {
                 "durable": false,
             })),
             Err(_) => undelivered("recipient-not-in-conversation"),
+        }
+    }
+
+    /// Offers an earlier owner's never-admitted async completion, whose run
+    /// ended under this owner, to the requesting harness's inbox. Only a
+    /// worker in a recovered live-usable conversation of the same requester
+    /// work admits it; nothing here resolves it.
+    /// `end` is this owner's own observation of it; without one (it ended
+    /// before this owner) the input says what the store recorded.
+    fn offer_recovered(&self, work: i64, position: usize, end: Option<&Value>) {
+        let follow_up = {
+            let store = self.store.lock().expect("store lock");
+            match end {
+                Some(end) => {
+                    store
+                        .completion_origin(work)
+                        .ok()
+                        .flatten()
+                        .map(|(accepted, argv)| crate::conversation::FollowUp {
+                            control: 0,
+                            caller_ref: Some(format!("bash-completion:{work}")),
+                            text: completion_text(&self.root_id, work, &argv, end, Some(accepted)),
+                            completion: Some(work),
+                            recovered: Some(accepted),
+                        })
+                }
+                None => store
+                    .recoverable_completion(work)
+                    .ok()
+                    .flatten()
+                    .map(|completion| recovered_follow_up(&store, &completion)),
+            }
+        };
+        let Some(follow_up) = follow_up else {
+            return;
+        };
+        let accepted = follow_up.recovered;
+        let inbox = self.inboxes.get().and_then(|inboxes| inboxes.get(position));
+        if inbox.is_none_or(|inbox| inbox.offer(follow_up).is_err()) {
+            self.report(json!({
+                "event": "bash-async-completion-not-offered",
+                "work": work,
+                "harness_position": position,
+                "accepted_generation": accepted,
+                "reason": "recipient-not-in-conversation",
+                "completion": "unchanged",
+                "meaning": "an earlier owner's async promise; not offered by this owner now, and not resolved by that",
+            }));
         }
     }
 
@@ -984,8 +1104,10 @@ impl Ingress {
                     "pid": adopted.harness_host_pid,
                 }));
                 let retainer = ingress.resume_retainer(adopted.work);
-                // Recipient facts are durable and reported separately; this
-                // path still does not reconstruct delivery to that recipient.
+                // An earlier owner's async promise is offered on its end
+                // only to a recovered live-usable conversation of the same
+                // requester work (the worker decides); otherwise it stays as
+                // the durable facts say.
                 ingress.finish(
                     &root,
                     adopted.work,
@@ -994,6 +1116,7 @@ impl Ingress {
                     None,
                     retainer,
                     None,
+                    (!child).then_some(harness),
                 );
             }
             Prior::Exited {
@@ -1017,6 +1140,9 @@ impl Ingress {
                     "meaning": if status.is_some() { "exit-reported-by-its-waiter" } else { "ended-with-work-namespace-status-unknown" },
                 }));
                 ingress.report(json!({ "event": "inherited-completion-account", "inherited_async": inherited_summary(&ingress.store, Some(harness)) }));
+                if !ingress.children.is_child(harness) {
+                    ingress.offer_recovered(work, harness, None);
+                }
                 ingress.leave(if status.is_some() {
                     Outcome::Ended
                 } else {
@@ -1038,6 +1164,9 @@ impl Ingress {
                     "meaning": "ended-with-root-namespace-status-unknown",
                 }));
                 ingress.report(json!({ "event": "inherited-completion-account", "inherited_async": inherited_summary(&ingress.store, Some(harness)) }));
+                if !ingress.children.is_child(harness) {
+                    ingress.offer_recovered(work, harness, None);
+                }
                 ingress.leave(Outcome::Unknown);
             }
         });
@@ -1257,11 +1386,56 @@ pub(crate) struct Completion {
 /// Longest command text quoted back in a completion input.
 const COMPLETION_COMMAND_CHARS: usize = 400;
 
+/// The input that offers a completion an earlier owner accepted, whose run
+/// ended before this owner, from its durable facts: its recorded end, and
+/// its sealed retained output if any. How its output stream ended was the
+/// earlier owner's observation and is not repeated as known.
+pub(crate) fn recovered_follow_up(
+    store: &Store,
+    completion: &crate::store::RecoverableCompletion,
+) -> crate::conversation::FollowUp {
+    let work = completion.work;
+    let root_id = store.root_id().unwrap_or_default();
+    let mut end = match completion.observer.as_deref() {
+        Some(observer) => {
+            json!({ "event": "end", "status": completion.outcome, "observer": observer })
+        }
+        None => json!({ "event": "end-unknown", "reason": completion.outcome }),
+    };
+    end["output"] = json!({ "state": "unknown", "reason": "not-observed-by-this-owner" });
+    end["retained"] = match store.output(work) {
+        Ok(Some(crate::store::OutputLookup {
+            record: Some(record),
+            ..
+        })) => retention::record_json(&root_id, work, &record),
+        _ => json!({ "state": "unknown", "reason": "no-sealed-record" }),
+    };
+    crate::conversation::FollowUp {
+        control: 0,
+        caller_ref: Some(format!("bash-completion:{work}")),
+        text: completion_text(
+            &root_id,
+            work,
+            &completion.argv,
+            &end,
+            Some(completion.accepted_generation),
+        ),
+        completion: Some(work),
+        recovered: Some(completion.accepted_generation),
+    }
+}
+
 /// The completion input's text: what the agent reads. A human summary,
 /// then one JSON line with the exact facts. Output is referenced by its
 /// retained identity, never inlined; wait, output state and retention are
 /// kept separate, and delivery is said not to be acceptance.
-pub(crate) fn completion_text(root_id: &str, work: i64, argv: &[String], end: &Value) -> String {
+pub(crate) fn completion_text(
+    root_id: &str,
+    work: i64,
+    argv: &[String],
+    end: &Value,
+    recovered: Option<i64>,
+) -> String {
     let command = argv.last().map_or(String::new(), |last| {
         let mut text: String = last.chars().take(COMPLETION_COMMAND_CHARS).collect();
         if last.chars().count() > COMPLETION_COMMAND_CHARS {
@@ -1306,7 +1480,7 @@ pub(crate) fn completion_text(root_id: &str, work: i64, argv: &[String], end: &V
                 .unwrap_or("unknown")
         ),
     };
-    let facts = json!({
+    let mut facts = json!({
         "completion": "agent-bash-root-v1-async",
         "version": 1,
         "root_id": root_id,
@@ -1322,8 +1496,17 @@ pub(crate) fn completion_text(root_id: &str, work: i64, argv: &[String], end: &V
         "retained": retained,
         "accepted_locally": false,
     });
+    if let Some(accepted) = recovered {
+        facts["recovered"] =
+            json!({ "accepted_generation": accepted, "earlier_admission": "none" });
+    }
+    let recovery = recovered.map_or(String::new(), |accepted| {
+        format!(
+            " Recovered after owner loss: accepted under owner generation {accepted}; no earlier owner admitted this completion as an input."
+        )
+    });
     format!(
-        "[Background Bash completion] Your background command (work {work}) {ended}; {stream}; {retention}\nCommand: {command}\n{facts}"
+        "[Background Bash completion] Your background command (work {work}) {ended}; {stream}; {retention}{recovery}\nCommand: {command}\n{facts}"
     )
 }
 
@@ -1864,6 +2047,7 @@ mod tests {
             Some(&mut sink),
             retainer,
             None,
+            None,
         );
         drop(sink);
         let events: Vec<Value> = BufReader::new(far)
@@ -1949,6 +2133,7 @@ mod tests {
             File::open(&source).unwrap(),
             Some(&mut sink),
             retainer,
+            None,
             None,
         );
         drop(sink);

@@ -2917,6 +2917,10 @@ fn overlapping_follow_up_is_refused_and_close_waits_for_the_open_turn() {
     let seen = run.drain_now();
     assert!(events(seen, "a", "close-stopping").is_empty(), "{seen:#?}");
     assert!(events(seen, "a", "exited").is_empty());
+    let deferred = events(seen, "a", "close-deferred");
+    assert_eq!(deferred.len(), 1, "{seen:#?}");
+    assert_eq!(deferred[0]["reason"], "input-open");
+    assert!(events(seen, "a", "close-not-applied").is_empty());
     assert!(alive(pid), "a close does not stop an open turn");
     run.cancel();
     let (terminal, status, seen) = run.terminal();
@@ -4591,4 +4595,465 @@ fn reopened_conversation_closed_with_new_input_owed_relaunches_it_with_the_same_
     let peer = read_state(&dir.state("h"));
     assert_eq!(peer["insertions"].as_array().unwrap().len(), 2, "{peer}");
     assert_eq!(peer["sessions"], json!(["sess-1"]));
+}
+
+/// One background (`async`) Bash run asked for by the harness's own
+/// descendant (the test-owned `fixtures/async_requester.py`, started by the
+/// peer's `spawn:`), which waits for `gate` and then writes `mark`.
+struct AsyncRun {
+    out: PathBuf,
+    gate: PathBuf,
+    mark: PathBuf,
+}
+
+impl AsyncRun {
+    fn new(dir: &Scratch, name: &str) -> Self {
+        let script = dir.0.join("async_requester.py");
+        if !script.exists() {
+            std::fs::write(&script, include_str!("fixtures/async_requester.py")).unwrap();
+        }
+        Self {
+            out: dir.0.join(format!("{name}.replies")),
+            gate: dir.0.join(format!("{name}.gate")),
+            mark: dir.0.join(format!("{name}.ended")),
+        }
+    }
+
+    /// The intent message that makes the harness ask for it.
+    fn message(&self, dir: &Scratch) -> String {
+        format!(
+            "spawn:/usr/bin/python3 {} {} {} {}",
+            dir.0.join("async_requester.py").display(),
+            self.out.display(),
+            self.gate.display(),
+            self.mark.display()
+        )
+    }
+
+    /// Its accepted work, once the requester was told `detached`.
+    fn work(&self) -> i64 {
+        let replies: Value = serde_json::from_str(&wait_file(&self.out)).unwrap();
+        let replies = replies.as_array().unwrap();
+        assert_eq!(replies.last().unwrap()["event"], "detached", "{replies:?}");
+        assert_eq!(replies[0]["delivery"], "async", "{replies:?}");
+        replies[0]["work"].as_i64().unwrap()
+    }
+
+    /// Lets it end, and waits until it ran to its end.
+    fn end(&self) {
+        std::fs::write(&self.gate, "").unwrap();
+        wait_file(&self.mark);
+    }
+}
+
+fn owner_events<'a>(seen: &'a [Value], event: &str, work: i64) -> Vec<&'a Value> {
+    seen.iter()
+        .filter(|value| value["event"] == event && value["work"] == work)
+        .collect()
+}
+
+fn inherited_record(account: &Value, work: i64) -> &Value {
+    account["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["work"] == work)
+        .unwrap_or_else(|| panic!("no inherited record of work {work}: {account}"))
+}
+
+/// R2-A: a known async promise of a parent whose owner died is kept for the
+/// same requester work once that conversation is recovered live-usable.
+/// Run X ends while no owner is attached (end before any offer); run Y is
+/// still live at recovery and ends under the second owner. Each completion
+/// is admitted exactly once under generation 2 (never by generation 1),
+/// carried through ACK and tagged turn end on the same surviving process.
+/// A third owner, after another owner death, offers neither again and
+/// accounts both as `turn-ended` with their generation-2 admission.
+#[test]
+fn known_async_promise_is_recovered_once_for_the_same_requester_work() {
+    let dir = Scratch::new("recovered-async");
+    let (x, y) = (AsyncRun::new(&dir, "x"), AsyncRun::new(&dir, "y"));
+    let mut first = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            3,
+            json!([{ "id": "h", "argv": peer(&dir.state("h"), &["--live-reattach"]),
+                     "messages": [x.message(&dir), y.message(&dir)] }]),
+        ),
+    );
+    let pid = first.event("h", "launched")["pid"].as_u64().unwrap();
+    let parent = first.event("h", "launched")["work"].as_i64().unwrap();
+    let (x_work, y_work) = (x.work(), y.work());
+    first.until("turn-end of input 1", |value| {
+        value["event"] == "turn-end" && value["input"] == 1
+    });
+    let seen = first.kill();
+    assert_eq!(owner_events(&seen, "async-owed", x_work).len(), 1);
+    assert!(
+        seen.iter()
+            .all(|value| value["event"] != "bash-async-completion-offered"),
+        "nothing ended under the first owner"
+    );
+    x.end();
+    // Its work PID 1's receipt follows its end; give root PID 1 its write.
+    std::thread::sleep(QUIET_WINDOW);
+    assert!(alive(pid));
+
+    let mut second = Run::start(&dir, &recover_for(&dir, "continue-attached"));
+    let account = second.until("inherited account", |value| {
+        value["event"] == "inherited-completion-account"
+    });
+    let before = inherited_record(&account["inherited_async"], x_work);
+    assert_eq!(before["completion"], "delivery-unknown", "{before}");
+    assert_eq!(before["admission"]["state"], "never-admitted");
+    assert_eq!(before["requester_work"], parent);
+    let reopened = second.event("h", "recovered-conversation");
+    assert_eq!(reopened["state"], "live-usable", "{reopened}");
+    let recovered = second.until("x recovered", |value| {
+        value["event"] == "bash-async-completion-recovered" && value["work"] == x_work
+    });
+    assert_eq!(recovered["accepted_generation"], 1, "{recovered}");
+    assert_eq!(recovered["recipient_work"], parent);
+    let admitted = second.until("x admitted", |value| {
+        value["event"] == "bash-async-completion-admitted" && value["work"] == x_work
+    });
+    assert_eq!(
+        admitted["recovered"]["accepted_generation"], 1,
+        "{admitted}"
+    );
+    let x_input = admitted["input"].clone();
+    second.until("x turn end", |value| {
+        value["event"] == "turn-end" && value["input"] == x_input
+    });
+    second.until("x settled", |value| {
+        value["event"] == "async-owed" && value["work"] == x_work && value["change"] == "turn-ended"
+    });
+    y.end();
+    let admitted = second.until("y admitted", |value| {
+        value["event"] == "bash-async-completion-admitted" && value["work"] == y_work
+    });
+    assert_eq!(
+        admitted["recovered"]["accepted_generation"], 1,
+        "{admitted}"
+    );
+    let y_input = admitted["input"].clone();
+    second.until("y turn end", |value| {
+        value["event"] == "turn-end" && value["input"] == y_input
+    });
+    second.until("y settled", |value| {
+        value["event"] == "async-owed" && value["work"] == y_work && value["change"] == "turn-ended"
+    });
+    let seen = second.kill();
+    for work in [x_work, y_work] {
+        assert_eq!(
+            owner_events(&seen, "bash-async-completion-admitted", work).len(),
+            1,
+            "work {work} admitted once"
+        );
+    }
+    assert!(events(&seen, "h", "launched").is_empty(), "same process");
+    assert_eq!(prompts(&dir), 4, "two intent inputs and two completions");
+
+    let mut third = Run::start(&dir, &recover_for(&dir, "continue-attached"));
+    let account = third.until("inherited account", |value| {
+        value["event"] == "inherited-completion-account"
+    });
+    for work in [x_work, y_work] {
+        let record = inherited_record(&account["inherited_async"], work);
+        assert_eq!(record["completion"], "turn-ended", "{record}");
+        assert_eq!(record["resolved_generation"], 2);
+        assert_eq!(record["accepted_generation"], 1);
+        assert_eq!(record["admission"]["admitted_generation"], 2);
+        assert_eq!(record["admission"]["acknowledged"], true);
+    }
+    assert_eq!(
+        third.event("h", "recovered-conversation")["state"],
+        "live-usable"
+    );
+    std::thread::sleep(QUIET_WINDOW);
+    third.control(r#"{"cmd":"close"}"#);
+    let (terminal, status, seen) = third.terminal();
+    assert_eq!(terminal["status"], "closed", "{terminal}");
+    assert_eq!(status.code(), Some(7));
+    for nothing in [
+        "bash-async-completion-recovered",
+        "bash-async-completion-admitted",
+        "bash-async-completion-not-reoffered",
+    ] {
+        assert!(
+            seen.iter().all(|value| value["event"] != nothing),
+            "{nothing}: {seen:#?}"
+        );
+    }
+    assert_eq!(terminal["async"]["recovered"], 0);
+    assert_eq!(prompts(&dir), 4, "nothing offered again");
+    let conn = db(&dir);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM message WHERE completion_work IS NOT NULL
+             AND producer = 'owner' AND admitted_generation = 2"
+        ),
+        2
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM bash_run WHERE delivery_mode = 'async'
+             AND completion_outcome = 'turn-ended' AND completion_generation = 2"
+        ),
+        2
+    );
+}
+
+/// An admitted completion is never admitted again. (1) Its ACK and tagged
+/// turn end were durable when its owner was lost before resolving the
+/// completion (this cut is produced by clearing that one resolution in the
+/// store while no owner runs): the next claim reconciles it `turn-ended`.
+/// (2) Its insertion was never acknowledged: it stays `delivery-unknown`
+/// across two further owners, with its one admission; the existing owed
+/// input resubmission of that same message (same key, at-most-once
+/// unproven) is not a second logical offer and settles nothing.
+#[test]
+fn admitted_completion_is_reconciled_or_stays_unknown_never_readmitted() {
+    // (1) ACK and tagged turn end durable, completion unresolved.
+    let dir = Scratch::new("admitted-settled");
+    let x = AsyncRun::new(&dir, "x");
+    let mut first = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            3,
+            json!([{ "id": "h", "argv": peer(&dir.state("h"), &["--live-reattach"]),
+                     "messages": [x.message(&dir)] }]),
+        ),
+    );
+    let x_work = x.work();
+    first.event("h", "turn-end");
+    x.end();
+    first.until("x settled", |value| {
+        value["event"] == "async-owed" && value["work"] == x_work && value["change"] == "turn-ended"
+    });
+    first.kill();
+    let conn = rusqlite::Connection::open(dir.store().join("intent.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE bash_run SET completion_outcome = NULL, completion_reason = NULL,
+                             completion_generation = NULL WHERE work = ?1",
+        [x_work],
+    )
+    .unwrap();
+    drop(conn);
+    let mut second = Run::start(&dir, &recover_for(&dir, "continue-attached"));
+    let recovered = second.until("intent-recovered", |value| {
+        value["event"] == "intent-recovered"
+    });
+    assert_eq!(
+        recovered["completions_reconciled"],
+        json!([x_work]),
+        "{recovered}"
+    );
+    assert_eq!(
+        second.event("h", "recovered-conversation")["state"],
+        "live-usable"
+    );
+    std::thread::sleep(QUIET_WINDOW);
+    second.control(r#"{"cmd":"close"}"#);
+    let (terminal, status, seen) = second.terminal();
+    assert_eq!(status.code(), Some(7), "{terminal}");
+    assert!(owner_events(&seen, "bash-async-completion-admitted", x_work).is_empty());
+    assert!(owner_events(&seen, "bash-async-completion-recovered", x_work).is_empty());
+    let record = inherited_record(&terminal["async"]["inherited"], x_work);
+    assert_eq!(record["completion"], "turn-ended", "{record}");
+    assert_eq!(
+        record["reason"],
+        "reconciled-durable-ack-and-tagged-turn-end"
+    );
+    assert_eq!(record["resolved_generation"], 2);
+    assert_eq!(record["admission"]["admitted_generation"], 1);
+    assert_eq!(prompts(&dir), 2);
+
+    // (2) Admitted, never acknowledged.
+    let dir = Scratch::new("admitted-unknown");
+    let x = AsyncRun::new(&dir, "x");
+    let mut first = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            3,
+            json!([{ "id": "h",
+                     "argv": peer(&dir.state("h"), &["--live-reattach", "--silent-after-acks", "1"]),
+                     "messages": [x.message(&dir)] }]),
+        ),
+    );
+    let pid = first.event("h", "launched")["pid"].as_u64().unwrap();
+    let x_work = x.work();
+    first.event("h", "turn-end");
+    x.end();
+    let admitted = first.until("x admitted", |value| {
+        value["event"] == "bash-async-completion-admitted" && value["work"] == x_work
+    });
+    assert_eq!(admitted["input"], 1);
+    wait_state(&dir.state("h"), |state| {
+        state["prompts"]
+            .as_array()
+            .is_some_and(|prompts| prompts.len() == 2)
+    });
+    first.kill();
+    for generation in [2, 3] {
+        let mut owner = Run::start(&dir, &recover_for(&dir, "continue-attached"));
+        let account = owner.until("inherited account", |value| {
+            value["event"] == "inherited-completion-account"
+        });
+        let record = inherited_record(&account["inherited_async"], x_work);
+        assert_eq!(record["completion"], "delivery-unknown", "{record}");
+        assert_eq!(record["admission"]["admitted_generation"], 1);
+        assert_eq!(record["admission"]["acknowledged"], false);
+        assert_eq!(owner.event("h", "reattached")["pid"].as_u64(), Some(pid));
+        // The owed message itself is resubmitted with its key (existing path).
+        owner.until("resubmission attempt", |value| {
+            value["event"] == "session-resumed"
+        });
+        std::thread::sleep(QUIET_WINDOW);
+        let seen = if generation == 2 {
+            owner.kill()
+        } else {
+            owner.cancel();
+            let (terminal, status, seen) = owner.terminal();
+            assert_eq!(status.code(), Some(2), "{terminal}");
+            let record = inherited_record(&terminal["async"]["inherited"], x_work);
+            assert_eq!(record["completion"], "delivery-unknown", "{record}");
+            seen
+        };
+        for nothing in [
+            "bash-async-completion-recovered",
+            "bash-async-completion-admitted",
+            "bash-async-completion-reconciled",
+        ] {
+            assert!(
+                seen.iter().all(|value| value["event"] != nothing),
+                "{nothing}: {seen:#?}"
+            );
+        }
+        assert!(
+            seen.iter()
+                .all(|value| value["event"] != "recovered-conversation"),
+            "an owed input is not a settled survivor"
+        );
+    }
+    let conn = db(&dir);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM message WHERE completion_work IS NOT NULL"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM bash_run WHERE delivery_mode = 'async' AND completion_outcome IS NULL"
+        ),
+        1
+    );
+}
+
+/// R2-B floor: without the declared live reattachment contract, the
+/// recovered survivor is held and its never-admitted promise is not offered;
+/// it stays `delivery-unknown` while the requester work lives. A close then
+/// ends that requester work, and only once its end is recorded is the
+/// promise `undelivered` (`requester-ended-before-admission`).
+#[test]
+fn absent_capability_keeps_promise_unknown_until_its_requester_ends() {
+    let dir = Scratch::new("recovered-async-absent");
+    let x = AsyncRun::new(&dir, "x");
+    let mut first = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            3,
+            json!([{ "id": "h", "argv": peer(&dir.state("h"), &[]), "messages": [x.message(&dir)] }]),
+        ),
+    );
+    let pid = first.event("h", "launched")["pid"].as_u64().unwrap();
+    let x_work = x.work();
+    first.event("h", "turn-end");
+    first.kill();
+    x.end();
+    std::thread::sleep(QUIET_WINDOW);
+    let mut second = Run::start(&dir, &recover_for(&dir, "continue-attached"));
+    let found = second.event("h", "recovered-conversation");
+    assert_eq!(found["state"], "unavailable", "{found}");
+    assert_eq!(found["reason"], "capability-absent");
+    let record = inherited_record(&found["inherited_async"], x_work);
+    assert_eq!(record["completion"], "delivery-unknown", "{record}");
+    assert_eq!(record["admission"]["state"], "never-admitted");
+    second.event("h", "holding-survivor");
+    std::thread::sleep(QUIET_WINDOW);
+    second.control(r#"{"cmd":"close"}"#);
+    let undelivered = second.until("requester-ended undelivered", |value| {
+        value["event"] == "inherited-completion-undelivered"
+    });
+    assert_eq!(undelivered["works"], json!([x_work]), "{undelivered}");
+    let (terminal, status, seen) = second.terminal();
+    assert_eq!(terminal["status"], "closed", "{terminal}");
+    assert_eq!(status.code(), Some(7));
+    assert!(!alive(pid));
+    assert!(seen.iter().all(|value| {
+        value["event"] != "bash-async-completion-admitted"
+            && value["event"] != "bash-async-completion-recovered"
+    }));
+    let record = inherited_record(&terminal["async"]["inherited"], x_work);
+    assert_eq!(record["completion"], "undelivered", "{record}");
+    assert_eq!(record["reason"], "requester-ended-before-admission");
+    assert_eq!(record["admission"]["state"], "never-admitted");
+    assert_eq!(prompts(&dir), 1, "nothing offered");
+}
+
+/// The fresh path is unchanged: a first owner's own completion is linked
+/// to its work, admitted once, carried through ACK and tagged turn end. A
+/// close requested while it is still owed is reported deferred (and then
+/// applied), not refused.
+#[test]
+fn fresh_completion_is_linked_and_close_waits_for_it_as_deferred() {
+    let dir = Scratch::new("fresh-async");
+    let x = AsyncRun::new(&dir, "x");
+    let mut run = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            3,
+            json!([{ "id": "h", "argv": peer(&dir.state("h"), &[]), "messages": [x.message(&dir)] }]),
+        ),
+    );
+    let x_work = x.work();
+    run.event("h", "turn-end");
+    run.control(r#"{"cmd":"close"}"#);
+    let deferred = run.event("h", "close-deferred");
+    assert_eq!(deferred["reason"], "async-completion-owed", "{deferred}");
+    x.end();
+    let admitted = run.until("x admitted", |value| {
+        value["event"] == "bash-async-completion-admitted" && value["work"] == x_work
+    });
+    assert_eq!(admitted["recovered"], Value::Null, "{admitted}");
+    let (terminal, status, seen) = run.terminal();
+    assert_eq!(terminal["status"], "closed", "{terminal}");
+    assert_eq!(status.code(), Some(7));
+    assert!(events(&seen, "h", "close-not-applied").is_empty());
+    assert_eq!(events(&seen, "h", "close-stopping").len(), 1);
+    assert_eq!(terminal["async"]["accepted"], 1, "{terminal}");
+    assert_eq!(terminal["async"]["turn_ended"], 1);
+    assert_eq!(terminal["async"]["recovered"], 0);
+    assert_eq!(terminal["async"]["owed"], 0);
+    let conn = db(&dir);
+    assert_eq!(
+        count(
+            &conn,
+            &format!(
+                "SELECT count(*) FROM message WHERE completion_work = {x_work}
+                 AND producer = 'owner' AND turn_end_generation = 1"
+            )
+        ),
+        1
+    );
 }
