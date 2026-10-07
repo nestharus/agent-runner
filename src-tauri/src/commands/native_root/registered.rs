@@ -6,7 +6,9 @@
 //! optional `config_root` and `env` (the provider's process environment and
 //! `host.env` for its own operations). Beside them it carries Runner's own
 //! policy for the root's tools: `bash_allow` or `bash_authority` and the
-//! mediated Bash requester `agent_bash_bin`.
+//! mediated Bash requester `agent_bash_bin`; and, when the root declares
+//! child routes, `root_child_bin`, the child requester its exploration
+//! offer names (required then, refused otherwise).
 //!
 //! Resolution, in order, each step only after the one before succeeded:
 //!
@@ -22,16 +24,24 @@
 //!    that one pinned object. The digest is reported for audit only; it is
 //!    never compared with an earlier root's.
 //! 2. **`describe`**, offering the resident-session and tool-mediation versions
-//!    this entry supports through `host.env`. The response is admitted by
+//!    this entry supports through `host.env`, and exploration too for a
+//!    parent offered child routes. The response is admitted by
 //!    the provider contract crate's own registry and typed decoding, which
 //!    tolerate advertisements this entry does not know (newer contract
 //!    versions, capabilities) and require the preferred version to be a
 //!    declared one. The contract, resident-session and tool-mediation versions
-//!    are then chosen by that crate's selection, from what the provider
-//!    declared.
+//!    (and exploration, for that parent) are then chosen by that crate's
+//!    selection, from what the provider declared. A parent with child routes
+//!    whose provider declares no exploration is refused here, before any
+//!    preparation: it is not given Bash alone instead.
 //! 3. **`policy.evaluate`** of opaque `settings`, with Runner's selected
-//!    mediation policy inserted in `launch.env`. The evaluated env must
-//!    preserve it and exactly one schema-valid effective marker must agree.
+//!    mediation policy inserted in `launch.env`, and the parent's
+//!    exploration offer beside it. The evaluated env must preserve each
+//!    exactly (and carry no offer where none was made), and exactly one
+//!    schema-valid effective marker of each must agree with it: the
+//!    exploration marker's routes and ingress with the offer's, its native
+//!    tool among the mediation marker's `native_tools`. Native names are
+//!    the provider's; this entry compares them, never supplies them.
 //!    Its accepted argv and env are the resident launch template.
 //! 4. **`resident.prepare`** of that template, with `host.data_root` the
 //!    root's fresh `<launch_dir>/provider`. Its arguments, appended to the
@@ -70,6 +80,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use agent_provider_contract::SchemaRegistry as ContractRegistry;
+use agent_provider_contract::exploration::{self, EffectiveExploration, Exploration, Limits};
 use agent_provider_contract::negotiation::select_contract_version;
 use agent_provider_contract::operations::Describe;
 use agent_provider_contract::resident_session::{
@@ -97,6 +108,9 @@ const SUPPORTED_CONTRACTS: &[&str] = &[CONTRACT_VERSION];
 /// Resident-session extension versions this entry supports.
 const RESIDENT_VERSIONS: &[u32] = &[1];
 
+/// Exploration extension versions this entry offers.
+const EXPLORATION_VERSIONS: &[u32] = &[1];
+
 /// Where `resident.prepare` keeps the root's resident configuration and
 /// state, under the launch directory.
 const DATA_ROOT: &str = "provider";
@@ -118,6 +132,10 @@ pub(super) struct Registration {
     pub(super) env: BTreeMap<String, String>,
     /// The mediated Bash requester the provider's tools must use.
     pub(super) agent_bash_bin: String,
+    /// The root-child requester a parent's exploration offer names: required
+    /// when the root declares child routes, refused when it declares none.
+    #[serde(default)]
+    pub(super) root_child_bin: Option<String>,
     #[serde(default)]
     pub(super) bash_allow: Vec<String>,
     #[serde(default)]
@@ -126,8 +144,8 @@ pub(super) struct Registration {
 
 /// A child route's registered provider (the request's
 /// `children.routes.NAME.registered`): a [`Registration`] less its tool
-/// policy, which is always the parent's. Nothing here offers the child any
-/// route of its own.
+/// policy, which is always the parent's, and less a child requester: nothing
+/// here offers the child any route of its own.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ChildRegistration {
@@ -154,6 +172,7 @@ impl ChildRegistration {
             config_root: self.config_root.clone(),
             env: self.env.clone(),
             agent_bash_bin: self.agent_bash_bin.clone(),
+            root_child_bin: None,
             bash_allow,
             bash_authority,
         }
@@ -192,12 +211,29 @@ pub(super) fn check(registration: &Registration) -> Result<(), String> {
     {
         return Err("provider: bash_allow names an empty command".to_owned());
     }
-    let requester = Path::new(&registration.agent_bash_bin);
-    let executable = requester.is_absolute()
-        && std::fs::metadata(requester)
-            .is_ok_and(|meta| meta.is_file() && meta.mode() & 0o111 != 0);
-    if !executable {
+    if !executable_file(&registration.agent_bash_bin) {
         return Err("provider: agent_bash_bin is not an absolute executable file".to_owned());
+    }
+    if let Some(requester) = &registration.root_child_bin
+        && !executable_file(requester)
+    {
+        return Err("provider: root_child_bin is not an absolute executable file".to_owned());
+    }
+    // The host's offers travel in settings' launch.env; a caller's own
+    // value there would stand in for (or forge) this entry's.
+    if let Some(env) = registration
+        .settings
+        .get("launch")
+        .and_then(|launch| launch.get("env"))
+        .and_then(Value::as_object)
+    {
+        for name in [tool_mediation::ENV, exploration::ENV] {
+            if env.contains_key(name) {
+                return Err(format!(
+                    "provider: settings launch.env sets {name}, this entry's to set"
+                ));
+            }
+        }
     }
     for name in registration.env.keys() {
         if name.is_empty() || name.contains(['=', '\0']) {
@@ -205,7 +241,10 @@ pub(super) fn check(registration: &Registration) -> Result<(), String> {
                 "provider: env name {name:?} is not an environment name"
             ));
         }
-        if name.starts_with("OULIPOLY_HOST_") || name == tool_mediation::ENV {
+        if name.starts_with("OULIPOLY_HOST_")
+            || name == tool_mediation::ENV
+            || name == exploration::ENV
+        {
             return Err(format!("provider: env {name} is this entry's to set"));
         }
         if name == oulipoly_root_supervisor::bash::BASH_ENV
@@ -225,16 +264,69 @@ pub(super) fn check(registration: &Registration) -> Result<(), String> {
     Ok(())
 }
 
+fn executable_file(path: &str) -> bool {
+    let path = Path::new(path);
+    path.is_absolute()
+        && std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.mode() & 0o111 != 0)
+}
+
+/// A parent's exploration offer: exactly the root's configured child
+/// `routes` (the owner's route authority, nothing added or filtered), the
+/// registration's `root_child_bin` and the owner's Bash ingress, which that
+/// requester reads. `limits` are the root's own ceilings as the owner
+/// enforces them, for the agent's information; the owner may refuse sooner
+/// (used route slots). No routes, no offer. Checked before anything runs.
+pub(super) fn offer(
+    registration: &Registration,
+    routes: Vec<String>,
+    limits: Limits,
+) -> Result<Option<Exploration>, String> {
+    let requester = match (&registration.root_child_bin, routes.is_empty()) {
+        (None, true) => return Ok(None),
+        (Some(_), true) => {
+            return Err(
+                "provider: root_child_bin names a child requester, but the root declares no child routes"
+                    .to_owned(),
+            );
+        }
+        (None, false) => {
+            return Err(
+                "provider: the root declares child routes; name root_child_bin, the child requester its exploration offer names"
+                    .to_owned(),
+            );
+        }
+        (Some(requester), false) => requester.clone(),
+    };
+    let offer = Exploration {
+        protocol: exploration::PROTOCOL.to_owned(),
+        routes,
+        requester,
+        ingress_env: oulipoly_root_supervisor::bash::BASH_ENV.to_owned(),
+        limits: Some(limits),
+    };
+    let value = serde_json::to_value(&offer).map_err(|error| error.to_string())?;
+    exploration::validate("Exploration", &value)
+        .map_err(|error| format!("children: routes cannot be offered: {error}"))?;
+    Ok(Some(offer))
+}
+
 /// A custody-checked registered provider, pinned for every operation.
 pub(super) struct Admitted<'a> {
     registration: &'a Registration,
     client: ProviderClient,
     /// The executed object's identity, for audit.
     pub(super) identity: String,
+    /// The parent's exploration offer; a child or a parent without child
+    /// routes has none, and then no exploration is selected either.
+    pub(super) offer: Option<Exploration>,
 }
 
-/// Checks the executable's custody and pins it, running nothing.
-pub(super) fn admit(registration: &Registration) -> Result<Admitted<'_>, String> {
+/// Checks the executable's custody and pins it, running nothing. `offer`
+/// is the parent's (see [`offer`]); a child's admission passes none.
+pub(super) fn admit(
+    registration: &Registration,
+    offer: Option<Exploration>,
+) -> Result<Admitted<'_>, String> {
     let path = Path::new(&registration.executable);
     let assessed = assess(path)?;
     let client = pin(path, &assessed)?;
@@ -242,6 +334,7 @@ pub(super) fn admit(registration: &Registration) -> Result<Admitted<'_>, String>
         registration,
         client,
         identity: assessed,
+        offer,
     })
 }
 
@@ -419,6 +512,8 @@ pub(super) struct Declared {
     pub(super) contract: String,
     pub(super) resident_session: u32,
     pub(super) tool_mediation: u32,
+    /// Selected only for an offering parent.
+    pub(super) exploration: Option<u32>,
 }
 
 impl Declared {
@@ -433,6 +528,7 @@ impl Declared {
             "agreed_contract": self.contract,
             "resident_session": self.resident_session,
             "tool_mediation": self.tool_mediation,
+            "exploration": self.exploration,
         })
     }
 }
@@ -445,14 +541,16 @@ pub(super) struct Prepared {
     pub(super) data_root: PathBuf,
     pub(super) template_env: Vec<String>,
     pub(super) effective_mediation: EffectiveMediation,
+    pub(super) effective_exploration: Option<EffectiveExploration>,
 }
 
 /// The provider's evaluated template and its reported configuration.
-/// This marker is not evidence that a live native CLI enforces it.
+/// These markers are not evidence that a live native CLI enforces them.
 #[derive(Debug, Clone)]
 pub(super) struct Evaluated {
     pub(super) launch: ResidentLaunchTemplate,
     pub(super) effective: EffectiveMediation,
+    pub(super) exploration: Option<EffectiveExploration>,
 }
 
 impl Registration {
@@ -479,6 +577,9 @@ impl Admitted<'_> {
         if selectors {
             env.extend(resident_session::FAMILY.host_selectors(RESIDENT_VERSIONS));
             env.extend(tool_mediation::FAMILY.host_selectors(tool_mediation::SUPPORTED_VERSIONS));
+            if self.offer.is_some() {
+                env.extend(exploration::FAMILY.host_selectors(EXPLORATION_VERSIONS));
+            }
         }
         HostContext {
             app: "oulipoly-agent-runner".to_owned(),
@@ -573,6 +674,18 @@ impl Admitted<'_> {
                 "provider: {} declares no tool mediation this entry supports ({error}); tool authority refused",
                 described.provider_id
             )))?;
+        let exploration = match self.offer {
+            Some(_) => Some(
+                exploration::select(EXPLORATION_VERSIONS, &capabilities).map_err(|error| {
+                    failed(format!(
+                        "provider: {} declares no exploration this entry offers ({error}); \
+                         the root declares child routes, so it is refused, not given Bash alone",
+                        described.provider_id
+                    ))
+                })?,
+            ),
+            None => None,
+        };
         Ok(Declared {
             provider_id: described.provider_id,
             display_name: described.display_name,
@@ -581,6 +694,7 @@ impl Admitted<'_> {
             contract,
             resident_session,
             tool_mediation,
+            exploration,
         })
     }
 
@@ -604,14 +718,19 @@ impl Admitted<'_> {
         let env = env
             .as_object_mut()
             .ok_or_else(|| failed("provider: settings launch.env must be an object".to_owned()))?;
-        // The registration's tool authority owns this variable, not opaque settings.
-        if env.contains_key(tool_mediation::ENV) {
-            return Err(failed(format!(
-                "provider: settings sets {}, this entry's to set",
-                tool_mediation::ENV
-            )));
+        // The registration's tool authority owns these variables, not opaque
+        // settings ([`check`] refused them before anything ran).
+        for name in [tool_mediation::ENV, exploration::ENV] {
+            if env.contains_key(name) {
+                return Err(failed(format!(
+                    "provider: settings sets {name}, this entry's to set"
+                )));
+            }
         }
         env.insert(tool_mediation::ENV.to_owned(), json!(tools.encode()));
+        if let Some(offer) = &self.offer {
+            env.insert(exploration::ENV.to_owned(), json!(offer.encode()));
+        }
         let result = self
             .invoke("policy.evaluate", self.host(None, true), settings)
             .map_err(failed)?;
@@ -667,6 +786,9 @@ impl Admitted<'_> {
         {
             return Err(failed("provider: effective mediation contradicts requester-owned policy or its tool inventory".to_owned()));
         }
+        let explored = self
+            .explored(&env, &policy.markers, &effective)
+            .map_err(failed)?;
         let settings = &self.registration.settings;
         let template = json!({
             "settings_id": settings.get("settings_id"),
@@ -680,6 +802,7 @@ impl Admitted<'_> {
             .map(|params| Evaluated {
                 launch: params.launch,
                 effective,
+                exploration: explored,
             })
             .map_err(|error| failed(format!("provider: resident launch template: {error}")))
     }
@@ -725,7 +848,67 @@ impl Admitted<'_> {
             data_root,
             template_env,
             effective_mediation: evaluated.effective,
+            effective_exploration: evaluated.exploration,
         })
+    }
+
+    /// The evaluated env's exploration offer and the provider's marker for
+    /// it, against this entry's offer: the same offer echoed (none where
+    /// none was made), and one schema-valid marker naming the offered
+    /// routes and ingress and a native tool the provider's own mediation
+    /// inventory lists. A marker where nothing was offered is refused.
+    fn explored(
+        &self,
+        env: &BTreeMap<String, String>,
+        markers: &[oulipoly_provider::generated::Marker],
+        mediation: &EffectiveMediation,
+    ) -> Result<Option<EffectiveExploration>, String> {
+        let echoed = Exploration::from_env(Some(env))
+            .map_err(|error| format!("provider: evaluated exploration: {error}"))?;
+        if echoed != self.offer {
+            return Err(match self.offer {
+                Some(_) => {
+                    "provider: evaluated env omits or changes this entry's exploration offer"
+                }
+                None => {
+                    "provider: evaluated env carries an exploration offer this entry did not make"
+                }
+            }
+            .to_owned());
+        }
+        let reported: Vec<_> = markers
+            .iter()
+            .filter(|marker| marker.name == exploration::MARKER)
+            .collect();
+        let Some(offer) = &self.offer else {
+            if reported.is_empty() {
+                return Ok(None);
+            }
+            return Err("provider: policy reports exploration this entry did not offer".to_owned());
+        };
+        let [marker] = reported[..] else {
+            return Err(
+                "provider: policy must report exactly one effective exploration marker".to_owned(),
+            );
+        };
+        exploration::validate("EffectiveExploration", &marker.value)
+            .map_err(|error| format!("provider: effective exploration marker: {error}"))?;
+        let effective: EffectiveExploration = serde_json::from_value(marker.value.clone())
+            .map_err(|error| format!("provider: effective exploration marker: {error}"))?;
+        let routes = |routes: &[String]| {
+            routes
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        if effective.protocol != offer.protocol
+            || routes(&effective.routes) != routes(&offer.routes)
+            || effective.ingress_env != offer.ingress_env
+            || !mediation.native_tools.contains(&effective.tool)
+        {
+            return Err("provider: effective exploration contradicts the offer or the provider's own tool inventory".to_owned());
+        }
+        Ok(Some(effective))
     }
 }
 
@@ -854,9 +1037,13 @@ pub(super) mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     /// A deterministic external provider (Python): answers `describe`
-    /// (offering `resident_session_v1` only when selected, unless `script`
-    /// says otherwise), `policy.evaluate` and `resident.prepare`, and records
-    /// each operation, its euid and its request in `<dir>/calls`.
+    /// (offering `resident_session_v1`, `tool_mediation_v1` and
+    /// `exploration_v1` only when selected, unless `script` says otherwise),
+    /// `policy.evaluate` (echoing the offers, reporting a marker for each,
+    /// refusing an offer its request did not select, as the contract's
+    /// `exploration::admit` would) and `resident.prepare`, and records each
+    /// operation, its euid and its request in `<dir>/calls`. Its native tool
+    /// names are its own stand-ins.
     pub(in crate::commands::native_root) fn fake_provider(dir: &Path, script: &str) -> PathBuf {
         let path = dir.join("fake-provider");
         std::fs::write(&path, fake_source(dir, script)).unwrap();
@@ -889,14 +1076,30 @@ marker.update(tool="fake_mediated_bash", native_tools=["fake_mediated_bash"])
 markers = [{{"name": "oulipoly.tool_mediation/v1", "value": marker}}]
 if request and request["host"].get("env", {{}}).get("OULIPOLY_HOST_TOOL_MEDIATION_V1") == "1":
     caps["tool_mediation_v1"] = True
+explore_selected = bool(request) and request["host"].get("env", {{}}).get("OULIPOLY_HOST_EXPLORATION_V1") == "1"
+if explore_selected:
+    caps["exploration_v1"] = True
+exploration_env = request and request["params"].get("launch", {{}}).get("env", {{}}).get("OULIPOLY_EXPLORATION_V1")
+exploration = json.loads(exploration_env) if exploration_env else None
+if exploration:
+    explore_marker = {{"protocol": exploration["protocol"], "routes": exploration["routes"],
+                      "tool": "fake_explore", "ingress_env": exploration["ingress_env"]}}
+    markers.append({{"name": "oulipoly.exploration/v1", "value": explore_marker}})
+    marker["native_tools"].append("fake_explore")
 {script}
-if op == "describe":
+if op == "policy.evaluate" and exploration_env and not explore_selected:
+    answer({{"accepted": False, "stdin": None, "prompt": None, "markers": [],
+            "diagnostics": [{{"code": "exploration", "message": "offer not selected", "severity": "error"}}]}})
+elif op == "describe":
     answer({{"provider_id": "fake-external", "display_name": "Fake external provider",
             "contract_versions": ["oulipoly.provider/v1"], "preferred_contract": "oulipoly.provider/v1",
             "capabilities": caps}})
 elif op == "policy.evaluate":
+    policy_env = {{"FAKE_POLICY": "1", "OULIPOLY_TOOL_MEDIATION_V1": mediation_env}}
+    if exploration_env:
+        policy_env["OULIPOLY_EXPLORATION_V1"] = exploration_env
     answer({{"accepted": True, "argv": ["fake-native", "--model", request["params"]["model"]["name"]],
-            "env": {{"FAKE_POLICY": "1", "OULIPOLY_TOOL_MEDIATION_V1": mediation_env}}, "stdin": None, "prompt": None, "diagnostics": [], "markers": markers}})
+            "env": policy_env, "stdin": None, "prompt": None, "diagnostics": [], "markers": markers}})
 elif op == "resident.prepare":
     data = request["host"]["data_root"]
     config = json.dumps(request["params"]["launch"], sort_keys=True).encode()
@@ -1016,7 +1219,7 @@ else:
         let dir = scratch();
         let fake = fake_provider(dir.path(), "");
         let registered = registration(dir.path(), &fake);
-        let admitted = admit(&registered).unwrap();
+        let admitted = admit(&registered, None).unwrap();
         assert_eq!(admitted.identity, assess(&fake).unwrap());
         assert!(calls(dir.path()).is_empty(), "admission runs nothing");
         // A same-bytes replacement after the custody check is a different
@@ -1093,7 +1296,7 @@ else:
         let dir = scratch();
         let fake = fake_provider(dir.path(), "");
         let registered = registration(dir.path(), &fake);
-        let admitted = admit(&registered).unwrap();
+        let admitted = admit(&registered, None).unwrap();
         let declared = admitted.describe().unwrap();
         assert_eq!(declared.provider_id, "fake-external");
         assert_eq!(declared.contract, CONTRACT_VERSION);
@@ -1107,7 +1310,7 @@ else:
         let dir = scratch();
         let fake = fake_provider(dir.path(), "caps.pop('resident_session_v1', None)");
         let registered = registration(dir.path(), &fake);
-        let failure = admit(&registered).unwrap().describe().unwrap_err();
+        let failure = admit(&registered, None).unwrap().describe().unwrap_err();
         let Failure::Provider { operation, reason } = failure else {
             panic!("{failure:?}")
         };
@@ -1129,7 +1332,7 @@ else:
         );
         let fake = fake_provider(dir.path(), &script);
         let registered = registration(dir.path(), &fake);
-        let declared = admit(&registered).unwrap().describe();
+        let declared = admit(&registered, None).unwrap().describe();
         assert_eq!(calls(dir.path()).len(), 1, "describe only");
         declared
     }
@@ -1191,7 +1394,7 @@ else:
         let dir = scratch();
         let fake = fake_provider(dir.path(), "");
         let registered = registration(dir.path(), &fake);
-        let admitted = admit(&registered).unwrap();
+        let admitted = admit(&registered, None).unwrap();
         admitted.describe().unwrap();
         let tools = serde_json::to_value(registered.mediation()).unwrap();
         let template = admitted.template().unwrap();
@@ -1240,7 +1443,7 @@ else:
              'diagnostics': [{'code': 'x', 'message': 'no such route', 'severity': 'error'}], 'markers': []})\n    sys.exit(0)",
         );
         let registered = registration(dir.path(), &fake);
-        let admitted = admit(&registered).unwrap();
+        let admitted = admit(&registered, None).unwrap();
         admitted.describe().unwrap();
         let failure = admitted.template().unwrap_err();
         assert!(
@@ -1254,7 +1457,7 @@ else:
             "if op == 'resident.prepare':\n    answer({'protocol': 'oulipoly.resident_session/v1'})\n    sys.exit(0)",
         );
         let registered = registration(dir.path(), &fake);
-        let admitted = admit(&registered).unwrap();
+        let admitted = admit(&registered, None).unwrap();
         admitted.describe().unwrap();
         let template = admitted.template().unwrap();
         let failure = admitted
@@ -1277,7 +1480,7 @@ else:
             let dir = scratch();
             let fake = fake_provider(dir.path(), edit);
             let registered = registration(dir.path(), &fake);
-            let failure = admit(&registered).unwrap().describe().unwrap_err();
+            let failure = admit(&registered, None).unwrap().describe().unwrap_err();
             assert!(
                 matches!(
                     failure,
@@ -1298,7 +1501,7 @@ else:
         let dir = scratch();
         let fake = fake_provider(dir.path(), "caps['tool_mediation_v2'] = True");
         let registered = registration(dir.path(), &fake);
-        let declared = admit(&registered).unwrap().describe().unwrap();
+        let declared = admit(&registered, None).unwrap().describe().unwrap();
         assert_eq!(declared.tool_mediation, 1);
         assert_eq!(
             calls(dir.path())[0]["request"]["host"]["env"]["OULIPOLY_HOST_TOOL_MEDIATION_V1"],
@@ -1328,7 +1531,7 @@ else:
                 &format!("if op == 'policy.evaluate':\n    {edit}"),
             );
             let registered = registration(dir.path(), &fake);
-            let admitted = admit(&registered).unwrap();
+            let admitted = admit(&registered, None).unwrap();
             admitted.describe().unwrap();
             let failure = admitted.template().unwrap_err();
             assert!(
@@ -1370,7 +1573,7 @@ else:
                 BashPolicy::Authority { .. } => {}
             }
             let original = registered.settings.clone();
-            let admitted = admit(&registered).unwrap();
+            let admitted = admit(&registered, None).unwrap();
             admitted.describe().unwrap();
             let evaluated = admitted.template().unwrap();
             assert_eq!(evaluated.effective.bash, bash);
@@ -1423,7 +1626,7 @@ else:
                 ),
             );
             let registered = registration(dir.path(), &fake);
-            let admitted = admit(&registered).unwrap();
+            let admitted = admit(&registered, None).unwrap();
             admitted.describe().unwrap();
             let failure = admitted.template().unwrap_err();
             assert!(
@@ -1433,6 +1636,287 @@ else:
             assert_eq!(calls(dir.path()).len(), 2);
             assert!(!dir.path().join("launch").exists());
         }
+    }
+
+    /// A parent registration naming a child requester, and its offer for
+    /// `routes`.
+    fn offering(dir: &Path, fake: &Path, routes: &[&str]) -> (Registration, Exploration) {
+        let mut registered = registration(dir, fake);
+        let requester = dir.join("root-child");
+        std::fs::write(&requester, "#!/bin/sh\nexit 69\n").unwrap();
+        std::fs::set_permissions(&requester, std::fs::Permissions::from_mode(0o755)).unwrap();
+        registered.root_child_bin = Some(requester.to_string_lossy().into_owned());
+        let limits = Limits {
+            max_starts: Some(3),
+            max_concurrent: Some(1),
+        };
+        let routes = routes.iter().map(|route| (*route).to_owned()).collect();
+        let offer = offer(&registered, routes, limits).unwrap().unwrap();
+        (registered, offer)
+    }
+
+    /// The offer is the configured routes, the named requester and the
+    /// owner's ingress; a requester without routes, routes without a
+    /// requester and a route name the contract cannot carry are refused
+    /// before anything runs.
+    #[test]
+    fn offer_is_the_configured_routes_with_the_requester_only_they_need() {
+        let dir = scratch();
+        let fake = fake_provider(dir.path(), "");
+        let (registered, made) = offering(dir.path(), &fake, &["luna-max", "fixed.1"]);
+        assert_eq!(made.routes, ["luna-max", "fixed.1"]);
+        assert_eq!(Some(&made.requester), registered.root_child_bin.as_ref());
+        assert_eq!(made.ingress_env, oulipoly_root_supervisor::bash::BASH_ENV);
+        assert_eq!(
+            made.limits,
+            Some(Limits {
+                max_starts: Some(3),
+                max_concurrent: Some(1)
+            })
+        );
+        check(&registered).unwrap();
+        let limits = || Limits {
+            max_starts: Some(1),
+            max_concurrent: Some(1),
+        };
+        let unneeded = offer(&registered, Vec::new(), limits()).unwrap_err();
+        assert!(unneeded.contains("declares no child routes"), "{unneeded}");
+        let plain = registration(dir.path(), &fake);
+        assert_eq!(offer(&plain, Vec::new(), limits()), Ok(None));
+        let missing = offer(&plain, vec!["luna".to_owned()], limits()).unwrap_err();
+        assert!(missing.contains("name root_child_bin"), "{missing}");
+        let label = offer(&registered, vec!["-flag".to_owned()], limits()).unwrap_err();
+        assert!(label.contains("cannot be offered"), "{label}");
+        let mut relative = registered;
+        relative.root_child_bin = Some("oulipoly-root-child".to_owned());
+        assert!(check(&relative).unwrap_err().contains("root_child_bin"));
+        assert!(calls(dir.path()).is_empty(), "nothing ran");
+    }
+
+    /// A parent offered routes selects exploration in every operation,
+    /// offers it beside the mediation policy, and keeps the provider's
+    /// reported native tool, listed in its own inventory, through prepare.
+    #[test]
+    fn offering_parent_selects_exploration_and_keeps_the_offer_through_prepare() {
+        let dir = scratch();
+        let fake = fake_provider(dir.path(), "");
+        let (registered, made) = offering(dir.path(), &fake, &["luna"]);
+        let admitted = admit(&registered, Some(made.clone())).unwrap();
+        let declared = admitted.describe().unwrap();
+        assert_eq!(declared.exploration, Some(1));
+        assert_eq!(declared.entry()["exploration"], 1);
+        let evaluated = admitted.template().unwrap();
+        let effective = evaluated.exploration.clone().unwrap();
+        assert_eq!(effective.routes, made.routes);
+        assert_eq!(effective.ingress_env, made.ingress_env);
+        assert!(evaluated.effective.native_tools.contains(&effective.tool));
+        let launch = dir.path().join("launch");
+        let prepared = admitted.prepare(&launch, evaluated).unwrap();
+        assert_eq!(prepared.effective_exploration, Some(effective));
+        let seen = calls(dir.path());
+        for call in &seen {
+            assert_eq!(
+                call["request"]["host"]["env"]["OULIPOLY_HOST_EXPLORATION_V1"], "1",
+                "{}",
+                call["op"]
+            );
+        }
+        for call in &seen[1..] {
+            let carried = call["request"]["params"]["launch"]["env"][exploration::ENV]
+                .as_str()
+                .unwrap();
+            assert_eq!(Exploration::decode(carried).unwrap(), made);
+        }
+        // The prepared configuration carries the same offer.
+        let config: Value =
+            serde_json::from_slice(&std::fs::read(&prepared.argv[3]).unwrap()).unwrap();
+        assert_eq!(
+            Exploration::decode(config["env"][exploration::ENV].as_str().unwrap()).unwrap(),
+            made
+        );
+    }
+
+    /// Child routes need common exploration support: a provider that does
+    /// not declare v1 is refused after describe alone, nothing prepared,
+    /// rather than given Bash alone. An additional unknown version beside
+    /// v1 is tolerated.
+    #[test]
+    fn offering_parent_without_declared_exploration_is_refused_after_describe() {
+        for edit in [
+            "caps.pop('exploration_v1', None)",
+            "caps['exploration_v1'] = False",
+            "caps['exploration_v1'] = '1'",
+            "caps.pop('exploration_v1', None); caps['exploration_v2'] = True",
+        ] {
+            let dir = scratch();
+            let fake = fake_provider(dir.path(), edit);
+            let (registered, made) = offering(dir.path(), &fake, &["luna"]);
+            let failure = admit(&registered, Some(made))
+                .unwrap()
+                .describe()
+                .unwrap_err();
+            let Failure::Provider { operation, reason } = &failure else {
+                panic!("{edit}: {failure:?}")
+            };
+            assert_eq!(*operation, "describe");
+            assert!(reason.contains("declares no exploration"), "{reason}");
+            assert!(reason.contains("not given Bash alone"), "{reason}");
+            assert_eq!(calls(dir.path()).len(), 1, "{edit}: describe only");
+            assert!(!dir.path().join("launch").exists());
+        }
+        let dir = scratch();
+        let fake = fake_provider(
+            dir.path(),
+            "caps['exploration_v2'] = True\ncaps['exploration_future'] = {'shape': 1}",
+        );
+        let (registered, made) = offering(dir.path(), &fake, &["luna"]);
+        let declared = admit(&registered, Some(made)).unwrap().describe().unwrap();
+        assert_eq!(declared.exploration, Some(1));
+    }
+
+    /// Without an offer (a child, or a parent with no routes) nothing is
+    /// selected or offered, and a provider that puts an offer in the
+    /// evaluated env or reports exploration anyway is refused before
+    /// preparation.
+    #[test]
+    fn no_offer_selects_nothing_and_refuses_an_offer_it_did_not_make() {
+        let dir = scratch();
+        let fake = fake_provider(dir.path(), "");
+        let registered = registration(dir.path(), &fake);
+        let admitted = admit(&registered, None).unwrap();
+        assert_eq!(admitted.describe().unwrap().exploration, None);
+        let evaluated = admitted.template().unwrap();
+        assert_eq!(evaluated.exploration, None);
+        assert!(
+            !evaluated
+                .launch
+                .env
+                .as_ref()
+                .unwrap()
+                .contains_key(exploration::ENV)
+        );
+        let prepared = admitted
+            .prepare(&dir.path().join("launch"), evaluated)
+            .unwrap();
+        assert_eq!(prepared.effective_exploration, None);
+        for call in calls(dir.path()) {
+            let text = call["request"].to_string();
+            assert!(!text.contains("EXPLORATION"), "{text}");
+        }
+        let forged = r#"{"protocol": "oulipoly.exploration/v1", "routes": ["luna"], "requester": "/r", "ingress_env": "OULIPOLY_ROOT_BASH_V1"}"#;
+        for (edit, fragment) in [
+            (
+                // A provider injecting an offer of its own into an accepted policy.
+                format!("if op == 'policy.evaluate':\n    exploration_env = {forged:?}\n    explore_selected = True"),
+                "did not make",
+            ),
+            (
+                "if op == 'policy.evaluate':\n    markers.append({'name': 'oulipoly.exploration/v1', 'value': {'protocol': 'oulipoly.exploration/v1', 'routes': ['luna'], 'tool': 'fake_mediated_bash', 'ingress_env': 'OULIPOLY_ROOT_BASH_V1'}})".to_owned(),
+                "did not offer",
+            ),
+        ] {
+            let dir = scratch();
+            let fake = fake_provider(dir.path(), &edit);
+            let registered = registration(dir.path(), &fake);
+            let admitted = admit(&registered, None).unwrap();
+            admitted.describe().unwrap();
+            let failure = admitted.template().unwrap_err();
+            assert!(
+                matches!(&failure, Failure::Provider { operation: "policy.evaluate", reason } if reason.contains(fragment)),
+                "{edit}: {failure:?}"
+            );
+            assert_eq!(calls(dir.path()).len(), 2, "{edit}: no prepare");
+        }
+    }
+
+    /// The host's offers are this entry's: a parent's or a child's opaque
+    /// settings or operation env naming them is refused before anything
+    /// runs, not overwritten.
+    #[test]
+    fn caller_supplied_offers_are_refused_before_anything_runs() {
+        let dir = scratch();
+        let fake = fake_provider(dir.path(), "");
+        let child: ChildRegistration = serde_json::from_value(json!({
+            "executable": fake,
+            "settings": { "launch": {} },
+            "agent_bash_bin": registration(dir.path(), &fake).agent_bash_bin,
+        }))
+        .unwrap();
+        let parent = |dir: &Path| offering(dir, &fake, &["luna"]).0;
+        let child = |_: &Path| child.with_policy(Vec::new(), Some(BashAuthority::TrustedTask));
+        let builders: [&dyn Fn(&Path) -> Registration; 2] = [&parent, &child];
+        for build in builders {
+            for name in [exploration::ENV, tool_mediation::ENV] {
+                let mut forged = build(dir.path());
+                forged.settings["launch"] = json!({ "env": { name: "{}" } });
+                let reason = check(&forged).unwrap_err();
+                assert!(reason.contains("this entry's to set"), "{reason}");
+                let mut forged = build(dir.path());
+                forged.env.insert(name.to_owned(), "{}".to_owned());
+                let reason = check(&forged).unwrap_err();
+                assert!(reason.contains("this entry's to set"), "{reason}");
+            }
+        }
+        // A child registration cannot name a requester of its own.
+        let named: Result<ChildRegistration, _> = serde_json::from_value(json!({
+            "executable": fake, "settings": {}, "agent_bash_bin": "/b",
+            "root_child_bin": "/r",
+        }));
+        assert!(named.unwrap_err().to_string().contains("unknown field"));
+        assert!(calls(dir.path()).is_empty(), "nothing ran");
+    }
+
+    /// The evaluated offer and the provider's exploration marker must agree
+    /// with the offer and with the provider's own mediation inventory;
+    /// anything else is refused before preparation.
+    #[test]
+    fn effective_exploration_must_agree_with_the_offer_and_provider_inventory() {
+        for edit in [
+            "markers.pop()",
+            "markers.append(markers[-1])",
+            "explore_marker['routes'] = ['other']",
+            "explore_marker['routes'] = ['luna']",
+            "explore_marker['ingress_env'] = 'OTHER_INGRESS'",
+            "explore_marker['tool'] = 'unlisted_explore'",
+            "explore_marker['protocol'] = 'oulipoly.exploration/v2'",
+            "explore_marker['extra'] = True",
+            "exploration_env = None",
+            "exploration['requester'] = '/other'; exploration_env = json.dumps(exploration)",
+            "exploration['routes'] = ['luna']; exploration_env = json.dumps(exploration)",
+            "exploration_env = '{\"protocol\": \"oulipoly.exploration/v1\"}'",
+        ] {
+            let dir = scratch();
+            let fake = fake_provider(
+                dir.path(),
+                &format!("if op == 'policy.evaluate':\n    {edit}"),
+            );
+            let (registered, made) = offering(dir.path(), &fake, &["luna", "sol"]);
+            let admitted = admit(&registered, Some(made)).unwrap();
+            admitted.describe().unwrap();
+            let failure = admitted.template().unwrap_err();
+            assert!(
+                matches!(
+                    failure,
+                    Failure::Provider {
+                        operation: "policy.evaluate",
+                        ..
+                    }
+                ),
+                "{edit}: {failure:?}"
+            );
+            assert_eq!(calls(dir.path()).len(), 2, "{edit}: no prepare");
+            assert!(!dir.path().join("launch").exists());
+        }
+        // The provider's own order of the same routes is agreement.
+        let dir = scratch();
+        let fake = fake_provider(
+            dir.path(),
+            "if op == 'policy.evaluate':\n    explore_marker['routes'] = ['sol', 'luna']",
+        );
+        let (registered, made) = offering(dir.path(), &fake, &["luna", "sol"]);
+        let admitted = admit(&registered, Some(made)).unwrap();
+        admitted.describe().unwrap();
+        assert!(admitted.template().unwrap().exploration.is_some());
     }
 
     /// Published adapters, administrative operations only: no native CLI starts.
@@ -1485,7 +1969,7 @@ else:
                 };
                 registered.settings = settings.as_object().unwrap().clone();
                 check(&registered).unwrap();
-                let admitted = admit(&registered).unwrap();
+                let admitted = admit(&registered, None).unwrap();
                 let declared = admitted.describe().unwrap();
                 assert_eq!(declared.provider_id, id);
                 assert_eq!(declared.tool_mediation, 1);

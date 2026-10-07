@@ -37,7 +37,8 @@
 //! The request names exactly one harness: a registered external `provider`,
 //! `opencode` (above and below) or `claude` (below). `provider`
 //! (`executable`, `settings`, optional `config_root` and `env`,
-//! `agent_bash_bin`, `bash_allow` or `bash_authority`): the provider's own
+//! `agent_bash_bin`, `bash_allow` or `bash_authority`, and `root_child_bin`
+//! exactly when the root declares child routes): the provider's own
 //! resident ACP v2 harness on stdio, resolved through what it declares and
 //! prepares, as the [`registered`] module docs describe. Provider settings
 //! stay opaque apart from neutral launch-env mediation. Runner supplies its
@@ -89,10 +90,22 @@
 //! the owner refuses its own child requests (depth 1). The parent's
 //! `bash` policy is the child's configuration, not a write barrier: the
 //! read-only brief is the child's task, not an enforced restriction. An
-//! embedded harness gets an `explore` tool naming the routes; a registered
-//! parent gets no exploration tool from this entry. Everything named is
-//! checked before any effect; the owner enforces route, slot, depth,
-//! budget and lineage. The caller owns `auth` and
+//! embedded harness gets an `explore` tool naming the routes. A registered
+//! parent is offered exploration through the provider contract's neutral
+//! extension: exactly the configured route names as opaque labels, its
+//! `root_child_bin` as the requester, the owner's Bash ingress variable,
+//! and the root's `max_starts` and `max_concurrent` for information. Its
+//! provider must declare exploration, or the root is refused after
+//! `describe`, before any preparation; it is not given Bash alone instead.
+//! A child, or a parent with no routes, is offered and selects nothing. The
+//! offer is discovery, not admission or isolation: the owner admits or
+//! refuses every request, and the parent's Bash reaches the same ingress.
+//! The provider reports the native tool it configured, which this entry
+//! only checks against the offer and the provider's own inventory.
+//! `OULIPOLY_EXPLORATION_V1` is this entry's to set: the root's `env`, a
+//! registration's `env` or `settings` naming it is refused before any
+//! effect. Everything named is checked before any effect; the owner
+//! enforces route, slot, depth, budget and lineage. The caller owns `auth` and
 //! the children's launch copies after the root ends, as for `opencode.auth`.
 //! The packaged front door passes `children` only as its site allows a
 //! parent route to offer them, stages `auth` once per root (an OpenCode
@@ -177,6 +190,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use agent_provider_contract::exploration::{self, Limits};
 use oulipoly_root_supervisor::children::{ChildPolicy, ChildRoute, PreparedSlot};
 use oulipoly_root_supervisor::native::{
     BashAuthority, ExploreTool, OpenCodeSetup, OpenCodeSetupError, REMOVED_ENV, check_opencode,
@@ -467,7 +481,12 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
     // registered child route's, before any of them runs.
     let root_admitted = match &request.provider {
         Some(registration) => {
-            match registered::check(registration).and_then(|()| registered::admit(registration)) {
+            let admitted = registered::check(registration)
+                .and_then(|()| {
+                    registered::offer(registration, child_routes(&request), limits(&request))
+                })
+                .and_then(|offer| registered::admit(registration, offer));
+            match admitted {
                 Ok(admitted) => Some((registration, admitted)),
                 Err(reason) => return Ok(refused(&out, reason)),
             }
@@ -630,6 +649,17 @@ fn run_registered(
         "tool_mediation": declared.tool_mediation,
         "effective_mediation": prepared.effective_mediation,
         "mediation_evidence": "provider-reported configuration; live native efficacy unqualified",
+        "exploration": match &admitted.offer {
+            Some(offer) => json!(offer),
+            None => json!("none offered: the root declares no child routes; mediated Bash alone"),
+        },
+        "exploration_version": declared.exploration,
+        "effective_exploration": prepared.effective_exploration,
+        "exploration_evidence": if admitted.offer.is_some() {
+            "provider-reported configuration of an offer, not admission: the owner admits or refuses every child; live native efficacy unqualified"
+        } else {
+            "none selected"
+        },
         "identity": {
             "describe_policy_prepare": "this entry's",
             "resident_serve": "the work identity, in the root's work namespaces",
@@ -766,6 +796,26 @@ fn explore_tool(request: &NativeRootRequest) -> Option<ExploreTool> {
     })
 }
 
+/// The configured child route names, in the owner's (sorted) route order:
+/// the offer's opaque labels.
+fn child_routes(request: &NativeRootRequest) -> Vec<String> {
+    request
+        .children
+        .as_ref()
+        .map(|children| children.routes.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// The root's child ceilings as the owner enforces them (it refuses a
+/// request above its own hard limits before any effect).
+fn limits(request: &NativeRootRequest) -> Limits {
+    let children = request.children.as_ref();
+    Limits {
+        max_starts: children.map(|children| children.max_starts),
+        max_concurrent: children.map(|children| children.max_concurrent),
+    }
+}
+
 /// The parent harness's `bash` policy, which its children inherit.
 fn bash_policy(request: &NativeRootRequest) -> (Vec<String>, Option<BashAuthority>) {
     match (&request.opencode, &request.claude, &request.provider) {
@@ -885,7 +935,7 @@ fn admit_children(
         .iter()
         .map(|(name, slots, registration)| {
             registered::check(registration)
-                .and_then(|()| registered::admit(registration))
+                .and_then(|()| registered::admit(registration, None))
                 .map(|admitted| ChildProvider {
                     name,
                     slots: *slots,
@@ -977,7 +1027,7 @@ fn prepare_children(
                 "tools_source": "the parent's bash policy, inherited; read-only exploration is the child's brief, not a write barrier",
                 "effective_mediation": evaluated.effective,
                 "mediation_evidence": "provider-reported configuration; live native efficacy unqualified",
-                "exploration": "none offered to the child; the owner refuses a child's own child request (depth 1)",
+                "exploration": "none offered or selected for the child; the owner refuses a child's own child request (depth 1)",
                 "slots": slot_receipts,
                 "slots_meaning": "prepared before the owner started, each with its own fresh data root; the k-th admission on this route takes slot k, once; unused slots are setup, not starts or admissions",
                 "identity": {
@@ -1233,6 +1283,11 @@ fn check_env(env: &BTreeMap<String, String>) -> Result<(), String> {
             || name == oulipoly_root_supervisor::SOCKET_ENV
         {
             return Err(format!("env {name} is the owner's to set"));
+        }
+        // Every harness, children included, inherits this environment: a
+        // value here would be an exploration offer nobody made.
+        if name == exploration::ENV {
+            return Err(format!("env {name} is this entry's to offer"));
         }
     }
     Ok(())
@@ -1677,6 +1732,8 @@ mod tests {
         assert!(existing.contains("fresh only"), "{existing}");
         let owned = read(base(&fresh, json!({ "OULIPOLY_ROOT_BASH_V1": "/x" }))).unwrap_err();
         assert!(owned.contains("owner's to set"), "{owned}");
+        let offered = read(base(&fresh, json!({ "OULIPOLY_EXPLORATION_V1": "{}" }))).unwrap_err();
+        assert!(offered.contains("this entry's to offer"), "{offered}");
         let mut extra = base(&fresh, json!({}));
         extra["inherit_env"] = json!(true);
         assert!(read(extra).unwrap_err().contains("unknown field"));
@@ -1913,6 +1970,77 @@ mod tests {
             },
             "name model and provider",
         );
+    }
+
+    /// A registered parent's offer is every configured route, registered
+    /// or not, with the root's own ceilings, which the owner's checks
+    /// accept; without routes there is none.
+    #[test]
+    fn registered_parent_is_offered_every_configured_route_within_owner_limits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let requester = dir.path().join("oulipoly-root-child");
+        std::fs::write(&requester, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&requester, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.path().join("request.json");
+        let mut value = json!({
+            "store": dir.path().join("store"),
+            "launch_dir": dir.path().join("launch"),
+            "cwd": "/", "env": {}, "messages": ["m"],
+            "outage_closure_cap": 1, "delivery_attempt_cap": 1,
+            "provider": {
+                "executable": "/opt/provider/bin/provider",
+                "settings": { "settings_id": "s" },
+                "agent_bash_bin": requester,
+                "root_child_bin": requester,
+                "bash_allow": ["git status"],
+            },
+            "children": {
+                "routes": {
+                    "luna": { "registered": {
+                        "executable": "/opt/provider/bin/provider",
+                        "settings": {}, "agent_bash_bin": "/b" }, "slots": 1 },
+                    "oc": { "model": "openai/luna", "provider": { "openai": {} } },
+                },
+                "opencode": { "deps": "/d", "agent_bash_tool": "/t", "agent_bash_bin": "/b" },
+                "max_starts": 2, "max_concurrent": 1,
+            },
+            "workload": { "isolation": "unprivileged-userns" },
+        });
+        std::fs::write(&path, value.to_string()).unwrap();
+        let request = read_request(&path).unwrap();
+        let registration = request.provider.as_ref().unwrap();
+        let offer = registered::offer(registration, child_routes(&request), limits(&request))
+            .unwrap()
+            .unwrap();
+        assert_eq!(offer.routes, ["luna", "oc"]);
+        assert_eq!(offer.ingress_env, oulipoly_root_supervisor::bash::BASH_ENV);
+        assert_eq!(
+            serde_json::to_value(&offer.limits).unwrap(),
+            json!({ "max_starts": 2, "max_concurrent": 1 })
+        );
+        let policy = child_policy(&request, None).unwrap();
+        assert_eq!(policy.routes.keys().collect::<Vec<_>>(), ["luna", "oc"]);
+        owner_request(
+            &request,
+            harness_kind(&request),
+            vec!["/usr/bin/env".to_owned()],
+            None,
+        )
+        .validate()
+        .unwrap();
+        // Children's registrations carry no requester.
+        assert!(child_registrations(&request)[0].2.root_child_bin.is_none());
+        value.as_object_mut().unwrap().remove("children");
+        std::fs::write(&path, value.to_string()).unwrap();
+        let request = read_request(&path).unwrap();
+        let refused = registered::offer(
+            request.provider.as_ref().unwrap(),
+            child_routes(&request),
+            limits(&request),
+        )
+        .unwrap_err();
+        assert!(refused.contains("declares no child routes"), "{refused}");
     }
 
     /// A provider that cannot be admitted runs nothing (64); once it ran,
