@@ -209,7 +209,8 @@ pub(crate) fn release_recovered(
 
 /// Ends one owed completion: `turn-ended` (an input carrying it was
 /// acknowledged and the agent's tagged turn end covered it) or
-/// `undelivered` with its reason. False if it was not owed (already ended).
+/// `undelivered` with its reason. False if not carried by this owner or
+/// durable admission facts do not support settlement; then it stays owed.
 pub(crate) fn settle_async(
     views: &Views,
     store: &Arc<Mutex<Store>>,
@@ -226,15 +227,19 @@ pub(crate) fn settle_async(
     let Some(at) = view.owed_async.iter().position(|owed| *owed == work) else {
         return false;
     };
-    if let Err(error) = store
+    match store
         .lock()
         .expect("store lock")
         .resolve_completion(work, resolution, reason)
     {
-        let _ = tx.send(Event::Report(
-            json!({ "event": error.label(), "reason": format!("{error:?}"), "work": work }),
-        ));
-        return false;
+        Ok(true) => {}
+        Ok(false) => return false,
+        Err(error) => {
+            let _ = tx.send(Event::Report(
+                json!({ "event": error.label(), "reason": format!("{error:?}"), "work": work }),
+            ));
+            return false;
+        }
     }
     view.owed_async.remove(at);
     if resolution == "turn-ended" {
@@ -292,7 +297,7 @@ pub(crate) fn async_summary(views: &Views) -> Value {
         "turn_ended": views.iter().map(|view| view.async_turn_ended).sum::<u64>(),
         "undelivered": undelivered,
         "owed": owed_total(&views),
-        "meaning": "turn_ended: a completion input was acknowledged and a tagged turn end covered it; not proof the agent read, used or accepted the output; recovered: earlier-generation promises this owner took up (also counted in turn_ended/undelivered/owed, not in accepted)",
+        "meaning": "turn_ended: a completion input was acknowledged and a tagged turn end covered it; not proof the agent read, used or accepted the output; recovered: cumulative earlier-generation promises this owner took up, not accepted here; released unresolved promises remain in the durable prior-generation account, so recovered is not a partition of turn_ended/undelivered/owed",
     })
 }
 

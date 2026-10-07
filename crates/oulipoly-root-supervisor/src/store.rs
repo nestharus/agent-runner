@@ -1005,23 +1005,34 @@ impl Store {
         })
     }
 
-    /// Records transport settlement of a current owner's completion. This
-    /// preserves the fact across churn; it is not recipient reconstruction.
+    /// Records a completion disposition only when its admission facts support
+    /// it. A failed response or ended connection does not settle an admitted
+    /// input still owed; its attempt history remains in `attempt`.
     pub(crate) fn resolve_completion(
         &mut self,
         work: i64,
         outcome: &str,
         reason: Option<&str>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let generation = self.generation;
         self.write(|tx| {
             tx.execute(
                 "UPDATE bash_run SET completion_outcome = ?2, completion_reason = ?3,
                                  completion_generation = ?4
-             WHERE work = ?1 AND delivery_mode = 'async' AND completion_outcome IS NULL",
+             WHERE work = ?1 AND delivery_mode = 'async' AND completion_outcome IS NULL
+               AND ((?2 = 'turn-ended' AND EXISTS (
+                     SELECT 1 FROM message m WHERE m.completion_work = ?1
+                       AND m.ack_label IS NOT NULL AND m.turn_end_generation IS NOT NULL))
+                 OR (?2 = 'undelivered' AND (
+                     NOT EXISTS (SELECT 1 FROM message m WHERE m.completion_work = ?1)
+                     OR EXISTS (SELECT 1 FROM message m WHERE m.completion_work = ?1
+                       AND m.ack_label IS NULL AND m.stop = 'rejected'
+                       AND NOT EXISTS (SELECT 1 FROM attempt a
+                         WHERE a.harness = m.harness AND a.idx = m.idx
+                           AND (a.outcome IS NULL OR a.outcome NOT IN ('rejected', 'not-sent')))))))",
                 params![work, outcome, reason, generation],
             )
-            .map(drop)
+            .map(|changed| changed > 0)
         })
     }
 
@@ -2050,9 +2061,33 @@ mod tests {
         store
             .resolve_completion(lost, "undelivered", Some("recipient-not-in-conversation"))
             .unwrap();
+        let Admission::Admitted(idx, _) = store
+            .admit_follow_up(0, 0, None, "completion", false, Some((delivered, None)))
+            .unwrap()
+        else {
+            panic!("completion admission")
+        };
+        let attempt = store.begin_attempt(0, idx).unwrap();
         store
-            .resolve_completion(delivered, "turn-ended", None)
+            .record_ack(
+                0,
+                idx,
+                attempt,
+                &DurableAck {
+                    label: "accepted".into(),
+                    basis: None,
+                    recovered: false,
+                    generation: 1,
+                    message_id: Some("m".into()),
+                },
+            )
             .unwrap();
+        store.record_turn_end(0, idx).unwrap();
+        assert!(
+            store
+                .resolve_completion(delivered, "turn-ended", None)
+                .unwrap()
+        );
         // Current-schema fixture with missing mode: never infer an async promise.
         store
             .conn
@@ -2157,6 +2192,153 @@ mod tests {
         assert_eq!(records[0]["admission"]["admitted_generation"], 1);
         assert_eq!(records[1]["completion"], "undelivered");
         assert_eq!(records[1]["admission"]["state"], "never-admitted");
+    }
+
+    /// Failed insertion responses are attempt facts, not final completion
+    /// dispositions. Fresh and recovered admissions remain the same logical
+    /// input, and only its durable ACK plus tagged end settles transport.
+    #[test]
+    fn admitted_completion_uncertainty_stays_owed_until_exact_link_end() {
+        for recovered in [false, true] {
+            for failure in [
+                "no-ack:invalid-response",
+                "no-ack:transport-closed",
+                "unknown-prior-owner",
+            ] {
+                let dir = Dir::new("completion-uncertain");
+                let mut store = Store::claim(&dir.0, Some(&intent())).unwrap().store;
+                let incarnation = store
+                    .begin_incarnation("token", "unprivileged-userns")
+                    .unwrap();
+                let parent = store.begin_work(0, incarnation).unwrap();
+                let run = store
+                    .begin_bash(0, parent, incarnation, 1, "[]", &["x".into()], "/", true)
+                    .unwrap();
+                if recovered {
+                    drop(store);
+                    store = Store::claim(&dir.0, None).unwrap().store;
+                }
+                let Admission::Admitted(idx, _) = store
+                    .admit_follow_up(0, 0, None, "completion", false, Some((run, Some(parent))))
+                    .unwrap()
+                else {
+                    panic!("first admission")
+                };
+                // Admission before wire is also not non-delivery proof.
+                assert!(
+                    !store
+                        .resolve_completion(run, "undelivered", Some("conversation-ended"))
+                        .unwrap()
+                );
+                let attempt = store.begin_attempt(0, idx).unwrap();
+                store.resolve_attempt(attempt, failure).unwrap();
+                assert!(
+                    !store
+                        .resolve_completion(run, "undelivered", Some(failure))
+                        .unwrap()
+                );
+                drop(store);
+                store = Store::claim(&dir.0, None).unwrap().store;
+                let before = store.inherited_completions(None).unwrap();
+                assert_eq!(before[0]["completion"], "delivery-unknown");
+                assert_eq!(before[0]["admission"]["acknowledged"], false);
+                assert!(matches!(
+                    store.admit_follow_up(0, 0, None, "again", false, Some((run, Some(parent)))),
+                    Ok(Admission::NotReoffered(_))
+                ));
+                let later = store.begin_attempt(0, idx).unwrap();
+                let ack = DurableAck {
+                    label: "duplicate-unknown".into(),
+                    basis: None,
+                    recovered: false,
+                    generation: store.generation(),
+                    message_id: Some("m".into()),
+                };
+                store.record_ack(0, idx, later, &ack).unwrap();
+                assert!(!store.resolve_completion(run, "turn-ended", None).unwrap());
+                assert!(
+                    !store
+                        .resolve_completion(run, "undelivered", Some("connection-ended"))
+                        .unwrap()
+                );
+                store.record_turn_end(0, idx).unwrap();
+                assert!(store.reconcile_completion(run).unwrap());
+                assert!(!store.reconcile_completion(run).unwrap());
+                drop(store);
+                let claimed = Store::claim(&dir.0, None).unwrap();
+                assert!(claimed.completions_reconciled.is_empty());
+                let store = claimed.store;
+                assert_eq!(
+                    store.inherited_completions(None).unwrap()[0]["completion"],
+                    "turn-ended"
+                );
+                let history: String = store
+                    .conn
+                    .query_row(
+                        "SELECT outcome FROM attempt WHERE id = ?1",
+                        [attempt],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(history, failure, "earlier attempt evidence survives");
+                let links: i64 = store
+                    .conn
+                    .query_row(
+                        "SELECT count(*) FROM message WHERE completion_work = ?1",
+                        [run],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(links, 1);
+            }
+        }
+    }
+
+    /// A rejection settles only conclusive non-insertion, never an earlier
+    /// uncertain attempt on that logical completion input.
+    #[test]
+    fn completion_rejection_does_not_erase_prior_uncertainty() {
+        for uncertain in [false, true] {
+            let dir = Dir::new("completion-rejection");
+            let mut store = Store::claim(&dir.0, Some(&intent())).unwrap().store;
+            let incarnation = store
+                .begin_incarnation("token", "unprivileged-userns")
+                .unwrap();
+            let parent = store.begin_work(0, incarnation).unwrap();
+            let run = store
+                .begin_bash(0, parent, incarnation, 1, "[]", &["x".into()], "/", true)
+                .unwrap();
+            let Admission::Admitted(idx, _) = store
+                .admit_follow_up(0, 0, None, "completion", false, Some((run, None)))
+                .unwrap()
+            else {
+                panic!("first admission")
+            };
+            if uncertain {
+                let prior = store.begin_attempt(0, idx).unwrap();
+                store
+                    .resolve_attempt(prior, "no-ack:invalid-response")
+                    .unwrap();
+            }
+            let rejected = store.begin_attempt(0, idx).unwrap();
+            store.resolve_attempt(rejected, "rejected").unwrap();
+            assert_eq!(
+                store
+                    .resolve_completion(run, "undelivered", Some("rejected"))
+                    .unwrap(),
+                !uncertain
+            );
+            drop(store);
+            let store = Store::claim(&dir.0, None).unwrap().store;
+            assert_eq!(
+                store.inherited_completions(None).unwrap()[0]["completion"],
+                if uncertain {
+                    "delivery-unknown"
+                } else {
+                    "undelivered"
+                }
+            );
+        }
     }
 
     /// Fresh-only schema: a store of the previous version is refused, not

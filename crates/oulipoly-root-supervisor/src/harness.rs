@@ -105,8 +105,8 @@ pub struct HarnessRecord {
     /// turn ends. Request delivery and the actual waited exit are separate
     /// observations (`close-stopping.signalled` and `exits`).
     pub close_stop_attempted: bool,
-    /// What a recovered owner found about conversing with this harness's
-    /// surviving work when every input was settled (`None` otherwise).
+    /// Recovery-time snapshot of this owner's conversation decision and
+    /// inherited account, not final usability or final completion truth.
     pub recovered_conversation: Option<Value>,
     pub messages: Vec<MessageRecord>,
 }
@@ -457,12 +457,12 @@ impl Worker {
         )
     }
 
-    /// The conversation ended: every completion not yet carried through a
-    /// turn end is undelivered, with what is known of how far it got.
+    /// The conversation ended: settle only completions whose durable facts
+    /// support non-delivery. Admitted uncertainty remains owed and unresolved,
+    /// for later exact-link ACK/turn-end reconciliation, from any generation.
     /// A recovered completion not admitted by this owner is released, not
     /// resolved: its requester work may outlive this conversation, and its
     /// end, once recorded, settles it (see [`Self::orphaned_completions`]).
-    /// One admitted by an earlier generation is not resolved here either.
     fn settle_unfinished_completions(&mut self, queued: Vec<FollowUp>) {
         self.recovered_recipient = None;
         let held: Vec<FollowUp> = self.pending_completions.drain(..).chain(queued).collect();
@@ -906,6 +906,7 @@ impl Worker {
     /// that this survivor is not conversed with and why.
     fn unconversed(&mut self, facts: &Value, state: &str, reason: &str) {
         let mut conversation = facts.clone();
+        conversation["scope"] = json!("recovery-time-snapshot");
         conversation["state"] = json!(state);
         conversation["reason"] = json!(reason);
         conversation["meaning"] = json!(match state {
@@ -999,6 +1000,7 @@ impl Worker {
             return self.hold(live, true, ConnEnd::Stop, "");
         }
         let mut conversation = facts;
+        conversation["scope"] = json!("recovery-time-snapshot");
         conversation["state"] = json!("live-usable");
         conversation["basis"] =
             json!("harness-declared-live-reattach-at-first-and-current-negotiation");
@@ -1823,8 +1825,14 @@ impl Worker {
                     // attribution entry after durable resolution; historical
                     // uncertainty still gates admission and close below.
                     self.view(|view| view.open.retain(|input| input.index != index));
-                    if let Some(work) = self.completion_of.remove(&index) {
-                        self.settle_async(work, "undelivered", Some("not-acknowledged: rejected"));
+                    if let Some(&work) = self.completion_of.get(&index)
+                        && self.settle_async(
+                            work,
+                            "undelivered",
+                            Some("not-acknowledged: rejected"),
+                        )
+                    {
+                        self.completion_of.remove(&index);
                     }
                 }
                 if let Some(end) = end {
@@ -2523,6 +2531,75 @@ mod tests {
             rx,
             dir,
         )
+    }
+
+    #[test]
+    fn failed_completion_response_keeps_owed_account_until_durable_end() {
+        let (worker, rx, _dir) = worker();
+        let mut store = worker.store.lock().unwrap();
+        let incarnation = store
+            .begin_incarnation("token", "unprivileged-userns")
+            .unwrap();
+        let parent = store.begin_work(0, incarnation).unwrap();
+        let work = store
+            .begin_bash(0, parent, incarnation, 1, "[]", &["x".into()], "/", true)
+            .unwrap();
+        let Admission::Admitted(index, _) = store
+            .admit_follow_up(0, 0, None, "completion", false, Some((work, None)))
+            .unwrap()
+        else {
+            panic!("first admission")
+        };
+        let attempt = store.begin_attempt(0, index).unwrap();
+        store
+            .resolve_attempt(attempt, "no-ack:invalid-response")
+            .unwrap();
+        drop(store);
+        worker.views.lock().unwrap().push(bash::View {
+            id: "test".into(),
+            ..Default::default()
+        });
+        bash::owe_async(&worker.views, &worker.tx, 0, work);
+        assert!(!worker.settle_async(work, "undelivered", Some("invalid-response")));
+        assert!(!worker.settle_async(work, "turn-ended", None));
+        let summary = bash::async_summary(&worker.views);
+        assert_eq!(summary["owed"], 1);
+        assert_eq!(summary["turn_ended"], 0);
+        assert_eq!(summary["undelivered"], json!([]));
+        let mut store = worker.store.lock().unwrap();
+        let later = store.begin_attempt(0, index).unwrap();
+        let ack = DurableAck {
+            label: "duplicate-unknown".into(),
+            basis: None,
+            recovered: false,
+            generation: store.generation(),
+            message_id: Some("m".into()),
+        };
+        store.record_ack(0, index, later, &ack).unwrap();
+        drop(store);
+        assert!(!worker.settle_async(work, "turn-ended", None));
+        worker
+            .store
+            .lock()
+            .unwrap()
+            .record_turn_end(0, index)
+            .unwrap();
+        assert!(worker.settle_async(work, "turn-ended", None));
+        assert!(!worker.settle_async(work, "turn-ended", None));
+        let summary = bash::async_summary(&worker.views);
+        assert_eq!(summary["owed"], 0);
+        assert_eq!(summary["turn_ended"], 1);
+        assert_eq!(summary["undelivered"], json!([]));
+        let changes: Vec<_> = rx
+            .try_iter()
+            .filter_map(|event| match event {
+                Event::Report(value) if value["event"] == "async-owed" => {
+                    Some(value["change"].clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(changes, vec![json!("owed"), json!("turn-ended")]);
     }
 
     /// CONFIGURED SEAM (A6): a harness launch whose spawn reply is lost or

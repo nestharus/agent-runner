@@ -3,7 +3,7 @@ name = "oulipoly-root-supervisor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Unwired per-root supervisor process owning ACP v2 harness subprocesses, with per-root durable intent (Linux)"
+description = "Per-root supervisor process owning ACP v2 harness subprocesses, with per-root durable intent (Linux)"
 
 [lib]
 name = "oulipoly_root_supervisor"

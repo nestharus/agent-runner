@@ -114,8 +114,9 @@
 //! Each accepted run is its own work under root PID 1, so it is killed on
 //! cancel, survives owner death like any work, and the run does not end
 //! until its end (or why it is unknown) is reported. Delivery is in-band to
-//! the requester only: no completion is supplied to any harness as a new
-//! input. Each run's output is also retained by the owner, within bounds,
+//! the requester for stream runs; async completion is offered as a later
+//! owner input to that same requester harness. Each run's output is also
+//! retained by the owner, within bounds,
 //! and sealed (count, SHA-256, losses) before its `end`, which names that
 //! identity; the requesting harness alone can read it back past any inline
 //! prefix (`op` `output`) and record its local acceptance of exactly that
@@ -329,7 +330,8 @@
 //! A surviving harness whose every input is settled (acknowledged or
 //! durably stopped) is not resubmitted to. The recovering owner reports
 //! `recovered-conversation` with one of three states, kept on the harness's
-//! terminal record (`recovered_conversation`) and named by a refused `send`
+//! terminal record (`recovered_conversation`, a recovery-time snapshot, not
+//! final usability or completion truth) and named by a refused `send`
 //! (`conversation-unavailable`):
 //!
 //! * `live-usable`: only under an explicit `continue-attached` recovery,
@@ -373,7 +375,7 @@
 //! generation admitted (admission is durable before any send, so such a
 //! completion never reached the harness), once
 //! (`bash-async-completion-recovered`), through the same hold and admission
-//! as a fresh completion, then `turn-ended` / `undelivered` as usual. One
+//! as a fresh completion. One
 //! already admitted is never admitted again
 //! (`bash-async-completion-not-reoffered`): with its ACK and tagged turn end
 //! durable it is reconciled `turn-ended` (at claim, or when observed); with
@@ -384,6 +386,13 @@
 //! owner. Never another recipient, a relaunched harness, a `stream` run or
 //! an unknown mode. Continuity stays the harness's declaration, and
 //! `turn-ended` stays transport evidence.
+//! Fresh and recovered completions share the linked input's settlement
+//! premise: failed/no response or conversation end leaves an admitted
+//! completion unresolved while that input remains owed. Earlier attempt
+//! outcomes stay in the durable history. A conclusive rejection supports
+//! `undelivered` only without earlier uncertain insertion; ACK without a
+//! tagged end stays unresolved. Later exact-link ACK and tagged end reconcile
+//! transport completion without another logical admission.
 //! The inherited owed-input path still reinitializes/resubmits without a live
 //! reattachment declaration; at-most-once is unproven there. This settled
 //! survivor contract must not be read as covering that path.
