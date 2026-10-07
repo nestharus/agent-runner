@@ -10,11 +10,20 @@
 //!
 //! Exit: the run's own exit code; 128+N for signal N; 69 when there is no
 //! ingress, connection failed before sending, or it refused (nothing ran);
-//! 71 for a proven no-start after acceptance; 74 for failed/unproven output
-//! delivery despite a known wait; 75 for uncertain launch/end, including a
+//! 71 for a proven no-start after acceptance, including a positive ordered
+//! `started.exec_error` once the physical wait and output are known;
+//! 74 for failed/unproven output delivery despite a known wait;
+//! 75 for uncertain launch/end, including a
 //! connection lost before acceptance. Uncertainty never authorizes a retry.
 //! A missing end or missing output closure is never 0. There is no
 //! fallback to any other owner, Broker or local execution.
+//! The stderr status channel preserves `started` and the actual `end` wait.
+//! A positive exec error also reports `requested-program-exec-failed`: the
+//! requested program did not begin executing, but accepted work remains in
+//! custody and may have caused pre-exec setup effects; do not replay it.
+//! Output failure (74) and uncertain end/protocol (75) retain priority over
+//! that error's exit 71. Ordinary code:127 remains exit 127, with no inference
+//! about start. Numeric process exits alone cannot distinguish these facts.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -71,6 +80,11 @@ fn main() -> ExitCode {
 
 fn receive(reader: impl BufRead, stdout: &mut impl Write, sent: bool) -> u8 {
     let mut accepted = false;
+    let mut accepted_work = None;
+    let mut started = false;
+    let mut exec_failed = false;
+    let mut protocol_failed = false;
+    let mut output_seen = false;
     let mut bytes = 0u64;
     let mut closed = false;
     let mut output_failed = false;
@@ -90,10 +104,19 @@ fn receive(reader: impl BufRead, stdout: &mut impl Write, sent: bool) -> u8 {
                 };
             }
             "accepted" => {
+                if accepted || started || output_seen {
+                    protocol_failed = true;
+                    say(
+                        &json!({ "outcome": "protocol-violation", "reason": "accepted-out-of-order", "meaning": "possible-effect-unknown" }),
+                    );
+                } else if event["durable"] == true {
+                    accepted_work = event["work"].as_u64().filter(|work| *work > 0);
+                }
                 accepted = true;
                 say(&event);
             }
             "output" => {
+                output_seen = true;
                 let decoded = event["b64"].as_str().and_then(unbase64);
                 let fault = match decoded {
                     None => Some("invalid-or-missing-base64".to_owned()),
@@ -112,8 +135,36 @@ fn receive(reader: impl BufRead, stdout: &mut impl Write, sent: bool) -> u8 {
                     say(&json!({ "outcome": "output-failed", "reason": reason }));
                 }
             }
-            "started" => {}
+            "started" => {
+                // This is a stage fact, not an inference from the wait or a
+                // redundant top-level copy. Keep reading for the actual end
+                // and output, even after a positive error or bad ordering.
+                say(&event);
+                let ordered =
+                    accepted_work.is_some() && !started && !output_seen && !protocol_failed;
+                started = true;
+                let error = match event.get("exec_error") {
+                    None | Some(Value::Null) => Some(None),
+                    Some(Value::String(error)) if !error.trim().is_empty() => Some(Some(error)),
+                    _ => None,
+                };
+                if !ordered || error.is_none() {
+                    protocol_failed = true;
+                    say(
+                        &json!({ "outcome": "protocol-violation", "reason": "invalid-started-stage", "meaning": "possible-effect-unknown" }),
+                    );
+                } else if let Some(Some(error)) = error {
+                    exec_failed = true;
+                    say(&json!({
+                        "outcome": "requested-program-exec-failed",
+                        "exec_error": error,
+                        "work": accepted_work,
+                        "meaning": "the requested program did not begin executing; accepted work may have caused setup effects; do not replay",
+                    }));
+                }
+            }
             "output-closed" => {
+                output_seen = true;
                 if closed || event["bytes"].as_u64() != Some(bytes) {
                     output_failed = true;
                     say(
@@ -123,6 +174,7 @@ fn receive(reader: impl BufRead, stdout: &mut impl Write, sent: bool) -> u8 {
                 closed = true;
             }
             "output-failed" => {
+                output_seen = true;
                 output_failed = true;
                 say(&event);
             }
@@ -151,11 +203,16 @@ fn receive(reader: impl BufRead, stdout: &mut impl Write, sent: bool) -> u8 {
                 } else {
                     None
                 };
-                return code.unwrap_or(EX_TEMPFAIL);
+                return match code {
+                    _ if protocol_failed => EX_TEMPFAIL,
+                    None => EX_TEMPFAIL,
+                    Some(_) if exec_failed => EX_OSERR,
+                    Some(code) => code,
+                };
             }
             "launch-failed" => {
                 say(&event);
-                return if event["not_started"] == true {
+                return if event["not_started"] == true && !started && !protocol_failed {
                     EX_OSERR
                 } else {
                     EX_TEMPFAIL
