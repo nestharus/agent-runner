@@ -65,10 +65,7 @@ class Requester(unittest.TestCase):
     def test_frontdoor_checks_requester_before_effects(self):
         with tempfile.TemporaryDirectory(prefix="u110-linux-requester-") as root:
             for rel in (frontdoor.RUNNER, frontdoor.SUPERVISOR, frontdoor.PID1,
-                        frontdoor.ROOT_CHILD, frontdoor.BASH_BIN, frontdoor.NODE,
-                        frontdoor.CLAUDE_EXECUTABLE, frontdoor.BASH_TOOL,
-                        frontdoor.DEPS + "/package-lock.json",
-                        frontdoor.CLAUDE_DEPS + "/package-lock.json"):
+                        frontdoor.ROOT_CHILD, frontdoor.BASH_BIN):
                 path = os.path.join(root, rel)
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 with open(path, "w") as f:
@@ -100,7 +97,7 @@ class Requester(unittest.TestCase):
         for routes in (None, ["luna-codex"]):
             asked = request() if routes is None else request(children={"routes": routes})
             checked = frontdoor.check_request(asked, site, NOW)
-            entry = frontdoor.entry_request("/opt/caller-selected-package", "/run/r", user, checked, {}, False)
+            entry = frontdoor.entry_request("/opt/caller-selected-package", "/run/r", user, checked, {})
             if routes is None:
                 self.assertNotIn("root_child_bin", entry["provider"])
                 self.assertNotIn("children", entry)

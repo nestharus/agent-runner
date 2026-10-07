@@ -1,118 +1,38 @@
-//! `native-root`: start one fresh native ACP v2 root (a registered external
-//! provider's resident harness, or an embedded OpenCode or Claude Code
-//! harness), or recover one this entry started, for cancel or attached
-//! continuation (Linux, opt-in, source build).
+//! `native-root`: one Linux ACP v2 root with a registered external provider.
 //!
-//! `--request <file>` starts a root. The request file names everything the
-//! root gets: a new launch directory and a new store, the native setup
-//! inputs, the messages, and **the whole environment** of the root. The
-//! per-root owner (`oulipoly-root-supervisor`, next to this binary) is
-//! started with only that environment; nothing of this process's
-//! environment passes through. Root PID 1 inherits it, and in-root Bash
-//! work runs in it unchanged. The native host gets it too, less what its
-//! launch argv removes or overrides (its own HOME and XDG directories,
-//! among others), plus the owner's ingress and socket variables. Stdout
-//! says which names reach where, never a value.
+//! `--request <file>` requires `provider`, fresh `store` and `launch_dir`,
+//! `cwd`, whole root `env`, messages, delivery/outage caps and `workload`.
+//! Embedded harness fields are unknown schema fields and are refused before
+//! effects. There is no harness/model/credential fallback or translation.
 //!
-//! `workload` declares who the root's work runs as, never inferred from
-//! this entry's euid: `{"isolation":"host-root","user":NAME}` (this entry,
-//! and so the owner, runs as host root; the native host and every in-root
-//! Bash run are started as host user NAME, which must not be uid 0) or
-//! `{"isolation":"unprivileged-userns"}` (a non-root caller; not host-root
-//! semantics). A declaration this process cannot honour is refused before
-//! any effect. Under `host-root` the launch directory is handed to NAME as
-//! the setup's module docs describe, the store stays the owner's private
-//! directory, and the work's IPC (the harness socket directory and the
-//! Bash ingress) is `<launch_dir>/ipc`, made fresh by the owner.
+//! `provider` names `executable`, opaque provider/v1 `settings`, optional
+//! `config_root`/`env`, `agent_bash_bin`, and exactly one Bash policy form:
+//! nonempty `bash_allow` or `bash_authority: "trusted-task"`. Adapter-owned
+//! settings/environment determine native behavior and credentials. The
+//! [`registered`] module checks executable custody and negotiates schemas,
+//! resident, tool mediation and exploration capabilities; source/byte hashes
+//! are provenance, never compatibility keys. The provider supplies resident
+//! stdio argv and its declared label. Generic Bash uses the root's ingress.
 //!
-//! `opencode.bash_allow` names the only whole commands the native host's
-//! `bash` may run, the default form. `opencode.bash_authority:
-//! "trusted-task"` instead lets it run any command for this task: the
-//! caller's explicit once-per-task authority, never implied by anything
-//! else and refused together with `bash_allow`. Either way every other
-//! native tool is denied and every command goes through the root's Bash
-//! ingress. `setup-completed` reports the effective policy (`launch.policy`,
-//! with the native permission config as written).
+//! `workload` declares `host-root` with a non-root host `user`, or
+//! `unprivileged-userns` for a non-root caller. Work runs under that identity;
+//! owner/store remain private. Host-root IPC is `<launch_dir>/ipc`. Setup
+//! hands provider data roots to the work identity, retaining root/per-work
+//! PID1 custody, actual waits and separate logical lineage.
 //!
-//! The request names exactly one harness: a registered external `provider`,
-//! `opencode` (above and below) or `claude` (below). `provider`
-//! (`executable`, `settings`, optional `config_root` and `env`,
-//! `agent_bash_bin`, `bash_allow` or `bash_authority`, and `root_child_bin`
-//! exactly when the root declares child routes): the provider's own
-//! resident ACP v2 harness on stdio, resolved through what it declares and
-//! prepares, as the [`registered`] module docs describe. Provider settings
-//! stay opaque apart from neutral launch-env mediation. Runner supplies its
-//! tool policy during policy evaluation through the SDK extension, for the
-//! provider to translate. The owner labels the harness with the provider's
-//! declared id. `claude` (`deps`, `node`, `agent_bash_bin`, `bash_allow` or
-//! `bash_authority`, `model`, `effort`, `config_dir`): one native Claude
-//! Code harness through the owner crate's ACP v2 receiver (`stdio`), as
-//! its `native_claude` module docs describe. No credential passes: Claude
-//! Code uses the work user's own login in `config_dir`, which this entry
-//! never reads. Its policy is the same named-list or `trusted-task` choice;
-//! `trusted-task` also offers the built-in Read, Write and Edit tools.
-//! `opencode` and `claude` are embedded harnesses, to be retired once
-//! registered providers can supply theirs.
+//! Optional `children` names `routes`, `max_starts`, `max_concurrent`.
+//! Every route requires `registered` (executable/settings/env/config_root/
+//! agent_bash_bin) and optional `slots` at most `max_starts`. Children inherit
+//! the parent's Bash policy. Each possible admission gets a fresh prepared
+//! provider data root; the owner consumes each slot once, across generations.
+//! A parent with children requires `root_child_bin`, offered through negotiated
+//! exploration/v1. No children means no requester/offer. The generic owner
+//! retains trusted Fixed child intents as well as Prepared ones; this front
+//! door admits only registered routes. Neither children nor Bash can acquire
+//! another owner's custody. No embedded requester or auth files are staged.
 //!
-//! `opencode.auth` (opt-in, with a model) names a private OpenCode
-//! `auth.json` that setup checks before any effect and places in the
-//! launch's own data directory. Such a launch enables OpenCode's built-in
-//! plugins and a loopback password inherited by the native host's requester.
-//! Required auth fields are checked, not the full native schema. Setup adds
-//! neither value to the root environment; caller-declared credentials can
-//! reach mediated Bash. Both files are reachable by the work identity. This
-//! entry does not refresh, copy back or remove them: the caller owns the
-//! source file and the launch directory's copy after the root ends.
-//!
-//! `children` (opt-in, any harness) lets the root's harness ask the owner for registered
-//! read-only children: `{"routes": {NAME: ROUTE}, "opencode"?: {"deps",
-//! "agent_bash_tool", "agent_bash_bin"}, "auth"?, "max_starts",
-//! "max_concurrent"}`. An OpenCode ROUTE is `{"model", "provider"}` (and
-//! needs `opencode`): a native OpenCode host the owner provisions at its
-//! admission under `<launch_dir>/children`, with the parent's `bash` policy
-//! and `auth` (a private access-only OpenCode `auth.json`, read again for
-//! each child; absent for a credential-free route). A registered ROUTE is
-//! `{"registered": {"executable", "settings", "config_root"?, "env"?,
-//! "agent_bash_bin"}, "slots"?}`: a registered provider, opaque to this
-//! entry as for a root, whose tool policy is always the parent's `bash`
-//! policy (it cannot name its own). Its executable's custody is checked and
-//! pinned with the root's, before anything runs. After the root's own
-//! harness setup, this entry describes and evaluates it and prepares
-//! `slots` (1 to `max_starts`, default `max_starts`) fresh slots under
-//! `<launch_dir>/child-slots/NAME/K`, each with its own data root handed to
-//! the work identity, as for a registered root; any failure there is a
-//! setup failure (73), the owner never started. The owner gives the route's
-//! k-th admission (every owner generation counted) slot k, once, and
-//! refuses the route once its slots are used; it runs that slot's
-//! `resident.serve` as the child's harness in the child's own work
-//! namespaces. An unused slot is setup, not a start or admission; this
-//! entry starts no preparer at run time. A child is offered no routes and
-//! the owner refuses its own child requests (depth 1). The parent's
-//! `bash` policy is the child's configuration, not a write barrier: the
-//! read-only brief is the child's task, not an enforced restriction. An
-//! embedded harness gets an `explore` tool naming the routes. A registered
-//! parent is offered exploration through the provider contract's neutral
-//! extension: exactly the configured route names as opaque labels, its
-//! `root_child_bin` as the requester, the owner's Bash ingress variable,
-//! and the root's `max_starts` and `max_concurrent` for information. Its
-//! provider must declare exploration, or the root is refused after
-//! `describe`, before any preparation; it is not given Bash alone instead.
-//! A child, or a parent with no routes, is offered and selects nothing. The
-//! offer is discovery, not admission or isolation: the owner admits or
-//! refuses every request, and the parent's Bash reaches the same ingress.
-//! The provider reports the native tool it configured, which this entry
-//! only checks against the offer and the provider's own inventory.
-//! `OULIPOLY_EXPLORATION_V1` is this entry's to set: the root's `env`, a
-//! registration's `env` or `settings` naming it is refused before any
-//! effect. Everything named is checked before any effect; the owner
-//! enforces route, slot, depth, budget and lineage. The caller owns `auth` and
-//! the children's launch copies after the root ends, as for `opencode.auth`.
-//! The packaged front door passes `children` only as its site allows a
-//! parent route to offer them, stages `auth` once per root (an OpenCode
-//! parent's own grant reused, or a Claude parent's separate child-provider
-//! grant; never Claude's login), and removes it and every child launch's
-//! copy when it retires the run. The packaged caller takes its answer and
-//! close from the parent's own events only. Not yet installed.
+//! The whole root environment is explicit; adapter operations use their own
+//! declared environment. This entry reports names, never secret values.
 //!
 //! `--recover <file>` acts on an existing store: `{"store", "purpose",
 //! "env"}`, `purpose` being `cancel` or `continue-attached`. A new owner
@@ -151,12 +71,14 @@
 //!
 //! Exit status, one meaning each:
 //!
-//! * `0`: the owner ended (`ended`): every harness's end observed, nothing owed.
+//! * `0`: the owner ended (`ended`): physical ends observed, insertion-ACK
+//!   absence counter zero; read rich turn/async records for settlement.
 //! * `82` to `87`: the owner's own class 2 to 7 (`cancelled`, `ended-owed`,
 //!   `incomplete` or `owned-unattached`, `authority-lost` or
 //!   `store-failed`, `root-absent`, `closed`). `87` (`closed`) says the
-//!   caller's close was followed through, its host ended by a kill: not
-//!   that anything was processed. Owed work stays in the store, for an
+//!   physical run ended after close, subject to insertion/refusal guards.
+//!   It is not logical settlement or retirement eligibility: ACK present
+//!   without tagged end and async debt can still yield this class (U112/R3). Owed work stays in the store, for an
 //!   explicit recovery, never by replaying a request.
 //! * `64`: the request was refused before any effect: nothing was run.
 //! * `65`: a registered provider refused or failed its `describe` or
@@ -191,14 +113,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_provider_contract::exploration::{self, Limits};
+use oulipoly_root_supervisor::bash::BashAuthority;
 use oulipoly_root_supervisor::children::{ChildPolicy, ChildRoute, PreparedSlot};
-use oulipoly_root_supervisor::native::{
-    BashAuthority, ExploreTool, OpenCodeSetup, OpenCodeSetupError, REMOVED_ENV, check_opencode,
-    provision_opencode,
-};
-use oulipoly_root_supervisor::native_claude::{
-    self, ClaudeSetup, ClaudeSetupError, Effort, provision_claude,
-};
 use oulipoly_root_supervisor::{Endpoint, HarnessSpec, Intent, Recover, Request, Workload};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -238,18 +154,8 @@ pub(crate) struct NativeRootRequest {
     messages: Vec<String>,
     outage_closure_cap: u32,
     delivery_attempt_cap: u32,
-    /// The native OpenCode setup inputs (`deps`, `agent_bash_tool`,
-    /// `agent_bash_bin`, `bash_allow` or `bash_authority`, optional `model`
-    /// and `provider`, and optional `auth`: see the module docs).
-    #[serde(default)]
-    opencode: Option<NativeSetup>,
-    /// The native Claude Code setup inputs, instead of `opencode`.
-    #[serde(default)]
-    claude: Option<ClaudeRequest>,
-    /// A registered external provider, instead of `opencode` or `claude`
-    /// (see [`registered`]).
-    #[serde(default)]
-    provider: Option<registered::Registration>,
+    /// The sole parent harness, resolved through provider contract negotiation.
+    provider: registered::Registration,
     /// Registered children the harness may ask for (see the module docs).
     #[serde(default)]
     children: Option<ChildrenRequest>,
@@ -261,43 +167,17 @@ pub(crate) struct NativeRootRequest {
 #[serde(deny_unknown_fields)]
 struct ChildrenRequest {
     routes: BTreeMap<String, ChildRouteRequest>,
-    /// The OpenCode child launch inputs; required by an OpenCode route only.
-    #[serde(default)]
-    opencode: Option<ChildOpenCode>,
-    #[serde(default)]
-    auth: Option<String>,
     max_starts: u32,
     max_concurrent: u32,
 }
 
-/// One child route: an OpenCode `model` and `provider`, or a `registered`
-/// provider with how many fresh `slots` to prepare (default `max_starts`).
+/// A registered child and its bounded fresh resident slots.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChildRouteRequest {
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    provider: Option<Map<String, Value>>,
-    #[serde(default)]
-    registered: Option<registered::ChildRegistration>,
+    registered: registered::ChildRegistration,
     #[serde(default)]
     slots: Option<u32>,
-}
-
-impl ChildRouteRequest {
-    /// The OpenCode route's model and provider, if it is one.
-    fn opencode(&self) -> Option<(&String, &Map<String, Value>)> {
-        self.model.as_ref().zip(self.provider.as_ref())
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ChildOpenCode {
-    deps: String,
-    agent_bash_tool: String,
-    agent_bash_bin: String,
 }
 
 /// The request's work declaration; the owner's [`Workload`] adds where the
@@ -310,49 +190,6 @@ enum RequestWorkload {
     },
     /// A struct variant so that a nominated `user` is refused, not ignored.
     UnprivilegedUserns {},
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NativeSetup {
-    deps: String,
-    agent_bash_tool: String,
-    agent_bash_bin: String,
-    #[serde(default)]
-    bash_allow: Vec<String>,
-    #[serde(default)]
-    bash_authority: Option<BashAuthority>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    provider: Option<Map<String, Value>>,
-    #[serde(default)]
-    auth: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ClaudeRequest {
-    deps: String,
-    node: String,
-    agent_bash_bin: String,
-    #[serde(default)]
-    bash_allow: Vec<String>,
-    #[serde(default)]
-    bash_authority: Option<BashAuthority>,
-    model: String,
-    effort: Effort,
-    config_dir: String,
-}
-
-/// One provisioned harness, whichever kind.
-struct Provisioned {
-    argv: Vec<String>,
-    receipt: Value,
-    /// Names the harness's own launch sets for itself.
-    set: Vec<String>,
-    /// Names the harness's launch removes.
-    removed: Vec<&'static str>,
 }
 
 /// The recovery request file.
@@ -450,23 +287,6 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
     if let Err(reason) = checked.validate() {
         return Ok(refused(&out, format!("owner request: {reason}")));
     }
-    // Each child route's setup inputs, checked now (no write), so that an
-    // unusable child launch refuses the root before any effect rather than
-    // only when the harness first asks.
-    if let Some(children) = checked
-        .intent
-        .as_ref()
-        .and_then(|intent| intent.children.as_ref())
-    {
-        for (name, route) in &children.routes {
-            let setup = route.opencode_setup(format!("{}/check", children.launch_base));
-            if let Some(setup) = setup
-                && let Err(reason) = check_opencode(&setup)
-            {
-                return Ok(refused(&out, format!("children: route {name}: {reason}")));
-            }
-        }
-    }
     let workload = checked
         .intent
         .as_ref()
@@ -479,102 +299,27 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
     };
     // Every provider executable's custody and pin, the root's then each
     // registered child route's, before any of them runs.
-    let root_admitted = match &request.provider {
-        Some(registration) => {
-            let admitted = registered::check(registration)
-                .and_then(|()| {
-                    registered::offer(registration, child_routes(&request), limits(&request))
-                })
-                .and_then(|offer| registered::admit(registration, offer));
-            match admitted {
-                Ok(admitted) => Some((registration, admitted)),
-                Err(reason) => return Ok(refused(&out, reason)),
-            }
-        }
-        None => None,
+    let registration = &request.provider;
+    let admitted = registered::check(registration)
+        .and_then(|()| registered::offer(registration, child_routes(&request), limits(&request)))
+        .and_then(|offer| registered::admit(registration, offer));
+    let admitted = match admitted {
+        Ok(admitted) => admitted,
+        Err(reason) => return Ok(refused(&out, reason)),
     };
     let child_registrations = child_registrations(&request);
     let children = match admit_children(&child_registrations) {
         Ok(children) => children,
         Err(reason) => return Ok(refused(&out, reason)),
     };
-    if let Some((registration, admitted)) = root_admitted {
-        return Ok(run_registered(
-            &out,
-            &request,
-            registration,
-            admitted,
-            children,
-            &owner,
-            &workload,
-        ));
-    }
-    let provisioned = match provision(&request, workload.identity.as_ref()) {
-        Ok(provisioned) => provisioned,
-        Err((false, reason)) => return Ok(refused(&out, format!("setup: {reason}"))),
-        Err((true, reason)) => {
-            out.entry(json!({
-                "entry": "terminal",
-                "stage": "setup-failed",
-                "reason": reason,
-                "launch_dir": request.launch_dir,
-                "effects": "possible",
-                "retry": "do-not-replay",
-            }));
-            return Ok(out.exit(EXIT_SETUP_FAILED));
-        }
-    };
-    let (child_routes, child_receipt) =
-        match prepare_children(&out, &request, children, workload.identity.as_ref()) {
-            Ok(prepared) => prepared,
-            Err(reason) => {
-                return Ok(registered_failure(
-                    &out,
-                    &request,
-                    registered::Failure::Setup {
-                        provider: true,
-                        reason,
-                    },
-                ));
-            }
-        };
-    let set: Vec<&str> = provisioned.set.iter().map(String::as_str).collect();
-    let mut reach = env_reach(
-        &request.env,
-        &set,
-        &provisioned.removed,
-        harness_kind(&request).1,
-    );
-    if request.claude.is_some() {
-        reach["claude_code"] = claude_code_reach(&request.env);
-    }
-    out.entry(json!({
-        "entry": "setup-completed",
-        "harness": harness_kind(&request).0,
-        "launch": provisioned.receipt,
-        "children": child_receipt,
-        "owner": owner,
-        "env": reach,
-        "workload": workload_report(&workload),
-    }));
-    let context = json!({
-        "store": request.store,
-        "launch_dir": request.launch_dir,
-        "setup": "retained",
-        "retry": "do-not-replay",
-    });
-    let owner_request = owner_request(
-        &request,
-        harness_kind(&request),
-        provisioned.argv,
-        Some(&child_routes),
-    );
-    Ok(start_owner(
+    Ok(run_registered(
         &out,
+        &request,
+        registration,
+        admitted,
+        children,
         &owner,
-        &request.env,
-        &owner_request,
-        &context,
+        &workload,
     ))
 }
 
@@ -720,63 +465,6 @@ fn registered_failure(out: &Out, request: &NativeRootRequest, failure: registere
     }
 }
 
-/// Provisions the request's one harness. `Err((false, _))`: refused before
-/// any setup write; `Err((true, _))`: construction failed, effects possible.
-fn provision(
-    request: &NativeRootRequest,
-    identity: Option<&oulipoly_root_supervisor::workload::Identity>,
-) -> Result<Provisioned, (bool, String)> {
-    if let Some(claude) = &request.claude {
-        let setup = ClaudeSetup {
-            dir: request.launch_dir.clone(),
-            deps: claude.deps.clone(),
-            node: claude.node.clone(),
-            agent_bash_bin: claude.agent_bash_bin.clone(),
-            bash_allow: claude.bash_allow.clone(),
-            bash_authority: claude.bash_authority,
-            model: claude.model.clone(),
-            effort: claude.effort,
-            config_dir: claude.config_dir.clone(),
-            start_timeout_s: None,
-            ack_timeout_s: None,
-            explore: explore_tool(request),
-        };
-        return match provision_claude(&setup, identity) {
-            Ok(launch) => Ok(Provisioned {
-                receipt: launch.to_json(),
-                argv: launch.argv,
-                set: Vec::new(),
-                removed: native_claude::REMOVED_ENV.to_vec(),
-            }),
-            Err(ClaudeSetupError::InputInvalid(reason)) => Err((false, reason)),
-            Err(ClaudeSetupError::ConstructionFailed(reason)) => Err((true, reason)),
-        };
-    }
-    let opencode = request.opencode.as_ref().expect("checked: one harness");
-    let setup = OpenCodeSetup {
-        dir: request.launch_dir.clone(),
-        deps: opencode.deps.clone(),
-        agent_bash_tool: opencode.agent_bash_tool.clone(),
-        agent_bash_bin: opencode.agent_bash_bin.clone(),
-        bash_allow: opencode.bash_allow.clone(),
-        bash_authority: opencode.bash_authority,
-        model: opencode.model.clone(),
-        provider: opencode.provider.clone(),
-        auth: opencode.auth.clone(),
-        explore: explore_tool(request),
-    };
-    match provision_opencode(&setup, identity) {
-        Ok(launch) => Ok(Provisioned {
-            receipt: launch.to_json(),
-            set: launch.env.iter().map(|(name, _)| name.clone()).collect(),
-            argv: launch.argv,
-            removed: REMOVED_ENV.to_vec(),
-        }),
-        Err(OpenCodeSetupError::InputInvalid(reason)) => Err((false, reason)),
-        Err(OpenCodeSetupError::ConstructionFailed(reason)) => Err((true, reason)),
-    }
-}
-
 fn workload_report(workload: &oulipoly_root_supervisor::workload::Resolved) -> Value {
     json!({
         "isolation": workload.isolation.label(),
@@ -784,15 +472,6 @@ fn workload_report(workload: &oulipoly_root_supervisor::workload::Resolved) -> V
         "uid": workload.identity.as_ref().map(|identity| identity.uid),
         "gid": workload.identity.as_ref().map(|identity| identity.gid),
         "ipc_dir": workload.ipc_dir,
-    })
-}
-
-/// The parent's `explore` tool, when the request allows children.
-fn explore_tool(request: &NativeRootRequest) -> Option<ExploreTool> {
-    request.children.as_ref().map(|children| ExploreTool {
-        routes: children.routes.keys().cloned().collect(),
-        max_starts: children.max_starts,
-        max_concurrent: children.max_concurrent,
     })
 }
 
@@ -818,12 +497,10 @@ fn limits(request: &NativeRootRequest) -> Limits {
 
 /// The parent harness's `bash` policy, which its children inherit.
 fn bash_policy(request: &NativeRootRequest) -> (Vec<String>, Option<BashAuthority>) {
-    match (&request.opencode, &request.claude, &request.provider) {
-        (Some(opencode), _, _) => (opencode.bash_allow.clone(), opencode.bash_authority),
-        (None, Some(claude), _) => (claude.bash_allow.clone(), claude.bash_authority),
-        (None, None, Some(provider)) => (provider.bash_allow.clone(), provider.bash_authority),
-        (None, None, None) => (Vec::new(), None),
-    }
+    (
+        request.provider.bash_allow.clone(),
+        request.provider.bash_authority,
+    )
 }
 
 /// The intent's child policy, from the request's `children`. A registered
@@ -834,38 +511,25 @@ fn child_policy(
     prepared: Option<&BTreeMap<String, ChildRoute>>,
 ) -> Option<ChildPolicy> {
     let children = request.children.as_ref()?;
-    let (bash_allow, bash_authority) = bash_policy(request);
     Some(ChildPolicy {
         routes: children
             .routes
             .iter()
             .map(|(name, route)| {
-                let launch = match (route.opencode(), &children.opencode) {
-                    (Some((model, provider)), Some(opencode)) => ChildRoute::Opencode {
-                        deps: opencode.deps.clone(),
-                        agent_bash_tool: opencode.agent_bash_tool.clone(),
-                        agent_bash_bin: opencode.agent_bash_bin.clone(),
-                        bash_allow: bash_allow.clone(),
-                        bash_authority,
-                        model: model.clone(),
-                        provider: provider.clone(),
-                        auth: children.auth.clone(),
-                    },
-                    _ => match prepared.and_then(|prepared| prepared.get(name)) {
-                        Some(prepared) => prepared.clone(),
-                        None => ChildRoute::Prepared {
-                            provider: "registered-provider".to_owned(),
-                            slots: (0..slot_count(children, route))
-                                .map(|index| PreparedSlot {
-                                    argv: vec!["/usr/bin/env".to_owned()],
-                                    data_root: slot_dir(request, name, index)
-                                        .join("provider")
-                                        .to_string_lossy()
-                                        .into_owned(),
-                                })
-                                .collect(),
-                            endpoint: Endpoint::Stdio,
-                        },
+                let launch = match prepared.and_then(|prepared| prepared.get(name)) {
+                    Some(prepared) => prepared.clone(),
+                    None => ChildRoute::Prepared {
+                        provider: "registered-provider".to_owned(),
+                        slots: (0..slot_count(children, route))
+                            .map(|index| PreparedSlot {
+                                argv: vec!["/usr/bin/env".to_owned()],
+                                data_root: slot_dir(request, name, index)
+                                    .join("provider")
+                                    .to_string_lossy()
+                                    .into_owned(),
+                            })
+                            .collect(),
+                        endpoint: Endpoint::Stdio,
                     },
                 };
                 (name.clone(), launch)
@@ -905,14 +569,14 @@ fn child_registrations(
     children
         .routes
         .iter()
-        .filter_map(|(name, route)| {
-            route.registered.as_ref().map(|registration| {
-                (
-                    name.clone(),
-                    slot_count(children, route),
-                    registration.with_policy(bash_allow.clone(), bash_authority),
-                )
-            })
+        .map(|(name, route)| {
+            (
+                name.clone(),
+                slot_count(children, route),
+                route
+                    .registered
+                    .with_policy(bash_allow.clone(), bash_authority),
+            )
         })
         .collect()
 }
@@ -1051,14 +715,8 @@ fn prepare_children(
 /// The harness id and endpoint of the request's one harness. A registered
 /// provider's id is what it declares; this placeholder serves the owner's
 /// checks before it is described.
-fn harness_kind(request: &NativeRootRequest) -> (&'static str, Endpoint) {
-    if request.provider.is_some() {
-        ("registered-provider", Endpoint::Stdio)
-    } else if request.claude.is_some() {
-        ("claude", Endpoint::Stdio)
-    } else {
-        ("opencode", Endpoint::UnixSocket)
-    }
+fn harness_kind(_request: &NativeRootRequest) -> (&'static str, Endpoint) {
+    ("registered-provider", Endpoint::Stdio)
 }
 
 /// `--recover`: one new owner for an existing store, for `cancel` or
@@ -1313,49 +971,22 @@ fn read_request(path: &Path) -> Result<NativeRootRequest, String> {
     if request.messages.is_empty() {
         return Err("messages names nothing to deliver".to_owned());
     }
-    let harnesses = [
-        request.opencode.is_some(),
-        request.claude.is_some(),
-        request.provider.is_some(),
-    ];
-    if harnesses.into_iter().filter(|named| *named).count() != 1 {
-        return Err("request names exactly one of opencode, claude and provider".to_owned());
-    }
     if let Some(children) = &request.children {
         check_child_routes(children)?;
     }
     Ok(request)
 }
 
-/// Each child route is either OpenCode-shaped (`model` and `provider`,
-/// with `children.opencode`) or `registered` (with at most `max_starts`
-/// slots), never both.
+/// Registered child slots cannot exceed the root's admission ceiling.
 fn check_child_routes(children: &ChildrenRequest) -> Result<(), String> {
     for (name, route) in &children.routes {
-        let opencode = route.model.is_some() || route.provider.is_some();
-        match (route.opencode(), &route.registered) {
-            (Some(_), None) if route.slots.is_none() => {
-                if children.opencode.is_none() {
-                    return Err(format!(
-                        "children: route {name}: an OpenCode route needs children.opencode"
-                    ));
-                }
-            }
-            (None, Some(_)) if !opencode => {
-                if route
-                    .slots
-                    .is_some_and(|slots| !(1..=children.max_starts).contains(&slots))
-                {
-                    return Err(format!(
-                        "children: route {name}: slots must be 1..=max_starts"
-                    ));
-                }
-            }
-            _ => {
-                return Err(format!(
-                    "children: route {name}: name model and provider (OpenCode) or registered (with optional slots)"
-                ));
-            }
+        if route
+            .slots
+            .is_some_and(|slots| !(1..=children.max_starts).contains(&slots))
+        {
+            return Err(format!(
+                "children: route {name}: slots must be 1..=max_starts"
+            ));
         }
     }
     Ok(())
@@ -1470,36 +1101,6 @@ fn env_reach(
             "set_by_launch": launch,
             "set_by_owner": owner_set,
         },
-    })
-}
-
-/// Which declared names the Claude receiver withholds from Claude Code
-/// itself (names only), besides its own launch settings.
-fn claude_code_reach(declared: &BTreeMap<String, String>) -> Value {
-    let withheld = |name: &str| {
-        [
-            "ANTHROPIC_",
-            "CLAUDE",
-            "OULIPOLY_",
-            "AGENT_BASH_",
-            "NODE_",
-            "OTEL_",
-        ]
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
-            || [
-                "AWS_BEARER_TOKEN_BEDROCK",
-                "ENABLE_TOOL_SEARCH",
-                "DEBUG_CLAUDE_AGENT_SDK",
-                "DEBUG",
-            ]
-            .contains(&name)
-    };
-    let names: Vec<&str> = declared.keys().map(String::as_str).collect();
-    json!({
-        "withheld": names.iter().copied().filter(|name| withheld(name)).collect::<Vec<_>>(),
-        "inherited": names.iter().copied().filter(|name| !withheld(name)).collect::<Vec<_>>(),
-        "set_by_launch": "launch.claude_env_set",
     })
 }
 
@@ -1653,18 +1254,18 @@ mod tests {
     fn env_reach_names_what_the_native_launch_replaces_and_never_values() {
         let declared = BTreeMap::from([
             ("HOME".to_owned(), "/owner-home-secret-path".to_owned()),
-            ("OPENCODE_CONFIG_CONTENT".to_owned(), "{}".to_owned()),
+            ("ADAPTER_OPTION".to_owned(), "{}".to_owned()),
             ("TOKEN".to_owned(), "secret-value".to_owned()),
         ]);
         let reach = env_reach(
             &declared,
             &["HOME", "XDG_CONFIG_HOME"],
-            &REMOVED_ENV,
+            &["ADAPTER_OPTION"],
             Endpoint::UnixSocket,
         );
         assert_eq!(
             reach["declared"],
-            json!(["HOME", "OPENCODE_CONFIG_CONTENT", "TOKEN"])
+            json!(["ADAPTER_OPTION", "HOME", "TOKEN"])
         );
         assert_eq!(reach["native_host"]["inherited"], json!(["TOKEN"]));
         assert_eq!(
@@ -1673,7 +1274,7 @@ mod tests {
         );
         assert_eq!(
             reach["native_host"]["removed_by_launch"],
-            json!(["OPENCODE_CONFIG_CONTENT"])
+            json!(["ADAPTER_OPTION"])
         );
         let text = reach.to_string();
         assert!(!text.contains("secret"), "{text}");
@@ -1702,153 +1303,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn request_refuses_existing_paths_owner_variables_and_unknown_fields() {
-        let dir = tempfile::tempdir().unwrap();
-        let fresh = dir.path().join("fresh");
-        let base = |store: &Path, env: Value| {
-            json!({
-                "store": store,
-                "launch_dir": dir.path().join("launch"),
-                "cwd": "/",
-                "env": env,
-                "messages": ["m"],
-                "outage_closure_cap": 1,
-                "delivery_attempt_cap": 1,
-                "opencode": {
-                    "deps": "/d", "agent_bash_tool": "/t", "agent_bash_bin": "/b",
-                    "bash_allow": ["true"],
-                },
-                "workload": { "isolation": "unprivileged-userns" },
-            })
-        };
-        let read = |value: Value| {
-            let path = dir.path().join("request.json");
-            std::fs::write(&path, value.to_string()).unwrap();
-            read_request(&path)
-        };
-        assert!(read(base(&fresh, json!({ "PATH": "/usr/bin" }))).is_ok());
-        let existing = read(base(dir.path(), json!({}))).unwrap_err();
-        assert!(existing.contains("fresh only"), "{existing}");
-        let owned = read(base(&fresh, json!({ "OULIPOLY_ROOT_BASH_V1": "/x" }))).unwrap_err();
-        assert!(owned.contains("owner's to set"), "{owned}");
-        let offered = read(base(&fresh, json!({ "OULIPOLY_EXPLORATION_V1": "{}" }))).unwrap_err();
-        assert!(offered.contains("this entry's to offer"), "{offered}");
-        let mut extra = base(&fresh, json!({}));
-        extra["inherit_env"] = json!(true);
-        assert!(read(extra).unwrap_err().contains("unknown field"));
-        let mut authed = base(&fresh, json!({}));
-        authed["opencode"]["auth"] = json!("/private/auth.json");
-        assert_eq!(
-            read(authed).unwrap().opencode.unwrap().auth.as_deref(),
-            Some("/private/auth.json")
-        );
-        // Exactly one harness kind.
-        let mut both = base(&fresh, json!({}));
-        both["claude"] = claude_setup();
-        assert!(read(both).unwrap_err().contains("exactly one"), "both");
-        let mut neither = base(&fresh, json!({}));
-        neither.as_object_mut().unwrap().remove("opencode");
-        assert!(
-            read(neither).unwrap_err().contains("exactly one"),
-            "neither"
-        );
-        let mut claude = base(&fresh, json!({}));
-        claude.as_object_mut().unwrap().remove("opencode");
-        claude["claude"] = claude_setup();
-        let request = read(claude.clone()).unwrap();
-        assert_eq!(harness_kind(&request), ("claude", Endpoint::Stdio));
-        let owner = owner_request(
-            &request,
-            harness_kind(&request),
-            vec!["/usr/bin/env".to_owned()],
-            None,
-        );
-        let spec = &owner.intent.as_ref().unwrap().harnesses[0];
-        assert_eq!(
-            (spec.id.as_str(), spec.endpoint),
-            ("claude", Endpoint::Stdio)
-        );
-        claude["claude"]["credential"] = json!("x");
-        assert!(read(claude).unwrap_err().contains("unknown field"));
-    }
-
-    /// A registered provider is a third harness kind, exclusive of the
-    /// embedded ones; its registration is checked when resolved, not here.
-    #[test]
-    fn request_names_a_registered_provider_instead_of_an_embedded_harness() {
-        let dir = tempfile::tempdir().unwrap();
-        let read = |value: Value| {
-            let path = dir.path().join("request.json");
-            std::fs::write(&path, value.to_string()).unwrap();
-            read_request(&path)
-        };
-        let base = json!({
-            "store": dir.path().join("store"),
-            "launch_dir": dir.path().join("launch"),
-            "cwd": "/",
-            "env": {},
-            "messages": ["m"],
-            "outage_closure_cap": 1,
-            "delivery_attempt_cap": 1,
-            "provider": {
-                "executable": "/opt/provider/bin/provider",
-                "settings": { "settings_id": "s" },
-                "agent_bash_bin": "/opt/agent-bash",
-                "bash_allow": ["git status"],
-            },
-            "workload": { "isolation": "unprivileged-userns" },
-        });
-        let request = read(base.clone()).unwrap();
-        assert_eq!(
-            harness_kind(&request),
-            ("registered-provider", Endpoint::Stdio)
-        );
-        assert_eq!(bash_policy(&request), (vec!["git status".to_owned()], None));
-        let policy = serde_json::to_value(request.provider.as_ref().unwrap().mediation()).unwrap();
-        assert_eq!(policy["bash"], json!({ "allow": ["git status"] }));
-        assert_eq!(policy["requester"], "/opt/agent-bash");
-        assert_eq!(
-            policy["ingress_env"],
-            oulipoly_root_supervisor::bash::BASH_ENV
-        );
-        assert_eq!(
-            policy["protocol"],
-            agent_provider_contract::tool_mediation::PROTOCOL
-        );
-        assert!(policy.get("explore").is_none());
-        let owner = owner_request(
-            &request,
-            ("fake-external", Endpoint::Stdio),
-            vec!["/p".to_owned()],
-            None,
-        );
-        let spec = &owner.intent.as_ref().unwrap().harnesses[0];
-        assert_eq!(
-            (spec.id.as_str(), spec.endpoint),
-            ("fake-external", Endpoint::Stdio)
-        );
-        let mut with_claude = base.clone();
-        with_claude["claude"] = claude_setup();
-        assert!(read(with_claude).unwrap_err().contains("exactly one"));
-        let mut native_fields = base.clone();
-        native_fields["provider"]["model"] = json!("m");
-        assert!(read(native_fields).unwrap_err().contains("unknown field"));
-        let mut children = base;
-        children["children"] = json!({
-            "routes": { "luna": { "model": "openai/luna", "provider": { "openai": {} } } },
-            "opencode": { "deps": "/d", "agent_bash_tool": "/t", "agent_bash_bin": "/b" },
-            "max_starts": 2, "max_concurrent": 1,
-        });
-        let request = read(children).unwrap();
-        assert_eq!(
-            serde_json::to_value(explore_tool(&request)).unwrap(),
-            json!({ "routes": ["luna"], "max_starts": 2, "max_concurrent": 1 })
-        );
-    }
-
-    /// A child route is OpenCode-shaped or registered, never both; a
-    /// registered child takes the parent's tool policy (it cannot name its
+    /// Each child route is registered; a registered child takes the parent's tool policy (it cannot name its
     /// own) and its slots are planned under the launch directory, at most
     /// the start budget, before anything runs.
     #[test]
@@ -1870,7 +1325,7 @@ mod tests {
             "launch_dir": dir.path().join("launch"),
             "cwd": "/", "env": {}, "messages": ["m"],
             "outage_closure_cap": 1, "delivery_attempt_cap": 1,
-            "claude": claude_setup(),
+            "provider": provider_setup(),
             "children": {
                 "routes": { "luna": { "registered": registered, "slots": 2 } },
                 "max_starts": 3, "max_concurrent": 1,
@@ -1882,7 +1337,7 @@ mod tests {
         assert_eq!(registrations.len(), 1);
         let (name, slots, registration) = &registrations[0];
         assert_eq!((name.as_str(), *slots), ("luna", 2));
-        // The Claude parent's trusted-task authority, inherited.
+        // The parent's neutral trusted-task authority, inherited.
         assert_eq!(
             serde_json::to_value(registration.mediation()).unwrap()["bash"],
             json!({ "authority": "trusted-task" })
@@ -1905,11 +1360,6 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        // The parent gets the route offered; the owner's checks pass.
-        assert_eq!(
-            explore_tool(&request).unwrap().routes,
-            vec!["luna".to_owned()]
-        );
         owner_request(
             &request,
             harness_kind(&request),
@@ -1954,21 +1404,21 @@ mod tests {
         );
         refuse(
             &|v| v["children"]["routes"]["luna"]["model"] = json!("openai/luna"),
-            "name model and provider (OpenCode) or registered",
+            "unknown field",
         );
         refuse(
             &|v| {
                 v["children"]["routes"]["oc"] =
                     json!({ "model": "openai/luna", "provider": { "openai": {} } })
             },
-            "an OpenCode route needs children.opencode",
+            "unknown field",
         );
         refuse(
             &|v| {
                 v["children"]["routes"]["oc"] =
                     json!({ "model": "openai/luna", "provider": { "openai": {} }, "slots": 1 })
             },
-            "name model and provider",
+            "unknown field",
         );
     }
 
@@ -2000,27 +1450,26 @@ mod tests {
                     "luna": { "registered": {
                         "executable": "/opt/provider/bin/provider",
                         "settings": {}, "agent_bash_bin": "/b" }, "slots": 1 },
-                    "oc": { "model": "openai/luna", "provider": { "openai": {} } },
+                    "other": { "registered": { "executable": "/opt/p", "settings": {}, "agent_bash_bin": "/b" } },
                 },
-                "opencode": { "deps": "/d", "agent_bash_tool": "/t", "agent_bash_bin": "/b" },
                 "max_starts": 2, "max_concurrent": 1,
             },
             "workload": { "isolation": "unprivileged-userns" },
         });
         std::fs::write(&path, value.to_string()).unwrap();
         let request = read_request(&path).unwrap();
-        let registration = request.provider.as_ref().unwrap();
+        let registration = &request.provider;
         let offer = registered::offer(registration, child_routes(&request), limits(&request))
             .unwrap()
             .unwrap();
-        assert_eq!(offer.routes, ["luna", "oc"]);
+        assert_eq!(offer.routes, ["luna", "other"]);
         assert_eq!(offer.ingress_env, oulipoly_root_supervisor::bash::BASH_ENV);
         assert_eq!(
             serde_json::to_value(&offer.limits).unwrap(),
             json!({ "max_starts": 2, "max_concurrent": 1 })
         );
         let policy = child_policy(&request, None).unwrap();
-        assert_eq!(policy.routes.keys().collect::<Vec<_>>(), ["luna", "oc"]);
+        assert_eq!(policy.routes.keys().collect::<Vec<_>>(), ["luna", "other"]);
         owner_request(
             &request,
             harness_kind(&request),
@@ -2034,12 +1483,9 @@ mod tests {
         value.as_object_mut().unwrap().remove("children");
         std::fs::write(&path, value.to_string()).unwrap();
         let request = read_request(&path).unwrap();
-        let refused = registered::offer(
-            request.provider.as_ref().unwrap(),
-            child_routes(&request),
-            limits(&request),
-        )
-        .unwrap_err();
+        let refused =
+            registered::offer(&request.provider, child_routes(&request), limits(&request))
+                .unwrap_err();
         assert!(refused.contains("declares no child routes"), "{refused}");
     }
 
@@ -2054,6 +1500,7 @@ mod tests {
             "cwd": "/", "env": {}, "messages": ["m"],
             "outage_closure_cap": 1, "delivery_attempt_cap": 1,
             "workload": { "isolation": "unprivileged-userns" },
+            "provider": provider_setup(),
         }))
         .unwrap();
         let sink = Captured::default();
@@ -2090,38 +1537,9 @@ mod tests {
         );
     }
 
-    fn claude_setup() -> Value {
-        json!({
-            "deps": "/d", "node": "/n", "agent_bash_bin": "/b",
-            "bash_authority": "trusted-task",
-            "model": "claude-opus-5-5", "effort": "medium",
-            "config_dir": "/home/nes/.claude5",
-        })
-    }
-
-    /// The Claude receiver's withheld names are reported by name only.
-    #[test]
-    fn claude_code_reach_names_withheld_credentials_never_values() {
-        let declared = BTreeMap::from([
-            ("ANTHROPIC_API_KEY".to_owned(), "secret-key".to_owned()),
-            (
-                "CLAUDE_CODE_OAUTH_TOKEN".to_owned(),
-                "secret-token".to_owned(),
-            ),
-            ("PATH".to_owned(), "/usr/bin".to_owned()),
-        ]);
-        let reach = claude_code_reach(&declared);
-        assert_eq!(
-            reach["withheld"],
-            json!(["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"])
-        );
-        assert_eq!(reach["inherited"], json!(["PATH"]));
-        let full = env_reach(&declared, &[], &native_claude::REMOVED_ENV, Endpoint::Stdio);
-        assert_eq!(
-            full["native_host"]["removed_by_launch"],
-            json!(["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"])
-        );
-        assert!(!reach.to_string().contains("secret"));
+    fn provider_setup() -> Value {
+        json!({ "executable": "/opt/provider", "settings": {},
+            "agent_bash_bin": "/b", "bash_authority": "trusted-task" })
     }
 
     /// The work identity is declared, never taken from the caller's euid:
@@ -2140,10 +1558,7 @@ mod tests {
                 "messages": ["m"],
                 "outage_closure_cap": 1,
                 "delivery_attempt_cap": 1,
-                "opencode": {
-                    "deps": "/d", "agent_bash_tool": "/t", "agent_bash_bin": "/b",
-                    "bash_allow": ["true"],
-                },
+                "provider": provider_setup(),
             });
             if let Some(workload) = workload {
                 value["workload"] = workload;
@@ -2189,5 +1604,44 @@ mod tests {
         )
         .validate()
         .unwrap();
+    }
+    #[test]
+    fn registered_request_refuses_embedded_shapes_before_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = json!({
+            "store": dir.path().join("store"), "launch_dir": dir.path().join("launch"),
+            "cwd": "/", "env": {}, "messages": ["m"],
+            "outage_closure_cap": 1, "delivery_attempt_cap": 1,
+            "provider": provider_setup(), "workload": {"isolation": "unprivileged-userns"}
+        });
+        let read = |value: Value| {
+            let path = dir.path().join("request.json");
+            std::fs::write(&path, value.to_string()).unwrap();
+            read_request(&path)
+        };
+        assert!(read(base.clone()).is_ok());
+        for key in ["opencode", "claude", "auth", "model", "credential"] {
+            let mut value = base.clone();
+            value[key] = json!({});
+            assert!(read(value).unwrap_err().contains("unknown field"), "{key}");
+        }
+        let mut missing = base.clone();
+        missing.as_object_mut().unwrap().remove("provider");
+        assert!(
+            read(missing)
+                .unwrap_err()
+                .contains("missing field `provider`")
+        );
+        let mut null = base.clone();
+        null["provider"] = Value::Null;
+        assert!(read(null).is_err());
+        let mut existing = base.clone();
+        existing["store"] = json!(dir.path());
+        assert!(read(existing).unwrap_err().contains("fresh only"));
+        let mut owned = base;
+        owned["env"] = json!({"OULIPOLY_ROOT_BASH_V1": "/x"});
+        assert!(read(owned).unwrap_err().contains("owner's to set"));
+        assert!(!dir.path().join("store").exists());
+        assert!(!dir.path().join("launch").exists());
     }
 }

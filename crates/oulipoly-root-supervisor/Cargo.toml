@@ -31,12 +31,6 @@ path = "src/bin/root_bash.rs"
 name = "oulipoly-root-child"
 path = "src/bin/root_child.rs"
 
-# Owner-side setup of one native OpenCode host's launch directory, policy
-# and harness argv (see the `native` module docs).
-[[bin]]
-name = "oulipoly-native-opencode-setup"
-path = "src/bin/native_opencode_setup.rs"
-
 # Deterministic ACP v2 peer used only as an owned harness in this crate's
 # process-level tests. It is not a real harness.
 [[bin]]

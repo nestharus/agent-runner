@@ -144,7 +144,6 @@ deadline_s = 900
 [models."codex~high"]
 route = "sol-high"
 bash = "trusted-task"
-credential_codex_profile = "/nonexistent/.codex4"
 children = ["luna-max"]
 child_max_starts = 1
 
@@ -174,10 +173,7 @@ fn direct_model_launch_runs_mapped_site_route_on_native_caller() {
     let argv = fixture.argv().expect("native caller invoked");
     assert_eq!(value_after(&argv, "--route"), Some("sol-high"));
     assert_eq!(value_after(&argv, "--deadline"), Some("900"));
-    assert_eq!(
-        value_after(&argv, "--credential-codex-profile"),
-        Some("/nonexistent/.codex4")
-    );
+    assert!(value_after(&argv, "--credential-codex-profile").is_none());
     assert_eq!(value_after(&argv, "--child-route"), Some("luna-max"));
     assert_eq!(value_after(&argv, "--child-max-starts"), Some("1"));
     assert!(argv.contains(&"--trusted-task".to_owned()));
@@ -478,4 +474,17 @@ fn nonanswered_stdout_loss_preserves_nonzero_caller_code() {
         fs::read_to_string(out.join("final.md")).unwrap(),
         "stand-in answer via cancelled-text"
     );
+}
+
+#[test]
+fn old_credential_config_refuses_without_invoking_caller() {
+    let fixture = Fixture::new(&CONFIG.replace(
+        "children =",
+        "credential_codex_profile = \"/unread\"\nchildren =",
+    ));
+    let output = fixture.run(&["-m", "codex~high", "q"]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(stderr(&output).contains("unknown field"));
+    assert!(fixture.argv().is_none());
+    assert!(!fixture.data_dir.exists());
 }

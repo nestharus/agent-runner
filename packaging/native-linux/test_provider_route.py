@@ -32,7 +32,6 @@ PROVIDER = {
         "launch": {},
     },
     "env": {"CODEX_HOME_HINT": "x"},
-    "credential": "none",
 }
 SITE = {
     "v": 1,
@@ -40,15 +39,14 @@ SITE = {
     "run_base": "/var/lib/oulipoly-native/runs",
     "max_deadline_s": 3600,
     "cancel_grace_s": 30,
-    "credential_margin_s": 300,
     "allow_keep": False,
     "default_path": "/usr/local/bin:/usr/bin:/bin",
     "routes": {
         "codex-sol": PROVIDER,
-        "fixture": {"model": "fixture/scripted", "credential": "none", "provider": {"fixture": {}}},
+        "fixture": PROVIDER,
     },
     "child_routes": {
-        "luna-max": {"model": "openai/gpt-6-luna", "credential": "required", "provider": {"openai": {}}},
+        "luna-max": PROVIDER,
     },
 }
 
@@ -101,23 +99,36 @@ class SiteShape(unittest.TestCase):
             with self.assertRaisesRegex(frontdoor.Refused, "route bad", msg=bad):
                 loaded(site(bad=bad))
 
+    def test_old_embedded_site_shapes_are_refused(self):
+        for old in (
+            {"model": "p/m", "provider": {"p": {}}, "credential": "none"},
+            {"harness": "claude", "model": "m", "effort": "medium", "config_dir": ".store", "credential": "none"},
+            dict(PROVIDER, credential="none"),
+        ):
+            with self.assertRaisesRegex(frontdoor.Refused, "expected registered provider shape"):
+                loaded(site(old=old))
+            value = site()
+            value["child_routes"]["old"] = old
+            with self.assertRaisesRegex(frontdoor.Refused, "child route old"):
+                loaded(value)
+
+    def test_example_is_generic_registered_only(self):
+        with open(os.path.join(os.path.dirname(__file__), "frontdoor.example.json")) as file:
+            example = loaded(json.load(file))
+        for route in list(example["routes"].values()) + list(example["child_routes"].values()):
+            self.assertEqual(route["harness"], "provider")
+            self.assertNotIn("credential", route)
+
+
 
 class Admission(unittest.TestCase):
     def test_provider_route_takes_no_credential_and_its_policy(self):
         checked = frontdoor.check_request(request(), SITE, NOW)
         self.assertEqual(checked["policy"], {"bash_allow": ["git status"]})
-        self.assertIsNone(checked["credential"])
-        with self.assertRaisesRegex(frontdoor.Refused, "takes no credential"):
+        self.assertNotIn("credential", checked)
+        with self.assertRaisesRegex(frontdoor.Refused, "unknown fields"):
             frontdoor.check_request(request(credential={"openai": {}}), SITE, NOW)
 
-    def test_provider_parent_children_take_a_separate_grant(self):
-        route = dict(PROVIDER, children=["luna-max"])
-        value = loaded(site(**{"codex-sol": route}))
-        with self.assertRaisesRegex(frontdoor.Refused, "need child_credential"):
-            frontdoor.check_request(request(children={"routes": ["luna-max"]}), value, NOW)
-        grant = {"openai": {"type": "oauth", "refresh": "", "access": "a", "expires": (NOW + 7200) * 1000}}
-        checked = frontdoor.check_request(request(children={"routes": ["luna-max"]}, child_credential=grant), value, NOW)
-        self.assertEqual(checked["children"]["grant"][1]["source"], "separate-child-grant")
 
     def test_executable_custody_is_root_and_an_executable_file(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -136,8 +147,7 @@ class Admission(unittest.TestCase):
                     frontdoor.check_provider_executable(route)
                 with self.assertRaisesRegex(frontdoor.Refused, "FileNotFoundError"):
                     frontdoor.check_provider_executable(dict(PROVIDER, executable=path + "-absent"))
-            # Embedded routes are not provider routes.
-            frontdoor.check_provider_executable(SITE["routes"]["fixture"])
+
 
     def test_admission_checks_custody_before_any_effect(self):
         calls = []
@@ -178,11 +188,11 @@ class RegisteredChildRoutes(unittest.TestCase):
     def test_registered_child_takes_no_grant_and_reaches_the_entry_as_registered(self):
         value = loaded(child_site())
         checked = frontdoor.check_request(request(children={"routes": ["luna-codex"]}), value, NOW)
-        self.assertIsNone(checked["children"]["grant"])
-        with self.assertRaisesRegex(frontdoor.Refused, "take no credential"):
+        self.assertNotIn("grant", checked["children"])
+        with self.assertRaisesRegex(frontdoor.Refused, "unknown fields"):
             frontdoor.check_request(request(children={"routes": ["luna-codex"]}, child_credential={}), value, NOW)
         user = pwd.getpwuid(os.getuid())
-        entry = frontdoor.entry_request("/opt/pkg", "/runs/1/r", user, checked, {}, False)
+        entry = frontdoor.entry_request("/opt/pkg", "/runs/1/r", user, checked, {})
         self.assertEqual(entry["provider"]["root_child_bin"], "/opt/pkg/bin/oulipoly-root-child")
         self.assertEqual(entry["children"], {
             "routes": {"luna-codex": {"registered": {
@@ -193,15 +203,6 @@ class RegisteredChildRoutes(unittest.TestCase):
             }}},
             "max_starts": 4, "max_concurrent": 2,
         })
-        # With an OpenCode child beside it, the OpenCode inputs come too.
-        grant = {"openai": {"type": "oauth", "refresh": "", "access": "a", "expires": (NOW + 7200) * 1000}}
-        mixed = frontdoor.check_request(request(children={"routes": ["luna-codex", "luna-max"]}, child_credential=grant), value, NOW)
-        entry = frontdoor.entry_request("/opt/pkg", "/runs/1/r", user, mixed, {}, False)
-        self.assertIn("opencode", entry["children"])
-        self.assertEqual(entry["children"]["routes"]["luna-max"]["model"], "openai/gpt-6-luna")
-        self.assertEqual(entry["provider"]["root_child_bin"], "/opt/pkg/bin/oulipoly-root-child")
-        self.assertNotIn("root_child_bin", entry["children"]["routes"]["luna-codex"]["registered"])
-
     def test_admission_checks_child_executable_custody_before_any_effect(self):
         calls = []
 
@@ -227,7 +228,7 @@ class EntryRequest(unittest.TestCase):
     def test_provider_route_emits_the_provider_and_no_embedded_harness(self):
         user = pwd.getpwuid(os.getuid())
         checked = frontdoor.check_request(request(), SITE, NOW)
-        value = frontdoor.entry_request("/opt/pkg", "/runs/1/r", user, checked, {"PATH": "/usr/bin"}, False)
+        value = frontdoor.entry_request("/opt/pkg", "/runs/1/r", user, checked, {"PATH": "/usr/bin"})
         self.assertNotIn("opencode", value)
         self.assertNotIn("claude", value)
         self.assertEqual(value["provider"], {
@@ -239,18 +240,18 @@ class EntryRequest(unittest.TestCase):
         })
         self.assertEqual(value["workload"], {"isolation": "host-root", "user": user.pw_name})
         trusted = frontdoor.check_request(request(bash={"authority": "trusted-task"}), site(**{"codex-sol": dict(PROVIDER, config_root="/etc/codex")}), NOW)
-        value = frontdoor.entry_request("/opt/pkg", "/runs/1/r", user, trusted, {}, False)
+        value = frontdoor.entry_request("/opt/pkg", "/runs/1/r", user, trusted, {})
         self.assertEqual(value["provider"]["bash_authority"], "trusted-task")
         self.assertEqual(value["provider"]["config_root"], "/etc/codex")
 
     def test_admitted_report_names_the_provider_not_a_model(self):
         report = frontdoor.harness_report(PROVIDER)
         self.assertEqual(report["harness"], "provider")
-        self.assertIsNone(report["model"])
+        self.assertNotIn("model", report)
         self.assertEqual(report["provider"]["executable"], PROVIDER["executable"])
         self.assertEqual(len(report["provider"]["settings_sha256"]), 64)
         self.assertNotIn("gpt-6.1-sol", json.dumps(report))
-        self.assertEqual(frontdoor.harness_report(SITE["routes"]["fixture"]), {"harness": "opencode", "model": "fixture/scripted"})
+
 
 
 RUNNER = os.environ.get("OULIPOLY_RUNNER")
@@ -338,7 +339,7 @@ class EntryContract(unittest.TestCase):
         route = dict(PROVIDER, executable=executable)
         checked = frontdoor.check_request(request(message="echo:through the front door", cwd=self.dir), site(**{"codex-sol": route}), NOW)
         user = pwd.getpwuid(os.getuid())
-        value = frontdoor.entry_request(self.package, self.run_dir, user, checked, {"PATH": "/usr/bin:/bin"}, False)
+        value = frontdoor.entry_request(self.package, self.run_dir, user, checked, {"PATH": "/usr/bin:/bin"})
         self.assertEqual(value["workload"]["isolation"], "host-root")
         # A host-root declaration needs a root entry (ROOT's run).
         value["workload"] = {"isolation": "unprivileged-userns"}

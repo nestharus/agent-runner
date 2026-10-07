@@ -95,7 +95,7 @@ use oulipoly_provider::generated::{
     CONTRACT_VERSION, EmptyParams, HostContext, PolicyEvaluateResult, RequestEnvelope,
 };
 use oulipoly_provider::resolver::ProviderArtifactRef;
-use oulipoly_root_supervisor::native::BashAuthority;
+use oulipoly_root_supervisor::bash::BashAuthority;
 use oulipoly_root_supervisor::workload::Identity;
 use oulipoly_runtime::provider_registry::ProviderClientFactory;
 use serde::Deserialize;

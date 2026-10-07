@@ -1,9 +1,7 @@
-"""Offline checks of the public caller: credential staging from an
-explicitly named source, refusals before anything starts, capture, the
+"""Offline checks of the public caller: request production, capture, the
 answer, close and deadline handling, and outcome classes. The front door
 is a scripted stand-in run directly (no sudo, no root, no model)."""
 
-import base64
 import json
 import os
 import shutil
@@ -19,9 +17,6 @@ NOW = time.time()
 SECRET = "fixture-access-marker"
 
 
-def jwt(claims):
-    part = lambda value: base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
-    return f"{part({'alg': 'none'})}.{part(claims)}.sig"
 
 
 # A scripted front door: checks the request line, then plays one scripted
@@ -81,7 +76,7 @@ FAKE_FRONTDOOR = textwrap.dedent("""
             else:
                 say({"event": "terminal", "status": "closed"})
             say({"entry": "terminal", "stage": "owner-ended", "relay": "complete"})
-            say({"frontdoor": "terminal", "stage": "ended", "exit": 87, "retire": {"credentials": {"ok": True}}})
+            say({"frontdoor": "terminal", "stage": "ended", "exit": 87, "retire": {"ok": True, "run_removed": True}})
             sys.exit(87)
         if cmd == "cancel":
             say({"frontdoor": "terminal", "stage": "ended", "exit": 92, "killed": True})
@@ -106,48 +101,6 @@ class Scratch(unittest.TestCase):
         return path
 
 
-class Credentials(Scratch):
-    def codex_profile(self, exp, account=True):
-        os.mkdir(self.path("profile"))
-        tokens = {"access_token": jwt({"exp": exp}), "refresh_token": "fixture-refresh-grant", "id_token": "x"}
-        if account:
-            tokens["account_id"] = "acct"
-        self.write("profile/auth.json", {"tokens": tokens})
-        return self.path("profile")
-
-    def test_codex_profile_gives_access_only(self):
-        exp = int(NOW) + 7200
-        entry = native_call.from_codex_profile(self.codex_profile(exp))["openai"]
-        self.assertEqual(entry["refresh"], "")
-        self.assertEqual(entry["expires"], exp * 1000)
-        self.assertEqual(entry["accountId"], "acct")
-        self.assertNotIn("fixture-refresh-grant", json.dumps(entry))
-
-    def test_opencode_auth_drops_refresh(self):
-        source = self.write("auth.json", {"openai": {"type": "oauth", "refresh": "fixture-refresh-grant", "access": SECRET,
-                                                     "expires": int(NOW + 7200) * 1000, "accountId": "acct"}})
-        entry = native_call.from_opencode_auth(source, "openai")["openai"]
-        self.assertEqual(entry, {"type": "oauth", "refresh": "", "access": SECRET, "expires": int(NOW + 7200) * 1000, "accountId": "acct"})
-
-    def test_refusals_quote_nothing(self):
-        api = self.write("api.json", {"openai": {"type": "api", "key": SECRET}})
-        with self.assertRaisesRegex(native_call.LocalRefusal, "not oauth"):
-            native_call.from_opencode_auth(api, "openai")
-        broken = self.write("broken.json", '{"openai": "' + SECRET)
-        with self.assertRaises(native_call.LocalRefusal) as caught:
-            native_call.from_opencode_auth(broken, "openai")
-        self.assertNotIn(SECRET, str(caught.exception))
-        os.symlink(api, self.path("link.json"))
-        with self.assertRaisesRegex(native_call.LocalRefusal, "not a regular file"):
-            native_call.from_opencode_auth(self.path("link.json"), "openai")
-        with self.assertRaisesRegex(native_call.LocalRefusal, "schema"):
-            native_call.from_opencode_auth(api, "anthropic")
-
-    def test_freshness_against_deadline(self):
-        credential = native_call.access_only("openai", SECRET, int(NOW + 1000) * 1000, None)
-        with self.assertRaisesRegex(native_call.LocalRefusal, "deadline needs 1200s"):
-            native_call.check_fresh(credential, 600, 600, NOW)
-        native_call.check_fresh(credential, 300, 600, NOW)
 
 
 class Calls(Scratch):
@@ -181,7 +134,7 @@ class Calls(Scratch):
     def test_answer_close_and_capture(self):
         source = self.write("auth.json", {"openai": {"type": "oauth", "refresh": "fixture-refresh-grant", "access": SECRET,
                                                      "expires": int(NOW + 7200) * 1000}})
-        code, out, result = self.call("answer", "--credential-opencode-auth", source, "--credential-provider", "openai",
+        code, out, result = self.call("answer",
                                       "--env", "PATH=/x:/usr/bin", "--deadline", "60")
         self.assertEqual((code, result["class"]), (0, "answered"))
         with open(os.path.join(out, "final.md")) as file:
@@ -191,8 +144,7 @@ class Calls(Scratch):
         seen = self.seen()
         self.assertEqual(seen["argv"], ["run"])
         self.assertEqual(seen["sudo_uid"], "1000")
-        self.assertEqual(seen["request"]["credential"]["openai"]["refresh"], "")
-        self.assertEqual(seen["request"]["credential"]["openai"]["access"], SECRET)
+        self.assertNotIn("credential", seen["request"])
         self.assertEqual(seen["request"]["env"], {"PATH": "/x:/usr/bin"})
         self.assertEqual(seen["request"]["bash"], {"authority": "trusted-task"})
         for name in os.listdir(out):
@@ -276,13 +228,6 @@ class Calls(Scratch):
         code, out, result = self.call("refuse")
         self.assertEqual((code, result["class"]), (4, "front-door-refused"))
 
-    def test_local_refusal_starts_nothing(self):
-        source = self.write("auth.json", {"openai": {"type": "oauth", "refresh": "", "access": SECRET,
-                                                     "expires": int(NOW + 100) * 1000}})
-        code, out, result = self.call("answer", "--credential-opencode-auth", source, "--credential-provider", "openai")
-        self.assertEqual((code, result["class"], result["started"]), (3, "refused-locally", False))
-        self.assertFalse(os.path.exists(self.path("fd", "seen.json")))
-        self.assertEqual(os.listdir(out), ["result.json"])
 
     def test_existing_out_is_refused(self):
         os.mkdir(self.path("taken"))

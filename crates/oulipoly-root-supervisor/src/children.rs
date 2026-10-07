@@ -67,7 +67,6 @@ use serde_json::{Value, json};
 use crate::bash::{Attributed, Gate, Sink, View, Views};
 use crate::custody::{Root, RootSlot};
 use crate::live::Custody;
-use crate::native::{BashAuthority, OpenCodeSetup, OpenCodeSetupError, provision_opencode};
 use crate::store::{ChildAdmission, DurableHarness, DurableMessage, Store};
 use crate::{Endpoint, Event, HarnessRecord};
 
@@ -97,8 +96,7 @@ pub struct ChildPolicy {
     pub max_starts: u32,
     /// Children admitted and not yet finished, at once.
     pub max_concurrent: u32,
-    /// Absolute directory under which each OpenCode child's launch
-    /// directory (`c<position>`) is made at its admission.
+    /// Absolute child launch base retained in the root intent.
     pub launch_base: String,
 }
 
@@ -106,23 +104,6 @@ pub struct ChildPolicy {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "harness", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ChildRoute {
-    /// A native OpenCode host provisioned per child (see [`crate::native`]):
-    /// these are the setup inputs less the launch directory.
-    Opencode {
-        deps: String,
-        agent_bash_tool: String,
-        agent_bash_bin: String,
-        #[serde(default)]
-        bash_allow: Vec<String>,
-        #[serde(default)]
-        bash_authority: Option<BashAuthority>,
-        model: String,
-        provider: serde_json::Map<String, Value>,
-        /// A private access-only OpenCode `auth.json` copied into each
-        /// child's launch; absent for a credential-free route.
-        #[serde(default)]
-        auth: Option<String>,
-    },
     /// A fixed launch (the trusted intent's own argv, like a harness spec).
     Fixed {
         argv: Vec<String>,
@@ -158,36 +139,7 @@ pub struct PreparedSlot {
 impl ChildRoute {
     fn endpoint(&self) -> Endpoint {
         match self {
-            Self::Opencode { .. } => Endpoint::UnixSocket,
             Self::Fixed { endpoint, .. } | Self::Prepared { endpoint, .. } => *endpoint,
-        }
-    }
-
-    /// The OpenCode setup for a child launch in `dir`.
-    pub fn opencode_setup(&self, dir: String) -> Option<OpenCodeSetup> {
-        match self {
-            Self::Opencode {
-                deps,
-                agent_bash_tool,
-                agent_bash_bin,
-                bash_allow,
-                bash_authority,
-                model,
-                provider,
-                auth,
-            } => Some(OpenCodeSetup {
-                dir,
-                deps: deps.clone(),
-                agent_bash_tool: agent_bash_tool.clone(),
-                agent_bash_bin: agent_bash_bin.clone(),
-                bash_allow: bash_allow.clone(),
-                bash_authority: *bash_authority,
-                model: Some(model.clone()),
-                provider: Some(provider.clone()),
-                auth: auth.clone(),
-                explore: None,
-            }),
-            Self::Fixed { .. } | Self::Prepared { .. } => None,
         }
     }
 }
@@ -241,22 +193,6 @@ impl ChildPolicy {
                                 "children: route {name}: slot data roots must be absolute and distinct"
                             ));
                         }
-                    }
-                }
-                ChildRoute::Opencode { .. } => {
-                    let setup = route
-                        .opencode_setup(format!("{}/check", self.launch_base))
-                        .expect("opencode route");
-                    crate::native::Policy::of(&setup)
-                        .map_err(|reason| format!("children: route {name}: {reason}"))?;
-                    if !setup
-                        .model
-                        .as_deref()
-                        .is_some_and(|model| model.contains('/'))
-                    {
-                        return Err(format!(
-                            "children: route {name}: model must be provider/model"
-                        ));
                     }
                 }
             }
@@ -812,7 +748,7 @@ pub(crate) fn serve(
         });
         (done, handle)
     };
-    let argv = launch_argv(ctx, position, &route, slot);
+    let argv = launch_argv(&route, slot);
     let record = match argv {
         Ok(argv) => {
             let _ = ctx
@@ -1118,14 +1054,9 @@ fn admit(
     })
 }
 
-/// The child's harness argv: a fixed one, its admission's prepared slot,
-/// or a fresh OpenCode launch provisioned now. `Err((reason, setup_effects))`: no process was started
-/// either way; `setup_effects` is `"none"` only when setup refused before
-/// any write, else `"possible"` (files, a copied credential among them, can
-/// remain under the launch base until the caller retires the run).
+/// Select the fixed argv or the admission's already prepared slot.
+/// Selection performs no setup writes and starts no process.
 fn launch_argv(
-    ctx: &Context<'_>,
-    position: usize,
     route: &ChildRoute,
     slot: Option<usize>,
 ) -> Result<Vec<String>, (String, &'static str)> {
@@ -1135,54 +1066,7 @@ fn launch_argv(
             .and_then(|index| slots.get(index))
             .map(|slot| slot.argv.clone())
             .ok_or(("no prepared slot was taken".to_owned(), "none")),
-        ChildRoute::Opencode { .. } => {
-            let policy = ctx
-                .registry
-                .policy
-                .as_ref()
-                .expect("admitted under a policy");
-            let base = std::path::Path::new(&policy.launch_base);
-            let identity = ctx.slot.workload.identity.as_ref();
-            make_base(base, identity).map_err(|reason| (reason, "possible"))?;
-            // Each child's launch is fresh: an existing directory (an
-            // earlier owner's) is refused by setup, never reused.
-            let dir = base.join(format!("c{position}"));
-            let setup = route
-                .opencode_setup(dir.to_string_lossy().into_owned())
-                .expect("opencode route");
-            match provision_opencode(&setup, identity) {
-                Ok(launch) => Ok(launch.argv),
-                // InputInvalid covers only provision writes: make_base has
-                // already run and may have created the shared directory.
-                Err(OpenCodeSetupError::InputInvalid(reason)) => {
-                    Err((format!("setup-refused: {reason}"), "possible"))
-                }
-                Err(OpenCodeSetupError::ConstructionFailed(reason)) => {
-                    Err((format!("setup-failed: {reason}"), "possible"))
-                }
-            }
-        }
     }
-}
-
-/// The children's launch base: the caller's, readable by the work
-/// identity's group, made once.
-fn make_base(
-    base: &std::path::Path,
-    identity: Option<&crate::workload::Identity>,
-) -> Result<(), String> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    match std::fs::DirBuilder::new().mode(0o700).create(base) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-        Err(error) => return Err(format!("children launch base: {error}")),
-    }
-    if let Some(identity) = identity {
-        std::os::unix::fs::lchown(base, None, Some(identity.gid))
-            .and_then(|()| std::fs::set_permissions(base, std::fs::Permissions::from_mode(0o750)))
-            .map_err(|error| format!("children launch base: {error}"))?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1446,7 +1330,7 @@ mod tests {
         assert_eq!(first.accepted["slot"]["of"], 2);
         assert_eq!(first.accepted["slot"]["data_root"], "/slots/0/provider");
         assert_eq!(
-            launch_argv(&ctx(&f), first.position, &first.route, first.slot).unwrap(),
+            launch_argv(&first.route, first.slot).unwrap(),
             vec!["serve-0".to_owned()]
         );
         f.registry.finish(first.position, json!({}), false);
@@ -1457,7 +1341,7 @@ mod tests {
         let second = admit(&ctx(&f), &who(0, f.parent), 7, &luna()).unwrap();
         assert_eq!(second.slot, Some(1));
         assert_eq!(
-            launch_argv(&ctx(&f), second.position, &second.route, second.slot).unwrap(),
+            launch_argv(&second.route, second.slot).unwrap(),
             vec!["serve-1".to_owned()]
         );
         f.registry.finish(second.position, json!({}), false);
@@ -1468,7 +1352,7 @@ mod tests {
         assert_eq!(children_rows(&f), 3);
         assert_eq!(f.registry.state.lock().unwrap().starts, 3);
         // A taken slot never launches without its admission's index.
-        assert!(launch_argv(&ctx(&f), 9, &second.route, None).is_err());
+        assert!(launch_argv(&second.route, None).is_err());
         // A later owner of this store: the per-route count is durable.
         let Fixture { _dir, store, .. } = f;
         drop(store);
@@ -1619,30 +1503,6 @@ mod tests {
         );
     }
 
-    /// Fault after make_base: actual provision input rejection leaves a
-    /// shared base but no child launch tree and starts no process.
-    #[test]
-    fn setup_input_refusal_after_base_creation_reports_possible_files() {
-        let f = fixture("base-effects", 4);
-        let route = ChildRoute::Opencode {
-            deps: f._dir.0.join("missing-deps").display().to_string(),
-            agent_bash_tool: f._dir.0.join("missing-tool").display().to_string(),
-            agent_bash_bin: f._dir.0.join("missing-bin").display().to_string(),
-            bash_allow: vec!["pwd".into()],
-            bash_authority: None,
-            model: "openai/gpt-6-luna".into(),
-            provider: serde_json::from_value(json!({"openai": {}})).unwrap(),
-            auth: None,
-        };
-        let base = std::path::Path::new(&f.registry.policy.as_ref().unwrap().launch_base);
-        assert!(!base.exists());
-        let (reason, effects) = launch_argv(&ctx(&f), 1, &route, None).unwrap_err();
-        assert!(reason.starts_with("setup-refused:"), "{reason}");
-        assert!(base.is_dir());
-        assert!(!base.join("c1").exists());
-        assert_eq!(effects, "possible");
-    }
-
     #[test]
     fn policy_ceilings_and_request_shape_are_enforced() {
         let dir = std::path::Path::new("/tmp/children-policy");
@@ -1667,5 +1527,20 @@ mod tests {
                 .route,
             "echo"
         );
+    }
+    #[test]
+    fn embedded_child_route_is_unknown_and_fixed_remains_supported() {
+        let old = json!({"harness": "opencode", "deps": "/d", "model": "p/m"});
+        assert!(
+            serde_json::from_value::<ChildRoute>(old)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown variant")
+        );
+        let fixed: ChildRoute = serde_json::from_value(json!({
+            "harness": "fixed", "argv": ["/bin/true"], "endpoint": "stdio"
+        }))
+        .unwrap();
+        assert_eq!(launch_argv(&fixed, None).unwrap(), ["/bin/true"]);
     }
 }
