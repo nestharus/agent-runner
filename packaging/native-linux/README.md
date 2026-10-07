@@ -153,10 +153,14 @@ registered routes. Generic root-child ingress, Agent Bash, retention,
 root/per-work PID1 and logical/custody ownership remain.
 
 The frontdoor does not read, convert, stage, refresh or scrub native credential
-files. Keep retains adapter state; discard removes the package run tree with
-descriptor-safe removal after physical entry termination. A free run lock
-allows later scratch sweep. Cleanup failure is visible. These are package
-scratch operations, not logical root retirement or provider credential proof.
+files. Keep retains adapter state. Discard removes the package run tree with
+descriptor-safe removal after physical entry termination, but only when the
+run holds no root store or its owner's terminal described the root as
+retirement-eligible (see Root control face); the front door then marks the
+run `private/retirement-eligible`. Otherwise the run and its store are kept
+and `retire` says `retained: root-not-retirement-eligible`. A free run lock
+allows later scratch sweep under the same rule. Cleanup failure is visible.
+None of this is provider credential proof.
 
 ## Programmatic caller
 
@@ -200,8 +204,53 @@ Owner closed/7 and Runner native87 denote physical run termination after
 close, subject to insertion/refusal guards. U112's ACK-present/end-absent case
 can retain async debt while physically closed. Neither code authorizes
 logical root retirement. The relay reads actual entry waits for scratch
-cleanup and passes owner records unchanged; R3 must read the separate logical
-settlement account. This slice adds no retirement/control framework.
+cleanup and passes owner records unchanged; discard reads only the owner's
+own described retirement eligibility, never the exit code.
+
+### Root control face (`session_control/v2`)
+
+The root owner speaks the shared root control vocabulary
+`oulipoly.session_control/v2` from `agent-provider-contract` (see the owner
+crate's `control` module). The front door relays, besides cancel/close/send,
+`{"cmd":"inspect"}` and v2 `request` records (at most 32768 bytes). It
+attests the requester: a request whose `requester` is not `uid:<this
+requester's uid>` is refused here (`requester-not-attested`) and never reaches
+the owner. A v2 `close` or `cancel` arms the same kill grace as the stdin
+shorthand. What the owner answers:
+
+- `input_hold` / `input_release`: refuse new caller input while held
+  (`input-held`); running turns, tools and owner completions continue. Not
+  pause, drain or close.
+- `close`: durable; it enters the claim ladder and a later owner keeps input
+  closed. The stdin `{"cmd":"close"}` is the same close.
+- `cancel` (v2): the root's durable lifecycle cancel. The stdin
+  `{"cmd":"cancel"}` (and this front door's deadline/abandon cancels) stays
+  the owner instance's cancellation.
+- `recover`: only through `native-root --recover` (`control` field), answered
+  by the recovering owner of the same incarnation. Under this front door the
+  entry is its namespace's init, so the root does not outlive its front door
+  and no packaged recover path exists.
+- `inspect`: a `control_state` record, settlement `observation`s and a
+  `settlement` event whose `retirement.eligible` is true only when every
+  input reads settled or not inserted on the owner's warranted reading, no
+  async completion is owed, every launch and incarnation is recorded ended by
+  its actual waiter and no control intent is pending.
+
+The caller exposes `--root FILE --inspect | --hold | --release` (exits:
+`inspected`/`acknowledged` 0, `control-refused` 18, `control-unknown` 19,
+`incomplete` 6). Hold/release first inspect, then address the authority the
+root itself reported, with a fresh request key.
+
+**Discovery.** Through the same sudoers `run` rule, stdin
+`{"v":1,"op":"discover"}` lists this requester's run directories that hold a
+root store: one `frontdoor: root` line each with a v2 `root_entry` (read by
+`oulipoly-root-supervisor --describe` without claiming or locking the store),
+whether this front door holds it live and its socket, then a `discovered`
+terminal. Entries are derived and rebuildable addressing: not ownership,
+admission, scheduling or a capacity reservation; their authority is the
+store's last record. The live-root cap stays 4 per requester at this front
+door, not a global reservation. Discovery reveals no handle token: attaching
+a live root still needs its handle.
 
 Frontdoor classes: native entry status or 90 refusal, 91 setup failure,
 92 kill requested with collection, 93 stop/collection unknown, 94 cleanup

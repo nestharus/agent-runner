@@ -39,6 +39,9 @@ class Scratch(unittest.TestCase):
             (root/rel).write_text('fake-secret')
         (root/'private/retention').write_text('discard')
         (root/'private/lock').touch()
+        # These controls exercise removal mechanics: the root is described
+        # retirement-eligible, as its owner's terminal would mark it.
+        (root/'private'/fd.RETIREMENT_ELIGIBLE).write_text('eligible')
         return root
 
     def actor(self, code):

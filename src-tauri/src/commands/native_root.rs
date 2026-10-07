@@ -35,7 +35,9 @@
 //! declared environment. This entry reports names, never secret values.
 //!
 //! `--recover <file>` acts on an existing store: `{"store", "purpose",
-//! "env"}`, `purpose` being `cancel` or `continue-attached`. A new owner
+//! "env", "control"?}`, `purpose` being `cancel` or `continue-attached`;
+//! `control` is an optional `session_control/v2` `recover` request, which
+//! the owner admits and answers (`attached`, `root_absent`, ...). A new owner
 //! claims the store (the next owner generation; earlier unresolved
 //! attempts become `unknown-prior-owner`) and positively attaches the
 //! recorded root PID 1 if it is still that exact process. `cancel` then
@@ -203,6 +205,11 @@ pub(crate) struct NativeRecoverRequest {
     /// The recovering owner's whole environment; attached work keeps the
     /// original root's.
     env: BTreeMap<String, String>,
+    /// An `oulipoly.session_control/v2` `recover` request record, passed to
+    /// the owner unchanged; the recovering owner answers it once it knows
+    /// what it found (see the owner crate's `control` module).
+    #[serde(default)]
+    control: Option<Value>,
 }
 
 /// Where this entry's own and relayed lines go.
@@ -735,6 +742,7 @@ pub(crate) fn recover(request_path: &Path) -> Result<i32, String> {
         store: request.store.clone(),
         intent: None,
         recover: Some(request.purpose),
+        control: request.control.clone(),
     };
     if let Err(reason) = owner_request.validate() {
         return Ok(refused(&out, format!("owner request: {reason}")));
@@ -1060,6 +1068,7 @@ fn owner_request(
             children: child_policy(request, children),
         }),
         recover: None,
+        control: None,
     }
 }
 

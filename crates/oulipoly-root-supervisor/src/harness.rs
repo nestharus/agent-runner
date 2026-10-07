@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 
 use crate::bash::{self, OpenInput, Views};
 use crate::children::{ChildLink, Registry};
-use crate::conversation::{Closing, FollowUp, Inbox};
+use crate::conversation::{Closing, FollowUp, Inbox, InputHold};
 use crate::custody::{self, Adopted, PidNs, ReceiptWait, Root, RootSlot, SpawnError, WorkStdio};
 use crate::live::Custody;
 use crate::store::{
@@ -254,6 +254,7 @@ struct Worker {
     /// The caller's further input to this harness's live conversation.
     inbox: Arc<Inbox>,
     closing: Arc<Closing>,
+    hold: Arc<InputHold>,
     close_stop_attempted: bool,
     children: Arc<Registry>,
     /// Set for a registered child: its requester and lineage.
@@ -291,6 +292,8 @@ pub(crate) struct Assignment {
     pub(crate) views: Views,
     pub(crate) inbox: Arc<Inbox>,
     pub(crate) closing: Arc<Closing>,
+    /// The root's input hold (caller input only).
+    pub(crate) hold: Arc<InputHold>,
     pub(crate) children: Arc<Registry>,
     pub(crate) continue_attached: bool,
 }
@@ -350,6 +353,7 @@ pub(crate) fn run_child(assignment: ChildAssignment) -> HarnessRecord {
             views,
             inbox,
             closing,
+            hold: Arc::default(),
             children,
             continue_attached: false,
         },
@@ -386,6 +390,7 @@ impl Worker {
             views,
             inbox,
             closing,
+            hold,
             children,
             continue_attached,
         } = assignment;
@@ -440,6 +445,7 @@ impl Worker {
             answered: std::collections::HashSet::new(),
             inbox,
             closing,
+            hold,
             close_stop_attempted: false,
             children,
             child,
@@ -2084,6 +2090,8 @@ impl Worker {
                 Some(self.stop_reason())
             } else if self.closing.requested() {
                 Some("input-closed")
+            } else if self.hold.held() {
+                Some("input-held")
             } else if self.head().is_some() || !self.no_open_input() {
                 Some("input-open")
             } else {
@@ -2535,6 +2543,7 @@ mod tests {
                 answered: std::collections::HashSet::new(),
                 inbox: Arc::new(Inbox::new().unwrap()),
                 closing: Arc::default(),
+                hold: Arc::default(),
                 close_stop_attempted: false,
                 children: Registry::new(
                     None,

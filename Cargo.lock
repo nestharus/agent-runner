@@ -11,7 +11,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "agent-provider-contract"
 version = "0.2.0"
-source = "git+https://github.com/nestharus/agent-provider-sdk.git#d6fc21af377dfce16a5ba2b49c0361fa465d4492"
+source = "git+https://github.com/nestharus/agent-provider-sdk.git#5bd733d35f39a1fe6f11c5663545a5cb131b3438"
 dependencies = [
  "base64 0.22.1",
  "jsonschema",
@@ -3186,6 +3186,7 @@ dependencies = [
 name = "oulipoly-root-supervisor"
 version = "0.1.0"
 dependencies = [
+ "agent-provider-contract",
  "libc",
  "oulipoly-acp",
  "rusqlite",

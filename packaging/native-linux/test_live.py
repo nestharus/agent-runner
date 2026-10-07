@@ -288,6 +288,66 @@ def async_entry(mode):
     return script[:close_start] + code + script[close_end:]
 
 
+CONTROL_ENTRY = textwrap.dedent("""
+    import json, sys
+    def say(v):
+        print(json.dumps(v), flush=True)
+    say({"entry": "setup-completed", "launch": {}})
+    me = {"root": "r1", "owner": "o1", "generation": "1", "incarnation": "1"}
+    held = "input_open"
+    for line in sys.stdin:
+        cmd = json.loads(line)
+        if cmd.get("cmd") == "inspect":
+            say({"kind": "control_state", "protocol": "oulipoly.session_control/v2", "reporter": me,
+                 "scope": {"root": "r1"}, "input": {"state": held}, "lifecycle": {"state": "open"},
+                 "observed_at_unix_ms": 1})
+            say({"event": "settlement", "retirement": {"eligible": False, "blocking": ["fixture"]}})
+        elif cmd.get("kind") == "request":
+            ref = {k: cmd[k] for k in ("request_key", "requester", "addressed")}
+            to = "input_held" if cmd["operation"] == "input_hold" else "input_open"
+            common = dict(ref, protocol=cmd["protocol"])
+            say(dict(common, kind="receipt", durable=True, observed_at_unix_ms=2))
+            say(dict(common, kind="admission", operation=cmd["operation"], responder=me, observed_at_unix_ms=3))
+            say(dict(common, kind="acknowledgment", operation=cmd["operation"], responder=me,
+                     observed_at_unix_ms=4, **{"from": held, "to": to}))
+            say(dict(common, kind="outcome", result="acknowledged", observed_at_unix_ms=5))
+            held = to
+        elif cmd.get("cmd") == "close":
+            say({"event": "terminal", "status": "closed", "async": {"accepted": 0, "turn_ended": 0, "undelivered": [], "owed": 0}})
+            say({"entry": "terminal", "relay": "complete"}); sys.exit(87)
+    sys.exit(70)
+""")
+
+
+class LiveControl(unittest.TestCase):
+    """The requester side of the root control face through the real live
+    relay: the caller inspects, then addresses a hold to the authority the
+    root reports, as the attested requester. The owner is scripted here;
+    its own semantics are the owner crate's process controls."""
+
+    setUp, tearDown, open, call, handle_file = (
+        LiveRoot.setUp, LiveRoot.tearDown, LiveRoot.open, LiveRoot.call, LiveRoot.handle_file)
+
+    def test_inspect_then_hold_and_release_address_the_reported_authority(self):
+        run, terminal = self.open(script=CONTROL_ENTRY)
+        handle = self.handle_file(terminal)
+        code, result = self.call("--root", handle, "--inspect")
+        self.assertEqual((code, result["class"]), (0, "inspected"), result)
+        self.assertEqual(result["control_state"]["input"]["state"], "input_open")
+        code, result = self.call("--root", handle, "--hold")
+        self.assertEqual((code, result["class"]), (0, "acknowledged"), result)
+        request = result["request"]
+        self.assertEqual(request["requester"], "uid:%d" % os.getuid())
+        self.assertEqual(request["addressed"], result["control_state"]["reporter"])
+        self.assertEqual([c["kind"] for c in result["claims"]], ["receipt", "admission", "acknowledgment", "outcome"])
+        self.assertEqual(result["claims"][2]["to"], "input_held")
+        code, result = self.call("--root", handle, "--release")
+        self.assertEqual(result["control_state"]["input"]["state"], "input_held")
+        self.assertEqual(result["claims"][2]["to"], "input_open")
+        code, result = self.call("--root", handle, "--close")
+        self.assertIn(code, (0, 6))
+
+
 class ForeignPeer(unittest.TestCase):
     def test_peer_of_another_uid_is_refused_before_hello(self):
         directory = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))

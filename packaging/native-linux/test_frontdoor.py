@@ -171,12 +171,27 @@ class Retention(Scratch):
             os.close(fd)
         return run
 
-    def test_discard_removes_package_run(self):
+    def mark_eligible(self, run):
+        with open(os.path.join(run, "private", frontdoor.RETIREMENT_ELIGIBLE), "w") as file:
+            file.write("eligible")
+
+    def test_discard_removes_package_run_only_for_an_eligible_root(self):
         run = self.make_run("a", "discard", False)
+        record = frontdoor.retire(run, "discard")
+        self.assertTrue(record["ok"])
+        self.assertIs(record["run_removed"], False)
+        self.assertEqual(record["retained"], "root-not-retirement-eligible")
+        self.assertTrue(os.path.isdir(os.path.join(run, "store")))
+        self.mark_eligible(run)
         record = frontdoor.retire(run, "discard")
         self.assertTrue(record["ok"])
         self.assertTrue(record["run_removed"])
         self.assertFalse(os.path.exists(run))
+
+    def test_discard_without_a_root_store_removes_the_run(self):
+        run = self.make_run("nostore", "discard", False)
+        os.rmdir(os.path.join(run, "store"))
+        self.assertTrue(frontdoor.retire(run, "discard")["run_removed"])
 
     def test_keep_preserves_adapter_owned_state(self):
         run = self.make_run("b", "keep", False)
@@ -189,12 +204,16 @@ class Retention(Scratch):
     def test_sweep_takes_only_runs_whose_lock_is_free(self):
         live = self.make_run("live", "discard", True)
         dead = self.make_run("dead", "discard", False)
+        self.mark_eligible(dead)
+        owed = self.make_run("owed", "discard", False)
         kept = self.make_run("kept", "keep", False)
         with mock.patch.object(frontdoor, "check_owned"):
             swept = frontdoor.sweep(self.dir)
-        self.assertEqual(sorted(os.path.basename(r["run"]) for r in swept), ["dead", "kept"])
+        self.assertEqual(sorted(os.path.basename(r["run"]) for r in swept), ["dead", "kept", "owed"])
         self.assertTrue(os.path.exists(os.path.join(live, "launch/provider/adapter-state")))
         self.assertFalse(os.path.exists(dead))
+        # A dead front door's run whose root was never described eligible.
+        self.assertTrue(os.path.isdir(os.path.join(owed, "store")))
         self.assertTrue(os.path.isdir(kept))
         self.assertTrue(os.path.lexists(os.path.join(kept, "launch/provider/adapter-state")))
 
@@ -204,9 +223,17 @@ class Controls(unittest.TestCase):
         self.assertEqual(frontdoor.control(b'{"cmd":"cancel"}'), {"cmd": "cancel"})
         self.assertEqual(frontdoor.control(b'{"cmd":"close"}'), {"cmd": "close"})
         self.assertEqual(frontdoor.control(b'{"cmd":"send","text":"more","ref":"r1"}')["text"], "more")
+        self.assertEqual(frontdoor.control(b'{"cmd":"inspect"}'), {"cmd": "inspect"})
+        request = {"kind": "request", "protocol": frontdoor.CONTROL_PROTOCOL, "request_key": "k"}
+        self.assertEqual(frontdoor.control(json.dumps(request).encode()), request)
+        oversize = dict(request, reason={"state": "present", "text": "x" * frontdoor.CONTROL_RECORD_LIMIT})
         for line in (b'{"cmd":"cancel","x":1}', b'{"cmd":"send","text":" "}', b'{"cmd":"send","text":"a","harness":"h"}',
-                     b'{"cmd":"recover"}', b'not json', b'[]', b'{"cmd":"send","text":"a","ref":1}'):
-            with self.subTest(line=line):
+                     b'{"cmd":"recover"}', b'not json', b'[]', b'{"cmd":"send","text":"a","ref":1}',
+                     json.dumps(dict(request, kind="acknowledgment")).encode(),
+                     json.dumps(dict(request, protocol="oulipoly.session_control/v1")).encode(),
+                     json.dumps(dict(request, cmd="close")).encode(),
+                     json.dumps(oversize).encode()):
+            with self.subTest(line=line[:80]):
                 self.assertIsNone(frontdoor.control(line))
 
 
@@ -282,7 +309,7 @@ class RelayTest(Scratch):
         self.assertFalse(relay.killed)
         seen = [l["cmd"] for l in lines if l.get("event") == "control-seen"]
         self.assertEqual(seen, [{"cmd": "send", "text": "more"}, {"cmd": "close"}])
-        self.assertIn({"frontdoor": "control-refused", "reason": "not cancel, close or send"}, lines)
+        self.assertIn({"frontdoor": "control-refused", "reason": "not cancel, close, send, inspect or a session_control request"}, lines)
         self.assertEqual([l["entry"] for l in lines if "entry" in l], ["setup-completed"])
 
     def test_stdin_eof_is_abandonment_cancel(self):
@@ -329,6 +356,47 @@ class RelayTest(Scratch):
         plain.requester_line(b'{"cmd":"close"}')
         self.assertEqual(plain.kill_at, 12.0)
 
+    def test_session_control_requests_need_the_attested_requester_and_close_arms_like_close(self):
+        relay, entry, run, (out_r, out_w), (in_r, in_w) = self.relay("ignore", 60, 5)
+        relay.requester_uid = 1234
+        relay.clock = lambda: 50.0
+        base = {"kind": "request", "protocol": frontdoor.CONTROL_PROTOCOL, "request_key": "k",
+                "addressed": {"root": "r", "owner": "o", "generation": "1", "incarnation": "1"},
+                "scope": {"root": "r"}}
+        with mock.patch.object(frontdoor, "OUT_FD", out_w):
+            relay.requester_line(json.dumps(dict(base, requester="uid:999", operation="close")).encode())
+            self.assertIsNone(relay.kill_at, "an unattested request changes nothing")
+            self.assertEqual(relay.controls, b"")
+            relay.requester_line(json.dumps(dict(base, requester="uid:1234", operation="input_hold")).encode())
+            self.assertIsNone(relay.kill_at, "hold is not close or cancel")
+            relay.requester_line(json.dumps(dict(base, requester="uid:1234", operation="close", request_key="k2")).encode())
+            self.assertEqual(relay.kill_at, 55.0)
+            self.assertEqual(relay.why, "requester close")
+            relay.flush()
+        relayed = [json.loads(line) for line in relay.controls.splitlines()]
+        lines = self.drain(out_r)
+        self.assertIn({"frontdoor": "control-refused", "reason": "requester-not-attested", "request_key": "k"}, lines)
+        self.assertEqual(relay.requester_uid, 1234)
+        self.assertEqual(relayed, [])  # already written to the entry's stdin
+        self.assertFalse(any(l.get("frontdoor") == "control-undelivered" for l in lines))
+
+    def test_owner_terminal_marks_only_an_eligible_root(self):
+        relay, entry, run, (out_r, out_w), (in_r, in_w) = self.relay("ignore", 60, 5)
+        marker = os.path.join(run, "private", frontdoor.RETIREMENT_ELIGIBLE)
+        with mock.patch.object(frontdoor, "OUT_FD", out_w):
+            relay.entry_line(json.dumps({"event": "terminal", "status": "closed",
+                                         "session_control": {"retirement": {"eligible": False, "blocking": ["input a:0 reads owed"]}}}).encode())
+            self.assertIs(relay.retirement, False)
+            self.assertFalse(os.path.exists(marker))
+            # A registered child's terminal is not the root's.
+            relay.entry_line(json.dumps({"event": "terminal", "child": {"id": "c"},
+                                         "session_control": {"retirement": {"eligible": True}}}).encode())
+            self.assertFalse(os.path.exists(marker))
+            relay.entry_line(json.dumps({"event": "terminal", "status": "closed",
+                                         "session_control": {"retirement": {"eligible": True, "blocking": []}}}).encode())
+        self.assertIs(relay.retirement, True)
+        self.assertTrue(os.path.exists(marker))
+
     def test_signal_is_abandonment(self):
         relay, entry, run, (out_r, out_w), (in_r, in_w) = self.relay("obey", 60, 5)
         relay.signals.append(15)
@@ -356,3 +424,55 @@ class EntryRequest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Discovery(Scratch):
+    """Per-requester derived discovery over a scripted describer."""
+
+    def test_lists_only_this_requesters_root_stores_as_root_entries(self):
+        package = os.path.join(self.dir, "pkg")
+        os.makedirs(os.path.join(package, "bin"))
+        describer = os.path.join(package, frontdoor.SUPERVISOR)
+        with open(describer, "w") as file:
+            file.write(textwrap.dedent("""\
+                #!%s
+                import json, sys
+                store, requester = sys.argv[2], sys.argv[4]
+                if store.endswith("broken/store"):
+                    print(json.dumps({"event": "describe-refused", "reason": "unknown store version 11"})); sys.exit(65)
+                print(json.dumps({"kind": "root_entry", "protocol": "oulipoly.session_control/v2", "describer": sys.argv[6],
+                                  "requester": requester, "authority": {"root": store, "owner": "o", "generation": "2", "incarnation": "1"},
+                                  "observed_at_unix_ms": 1}))
+            """ % sys.executable))
+        os.chmod(describer, 0o755)
+        base = os.path.join(self.dir, "runs")
+        me = os.getuid()
+        for uid, name, store in ((me, "a", True), (me, "broken", True), (me, "nostore", False), (me + 1, "other", True)):
+            run = os.path.join(base, str(uid), name)
+            os.makedirs(os.path.join(run, "private"))
+            if store:
+                os.makedirs(os.path.join(run, "store"))
+        held = os.open(os.path.join(base, str(me), "a", "private", "lock"), os.O_RDWR | os.O_CREAT)
+        self.addCleanup(os.close, held)
+        fcntl.flock(held, fcntl.LOCK_EX)
+        open(os.path.join(base, str(me), "a", frontdoor.LIVE_SOCKET), "w").close()
+        user = types.SimpleNamespace(pw_uid=me, pw_name="me")
+        out_r, out_w = os.pipe()
+        self.addCleanup(os.close, out_r)
+        with mock.patch.object(frontdoor, "check_owned"), mock.patch.object(frontdoor, "OUT_FD", out_w):
+            self.assertEqual(frontdoor.discover(package, {"run_base": base}, user), 0)
+        os.close(out_w)
+        lines = [json.loads(line) for line in os.read(out_r, 1 << 20).splitlines()]
+        roots = {line["run"]: line for line in lines if line.get("frontdoor") == "root"}
+        self.assertEqual(sorted(roots), ["a", "broken"], "only this requester's runs with a root store")
+        self.assertTrue(roots["a"]["live"])
+        self.assertEqual(roots["a"]["entry"]["kind"], "root_entry")
+        self.assertEqual(roots["a"]["entry"]["requester"], f"uid:{me}")
+        self.assertEqual(roots["a"]["entry"]["describer"], "frontdoor")
+        self.assertIsNone(roots["broken"]["entry"])
+        self.assertIn("version", roots["broken"]["describe_error"])
+        self.assertNotIn("token", json.dumps(roots), "discovery reveals no live handle token")
+        terminal = lines[-1]
+        self.assertEqual(terminal["stage"], "discovered")
+        self.assertEqual(terminal["roots"], 2)
+        self.assertEqual(terminal["live_cap"]["per_requester"], frontdoor.MAX_LIVE_ROOTS)

@@ -5057,3 +5057,515 @@ fn fresh_completion_is_linked_and_close_waits_for_it_as_deferred() {
         1
     );
 }
+
+// ---------------------------------------------------------------------------
+// Root control face: `oulipoly.session_control/v2` at the owner (see the
+// crate's `control` module). Deterministic peers and unprivileged
+// namespaces only; claims are checked with the shared contract's own
+// reference operations, not a local copy of their meaning.
+
+use agent_provider_contract::session_control as sc;
+
+/// The root's requester as this owner names it: the uid its work runs as.
+fn requester() -> String {
+    // SAFETY: geteuid has no preconditions.
+    format!("uid:{}", unsafe { libc::geteuid() })
+}
+
+fn v2_request(key: &str, operation: &str, addressed: &Value) -> Value {
+    json!({
+        "kind": "request",
+        "protocol": sc::PROTOCOL,
+        "request_key": key,
+        "requester": requester(),
+        "addressed": addressed,
+        "operation": operation,
+        "scope": { "root": addressed["root"] },
+    })
+}
+
+fn claim(value: &Value) -> sc::Record {
+    sc::Record::decode(value).unwrap_or_else(|error| panic!("{error}: {value}"))
+}
+
+impl Run {
+    /// The first line after everything seen so far that matches.
+    fn until_new(&mut self, what: &str, pred: impl Fn(&Value) -> bool) -> Value {
+        let start = self.seen.len();
+        loop {
+            if let Some(value) = self.seen[start..].iter().find(|value| pred(value)) {
+                return value.clone();
+            }
+            match self.lines.recv_timeout(WATCHDOG) {
+                Ok(value) => {
+                    self.observe(&value);
+                    self.seen.push(value);
+                }
+                Err(_) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    panic!("watchdog: no {what}\nseen: {:#?}", self.seen);
+                }
+            }
+        }
+    }
+
+    /// The next record of `kind` answering `key`.
+    fn answer(&mut self, kind: &str, key: &str) -> Value {
+        self.until_new(&format!("{kind} for {key}"), |value| {
+            value["kind"] == kind && value["request_key"] == key
+        })
+    }
+
+    /// Sends a request and collects its kept answer up to the outcome.
+    fn ask(&mut self, request: &Value) -> Vec<Value> {
+        let key = request["request_key"].as_str().unwrap().to_owned();
+        let start = self.seen.len();
+        self.control(&request.to_string());
+        self.answer("outcome", &key);
+        self.seen[start..]
+            .iter()
+            .filter(|value| value["request_key"] == key.as_str() && value["kind"].is_string())
+            .cloned()
+            .collect()
+    }
+
+    fn inspect(&mut self) -> sc::ControlState {
+        self.control(r#"{"cmd":"inspect"}"#);
+        let state = self.until_new("control state", |value| value["kind"] == "control_state");
+        self.until_new("settlement", |value| value["event"] == "settlement");
+        match claim(&state) {
+            sc::Record::ControlState(state) => state,
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+/// The requester-side trace of one request over the claims it received.
+fn trace(request: &Value, answers: &[Value]) -> sc::RequestTrace {
+    let sc::Record::Request(request) = claim(request) else {
+        panic!("not a request");
+    };
+    let mut trace = sc::RequestTrace::new(request).unwrap();
+    for answer in answers {
+        trace.accept(&claim(answer)).unwrap();
+    }
+    trace
+}
+
+fn kinds(answers: &[Value]) -> Vec<&str> {
+    answers
+        .iter()
+        .map(|value| value["kind"].as_str().unwrap())
+        .collect()
+}
+
+/// Input hold is admission/input only and release reopens it through the
+/// same authority. The first turn is still running (ACKed, its tagged end
+/// gated) when the hold is acknowledged; that turn then ends while held,
+/// a new caller input is refused `input-held`, and after release a new
+/// input is admitted. Also: negotiation from the owner's advertisement, a
+/// foreign requester, a malformed record (control-only diagnostic, the run
+/// continues), a key conflict, faithful replay of an identical request,
+/// and the warranted settlement reading at a closed, fully settled end.
+#[test]
+fn input_hold_holds_new_input_only_and_release_reopens_it() {
+    let dir = Scratch::new("hold");
+    let gate = dir.0.join("gate");
+    let state = dir.state("a");
+    let gate_arg = gate.display().to_string();
+    let mut run = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            1,
+            json!([{
+                "id": "a",
+                "argv": peer(&state, &["--off-session-turn", "sess-x", "--off-session-after-ack", "--turn-gate", &gate_arg]),
+                "messages": ["one"],
+            }]),
+        ),
+    );
+    let announcement = run.until("announcement", |value| value["event"] == "session-control");
+    assert_eq!(announcement["requester"], requester());
+    let local = sc::Offer {
+        operations: vec![
+            sc::Operation::InputHold,
+            sc::Operation::InputRelease,
+            sc::Operation::Close,
+        ],
+        reports: vec![sc::Report::Inspection],
+        facts: vec![
+            sc::FactType::Insertion,
+            sc::FactType::TaggedEnd,
+            sc::FactType::LogicalSettlement,
+        ],
+    };
+    let selected = sc::select(&local, &announcement["advertisement"]).unwrap();
+    assert!(selected.operations.contains(&sc::Operation::InputHold));
+    assert!(selected.operations.contains(&sc::Operation::InputRelease));
+    run.until("insertion ACK", |value| {
+        value["event"] == "ack" && value["index"] == 0
+    });
+
+    let state0 = run.inspect();
+    assert_eq!(state0.input.state, sc::State::InputOpen);
+    assert_eq!(state0.lifecycle.state, sc::State::Open);
+    assert!(state0.pending.is_empty());
+    let authority = serde_json::to_value(&state0.reporter).unwrap();
+    assert_ne!(authority["incarnation"], "none");
+
+    // Requester boundary: another requester is refused, nothing changes.
+    let mut foreign = v2_request("k-foreign", "input_hold", &authority);
+    foreign["requester"] = json!("uid:4242424");
+    let answers = run.ask(&foreign);
+    assert_eq!(kinds(&answers), ["refusal", "outcome"]);
+    assert_eq!(answers[0]["reason"], "not_permitted");
+    // A malformed record is a control-only diagnostic.
+    run.control(&json!({ "kind": "request", "protocol": sc::PROTOCOL }).to_string());
+    let diagnostic = run.until_new("diagnostic", |value| {
+        value["event"] == "session-control-unavailable"
+    });
+    assert_eq!(diagnostic["diagnostic"]["reason"], "invalid_record");
+
+    let hold = v2_request("k-hold", "input_hold", &authority);
+    let sc::Record::Request(typed) = claim(&hold) else {
+        unreachable!()
+    };
+    typed.agree(&selected).unwrap();
+    let held = run.ask(&hold);
+    assert_eq!(
+        kinds(&held),
+        ["receipt", "admission", "acknowledgment", "outcome"]
+    );
+    assert_eq!(held[2]["from"], "input_open");
+    assert_eq!(held[2]["to"], "input_held");
+    assert_eq!(held[1]["responder"], authority);
+    assert_eq!(held[0]["durable"], true);
+    let hold_trace = trace(&hold, &held);
+    run.until_new("hold applied", |value| {
+        value["event"] == "input-hold" && value["held"] == true
+    });
+    // The running turn continues and ends while held.
+    std::fs::write(&gate, b"").unwrap();
+    run.until("turn end while held", |value| {
+        value["event"] == "turn-end" && value["input"] == 0
+    });
+    run.control(&json!({ "cmd": "send", "text": "two" }).to_string());
+    let refused = run.until_new("held send", |value| value["event"] == "follow-up-refused");
+    assert_eq!(refused["reason"], "input-held", "{refused}");
+    // Same key, other content: refused, not a retry, not kept.
+    run.control(&v2_request("k-hold", "input_release", &authority).to_string());
+    let conflict = run.answer("refusal", "k-hold");
+    assert_eq!(conflict["reason"], "key_conflict");
+    assert_eq!(conflict["operation"], "input_release");
+    // The identical request: the kept claims, replayed unchanged.
+    let replay = run.ask(&hold);
+    assert_eq!(replay, held, "faithful replay");
+    assert_eq!(run.inspect().input.state, sc::State::InputHeld);
+
+    let release = v2_request("k-release", "input_release", &authority);
+    let released = run.ask(&release);
+    assert_eq!(released[2]["from"], "input_held");
+    assert_eq!(released[2]["to"], "input_open");
+    run.control(&json!({ "cmd": "send", "text": "two" }).to_string());
+    assert_eq!(
+        run.until_new("admitted", |value| value["event"] == "follow-up-admitted")["input"],
+        1
+    );
+    run.until("second turn end", |value| {
+        value["event"] == "turn-end" && value["input"] == 1
+    });
+    let now = run.inspect();
+    assert_eq!(now.input.state, sc::State::InputOpen);
+    assert_eq!(now.input.since.as_ref().unwrap().request_key, "k-release");
+    assert_eq!(hold_trace.relate(&now), sc::Relation::Superseded);
+    assert_eq!(
+        trace(&release, &released).relate(&now),
+        sc::Relation::Current
+    );
+
+    run.control(r#"{"cmd":"close"}"#);
+    let (terminal, status, seen) = run.terminal();
+    assert_eq!(status.code(), Some(7), "{terminal}");
+    assert_eq!(terminal["control"]["lifecycle"], "closing");
+    let retirement = &terminal["session_control"]["retirement"];
+    assert_eq!(retirement["eligible"], true, "{terminal}");
+    let observations: Vec<&Value> = seen
+        .iter()
+        .filter(|value| value["kind"] == "observation")
+        .collect();
+    assert!(!observations.is_empty());
+    for value in observations {
+        assert!(matches!(claim(value), sc::Record::Observation(_)));
+    }
+    // Recorded hold: one durable transition each way, kept in the store.
+    let conn = db(&dir);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM control WHERE kind = 'acknowledgment'"
+        ),
+        3
+    );
+}
+
+/// The U112 countermeaning at the control consumer: an input ACKed with no
+/// tagged end, close acknowledged and deferred, then the peer actually
+/// exits and is waited. The run is `closed`/7, yet the warranted reading of
+/// that input is `owed` and retirement is not eligible.
+#[test]
+fn ack_without_tagged_end_then_waited_exit_is_not_retirement() {
+    let dir = Scratch::new("acknoend");
+    let exit = dir.0.join("exit");
+    let exit_arg = exit.display().to_string();
+    let mut run = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            1,
+            json!([{ "id": "a", "argv": peer(&dir.state("a"), &["--no-idle", "--exit-when-file", &exit_arg]), "messages": ["x"] }]),
+        ),
+    );
+    run.until("insertion ACK", |value| {
+        value["event"] == "ack" && value["index"] == 0
+    });
+    let authority = serde_json::to_value(run.inspect().reporter).unwrap();
+    let closed = run.ask(&v2_request("k-close", "close", &authority));
+    assert_eq!(closed[2]["to"], "closing");
+    std::fs::write(&exit, b"").unwrap();
+    let (terminal, status, seen) = run.terminal();
+    assert_eq!(status.code(), Some(7), "{terminal}");
+    assert_eq!(terminal["status"], "closed");
+    assert_eq!(harness(&terminal, "a")["exits"], json!(["code:7"]));
+    let summary = &terminal["session_control"];
+    assert_eq!(summary["retirement"]["eligible"], false, "{summary}");
+    let input = summary["subjects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|subject| subject["subject"]["input"] == "0")
+        .unwrap();
+    assert_eq!(input["reading"]["logical"], "owed", "{input}");
+    assert_eq!(input["reading"]["basis"], "warranted");
+    // The physical end is reported apart from the logical reading.
+    let root = summary["subjects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|subject| subject["subject"].get("input").is_none())
+        .unwrap();
+    assert_eq!(
+        root["reading"]["physical_custody"]["state"], "exited_waited",
+        "{root}"
+    );
+    // The emitted observations, read again by the shared reference reader
+    // under the reporter's lineage, say the same.
+    let observations: Vec<sc::Observation> = seen
+        .iter()
+        .filter(|value| value["kind"] == "observation")
+        .map(|value| match claim(value) {
+            sc::Record::Observation(observation) => observation,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    let subject = observations
+        .iter()
+        .find(|o| o.subject.input.as_deref() == Some("0"))
+        .unwrap()
+        .subject
+        .clone();
+    let lineage = sc::Lineage {
+        root: subject.root.clone(),
+        authorities: vec![observations[0].reporter.clone()],
+    };
+    let reading = sc::read_settlement(&subject, Some(&lineage), &observations);
+    assert_eq!(reading.logical, sc::LogicalReading::Owed);
+}
+
+/// An acknowledged close and the prior ACK survive owner death. The
+/// successor attaches the same incarnation through a `recover` request
+/// (admitted and acknowledged `attached` by the new generation, never by
+/// the dead owner), keeps input closed, reports the close as current with
+/// the original request as its basis, refuses a request still addressed to
+/// the dead owner as `stale_authority`, and replays the kept close claims
+/// unchanged. While the old owner lived, a recover was refused `owner_live`
+/// and changed nothing.
+#[test]
+fn acknowledged_close_survives_owner_death_and_successor_attach() {
+    let dir = Scratch::new("closelives");
+    let mut first = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            1,
+            json!([{ "id": "a", "argv": peer(&dir.state("a"), &["--no-idle", "--live-reattach"]), "messages": ["x"] }]),
+        ),
+    );
+    let root_pid = first.until("root pid1", |value| value["event"] == "root-pid1-started")["pid"]
+        .as_u64()
+        .unwrap();
+    let peer_pid = first.event("a", "launched")["pid"].as_u64().unwrap();
+    first.until("insertion ACK", |value| {
+        value["event"] == "ack" && value["index"] == 0
+    });
+    let a1 = serde_json::to_value(first.inspect().reporter).unwrap();
+    // Discovery's describer reads the live root's authority without
+    // claiming or locking its store.
+    let described = std::process::Command::new(SUPERVISOR)
+        .args([
+            "--describe",
+            &dir.store().display().to_string(),
+            "--requester",
+            &requester(),
+            "--describer",
+            "test",
+        ])
+        .output()
+        .unwrap();
+    assert!(described.status.success());
+    let entry: Value = serde_json::from_slice(&described.stdout).unwrap();
+    assert!(matches!(claim(&entry), sc::Record::RootEntry(_)));
+    assert_eq!(
+        entry["authority"], a1,
+        "the store's last record is this owner"
+    );
+    let close = v2_request("k-close", "close", &a1);
+    let closed = first.ask(&close);
+    assert_eq!(
+        kinds(&closed),
+        ["receipt", "admission", "acknowledgment", "outcome"]
+    );
+
+    // A recover while this owner holds the root: refused, nothing written.
+    let recover_request = v2_request("k-recover", "recover", &a1);
+    let request =
+        json!({ "store": dir.store(), "recover": "continue-attached", "control": recover_request });
+    let (terminal, status, seen) = Run::start(&dir, &request).terminal();
+    assert_eq!(status.code(), Some(65), "{terminal}");
+    let refusal = seen
+        .iter()
+        .find(|value| value["kind"] == "refusal")
+        .unwrap();
+    assert_eq!(refusal["reason"], "owner_live");
+    assert_eq!(
+        count(
+            &db(&dir),
+            "SELECT count(*) FROM control WHERE request_key = 'k-recover'"
+        ),
+        0
+    );
+
+    first.kill();
+    assert!(alive(root_pid) && alive(peer_pid));
+
+    let mut second = Run::start(&dir, &request);
+    let announcement = second.until("announcement", |value| value["event"] == "session-control");
+    assert_eq!(
+        announcement["lifecycle"]["state"], "closing",
+        "{announcement}"
+    );
+    assert_eq!(announcement["lifecycle"]["since"]["request_key"], "k-close");
+    let a2 = announcement["authority"].clone();
+    assert_eq!(a2["root"], a1["root"]);
+    assert_eq!(a2["incarnation"], a1["incarnation"]);
+    assert_ne!(a2["generation"], a1["generation"]);
+    assert_ne!(a2["owner"], a1["owner"]);
+    let attached = second.answer("outcome", "k-recover");
+    assert_eq!(attached["result"], "acknowledged", "{attached}");
+    let recovered: Vec<Value> = second
+        .seen
+        .iter()
+        .filter(|value| value["request_key"] == "k-recover" && value["kind"].is_string())
+        .cloned()
+        .collect();
+    assert_eq!(
+        kinds(&recovered),
+        ["receipt", "admission", "acknowledgment", "outcome"]
+    );
+    assert_eq!(recovered[2]["to"], "attached");
+    assert_eq!(recovered[2]["responder"], a2);
+    trace(&recover_request, &recovered);
+    second.until("custody", |value| {
+        value["event"] == "custody" && value["outcome"] == "attached"
+    });
+
+    second.control(&json!({ "cmd": "send", "text": "late" }).to_string());
+    let refused = second.until_new("closed input", |value| {
+        value["event"] == "follow-up-refused"
+    });
+    assert_eq!(refused["reason"], "input-closed", "{refused}");
+    let now = second.inspect();
+    assert_eq!(now.lifecycle.state, sc::State::Closing);
+    assert_eq!(trace(&close, &closed).relate(&now), sc::Relation::Current);
+    let stale = second.ask(&v2_request("k-stale", "input_hold", &a1));
+    assert_eq!(stale[0]["reason"], "stale_authority");
+    assert_eq!(stale[0]["responder"], a2);
+    let replay = second.ask(&close);
+    assert_eq!(
+        replay, closed,
+        "the successor replays the kept claims unchanged"
+    );
+
+    second.cancel();
+    let (terminal, _, _) = second.terminal();
+    assert_eq!(terminal["status"], "cancelled", "{terminal}");
+    assert_eq!(terminal["session_control"]["retirement"]["eligible"], false);
+}
+
+/// The recorded incarnation's process identity no longer matches (a reused
+/// pid stands in as a changed start time): a `recover` request is admitted
+/// by the successor and refused `root_absent`, and nothing is started or
+/// signalled before that answer.
+#[test]
+fn recover_of_a_mismatched_incarnation_is_root_absent_before_effects() {
+    let dir = Scratch::new("recabsent");
+    let mut first = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            1,
+            json!([{ "id": "h", "argv": peer(&dir.state("h"), &["--mode", "insert-then-silent"]), "messages": ["x"] }]),
+        ),
+    );
+    let old_root = first.until("root pid1", |value| value["event"] == "root-pid1-started")["pid"]
+        .as_u64()
+        .unwrap();
+    let old_peer = first.event("h", "launched")["pid"].as_u64().unwrap();
+    wait_state(&dir.state("h"), |state| {
+        state["insertions"].as_array().unwrap().len() == 1
+    });
+    let a1 = serde_json::to_value(first.inspect().reporter).unwrap();
+    first.kill();
+    rusqlite::Connection::open(dir.store().join("intent.sqlite3"))
+        .unwrap()
+        .execute(
+            "UPDATE incarnation SET start_time = start_time + 1 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    let recover_request = v2_request("k-recover", "recover", &a1);
+    let request =
+        json!({ "store": dir.store(), "recover": "continue-attached", "control": recover_request });
+    let (terminal, status, seen) = Run::start(&dir, &request).terminal();
+    assert_eq!(status.code(), Some(6), "{terminal}");
+    let answers: Vec<Value> = seen
+        .iter()
+        .filter(|value| value["request_key"] == "k-recover" && value["kind"].is_string())
+        .cloned()
+        .collect();
+    assert_eq!(
+        kinds(&answers),
+        ["receipt", "admission", "refusal", "outcome"]
+    );
+    assert_eq!(answers[2]["reason"], "root_absent");
+    assert_eq!(answers[2]["stage"], "transition");
+    trace(&recover_request, &answers);
+    assert!(roots_started(&seen).is_empty());
+    assert!(events(&seen, "h", "launched").is_empty());
+    assert!(
+        alive(old_root) && alive(old_peer),
+        "nothing signalled by a stored pid"
+    );
+    assert_eq!(terminal["session_control"]["retirement"]["eligible"], false);
+}

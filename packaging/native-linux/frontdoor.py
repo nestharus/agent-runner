@@ -13,9 +13,15 @@ is N+2G. Admission and collection are bounded; kernel/FS stalls remain outside
 a finite guarantee. Run discard uses descriptor-safe removal.
 Native exit status or 90 refusal, 91 setup failure, 92 kill requested,
 93 stop/collection unknown, 94 cleanup/residue failed. No replay.
-Physical entry wait permits package run cleanup; it does not establish logical
-settlement or root retirement eligibility. closed/7 (native87) retains the
-U112 ACKed-without-tagged-end boundary for later R3 controls.
+Physical entry wait permits package run cleanup only. Under `discard` the run
+(and its root store) is removed only when the owner's terminal described the
+root as retirement-eligible on its warranted settlement reading
+(session_control/v2) or no store exists; otherwise it is kept. closed/7
+(native87) alone never makes a root eligible.
+Controls: cancel/close/send/inspect lines and session_control/v2 `request`
+records, whose requester must be this attested requester (`uid:<n>`).
+Stdin `{"v":1,"op":"discover"}` instead lists this requester's roots as v2
+`root_entry` records: derived addressing, not ownership or capacity.
 Task output is unredacted. Full contract and limits: share/README.md.
 """
 
@@ -67,6 +73,19 @@ SUPERVISOR = "bin/oulipoly-root-supervisor"
 PID1 = "bin/oulipoly-root-pid1"
 ROOT_CHILD = "bin/oulipoly-root-child"
 BASH_BIN = "agent-bash/agent-bash"
+
+# session_control/v2 (agent-provider-contract): record line bound and the
+# requester name the root owner answers for this front door's requester.
+CONTROL_PROTOCOL = "oulipoly.session_control/v2"
+CONTROL_RECORD_LIMIT = 32768
+# Marks a run whose owner described its root as retirement-eligible; only
+# such a run (or one without a root store) is discarded, by retire or sweep.
+RETIREMENT_ELIGIBLE = "retirement-eligible"
+
+
+def control_requester(uid):
+    return f"uid:{uid}"
+
 
 # Names a requester may not put in the root environment: it reaches the
 # owner and root PID 1 (root) as well as the work. Loader and libc names
@@ -494,12 +513,23 @@ def stale_runs(user_dir):
     return found
 
 
+def retirement_eligible(run):
+    """Whether this run's root may be discarded: its owner described it as
+    retirement-eligible (marker), or no root store was ever made."""
+    return os.path.lexists(os.path.join(run, "private", RETIREMENT_ELIGIBLE)) \
+        or not os.path.lexists(os.path.join(run, "store"))
+
+
 def retire(run, retention):
-    """Clean package scratch after physical entry termination, not logical settlement.
-    Adapter-owned state is retained with the run under keep, discarded with it
-    under discard. This layer knows no adapter credential paths or semantics.
+    """Clean package scratch after physical entry termination. Under discard
+    the run is removed only if `retirement_eligible`; otherwise it is kept,
+    and says why. Adapter-owned state is retained with the run under keep,
+    discarded with it under discard. This layer knows no adapter credential
+    paths or semantics.
     """
     removed = None
+    if retention == "discard" and not retirement_eligible(run):
+        return {"ok": True, "run_removed": False, "retained": "root-not-retirement-eligible"}
     if retention == "discard":
         try:
             if not shutil.rmtree.avoids_symlink_attacks:
@@ -666,7 +696,16 @@ def control(line):
         value = json.loads(line)
     except ValueError:
         return None
-    if value in ({"cmd": "cancel"}, {"cmd": "close"}):
+    if value in ({"cmd": "cancel"}, {"cmd": "close"}, {"cmd": "inspect"}):
+        return value
+    if (
+        isinstance(value, dict)
+        and value.get("kind") == "request"
+        and value.get("protocol") == CONTROL_PROTOCOL
+        and "cmd" not in value
+        and len(line) <= CONTROL_RECORD_LIMIT
+    ):
+        # The owner validates the record; this layer attests its requester.
         return value
     if (
         isinstance(value, dict)
@@ -698,6 +737,10 @@ class Relay:
         # (its `async-owed` events). A requester close arms the kill grace
         # only once none is owed; the deadline bounds the wait regardless.
         self.owed_async = 0
+        # This front door's attested requester, for session_control records.
+        self.requester_uid = None
+        # The owner's described retirement eligibility, from its terminal.
+        self.retirement = None
         self.close_waiting = False
         self.why = None
         self.stdout_gone = False
@@ -778,7 +821,27 @@ class Relay:
             self.kill_at = self.cancel_at + self.grace
             self.why = "requester close"
 
+    def note_owner_terminal(self, line):
+        """Records the owner's described retirement eligibility, and marks
+        the run when it is eligible (so a later sweep may discard it)."""
+        if b'"session_control"' not in line:
+            return
+        try:
+            value = json.loads(line)
+        except ValueError:
+            return
+        if not (isinstance(value, dict) and value.get("event") == "terminal" and "child" not in value):
+            return
+        retirement = (value.get("session_control") or {}).get("retirement") or {}
+        self.retirement = retirement.get("eligible") is True
+        if self.retirement:
+            try:
+                write_private(os.path.join(self.run, "private", RETIREMENT_ELIGIBLE), "eligible")
+            except OSError:
+                self.retirement = False
+
     def entry_line(self, line):
+        self.note_owner_terminal(line)
         self.queue_output(line)
         if b'"async-owed"' in line:
             try:
@@ -794,20 +857,29 @@ class Relay:
     def requester_line(self, line):
         value = control(line)
         if value is None:
-            self.say({"frontdoor": "control-refused", "reason": "not cancel, close or send"})
+            self.say({"frontdoor": "control-refused", "reason": "not cancel, close, send, inspect or a session_control request"})
         else:
-            if value["cmd"] == "close" and self.owed_async > 0:
+            if value.get("kind") == "request":
+                if self.requester_uid is None or value.get("requester") != control_requester(self.requester_uid):
+                    self.say({"frontdoor": "control-refused", "reason": "requester-not-attested",
+                              "request_key": value.get("request_key") if isinstance(value.get("request_key"), str) else None})
+                    return
+                # The same close/cancel arming as the stdin shorthand.
+                command = {"close": "close", "cancel": "cancel"}.get(value.get("operation"))
+            else:
+                command = value["cmd"]
+            if command == "close" and self.owed_async > 0:
                 # The owner keeps the harness for owed background
                 # completions (bounded by the deadline); arm once none is.
                 self.close_waiting = True
-            elif value["cmd"] in ("cancel", "close"):
+            elif command in ("cancel", "close"):
                 # Native close/cancel may never complete. Arm before I/O.
                 if self.cancel_at is None:
                     self.cancel_at = self.clock()
                     self.kill_at = self.cancel_at + self.grace
-                    self.why = "requester " + value["cmd"]
+                    self.why = "requester " + command
             if not self.to_entry(value):
-                self.say({"frontdoor": "control-undelivered", "cmd": value["cmd"]})
+                self.say({"frontdoor": "control-undelivered", "cmd": command or value.get("kind")})
                 self.abandon("control backpressure")
 
     def step(self, stdin_fd, timeout=0.2):
@@ -1008,6 +1080,7 @@ class LiveRelay(Relay):
         self.account_events = []
         self.account_bytes = 0
         self.account_errors = []
+        self.requester_uid = uid
 
     def entry_line(self, line):
         try:
@@ -1380,6 +1453,91 @@ def open_live(package, site, checked, run_id, run_dir, request_path, user):
     return 0
 
 
+def run_lock_held(run):
+    """Whether a front door holds this run's lock now (its owner is live)."""
+    try:
+        fd = os.open(os.path.join(run, "private", "lock"), os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def describe_root(package, store, uid):
+    """The owner binary's read-only `root_entry` for one store, or why not."""
+    try:
+        result = subprocess.run(
+            [os.path.join(package, SUPERVISOR), "--describe", store,
+             "--requester", control_requester(uid), "--describer", "frontdoor"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            env=ENTRY_ENV, cwd="/", timeout=ADMISSION_S, check=False, close_fds=True)
+    except (OSError, subprocess.SubprocessError) as error:
+        return None, type(error).__name__
+    try:
+        value = json.loads(result.stdout.decode().strip().splitlines()[-1])
+    except (ValueError, IndexError, UnicodeError):
+        return None, "describe output unreadable"
+    if result.returncode == 0 and isinstance(value, dict) and value.get("kind") == "root_entry":
+        return value, None
+    return None, str(value.get("reason", "describe refused")) if isinstance(value, dict) else "describe refused"
+
+
+def discover(package, site, user):
+    """Lists this requester's roots under this front door's run base: one
+    `root_entry` (session_control/v2) per root store, read without claiming
+    it, with whether this front door holds it live. Derived and rebuildable;
+    not ownership, admission, scheduling or a capacity reservation. The live
+    cap is per requester at this front door, not a global reservation."""
+    base = site["run_base"]
+    check_owned(base)
+    user_dir = os.path.join(base, str(user.pw_uid))
+    try:
+        names = sorted(os.listdir(user_dir))
+        check_owned(user_dir)
+    except FileNotFoundError:
+        names = []
+    roots = 0
+    for name in names:
+        run = os.path.join(user_dir, name)
+        store = os.path.join(run, "store")
+        try:
+            check_owned(run)
+            check_owned(os.path.join(run, "private"))
+        except (Refused, OSError):
+            continue
+        if not os.path.isdir(store) or os.path.islink(store):
+            continue
+        roots += 1
+        entry, reason = describe_root(package, store, user.pw_uid)
+        live = run_lock_held(run) and os.path.lexists(os.path.join(run, LIVE_SOCKET))
+        emit({
+            "frontdoor": "root",
+            "run": name,
+            "live": live,
+            "socket": os.path.join(run, LIVE_SOCKET) if live else None,
+            "front_door_holds_run": run_lock_held(run),
+            "retirement_eligible_marked": os.path.lexists(os.path.join(run, "private", RETIREMENT_ELIGIBLE)),
+            "entry": entry,
+            "describe_error": reason,
+        })
+    emit({
+        "frontdoor": "terminal",
+        "stage": "discovered",
+        "requester": control_requester(user.pw_uid),
+        "roots": roots,
+        "live_roots": live_roots(user_dir),
+        "live_cap": {"per_requester": MAX_LIVE_ROOTS, "scope": "this requester at this front door; not a global reservation"},
+        "meaning": "descriptive addresses of this requester's root stores; an entry's authority is the store's last record, not proof it is current; attaching a live root still needs its handle",
+        "exit": 0,
+    })
+    return 0
+
+
 def entry_exit(status, killed):
     if killed:
         return EXIT_KILLED
@@ -1434,6 +1592,8 @@ def admit(argv, environ, stdin_fd, now):
         request = json.loads(line)
     except ValueError:
         raise Refused("request is not JSON") from None
+    if request == {"v": 1, "op": "discover"}:
+        return package, site, user, None, None, rest
     checked = check_request(request, site, now)
     check_provider_executable(checked["route"])
     for child in (checked["children"] or {}).get("routes", {}).values():
@@ -1462,6 +1622,12 @@ def run_locked(argv, environ, stdin_fd=0):
     except (OSError, ValueError, TypeError, OverflowError) as error:
         emit({"frontdoor": "terminal", "stage": "refused", "reason": type(error).__name__, "effects": "none"})
         return EXIT_REFUSED
+    if checked is None:
+        try:
+            return discover(package, site, user)
+        except (Refused, OSError) as error:
+            emit({"frontdoor": "terminal", "stage": "refused", "reason": str(error) if isinstance(error, Refused) else type(error).__name__, "effects": "none"})
+            return EXIT_REFUSED
 
     children = checked["children"]
     try:
@@ -1518,6 +1684,7 @@ def run_locked(argv, environ, stdin_fd=0):
         except (OSError, subprocess.SubprocessError) as error:
             raise RunFailed(f"entry not started: {type(error).__name__}") from None
         relay = Relay(entry, run_dir, checked["deadline"] + site["cancel_grace_s"], site["cancel_grace_s"])
+        relay.requester_uid = user.pw_uid
         relay.stdin_buffer = rest
         for number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
             signal.signal(number, lambda number, frame: relay.signals.append(number))
