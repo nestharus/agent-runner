@@ -401,6 +401,22 @@ class RelayTest(Scratch):
         self.assertIs(relay.retirement, False)
         self.assertEqual(frontdoor.root_terminal(run)["session_control"], owed["session_control"])
 
+    def test_latest_account_replace_failure_is_unknown_and_next_save_recovers(self):
+        relay, entry, run, _, _ = self.relay("ignore", 60, 5)
+        positive = {"event": "terminal", "session_control": {"retirement": {"eligible": True}}}
+        owed = {"event": "terminal", "session_control": {"retirement": {"eligible": False, "blocking": ["owed"]}}}
+        relay.note_owner_terminal(json.dumps(positive).encode())
+        with mock.patch.object(frontdoor.os, "replace", side_effect=OSError("U122 synthetic account replace failure")):
+            relay.note_owner_terminal(json.dumps(owed).encode())
+        self.assertTrue(relay.terminal_account_unavailable)
+        self.assertEqual(frontdoor.root_terminal(run)["knowledge"], "unknown")
+        self.assertFalse(frontdoor.root_terminal(run)["session_control"]["retirement"]["eligible"])
+        self.assertFalse(any(name.startswith(frontdoor.ROOT_TERMINAL + ".next")
+                             for name in os.listdir(os.path.join(run, "private"))))
+        relay.note_owner_terminal(json.dumps(owed).encode())
+        self.assertFalse(relay.terminal_account_unavailable)
+        self.assertEqual(frontdoor.root_terminal(run)["session_control"], owed["session_control"])
+
     def test_signal_is_abandonment(self):
         relay, entry, run, (out_r, out_w), (in_r, in_w) = self.relay("obey", 60, 5)
         relay.signals.append(15)
@@ -444,7 +460,7 @@ class Discovery(Scratch):
                 store, requester = sys.argv[2], sys.argv[4]
                 if store.endswith("broken/store"):
                     print(json.dumps({"event": "describe-refused", "reason": "unknown store version 11"})); sys.exit(65)
-                print(json.dumps({"kind": "root_entry", "protocol": "oulipoly.session_control/v2", "describer": sys.argv[6],
+                print(json.dumps({"kind": "root_entry", "protocol": "oulipoly.session_control/v3", "describer": sys.argv[6],
                                   "requester": requester, "authority": {"root": store, "owner": "o", "generation": "2", "incarnation": "1"},
                                   "observed_at_unix_ms": 1}))
             """ % sys.executable))

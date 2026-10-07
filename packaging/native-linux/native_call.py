@@ -603,10 +603,10 @@ LIVE_EXITS = {
     "cleanup-failed": 7, "ended-otherwise": 9, "root-absent": 11, "root-dead": 12, "root-foreign": 13,
     "root-refused": 14, "follow-up-refused": 15, "root-ended": 16,
     "root-unavailable": 17, "async-undelivered": 10,
-    "inspected": 0, "acknowledged": 0, "control-refused": 18, "control-unknown": 19,
+    "inspected": 0, "acknowledged": 0, "fulfilled": 0, "unfulfilled": 18, "control-unavailable": 19, "control-refused": 18, "control-unknown": 19,
 }
 
-CONTROL_PROTOCOL = "oulipoly.session_control/v2"
+CONTROL_PROTOCOL = "oulipoly.session_control/v3"
 
 
 def read_private(path):
@@ -951,10 +951,14 @@ def parse_live_args(argv):
     action.add_argument("--close", action="store_true", help="close the root: drain and end its tree")
     action.add_argument("--stop", action="store_true", help="stop this owner instance; distinct from durable session-control cancel")
     action.add_argument("--inspect", action="store_true",
-                        help="report the root's control state and settlement reading (session_control/v2)")
+                        help="report the root's control state and settlement reading (session_control/v3)")
     action.add_argument("--hold", action="store_true",
                         help="hold new input (admission only; running work continues)")
     action.add_argument("--release", action="store_true", help="release an input hold")
+    action.add_argument("--control-request", help="submit an exact shared control request from a JSON file (including replay)")
+    parser.add_argument("--control-prior", help="prior caller result preserving the immutable original and its claims")
+    parser.add_argument("--control-reader", default=os.path.join(os.path.dirname(os.path.realpath(__file__)), "oulipoly-root-supervisor"),
+                        help="read-only SDK consumer executable; defaults to the packaged supervisor")
     parser.add_argument("--wait", type=int, default=1800, help="this call's own bound; the root is unaffected by it")
     args = parser.parse_args(argv)
     if not 1 <= args.wait <= MAX_DEADLINE_S:
@@ -1001,7 +1005,7 @@ def main_live(argv):
                 **base, "turn": account,
                 "transport": {"errors": attached.errors, "attached": attached.events[0] if attached.events else None},
                 "root": "ended" if account["root_ended"] else "live (detached; this exit is not the root's end)"})
-        if args.inspect or args.hold or args.release:
+        if args.inspect or args.hold or args.release or args.control_request:
             return live_control(args, attached, base, until)
         cmd = "close" if args.close else "cancel"
         attached.write({"cmd": cmd})
@@ -1049,33 +1053,62 @@ def inspected(attached, until):
                     and state.get("protocol") == CONTROL_PROTOCOL \
                     and isinstance(state.get("reporter"), dict) \
                     and isinstance(settlement, dict) and settlement.get("event") == "settlement":
+                attached.control_advertisement = event.get("advertisement")
                 return state, settlement
             break
     return None, None
 
 
+def read_control(args, advertisement, state, request=None, claims=None, prior=None):
+    """Use the shared SDK's actual structural/semantic/trace readers."""
+    prior = prior or {}
+    payload = {"advertisement": advertisement, "state": state, "request": request,
+               "claims": claims or [], "original": prior.get("original", prior.get("request")),
+               "prior_claims": prior.get("prior_claims", []) + prior.get("claims", [])}
+    try:
+        process = subprocess.run([args.control_reader, "--read-control"],
+                                 input=json.dumps(payload), text=True, capture_output=True, timeout=15)
+        if process.returncode != 0:
+            raise ValueError("SDK reader failed")
+        reading = json.loads(process.stdout)
+        if not isinstance(reading, dict) or "class" not in reading:
+            raise ValueError("SDK reader returned no reading")
+        return reading
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return {"class": "control-unavailable", "diagnostics": [{"reason": "reader_unavailable", "detail": type(error).__name__}]}
+
+
 def live_control(args, attached, base, until):
-    """`--inspect`, or one `session_control/v2` hold/release request addressed
-    to the authority the root's own inspection reports. The answer is the
-    owner's claims for this request; this caller attests nothing itself."""
+    """Fresh inspection/agreement, exact submission, and preserved-original trace."""
     state, settlement = inspected(attached, until)
-    fields = {**base, "control_state": state, "settlement": settlement}
+    advertisement = getattr(attached, "control_advertisement", None)
+    fields = {**base, "control_state": state, "settlement": settlement, "advertisement": advertisement}
     if state is None or settlement is None:
         attached.detach()
         return live_result(args.out, "incomplete", {**fields, "reason": "no inspection within the wait bound"})
-    if args.inspect:
+    inspection = read_control(args, advertisement, state)
+    if inspection["class"] != "inspected" or args.inspect:
         attached.detach()
-        return live_result(args.out, "inspected", fields)
-    key = "c" + os.urandom(8).hex()
-    request = {
-        "kind": "request", "protocol": CONTROL_PROTOCOL, "request_key": key,
-        "requester": f"uid:{os.getuid()}", "addressed": state["reporter"],
-        "operation": "input_hold" if args.hold else "input_release",
-        "scope": {"root": state["reporter"]["root"]},
-    }
+        return live_result(args.out, inspection["class"], {**fields, "reading": inspection})
+    prior = {}
+    if args.control_prior:
+        with open(args.control_prior, encoding="utf-8") as file:
+            prior = json.load(file)
+    if args.control_request:
+        with open(args.control_request, encoding="utf-8") as file:
+            request = json.load(file)
+    else:
+        request = {"kind": "request", "protocol": CONTROL_PROTOCOL,
+                   "request_key": "c" + os.urandom(8).hex(), "requester": f"uid:{os.getuid()}",
+                   "addressed": state["reporter"], "operation": "input_hold" if args.hold else "input_release",
+                   "scope": {"root": state["reporter"]["root"]}}
+    admission = read_control(args, advertisement, state, request, prior=prior)
+    if admission["class"] == "control-unavailable":
+        attached.detach()
+        return live_result(args.out, "control-unavailable", {**fields, "request": request, "reading": admission})
     attached.write(request)
-    attached.log(action="send", control=request["operation"], request_key=key)
-    claims, refusal = [], None
+    attached.log(action="send", control=request["operation"], request_key=request["request_key"])
+    claims, refusal, answered = [], None, False
     while True:
         event = attached.next_event(until)
         if event is None or event.get("frontdoor") == "terminal":
@@ -1083,18 +1116,25 @@ def live_control(args, attached, base, until):
         if event.get("frontdoor") == "control-refused" or event.get("event") == "session-control-unavailable":
             refusal = event
             break
-        if event.get("request_key") == key and isinstance(event.get("kind"), str):
-            claims.append(event)
-            if event["kind"] == "outcome" or (event["kind"] == "refusal" and event.get("reason") == "key_conflict"):
-                break
+        if event.get("event") == "control-answer" and event.get("request") == request:
+            claims = event.get("claims", [])
+            answered = True
+            break
+    reading = read_control(args, advertisement, state, request, claims, prior)
+    current_state, current_settlement = inspected(attached, until) if answered else (None, None)
+    fields["submission_inspection"] = state
+    fields["control_state"], fields["settlement"] = current_state, current_settlement
+    if current_state is not None:
+        reading = read_control(args, getattr(attached, "control_advertisement", None), current_state, request, claims, prior)
+    else:
+        reading["inspection_unavailable"] = True
     attached.detach()
-    outcome = next((c for c in reversed(claims) if c["kind"] == "outcome"), None)
-    cls = "control-refused" if refusal is not None else \
-        "acknowledged" if outcome and outcome.get("result") == "acknowledged" else \
-        "control-refused" if outcome and outcome.get("result") == "refused" else \
-        "control-unknown" if outcome else "incomplete"
-    return live_result(args.out, cls, {**fields, "request": request, "claims": claims, "refusal": refusal,
-                                       "meaning": "hold refuses input received after acknowledgment; already in-flight input may still be admitted; running work continues"})
+    cls = "control-refused" if refusal is not None else reading["class"] if answered and current_state is not None else "incomplete"
+    return live_result(args.out, cls, {**fields, "request": request, "claims": claims,
+        "original": reading.get("original", prior.get("original", request)),
+        "prior_claims": prior.get("prior_claims", []) + prior.get("claims", []),
+        "reading": reading, "refusal": refusal,
+        "meaning": "shared transition knowledge; running-work settlement is separately reported"})
 
 
 def main(argv):

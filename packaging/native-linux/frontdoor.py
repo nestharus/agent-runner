@@ -18,7 +18,7 @@ Physical entry wait permits package run cleanup only. Discard removes the
 run and store after drain, reporting the retained logical account or unknown
 with do-not-replay. Keep preserves diagnostics. Neither removal nor closed/7
 (native87) establishes logical retirement.
-Controls: cancel/close/send/inspect lines and session_control/v2 `request`
+Controls: cancel/close/send/inspect lines and session_control/v3 `request`
 records, whose requester must be this attested requester (`uid:<n>`).
 Stdin `{"v":1,"op":"discover"}` instead lists this requester's roots as v2
 `root_entry` records: derived addressing, not ownership or capacity.
@@ -74,9 +74,9 @@ PID1 = "bin/oulipoly-root-pid1"
 ROOT_CHILD = "bin/oulipoly-root-child"
 BASH_BIN = "agent-bash/agent-bash"
 
-# session_control/v2 (agent-provider-contract): record line bound and the
+# session_control/v3 (agent-provider-contract): record line bound and the
 # requester name the root owner answers for this front door's requester.
-CONTROL_PROTOCOL = "oulipoly.session_control/v2"
+CONTROL_PROTOCOL = "oulipoly.session_control/v3"
 CONTROL_RECORD_LIMIT = 32768
 # Final logical account survives in the package terminal even under discard.
 ROOT_TERMINAL = "root-terminal.json"
@@ -512,6 +512,11 @@ def stale_runs(user_dir):
     return found
 
 
+def unknown_root_terminal():
+    return {"knowledge": "unknown", "session_control": {"retirement": {
+        "eligible": False, "blocking": ["latest owner account unavailable"]}}}
+
+
 def root_terminal(run):
     """Last retained owner account, or explicit unknown; no replay inference."""
     try:
@@ -525,18 +530,17 @@ def root_terminal(run):
                 raise ValueError("not an account")
             return value
     except (OSError, ValueError):
-        return {"knowledge": "unknown", "session_control": {"retirement": {
-            "eligible": False, "blocking": ["no final owner account available"]}}}
+        return unknown_root_terminal()
 
 
-def retire(run, retention):
+def retire(run, retention, account_unavailable=False):
     """Remove package scratch after physical entry termination. Logical
     retirement stays in the returned account; removal never settles it.
     Keep preserves the store and adapter diagnostics. This layer knows no
     adapter credential paths or semantics. Caller establishes physical drain.
     """
     removed = None
-    account = root_terminal(run)
+    account = unknown_root_terminal() if account_unavailable else root_terminal(run)
     if retention == "discard":
         try:
             if not shutil.rmtree.avoids_symlink_attacks:
@@ -756,6 +760,7 @@ class Relay:
         self.requester_uid = None
         # The owner's described retirement eligibility, from its terminal.
         self.retirement = None
+        self.terminal_account_unavailable = False
         self.close_waiting = False
         self.why = None
         self.stdout_gone = False
@@ -850,11 +855,34 @@ class Relay:
         if "session_control" not in account:
             account["knowledge"] = "unknown"
         path = os.path.join(self.run, "private", ROOT_TERMINAL)
+        # Invalidate superseded knowledge before attempting publication. A
+        # failed replacement must never expose the previous affirmative account.
+        self.terminal_account_unavailable = True
+        self.retirement = False
+        pending = path + ".next-" + secrets.token_hex(8)
+        created = False
         try:
-            write_private(path + ".next", account)
-            os.replace(path + ".next", path)
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            created = True
+            with os.fdopen(fd, "w", encoding="utf-8") as file:
+                file.write(json.dumps(account))
+            os.replace(pending, path)
+            self.terminal_account_unavailable = False
+            self.retirement = retirement.get("eligible") is True
         except OSError:
             self.collection_errors.append("root-terminal-account-unavailable")
+        finally:
+            if created:
+                try:
+                    os.unlink(pending)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    self.collection_errors.append("root-terminal-temporary-cleanup-unavailable")
 
     def entry_line(self, line):
         self.note_owner_terminal(line)
@@ -1394,7 +1422,7 @@ def live_daemon(package, site, checked, run_id, run_dir, request_path, user, lis
     relay.stop_listening(socket_path)
     os.close(alive)
     code = entry_exit(status, relay.killed)
-    retired = retire(run_dir, checked["retention"]) if status is not None else {"ok": False, "stop": "unknown", "run_removed": False}
+    retired = retire(run_dir, checked["retention"], relay.terminal_account_unavailable) if status is not None else {"ok": False, "stop": "unknown", "run_removed": False}
     if relay.collection_errors:
         code = EXIT_UNKNOWN
     if status is not None and not retired["ok"]:
@@ -1515,7 +1543,7 @@ def describe_root(package, store, uid):
 
 def discover(package, site, user):
     """Lists this requester's roots under this front door's run base: one
-    `root_entry` (session_control/v2) per root store, read without claiming
+    `root_entry` (session_control/v3) per root store, read without claiming
     it, with whether this front door holds it live. Derived and rebuildable;
     not ownership, admission, scheduling or a capacity reservation. The live
     cap is per requester at this front door, not a global reservation."""
@@ -1717,7 +1745,7 @@ def run_locked(argv, environ, stdin_fd=0):
         status = relay.run_to_end(stdin_fd)
         os.close(alive)
         code = entry_exit(status, relay.killed)
-        retired = retire(run_dir, checked["retention"]) if status is not None else {"ok": False, "stop": "unknown", "run_removed": False}
+        retired = retire(run_dir, checked["retention"], relay.terminal_account_unavailable) if status is not None else {"ok": False, "stop": "unknown", "run_removed": False}
         if relay.collection_errors:
             code = EXIT_UNKNOWN
         if status is not None and (not retired["ok"] or any(not record["ok"] for record in swept)):
@@ -1749,7 +1777,7 @@ def run_locked(argv, environ, stdin_fd=0):
             while entry.poll() is None and time.monotonic() < end:
                 time.sleep(0.01)
             status = entry.poll()
-        retired = retire(run_dir, checked["retention"]) if entry is None or status is not None else {"ok": False, "stop": "unknown"}
+        retired = retire(run_dir, checked["retention"], relay.terminal_account_unavailable if relay is not None else False) if entry is None or status is not None else {"ok": False, "stop": "unknown"}
         stage = "run-failed" if isinstance(failure, RunFailed) else "front-door-failed"
         emit({
             "frontdoor": "terminal",

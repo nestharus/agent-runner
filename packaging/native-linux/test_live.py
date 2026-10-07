@@ -298,21 +298,25 @@ CONTROL_ENTRY = textwrap.dedent("""
     for line in sys.stdin:
         cmd = json.loads(line)
         if cmd.get("cmd") == "inspect":
-            state = {"kind": "control_state", "protocol": "oulipoly.session_control/v2", "reporter": me,
+            state = {"kind": "control_state", "protocol": "oulipoly.session_control/v3", "reporter": me,
                  "scope": {"root": "r1"}, "input": {"state": held}, "lifecycle": {"state": "open"},
                  "observed_at_unix_ms": 1}
             settlement = {"event": "settlement", "retirement": {"eligible": False, "blocking": ["fixture"]}}
-            say({"event": "inspection", "inspection_key": "old", "control_state": state, "settlement": settlement})
-            say({"event": "inspection", "inspection_key": cmd["inspection_key"], "control_state": state, "settlement": settlement})
+            say({"event": "inspection", "inspection_key": "old", "control_state": state, "settlement": settlement,
+                 "advertisement": {"oulipoly.session_control/v3": {"operations": ["input_hold", "input_release", "recover", "close", "cancel"], "reports": ["inspection"], "facts": []}}})
+            say({"event": "inspection", "inspection_key": cmd["inspection_key"], "control_state": state, "settlement": settlement,
+                 "advertisement": {"oulipoly.session_control/v3": {"operations": ["input_hold", "input_release", "recover", "close", "cancel"], "reports": ["inspection"], "facts": []}}})
         elif cmd.get("kind") == "request":
             ref = {k: cmd[k] for k in ("request_key", "requester", "addressed")}
             to = "input_held" if cmd["operation"] == "input_hold" else "input_open"
             common = dict(ref, protocol=cmd["protocol"])
-            say(dict(common, kind="receipt", durable=True, observed_at_unix_ms=2))
-            say(dict(common, kind="admission", operation=cmd["operation"], responder=me, observed_at_unix_ms=3))
-            say(dict(common, kind="acknowledgment", operation=cmd["operation"], responder=me,
-                     observed_at_unix_ms=4, **{"from": held, "to": to}))
-            say(dict(common, kind="outcome", result="acknowledged", observed_at_unix_ms=5))
+            claims = [dict(common, kind="receipt", durable=True, observed_at_unix_ms=2),
+                      dict(common, kind="admission", operation=cmd["operation"], responder=me, observed_at_unix_ms=3),
+                      dict(common, kind="acknowledgment", operation=cmd["operation"], responder=me,
+                           observed_at_unix_ms=4, **{"from": held, "to": to}),
+                      dict(common, kind="outcome", result="acknowledged", observed_at_unix_ms=5)]
+            for claim in claims: say(claim)
+            say({"event": "control-answer", "request": cmd, "claims": claims})
             held = to
         elif cmd.get("cmd") == "close":
             say({"event": "terminal", "status": "closed", "async": {"accepted": 0, "turn_ended": 0, "undelivered": [], "owed": 0}})
@@ -329,6 +333,12 @@ class LiveControl(unittest.TestCase):
 
     setUp, tearDown, open, call, handle_file = (
         LiveRoot.setUp, LiveRoot.tearDown, LiveRoot.open, LiveRoot.call, LiveRoot.handle_file)
+
+    def call(self, *argv):
+        reader = os.environ.get("ROOT_CONTROL_READER")
+        if not reader:
+            self.skipTest("ROOT_CONTROL_READER must name a built SDK consumer")
+        return LiveRoot.call(self, *argv, "--control-reader", reader)
 
     def test_stop_names_the_owner_instance_control(self):
         run, terminal = self.open(script=ENTRY)
@@ -350,7 +360,7 @@ class LiveControl(unittest.TestCase):
         self.assertEqual([c["kind"] for c in result["claims"]], ["receipt", "admission", "acknowledgment", "outcome"])
         self.assertEqual(result["claims"][2]["to"], "input_held")
         code, result = self.call("--root", handle, "--release")
-        self.assertEqual(result["control_state"]["input"]["state"], "input_held")
+        self.assertEqual(result["submission_inspection"]["input"]["state"], "input_held")
         self.assertEqual(result["claims"][2]["to"], "input_open")
         code, result = self.call("--root", handle, "--close")
         self.assertIn(code, (0, 6))

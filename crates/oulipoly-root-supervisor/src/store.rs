@@ -75,7 +75,7 @@
 //!   recorded. No migration: other schemas are refused.
 //! * Version 12 gives each owner claim a random `token` (the owner part of
 //!   the root's control authority, see [`crate::control`]) and keeps
-//!   `control`: every `oulipoly.session_control/v2` claim this root's owners
+//!   `control`: every `oulipoly.session_control/v3` claim this root's owners
 //!   committed, as the exact record line, in commit order. A later owner
 //!   reads them back as durable control intent (hold, close, cancel) and
 //!   replays them unchanged; it never rewrites one. No migration.
@@ -783,6 +783,25 @@ impl Store {
     /// Every committed control claim, in commit order.
     pub(crate) fn control_rows(&self) -> rusqlite::Result<Vec<ControlRow>> {
         control_rows(&self.conn)
+    }
+
+    /// Verify the persisted admission's writer against actual owner custody.
+    /// SDK generation strings alone confer no newer-owner authority.
+    pub(crate) fn predecessor_control_owner(
+        &self,
+        authority: &agent_provider_contract::session_control::Authority,
+        admitted_generation: i64,
+    ) -> rusqlite::Result<bool> {
+        if admitted_generation >= self.generation
+            || authority.generation != admitted_generation.to_string()
+        {
+            return Ok(false);
+        }
+        self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM owner WHERE generation = ?1 AND token = ?2)",
+            params![admitted_generation, authority.owner],
+            |row| row.get(0),
+        )
     }
 
     /// Commits control claim lines together, under the generation fence,

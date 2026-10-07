@@ -1,5 +1,5 @@
 //! The root's control face in the shared vocabulary
-//! (`oulipoly.session_control/v2`, from `agent-provider-contract`). This
+//! (`oulipoly.session_control/v3`, from `agent-provider-contract`). This
 //! owner is the root authority the vocabulary addresses; the contract
 //! defines what the claims mean and refuses ones that contradict, and this
 //! module realizes them: authority, admission, enforcement, durability and
@@ -33,17 +33,17 @@
 //! transition is applied and reported. Each record is kept as its exact
 //! line. A repeated identical request is answered by replaying those lines
 //! unchanged and makes no second transition; the same key with other
-//! content is refused `key_conflict` (not kept). A store failure leaves an
+//! content gets a separate exact submitted/original `conflict` (not kept). A store failure leaves an
 //! `unknown` outcome (`evidence_unavailable`), not kept, and no transition.
 //!
-//! A later owner reads the kept claims back as durable control intent: an
-//! acknowledged hold stays held, an acknowledged close keeps input closed
-//! and is followed through, and an acknowledged cancel cancels. An
-//! acknowledgment never becomes absence after owner death. A request an
-//! earlier owner admitted but never answered stays pending; the successor
-//! reports `unknown` (`authority_changed`) with itself as reporter. Present
-//! successor fulfillment and attributed negative answers remain a later
-//! consumer batch; pending knowledge is an honest partial result.
+//! A later owner retains every original admission and positive answer. It
+//! resolves inherited admitted intent through a distinct same-incarnation
+//! fulfillment or attributed non-fulfillment, committed under the actual
+//! owner fence before effects. The admission's recorded writer must match a
+//! real predecessor in the store's owner history. Current attached custody
+//! permits transitions; positively absent custody permits root_absent, and a
+//! close after durable cancellation permits already_terminal. Unknown custody,
+//! missing admission or lineage mismatch stays unknown/pending.
 //!
 //! # Operations here
 //!
@@ -141,6 +141,7 @@ struct Entry {
     request: sc::Request,
     trace: sc::RequestTrace,
     lines: Vec<String>,
+    admission_generation: Option<i64>,
 }
 
 pub(crate) struct Face {
@@ -218,6 +219,7 @@ impl Face {
                     request: request.clone(),
                     trace,
                     lines: vec![row.line.clone()],
+                    admission_generation: None,
                 }),
                 Err(_) => self.unreadable += 1,
             }
@@ -232,10 +234,16 @@ impl Face {
             self.unreadable += 1;
             return;
         }
+        if matches!(record, sc::Record::Admission(_)) {
+            entry.admission_generation = Some(row.generation);
+        }
         entry.lines.push(row.line.clone());
         if let sc::Record::Acknowledgment(ack) = &record {
             let reference = entry.request.reference();
             self.transition(ack.operation, ack.to, reference);
+        } else if let sc::Record::Fulfillment(fulfilled) = &record {
+            let reference = entry.request.reference();
+            self.transition(fulfilled.operation, fulfilled.to, reference);
         }
     }
 
@@ -356,53 +364,112 @@ impl Face {
             entry.request.operation != sc::Operation::Recover
                 && entry.trace.acknowledgment().is_none()
                 && entry.trace.refusal().is_none()
+                && entry.trace.fulfillment().is_none()
+                && entry.trace.non_fulfillment().is_none()
         })
     }
 
-    /// A successor's report on each request an earlier owner admitted and
-    /// never answered: `unknown` (`authority_changed`), kept. Returns the
-    /// lines to emit.
-    pub(crate) fn report_inherited(&mut self, store: &mut Store) -> Vec<String> {
+    /// Resolve inherited admitted intent only under the actual store fence
+    /// and observed same-incarnation custody. Unknown remains explicit otherwise.
+    pub(crate) fn report_inherited(&mut self, store: &mut Store, found: Found) -> Vec<String> {
         let me = self.authority();
         let mut lines = Vec::new();
-        let indices: Vec<usize> = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| {
-                entry.request.operation != sc::Operation::Recover
-                    && entry.trace.acknowledgment().is_none()
-                    && entry.trace.refusal().is_none()
-                    && entry.request.addressed != me
-            })
-            .map(|(index, _)| index)
-            .collect();
-        for index in indices {
-            let request = &self.entries[index].request;
-            let outcome = sc::Record::Outcome(sc::Outcome {
+        for index in 0..self.entries.len() {
+            let entry = &self.entries[index];
+            if entry.request.operation == sc::Operation::Recover
+                || entry.request.addressed == me
+                || entry.trace.acknowledgment().is_some()
+                || entry.trace.fulfillment().is_some()
+                || entry.trace.non_fulfillment().is_some()
+                || entry.trace.refusal().is_some()
+            {
+                continue;
+            }
+            let request = entry.request.clone();
+            let inherited = entry.admission_generation.is_some_and(|generation| {
+                request.addressed.root == me.root
+                    && request.addressed.incarnation == me.incarnation
+                    && me.incarnation != "none"
+                    && store
+                        .predecessor_control_owner(&request.addressed, generation)
+                        .unwrap_or(false)
+            });
+            let (from, to) = match request.operation {
+                sc::Operation::InputHold => (self.input.state, sc::State::InputHeld),
+                sc::Operation::InputRelease => (self.input.state, sc::State::InputOpen),
+                sc::Operation::Close => (self.lifecycle.state, sc::State::Closing),
+                sc::Operation::Cancel => (self.lifecycle.state, sc::State::Cancelling),
+                sc::Operation::Recover => unreachable!(),
+            };
+            let mut records = Vec::new();
+            let mut result = sc::OutcomeResult::Unknown;
+            if inherited && found != Found::Unattached {
+                let negative = if found == Found::Absent {
+                    Some(sc::NonFulfillmentReason::RootAbsent)
+                } else if request.operation == sc::Operation::Close && from == sc::State::Cancelling
+                {
+                    Some(sc::NonFulfillmentReason::AlreadyTerminal)
+                } else {
+                    None
+                };
+                if let Some(reason) = negative {
+                    records.push(sc::Record::NonFulfillment(sc::NonFulfillment {
+                        protocol: sc::PROTOCOL.to_owned(),
+                        request_key: request.request_key.clone(),
+                        requester: request.requester.clone(),
+                        addressed: request.addressed.clone(),
+                        reporter: me.clone(),
+                        operation: request.operation,
+                        reason,
+                        observed_at_unix_ms: now_ms(),
+                    }));
+                    result = sc::OutcomeResult::Unfulfilled;
+                } else {
+                    records.push(sc::Record::Fulfillment(sc::Fulfillment {
+                        protocol: sc::PROTOCOL.to_owned(),
+                        request_key: request.request_key.clone(),
+                        requester: request.requester.clone(),
+                        addressed: request.addressed.clone(),
+                        reporter: me.clone(),
+                        operation: request.operation,
+                        from,
+                        to,
+                        observed_at_unix_ms: now_ms(),
+                    }));
+                    result = sc::OutcomeResult::Fulfilled;
+                }
+            }
+            records.push(sc::Record::Outcome(sc::Outcome {
                 protocol: sc::PROTOCOL.to_owned(),
                 request_key: request.request_key.clone(),
                 requester: request.requester.clone(),
                 addressed: request.addressed.clone(),
-                result: sc::OutcomeResult::Unknown,
-                uncertainty: Some(sc::Uncertainty::AuthorityChanged),
+                result,
+                uncertainty: (result == sc::OutcomeResult::Unknown)
+                    .then_some(sc::Uncertainty::AuthorityChanged),
                 reporter: Some(me.clone()),
                 observed_at_unix_ms: now_ms(),
-            });
-            let mut trace = self.entries[index].trace.clone();
-            if trace.accept(&outcome).is_err() {
+            }));
+            let mut trace = entry.trace.clone();
+            if records.iter().any(|record| trace.accept(record).is_err()) {
                 continue;
             }
-            let text = line(&outcome);
-            if store
-                .append_control(&[self.row(request, "outcome", &text)])
-                .is_err()
-            {
+            let texts: Vec<_> = records.iter().map(line).collect();
+            let rows: Vec<_> = texts
+                .iter()
+                .map(|text| self.row(&request, "successor", text))
+                .collect();
+            // This immediate transaction rejects an older writer before effects.
+            if store.append_control(&rows).is_err() {
                 break;
             }
             self.entries[index].trace = trace;
-            self.entries[index].lines.push(text.clone());
-            lines.push(text);
+            self.entries[index].lines.extend(texts.iter().cloned());
+            lines.extend(texts);
+            if result == sc::OutcomeResult::Fulfilled {
+                self.transition(request.operation, to, request.reference());
+                self.hold.set(self.input.state == sc::State::InputHeld);
+            }
         }
         lines
     }
@@ -435,7 +502,7 @@ impl Face {
         }
     }
 
-    /// Answers one control line that is a v2 record. Returns the lines to
+    /// Answers one control line that is a v3 record. Returns the lines to
     /// emit (claims, or one control-only diagnostic) and the transition to
     /// apply, if its acknowledgment is now durable.
     pub(crate) fn handle_line(
@@ -479,8 +546,18 @@ impl Face {
                 // Faithful replay: the kept lines, unchanged; no transition.
                 sc::Repetition::SameRequest => (entry.lines[1..].to_vec(), None),
                 _ => {
-                    let refusal = self.refusal(&request, sc::RefusalReason::KeyConflict);
-                    self.answer(&request, vec![refusal], false, store)
+                    let conflict = sc::Record::Conflict(sc::Conflict {
+                        protocol: sc::PROTOCOL.to_owned(),
+                        submitted: request,
+                        original: entry.request.clone(),
+                        responder: self.authority(),
+                        observed_at_unix_ms: now_ms(),
+                    });
+                    // Original request and faithful positive/final replay precede the
+                    // separate conflict answer, allowing both caller joins.
+                    let mut lines = entry.lines.clone();
+                    lines.push(line(&conflict));
+                    (lines, None)
                 }
             };
         }
@@ -633,6 +710,7 @@ impl Face {
                 request,
                 trace,
                 lines: kept,
+                admission_generation: Some(self.generation),
             });
             return (lines, None);
         }
@@ -643,6 +721,7 @@ impl Face {
             request: request.clone(),
             trace: answered,
             lines: kept,
+            admission_generation: Some(self.generation),
         });
         match answer {
             Ok((_, to)) => {
@@ -783,6 +862,7 @@ impl Face {
                 request: request.clone(),
                 trace,
                 lines: kept,
+                admission_generation: Some(self.generation),
             });
         }
         (lines, None)
@@ -1051,7 +1131,7 @@ pub fn describe_entry(
     Ok(text)
 }
 
-/// Whether a control line is a v2 record rather than a stdin command.
+/// Whether a control line is a v3 record rather than a stdin command.
 pub(crate) fn is_record(value: &Value) -> bool {
     value.get("kind").is_some() && value.get("cmd").is_none()
 }
@@ -1115,13 +1195,10 @@ mod tests {
         }
     }
 
-    /// A request an earlier owner admitted and never answered (it died
-    /// between admission and acknowledgment) stays pending after owner
-    /// churn; the successor reports it `unknown` (`authority_changed`)
-    /// as itself, cannot acknowledge it, and applies nothing from it.
-    /// An acknowledged hold, by contrast, holds for the successor.
+    /// A successor fulfills admitted intent under its own fence while the
+    /// original admission and the earlier acknowledged hold remain intact.
     #[test]
-    fn admitted_unanswered_intent_stays_pending_and_acknowledged_hold_holds() {
+    fn successor_fulfills_admitted_intent_and_keeps_original_positive() {
         let dir = dir("pending");
         let mut store = Store::claim(&dir.0, Some(&intent())).unwrap().store;
         let mut first = face(&store);
@@ -1173,19 +1250,21 @@ mod tests {
         assert_eq!(state.pending.len(), 1);
         assert_eq!(state.pending[0].status, sc::PendingStatus::Admitted);
         assert_eq!(state.pending[0].request.request_key, "k-close");
-        let reported = second.report_inherited(&mut store);
-        assert_eq!(reported.len(), 1);
-        let sc::Record::Outcome(outcome) = sc::Record::decode_line(&reported[0]).unwrap() else {
+        let reported = second.report_inherited(&mut store, Found::Attached);
+        assert_eq!(reported.len(), 2);
+        let sc::Record::Outcome(outcome) = sc::Record::decode_line(&reported[1]).unwrap() else {
             panic!("not an outcome");
         };
-        assert_eq!(outcome.result, sc::OutcomeResult::Unknown);
-        assert_eq!(outcome.uncertainty, Some(sc::Uncertainty::AuthorityChanged));
+        assert_eq!(outcome.result, sc::OutcomeResult::Fulfilled);
+        assert_eq!(outcome.uncertainty, None);
         assert_eq!(outcome.reporter, Some(second.authority()));
         // The same close re-sent is the same request: replayed, not applied.
         let (replayed, effect) = second.handle(close.clone(), &mut store);
         assert_eq!(effect, None);
-        assert_eq!(replayed.len(), 3);
-        // Settlement cannot be retirement while it is pending.
+        assert_eq!(replayed.len(), 4);
+        assert!(second.state().pending.is_empty());
+        assert_eq!(second.lifecycle_state(), sc::State::Closing);
+        // Physical custody still independently blocks retirement.
         let facts = store.settlement_facts().unwrap();
         let (_, summary) = second.settlement(&facts, Vec::new());
         assert_eq!(summary["retirement"]["eligible"], false, "{summary}");
@@ -1201,6 +1280,75 @@ mod tests {
             .unwrap();
         assert_eq!(entry.trace.outcomes().len(), 1);
         assert!(entry.trace.acknowledgment().is_none());
+        assert!(entry.trace.fulfillment().is_some());
+    }
+
+    fn admit_without_answer(
+        dir: &std::path::Path,
+        store: &mut Store,
+        face: &mut Face,
+    ) -> sc::Request {
+        let request = request(face, "pending-close", sc::Operation::Close);
+        let db = rusqlite::Connection::open(dir.join("intent.sqlite3")).unwrap();
+        db.execute_batch("CREATE TRIGGER cut_answer BEFORE INSERT ON control WHEN NEW.kind='acknowledgment' AND NEW.request_key='pending-close' BEGIN SELECT RAISE(ABORT,'selected admission cut'); END").unwrap();
+        assert_eq!(face.handle(request.clone(), store).1, None);
+        db.execute_batch("DROP TRIGGER cut_answer").unwrap();
+        request
+    }
+
+    #[test]
+    fn stale_successor_cannot_fulfill_after_a_newer_store_claim() {
+        let dir = dir("successor-fence");
+        let mut first_store = Store::claim(&dir.0, Some(&intent())).unwrap().store;
+        let mut first = face(&first_store);
+        let original = admit_without_answer(&dir.0, &mut first_store, &mut first);
+        drop(first_store);
+        let mut stale_store = Store::claim(&dir.0, None).unwrap().store;
+        let mut stale = face(&stale_store);
+        // Simulate loss/replacement of its advisory custody lock, as the
+        // existing store fence control does. No concurrent writer is authorized.
+        std::fs::remove_file(dir.0.join("owner.lock")).unwrap();
+        let mut current_store = Store::claim(&dir.0, None).unwrap().store;
+        assert!(
+            stale
+                .report_inherited(&mut stale_store, Found::Attached)
+                .is_empty()
+        );
+        assert_eq!(stale.lifecycle_state(), sc::State::Open);
+        assert!(stale.entries[0].trace.fulfillment().is_none());
+        let mut current = face(&current_store);
+        assert_eq!(
+            current
+                .report_inherited(&mut current_store, Found::Attached)
+                .len(),
+            2
+        );
+        assert_eq!(current.entries[0].request, original);
+        assert!(current.entries[0].trace.acknowledgment().is_none());
+        assert_eq!(current.lifecycle_state(), sc::State::Closing);
+    }
+
+    #[test]
+    fn inherited_close_after_durable_cancel_is_attributed_unfulfilled() {
+        let dir = dir("successor-negative");
+        let mut store = Store::claim(&dir.0, Some(&intent())).unwrap().store;
+        let mut first = face(&store);
+        let original = admit_without_answer(&dir.0, &mut store, &mut first);
+        let cancel = request(&first, "cancel-positive", sc::Operation::Cancel);
+        let positive = first.handle(cancel, &mut store).0;
+        drop(store);
+        let mut store = Store::claim(&dir.0, None).unwrap().store;
+        let mut second = face(&store);
+        let reports = second.report_inherited(&mut store, Found::Attached);
+        assert_eq!(reports.len(), 2);
+        assert_eq!(second.entries[0].request, original);
+        let negative = second.entries[0].trace.non_fulfillment().unwrap();
+        assert_eq!(negative.reason, sc::NonFulfillmentReason::AlreadyTerminal);
+        assert_eq!(negative.reporter, second.authority());
+        assert!(second.entries[0].trace.acknowledgment().is_none());
+        assert_eq!(&second.entries[1].lines[1..], positive);
+        assert_eq!(second.lifecycle_state(), sc::State::Cancelling);
+        assert!(second.state().pending.is_empty());
     }
 
     #[test]

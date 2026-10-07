@@ -145,7 +145,7 @@
 //! Later stdin lines are control commands, numbered from 1 in arrival order
 //! (`control`, every line counted): `{"cmd":"cancel"}`, `{"cmd":"send",
 //! "text":..., "harness"?:..., "ref"?:...}`, `{"cmd":"close"}` (see
-//! Live conversation), `{"cmd":"inspect"}`, and `oulipoly.session_control/v2`
+//! Live conversation), `{"cmd":"inspect"}`, and `oulipoly.session_control/v3`
 //! `request` records (see Root control face). Anything else is
 //! `control-refused`. Stdin EOF is neither a cancel nor a close. Stdout
 //! carries one JSON object per line: progress events and `session_control`
@@ -210,7 +210,7 @@
 //! # Root control face
 //!
 //! This owner speaks the shared root control vocabulary
-//! `oulipoly.session_control/v2` (`agent-provider-contract`) as the root
+//! `oulipoly.session_control/v3` (`agent-provider-contract`) as the root
 //! authority it addresses: input hold/release, close, cancel and a
 //! purposeful recovery's `recover`, on one durable claim ladder, plus
 //! `control_state` inspection and settlement `observation`s with a
@@ -610,6 +610,7 @@
 pub mod bash;
 pub mod children;
 pub mod control;
+pub mod control_reader;
 mod conversation;
 mod custody;
 mod harness;
@@ -678,7 +679,7 @@ pub struct Request {
     /// new incarnation when the recorded one is gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recover: Option<Recover>,
-    /// A purposeful recovery's `oulipoly.session_control/v2` `recover`
+    /// A purposeful recovery's `oulipoly.session_control/v3` `recover`
     /// request record, answered once this owner knows what it found (see
     /// the `control` module). Only with `recover`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1046,7 +1047,14 @@ where
             emit_line(&mut out, &line);
         }
     }
-    for line in face.report_inherited(&mut store) {
+    let found = if recovery.unattached.is_some() {
+        control::Found::Unattached
+    } else if recovery.root.is_some() {
+        control::Found::Attached
+    } else {
+        control::Found::Absent
+    };
+    for line in face.report_inherited(&mut store, found) {
         emit_line(&mut out, &line);
     }
     if let Some(reason) = recovery.unattached {
@@ -1142,7 +1150,7 @@ where
                     "event": "close-requested",
                     "by": "inherited-control-intent",
                     "input": "closed",
-                    "meaning": "an earlier owner acknowledged this close; it stays in force",
+                    "meaning": "durable close intent is acknowledged or fulfilled; it stays in force",
                 }),
             );
         }
@@ -1304,6 +1312,11 @@ where
                         }
                         None => {}
                     }
+                    emit(
+                        &mut out,
+                        &json!({"event": "control-answer", "request": command,
+                        "claims": lines.iter().filter_map(|line| serde_json::from_str::<Value>(line).ok()).collect::<Vec<_>>()}),
+                    );
                     continue;
                 }
                 match command
@@ -1387,6 +1400,7 @@ where
                                         &json!({
                                             "event": "inspection", "inspection_key": key,
                                             "control_state": state, "settlement": event,
+                                            "advertisement": face.announcement()["advertisement"],
                                         }),
                                     );
                                 }

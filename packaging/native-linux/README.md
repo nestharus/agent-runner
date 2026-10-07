@@ -156,6 +156,11 @@ The frontdoor does not read, convert, stage, refresh or scrub native credential
 files. Keep retains adapter state. Discard removes the package run tree with
 descriptor-safe removal after physical entry termination. The final package
 terminal retains the owner's logical account (including owed/pending work),
+with explicit unknown if the latest account could not be published. A failed
+publication normally invalidates the superseded account and does not disable
+later saves. If invalidation itself fails, the current relay still returns
+unknown, while the older diagnostic file may remain; no durable failure flag
+across relay death is promised,
 or explicit unknown if unavailable, with `retry: do-not-replay`. Physical
 store removal does not claim logical retirement. Keep explicitly preserves
 `private/root-terminal.json`, the store and adapter diagnostics. A free run
@@ -208,12 +213,12 @@ logical root retirement. The relay reads actual entry waits for scratch
 cleanup and passes owner records unchanged. Discard reports logical knowledge
 separately, including unknown when the entry died without a final owner account.
 
-### Root control face (`session_control/v2`)
+### Root control face (`session_control/v3`)
 
 The root owner speaks the shared root control vocabulary
-`oulipoly.session_control/v2` from `agent-provider-contract` (see the owner
+`oulipoly.session_control/v3` from `agent-provider-contract` (see the owner
 crate's `control` module). The front door relays, besides cancel/close/send,
-`{"cmd":"inspect"}` and v2 `request` records (at most 32768 bytes). It
+`{"cmd":"inspect"}` and v3 `request` records (at most 32768 bytes). It
 attests the requester: a request whose `requester` is not `uid:<this
 requester's uid>` is refused here (`requester-not-attested`) and never reaches
 the owner. Close and durable cancel arm kill grace only after the owner reports
@@ -226,7 +231,7 @@ run deadline still bounds an unresponsive owner. What the owner answers:
   Running turns, tools and owner completions continue. No physical pause.
 - `close`: durable; it enters the claim ladder and a later owner keeps input
   closed. The stdin `{"cmd":"close"}` is the same close.
-- `cancel` (v2): the root's durable lifecycle cancel. The stdin
+- `cancel` (v3): the root's durable lifecycle cancel. The stdin
   `{"cmd":"cancel"}` (and this front door's deadline/abandon cancels) stays
   the owner instance's cancellation.
 - `recover`: only through `native-root --recover` (`control` field), answered
@@ -243,25 +248,52 @@ run deadline still bounds an unresponsive owner. What the owner answers:
   aggregation over recorded actors, explicitly separate from SDK one-reference
   physical knowledge; actor completeness/native retirement remains unqualified.
 
-The caller exposes `--root FILE --inspect | --hold | --release` (exits:
-`inspected`/`acknowledged` 0, `control-refused` 18, `control-unknown` 19,
-`incomplete` 6). Hold/release first inspect, then address the authority the
-root itself reported, with a fresh request key. Each inspection carries a fresh
-`inspection_key`; the owner returns one envelope containing its shared state
-record and settlement. Only that matching envelope is current for this caller.
-No matching response means no current reading, even with unread relay backlog.
-This transport envelope does not replace SDK capability selection/correlation.
+The caller exposes `--root FILE --inspect | --hold | --release`, plus
+`--control-request JSON` for an exact submission/replay and `--control-prior`
+for its prior caller result. Hold/release use a fresh key. A fresh
+`inspection_key` selects one owner envelope containing the actual advertisement,
+shared state and settlement. The packaged supervisor's read-only
+`--read-control` mode uses the SDK's schema, capability selection, agreement and
+trace operations. `--control-reader` may name that reader explicitly; no binary,
+banner or source revision participates in negotiation. Missing/incompatible
+control disables this control encounter only; the root's execution continues.
 
-**Partial source scope.** Admitted inherited intent stays honestly pending/unknown.
-A later consumer batch after the SDK control follow-up owes positive and
-attributed negative successor enactment, and full caller advertisement,
-selection, immutable correlation and fulfilled-outcome uptake. Key-conflict
-correlation, actor completeness and native qualification remain unfinished.
-Packaged owner-only restart is unestablished; entry death has no survivor.
+A changed submission requires the caller's preserved original, including after
+its final outcome. Both exact submission and original-trace conflict joins are
+checked. The owner faithfully replays the original before the separate conflict
+answer. Returned claims, rejected records and diagnostics remain in the caller
+result. Fulfillment is distinct from acknowledgment and non-fulfillment:
+`inspected`/`acknowledged`/`fulfilled` exit 0, `control-refused`/`unfulfilled`
+exit 18, `control-unknown`/`control-unavailable` exit 19, and a contradictory or
+incomplete account exits 6. Transition knowledge does not establish work
+settlement. Raw owner events remain in the caller's capture as well.
+
+Direct owner succession can enact admitted intent only under the actual store
+owner history and generation fence, in the same recorded incarnation. Its own
+present fulfillment preserves the original admission and manufactures no
+predecessor ACK. Known positives are retained. Observed absent custody, or close
+under durable cancellation, permits attributed terminal non-fulfillment;
+missing admission, unknown custody and mismatched lineage remain unknown.
+
+**Direct recovery guarantee scope.** The roots used here are the explicit
+owner store (SQLite intent/control and recorded incarnation), its live root
+PID 1 socket/receipts, and the recorded harness/provider state paths. This
+supports deliberate owner-process loss on the current running host, with
+successfully committed owner claims and identity-checked live custody. It does
+not promise reconstruction of a run tree after host/power loss or establish
+publication of incoming provider-state ancestry. A visible directory or later
+SDK success is no receipt for an earlier failed publication. Diagnostic keep is
+inspection. When provider publication/lineage is uncertain, use a fresh root
+and retain prior input uncertainty/do-not-replay; this control face supplies no
+new replay authority or provider durability guarantee. The existing direct
+input retry mechanism does not enforce that lineage precondition, and remains
+an explicit gap for callers requiring that higher guarantee. Packaged owner-only
+restart remains unestablished; entry death has no survivor. Native providers,
+all-actor custody, cutover, stress and broader review remain separately owed.
 
 **Discovery.** Through the same sudoers `run` rule, stdin
 `{"v":1,"op":"discover"}` lists this requester's run directories that hold a
-root store: one `frontdoor: root` line each with a v2 `root_entry` (read by
+root store: one `frontdoor: root` line each with a v3 `root_entry` (read by
 `oulipoly-root-supervisor --describe` without claiming or locking the store),
 whether this front door holds it live and its socket, then a `discovered`
 terminal. Entries are derived and rebuildable addressing: not ownership,
