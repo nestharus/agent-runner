@@ -18,6 +18,11 @@
 //!   mapped user. It does not stand for host-root semantics, and it cannot
 //!   name a different identity.
 //!
+//! Under both, each harness and Bash run also has a mount namespace of its
+//! own with a `/proc` of its work's PID namespace (made by its work PID 1
+//! before the identity is taken); a host where that cannot be made refuses
+//! the start rather than run work against the host's `/proc`.
+//!
 //! Owner IPC grants nothing by uid alone: a peer is admitted by its uid
 //! **and** its membership of the exact PID namespace of a live work of
 //! this owner (see the `bash` module and the harness socket connection).

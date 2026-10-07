@@ -210,7 +210,14 @@ struct Run {
 
 impl Run {
     fn start(dir: &Scratch, spec: &Value) -> Self {
-        let mut command = Command::new(SUPERVISOR);
+        Self::start_in(dir, spec, &[SUPERVISOR.to_owned()])
+    }
+
+    /// Starts the supervisor through `argv`, which must end by exec'ing it
+    /// (so that this test's child is the supervisor itself).
+    fn start_in(dir: &Scratch, spec: &Value, argv: &[String]) -> Self {
+        let mut command = Command::new(&argv[0]);
+        command.args(&argv[1..]);
         command.stdin(Stdio::piped()).stdout(Stdio::piped());
         // SAFETY: prctl with integer arguments, async-signal-safe.
         unsafe {
@@ -2913,33 +2920,225 @@ fn peer_route(dir: &Scratch, name: &str, extra: &[&str]) -> Value {
     json!({ "harness": "fixed", "argv": peer(&dir.state(name), extra), "endpoint": "stdio" })
 }
 
-/// The pid (in this test's namespace) a fixture process wrote to `path`.
-fn wait_pid(path: &Path) -> i32 {
+/// Waits for the file a fixture process inside a work writes once.
+fn wait_file(path: &Path) -> String {
     let deadline = std::time::Instant::now() + WATCHDOG;
     loop {
-        if let Some(pid) = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|text| text.trim().parse::<i32>().ok())
-        {
-            return pid;
+        if let Ok(text) = std::fs::read_to_string(path) {
+            return text;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "watchdog: pid file {}",
+            "watchdog: fixture file {}",
             path.display()
         );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
-/// A shell line that writes its own pid (as this test's /proc names it) to
-/// `path`, ignores TERM, HUP and INT, leaves its session and outlives its
-/// starter: an adversarial descendant, not a harness or a Bash run.
+/// The pids, in this test's namespace, of every process this test's
+/// `/proc` shows in PID namespace `ns` (`pid:[inode]`) with pid `local`
+/// there: what a host-side observer resolves from a work's own view.
+fn host_pids_in(ns: &str, local: i32) -> Vec<i32> {
+    let local = local.to_string();
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|pid| {
+            std::fs::read_link(format!("/proc/{pid}/ns/pid"))
+                .is_ok_and(|link| link.to_str() == Some(ns))
+                && std::fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|status| {
+                    status
+                        .lines()
+                        .find_map(|line| line.strip_prefix("NSpid:"))
+                        .and_then(|pids| pids.split_whitespace().last())
+                        == Some(local.as_str())
+                })
+        })
+        .collect()
+}
+
+/// The pid in this test's namespace of the fixture process that wrote its
+/// own pid and PID namespace, as its work's `/proc` names them, to `path`.
+fn wait_pid(path: &Path) -> i32 {
+    let text = wait_file(path);
+    let (local, ns) = text
+        .trim()
+        .split_once(' ')
+        .unwrap_or_else(|| panic!("pid file: {text}"));
+    let local: i32 = local.parse().unwrap();
+    let pids = host_pids_in(ns, local);
+    assert_eq!(pids.len(), 1, "{text}: {pids:?}");
+    pids[0]
+}
+
+/// A shell line that writes its own pid and PID namespace (as its work's
+/// own /proc names them) to `path`, ignores TERM, HUP and INT, leaves its
+/// session and outlives its starter: an adversarial descendant, not a
+/// harness or a Bash run.
 fn adversary(path: &Path) -> String {
+    let path = path.display();
     format!(
-        "setsid /bin/sh -c 'trap \"\" TERM HUP INT; while read k v r; do [ \"$k\" = NSpid: ] && echo $v > {}; done < /proc/self/status; exec sleep 600' </dev/null >/dev/null 2>&1 &",
-        path.display()
+        "setsid /bin/sh -c 'trap \"\" TERM HUP INT; echo $$ $(readlink /proc/self/ns/pid) > {path}.part && mv {path}.part {path}; exec sleep 600' </dev/null >/dev/null 2>&1 &"
     )
+}
+
+/// One line of what a shell in a work sees of its own `/proc`: the pid
+/// `/proc/self` names (through the shell's own redirect, so the shell
+/// itself), its own pid (`$$`), its PID namespace, the `NSpid` fields its
+/// `/proc` shows, and the options of the topmost `/proc` mount it sees.
+const PROC_FACTS: &str = r#"read p r < /proc/self/stat; while read k v; do [ "$k" = NSpid: ] && n=$v; done < /proc/self/status; set -- $n; n=$(IFS=,; echo "$*"); m=$(while read a b c d e f g; do [ "$e" = /proc ] && echo "$g"; done < /proc/self/mountinfo | tail -n 1); echo "proc-view self=$p own=$$ ns=$(readlink /proc/self/ns/pid) nspid=$n propagation=${m:-none}""#;
+
+/// The facts of a [`PROC_FACTS`] line in `text`.
+fn proc_facts(text: &str) -> std::collections::HashMap<String, String> {
+    let line = text
+        .lines()
+        .find_map(|line| line.split_once("proc-view ").map(|(_, facts)| facts))
+        .unwrap_or_else(|| panic!("no proc-view line: {text}"));
+    line.split_whitespace()
+        .filter_map(|fact| fact.split_once('='))
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect()
+}
+
+/// The `/proc` mounts this test's own mount namespace has, as mountinfo
+/// lines: a work's private `/proc` must not appear among them.
+fn own_proc_mounts() -> Vec<String> {
+    std::fs::read_to_string("/proc/self/mountinfo")
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains(" - proc "))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The workload invariant: a harness's descendants and a Bash run each see
+/// a `/proc` of their own work's PID namespace (their own pid, no host pid
+/// fields, a mount that propagates nothing back), while the owner's host
+/// view still resolves the same process, attributes Bash from it, and the
+/// host's mounts are unchanged.
+#[test]
+fn work_sees_a_proc_of_its_own_pid_namespace_and_host_attribution_holds() {
+    let dir = Scratch::new("proc-view");
+    let host_mounts = own_proc_mounts();
+    let facts_file = dir.0.join("harness.facts");
+    let spawned = format!(
+        "{{ {PROC_FACTS}; }} > {path}.part && mv {path}.part {path}; exec sleep 600",
+        path = facts_file.display()
+    );
+    let mut run = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            1,
+            json!([{ "id": "a", "argv": peer(&dir.state("a"), &[]), "messages": [
+                format!("spawn:{spawned}"),
+                format!("bash:{PROC_FACTS}"),
+            ] }]),
+        ),
+    );
+    let launched = run.event("a", "launched");
+    let harness = launched["pid"].as_i64().unwrap();
+    let harness_ns = std::fs::read_link(format!("/proc/{harness}/ns/pid")).unwrap();
+
+    // A descendant of the harness, in the harness's own namespace.
+    let inside = proc_facts(&wait_file(&facts_file));
+    assert_eq!(inside["self"], inside["own"], "{inside:?}");
+    assert_eq!(
+        inside["nspid"], inside["own"],
+        "no host pid field: {inside:?}"
+    );
+    assert_eq!(Path::new(&inside["ns"]), harness_ns, "{inside:?}");
+    assert!(
+        !inside["propagation"].contains("shared:"),
+        "the work's /proc propagates to a peer group: {inside:?}"
+    );
+    // The owner's host view resolves that same process, in that namespace,
+    // as a descendant of the launched harness.
+    let own: i32 = inside["own"].parse().unwrap();
+    let resolved = host_pids_in(&inside["ns"], own);
+    assert_eq!(resolved.len(), 1, "{inside:?}: {resolved:?}");
+    let mut ancestor = resolved[0];
+    while ancestor > 1 && i64::from(ancestor) != harness {
+        ancestor = i32::try_from(ppid(u64::try_from(ancestor).unwrap())).unwrap();
+    }
+    assert_eq!(i64::from(ancestor), harness, "{resolved:?}");
+    let descendant_fd = pidfd(resolved[0]).expect("descendant pidfd");
+    assert_eq!(
+        own_proc_mounts(),
+        host_mounts,
+        "a work's mount reached the host"
+    );
+
+    // A Bash run: pid 2 of its own new namespace, seen as such by its own
+    // /proc, and still attributed by the owner to the harness that asked.
+    let answer = run.until("bash reply", |value| {
+        value["harness"] == "a" && value["event"] == "agent-message" && value["input"] == 1
+    });
+    let text = answer["text"].as_str().unwrap();
+    assert!(text.contains("exit=Some(0)"), "{text}");
+    let bash = proc_facts(text);
+    assert_eq!(bash["self"], "2", "{bash:?}");
+    assert_eq!(bash["own"], "2", "{bash:?}");
+    assert_eq!(bash["nspid"], "2", "{bash:?}");
+    assert_ne!(Path::new(&bash["ns"]), harness_ns, "{bash:?}");
+    assert!(!bash["propagation"].contains("shared:"), "{bash:?}");
+    let accepted = owner_event(run.drain_now(), "bash-accepted")[0].clone();
+    assert_eq!(accepted["harness"], "a", "{accepted}");
+
+    run.until("turn end", |value| {
+        value["event"] == "turn-end" && value["input"] == 1
+    });
+    run.control(r#"{"cmd":"close"}"#);
+    let (terminal, status, seen) = run.terminal();
+    assert_eq!(status.code(), Some(7), "{terminal}");
+    let exited_event = events(&seen, "a", "exited")[0];
+    assert_eq!(exited_event["namespace"]["drained"], true, "{exited_event}");
+    assert!(
+        exited(&descendant_fd, 5_000),
+        "the harness's descendant survived the close"
+    );
+    assert_eq!(own_proc_mounts(), host_mounts);
+}
+
+/// Where a work cannot get a `/proc` of its own (here: an enclosing user
+/// namespace allows no further mount namespaces, while PID namespaces are
+/// still allowed), the harness is not started against the host's `/proc`:
+/// its start fails visibly as `workload-proc`, and it never runs.
+#[test]
+fn work_that_cannot_get_its_own_proc_is_refused_and_never_runs() {
+    let dir = Scratch::new("proc-refused");
+    // SAFETY: getuid/getgid have no preconditions.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let wrapper = [
+        "/usr/bin/unshare".to_owned(),
+        "--map-root-user".to_owned(),
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        format!(
+            "echo 0 > /proc/sys/user/max_mnt_namespaces && exec /usr/bin/unshare --map-user={uid} --map-group={gid} {SUPERVISOR}"
+        ),
+    ];
+    let state = dir.state("a");
+    let mut run = Run::start_in(
+        &dir,
+        &spec(
+            &dir,
+            1,
+            json!([{ "id": "a", "argv": peer(&state, &[]), "messages": ["echo:never"] }]),
+        ),
+        &wrapper,
+    );
+    let failed = run.event("a", "launch-failed");
+    let reason = failed["reason"].as_str().unwrap();
+    assert!(
+        reason.starts_with("workload-proc: mount namespace: "),
+        "{failed}"
+    );
+    run.cancel();
+    let (terminal, _status, seen) = run.terminal();
+    assert!(!state.exists(), "the harness ran: {terminal}");
+    assert!(events(&seen, "a", "ack").is_empty());
 }
 
 fn child_result(seen: &[Value]) -> Vec<&Value> {
@@ -3539,4 +3738,270 @@ fn recovered_child_is_stopped_never_continued() {
         ),
         1
     );
+}
+
+/// A fake native `claude -p --input-format stream-json --output-format
+/// stream-json` for a real provider adapter. It records what its own
+/// `/proc` shows of itself (pid, start time, `NSpid`, PID namespace, boot
+/// id) and every launch record under `ACTOR_ROOT` that names its pid as
+/// the actor, runs [`PROC_FACTS`] through the root's Bash ingress with
+/// `ROOT_BASH`, then echoes the submitted user record (the adapter's
+/// consumption evidence) and answers once. No real native or model runs.
+const FAKE_NATIVE: &str = r#"#!/usr/bin/python3
+import glob, json, os, subprocess, sys
+args = sys.argv[1:]
+line = sys.stdin.readline()
+pid = os.getpid()
+stat = open('/proc/self/stat').read()
+nspid = [l.split()[1:] for l in open('/proc/self/status').read().splitlines() if l.startswith('NSpid:')][0]
+actors = []
+for path in glob.glob(os.environ['ACTOR_ROOT'] + '/**/*.json', recursive=True):
+    try:
+        record = json.load(open(path))
+    except Exception:
+        continue
+    if isinstance(record, dict) and record.get('actor_id') == pid:
+        actors.append({'path': path, 'incarnation': record.get('incarnation'), 'phase': record.get('phase')})
+bash = subprocess.run([os.environ['ROOT_BASH'], '--', '/bin/sh', '-c', os.environ['PROC_FACTS']],
+                      capture_output=True, text=True)
+with open(os.environ['CALLS'], 'a') as f:
+    f.write(json.dumps({'argv': args, 'pid': pid, 'pgid': os.getpgid(0),
+                        'proc_self_pid': int(stat.split()[0]),
+                        'start_ticks': stat.rsplit(')', 1)[1].split()[19],
+                        'nspid': nspid, 'pidns': os.readlink('/proc/self/ns/pid'),
+                        'boot_id': open('/proc/sys/kernel/random/boot_id').read().strip(),
+                        'actors': actors,
+                        'bash': {'exit': bash.returncode, 'stdout': bash.stdout, 'stderr': bash.stderr[-2000:]}}) + '\n')
+message = json.loads(line)
+prompt = message['message']['content'][0]['text']
+options, i = {}, 0
+while i < len(args):
+    if args[i] in ['--append-system-prompt', '--model', '--input-format', '--output-format', '--resume', '--session-id']:
+        options[args[i]] = args[i + 1]
+        i += 2
+    else:
+        i += 1
+session = options.get('--resume', options.get('--session-id'))
+def emit(event):
+    print(json.dumps(event), flush=True)
+emit({'type': 'system', 'subtype': 'init', 'session_id': session, 'model': 'fixture'})
+emit({'type': 'user', 'uuid': message['uuid'], 'session_id': session, 'message': message['message']})
+emit({'type': 'assistant', 'parent_tool_use_id': None, 'message': {'content': [{'type': 'text', 'text': 'reply to %s' % prompt}]}})
+emit({'type': 'result', 'subtype': 'success', 'is_error': False, 'stop_reason': 'end_turn', 'session_id': session})
+"#;
+
+/// One provider/v1 operation of `adapter`, run as this test with only
+/// `PATH` and `home`: its result, or a panic with what it said.
+fn provider_op(
+    adapter: &str,
+    home: &Path,
+    operation: &str,
+    data_root: Option<&Path>,
+    params: Value,
+) -> Value {
+    let env = if operation == "policy.evaluate" {
+        json!({})
+    } else {
+        json!({ "OULIPOLY_HOST_RESIDENT_SESSION_V1": "1" })
+    };
+    let request = json!({
+        "contract": "oulipoly.provider/v1",
+        "request_id": format!("proc-view-{operation}"),
+        "provider_instance_id": null,
+        "host": { "app": "oulipoly-agent-runner", "app_version": null, "platform": "linux",
+                  "working_directory": null, "config_root": null, "data_root": data_root,
+                  "env": env, "deadline_unix_ms": null },
+        "params": params,
+    });
+    let mut child = Command::new(adapter)
+        .arg(operation)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    assert!(
+        output.status.success() && envelope["ok"] == true,
+        "{operation}: {:?} {envelope} {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    envelope["result"].clone()
+}
+
+/// The workload invariant with a real resident provider: a real provider
+/// adapter (`OULIPOLY_PROVIDER_ADAPTER`, a built `agent-runner-claude`)
+/// describes, evaluates and prepares itself, and the owner serves its
+/// resident endpoint as a plain stdio harness (no Runner front door or
+/// registration path here) with a fake native. Two inputs are acknowledged
+/// and answered on one native session; each native turn's provider actor
+/// record names that native's own incarnation, as the native's own `/proc`
+/// shows it in the harness's PID namespace; and each native's Bash request
+/// through the root's ingress is attributed to the harness and runs as pid
+/// 2 of its own namespace, which its own `/proc` also shows.
+#[test]
+#[ignore = "needs OULIPOLY_PROVIDER_ADAPTER (a built agent-runner-claude)"]
+fn real_provider_adapter_records_its_own_native_incarnation_through_the_owner() {
+    let adapter = std::env::var("OULIPOLY_PROVIDER_ADAPTER")
+        .expect("OULIPOLY_PROVIDER_ADAPTER: a built agent-runner-claude");
+    let dir = Scratch::new("provider-proc");
+    let home = dir.0.join("home");
+    let project = dir.0.join("project");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(&project).unwrap();
+    let native = dir.0.join("claude");
+    std::fs::write(&native, FAKE_NATIVE).unwrap();
+    std::fs::set_permissions(&native, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let calls = dir.0.join("native-calls");
+    let data_root = dir.0.join("launch/provider");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&data_root)
+        .unwrap();
+
+    let described = provider_op(&adapter, &home, "describe", None, json!({}));
+    assert_eq!(
+        described["capabilities"]["resident_session_v1"], true,
+        "{described}"
+    );
+    let settings = json!({
+        "settings_id": "proc-view-witness",
+        "mode": "headless",
+        "model": { "name": "claude-opus", "provider_args": ["--model", "opus"],
+                   "inputs": { "prompt": null, "named": {} } },
+        "launch": { "command": native, "prompt_mode": "stdin",
+                    "env": { "CALLS": calls, "ACTOR_ROOT": data_root,
+                             "ROOT_BASH": env!("CARGO_BIN_EXE_oulipoly-root-bash"),
+                             "PROC_FACTS": PROC_FACTS } },
+    });
+    let policy = provider_op(&adapter, &home, "policy.evaluate", None, settings.clone());
+    assert_eq!(policy["accepted"], true, "{policy}");
+    let launch = json!({
+        "settings_id": settings["settings_id"], "mode": settings["mode"], "model": settings["model"],
+        "argv": policy["argv"], "env": policy["env"],
+    });
+    let prepared = provider_op(
+        &adapter,
+        &home,
+        "resident.prepare",
+        Some(&data_root),
+        json!({ "protocol": "oulipoly.resident_session/v1", "launch": launch }),
+    );
+    assert_eq!(prepared["invocation"]["endpoint"], "stdio", "{prepared}");
+    let mut argv = vec![adapter.clone()];
+    argv.extend(
+        prepared["invocation"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap().to_owned()),
+    );
+
+    let mut spec = spec(
+        &dir,
+        1,
+        json!([{ "id": "provider", "argv": argv, "endpoint": "stdio", "messages": ["first"] }]),
+    );
+    spec["intent"]["cwd"] = json!(project);
+    // The owner, and so the served endpoint, has only PATH and the
+    // fixture's HOME.
+    let wrapper = [
+        "/usr/bin/env".to_owned(),
+        "-i".to_owned(),
+        "PATH=/usr/bin:/bin".to_owned(),
+        format!("HOME={}", home.display()),
+        SUPERVISOR.to_owned(),
+    ];
+    let mut run = Run::start_in(&dir, &spec, &wrapper);
+    let launched = run.event("provider", "launched");
+    let harness = launched["pid"].as_i64().unwrap();
+    let harness_ns = std::fs::read_link(format!("/proc/{harness}/ns/pid")).unwrap();
+    let ack0 = run.until("ack 0", |value| {
+        value["event"] == "ack" && value["index"] == 0
+    });
+    let reply0 = run.until("reply 0", |value| {
+        value["event"] == "agent-message" && value["input"] == 0
+    });
+    assert_eq!(reply0["text"], "reply to first", "{reply0}");
+    let turn0 = run.until("turn-end 0", |value| {
+        value["event"] == "turn-end" && value["input"] == 0
+    });
+    assert_eq!(turn0["message_id"], ack0["message_id"], "{turn0}");
+    run.control(&json!({ "cmd": "send", "text": "second", "ref": "f1" }).to_string());
+    run.event("provider", "follow-up-admitted");
+    let reply1 = run.until("reply 1", |value| {
+        value["event"] == "agent-message" && value["input"] == 1
+    });
+    assert_eq!(reply1["text"], "reply to second", "{reply1}");
+    let turn1 = run.until("turn-end 1", |value| {
+        value["event"] == "turn-end" && value["input"] == 1
+    });
+    assert_eq!(turn1["session"], turn0["session"]);
+    run.control(r#"{"cmd":"close"}"#);
+    let (terminal, status, seen) = run.terminal();
+    assert_eq!(status.code(), Some(7), "{terminal}");
+    assert_eq!(terminal["status"], "closed", "{terminal}");
+    let accepted = owner_event(&seen, "bash-accepted");
+    assert_eq!(accepted.len(), 2, "{seen:#?}");
+    for (input, accepted) in accepted.iter().enumerate() {
+        assert_eq!(accepted["harness"], "provider", "{accepted}");
+        assert_eq!(accepted["inputs_open"][0]["index"], input, "{accepted}");
+    }
+    let ended = owner_event(&seen, "bash-ended");
+    assert_eq!(ended.len(), 2, "{seen:#?}");
+    assert!(
+        ended.iter().all(|end| end["status"] == "code:0"),
+        "{ended:?}"
+    );
+    assert_eq!(terminal["owed"], 0);
+    assert_eq!(terminal["all_harnesses_reaped"], true);
+
+    let natives: Vec<Value> = std::fs::read_to_string(&calls)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(natives.len(), 2, "{natives:?}");
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    for call in &natives {
+        println!("native: {call}");
+        let pid = call["pid"].as_i64().unwrap();
+        // Its own /proc names it, with no host pid fields, in the harness's
+        // PID namespace; it leads its own process group (the actor).
+        assert_eq!(call["proc_self_pid"], pid, "{call}");
+        assert_eq!(call["nspid"], json!([pid.to_string()]), "{call}");
+        assert_eq!(
+            Path::new(call["pidns"].as_str().unwrap()),
+            harness_ns,
+            "{call}"
+        );
+        assert_eq!(call["pgid"], pid, "{call}");
+        // The provider recorded exactly that incarnation as its actor.
+        let expected = format!(
+            "linux:{}:{}",
+            boot.trim(),
+            call["start_ticks"].as_str().unwrap()
+        );
+        let actors = call["actors"].as_array().unwrap();
+        assert_eq!(actors.len(), 1, "{call}");
+        assert_eq!(actors[0]["incarnation"], expected.as_str(), "{call}");
+        assert_eq!(call["bash"]["exit"], 0, "{call}");
+        let bash = proc_facts(call["bash"]["stdout"].as_str().unwrap());
+        assert_eq!(bash["self"], "2", "{call}");
+        assert_eq!(bash["own"], "2", "{call}");
+        assert_eq!(bash["nspid"], "2", "{call}");
+        assert_ne!(Path::new(&bash["ns"]), harness_ns, "{call}");
+    }
 }
