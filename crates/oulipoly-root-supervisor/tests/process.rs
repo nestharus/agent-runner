@@ -5059,7 +5059,7 @@ fn fresh_completion_is_linked_and_close_waits_for_it_as_deferred() {
 }
 
 // ---------------------------------------------------------------------------
-// Root control face: `oulipoly.session_control/v2` at the owner (see the
+// Root control face: `oulipoly.session_control/v3` at the owner (see the
 // crate's `control` module). Deterministic peers and unprivileged
 // namespaces only; claims are checked with the shared contract's own
 // reference operations, not a local copy of their meaning.
@@ -5072,7 +5072,7 @@ fn requester() -> String {
     format!("uid:{}", unsafe { libc::geteuid() })
 }
 
-fn v2_request(key: &str, operation: &str, addressed: &Value) -> Value {
+fn control_request(key: &str, operation: &str, addressed: &Value) -> Value {
     json!({
         "kind": "request",
         "protocol": sc::PROTOCOL,
@@ -5216,7 +5216,7 @@ fn input_hold_holds_new_input_only_and_release_reopens_it() {
     assert_ne!(authority["incarnation"], "none");
 
     // Requester boundary: another requester is refused, nothing changes.
-    let mut foreign = v2_request("k-foreign", "input_hold", &authority);
+    let mut foreign = control_request("k-foreign", "input_hold", &authority);
     foreign["requester"] = json!("uid:4242424");
     let answers = run.ask(&foreign);
     assert_eq!(kinds(&answers), ["refusal", "outcome"]);
@@ -5228,7 +5228,7 @@ fn input_hold_holds_new_input_only_and_release_reopens_it() {
     });
     assert_eq!(diagnostic["diagnostic"]["reason"], "invalid_record");
 
-    let hold = v2_request("k-hold", "input_hold", &authority);
+    let hold = control_request("k-hold", "input_hold", &authority);
     let sc::Record::Request(typed) = claim(&hold) else {
         unreachable!()
     };
@@ -5254,17 +5254,29 @@ fn input_hold_holds_new_input_only_and_release_reopens_it() {
     run.control(&json!({ "cmd": "send", "text": "two" }).to_string());
     let refused = run.until_new("held send", |value| value["event"] == "follow-up-refused");
     assert_eq!(refused["reason"], "input-held", "{refused}");
-    // Same key, other content: refused, not a retry, not kept.
-    run.control(&v2_request("k-hold", "input_release", &authority).to_string());
-    let conflict = run.answer("refusal", "k-hold");
-    assert_eq!(conflict["reason"], "key_conflict");
-    assert_eq!(conflict["operation"], "input_release");
+    // Exact submitted/original conflict stays separate after original final.
+    let submitted = control_request("k-hold", "input_release", &authority);
+    run.control(&submitted.to_string());
+    let conflict = run.until_new("submission conflict", |value| value["kind"] == "conflict");
+    let sc::Record::Conflict(answer) = claim(&conflict) else {
+        panic!("not conflict")
+    };
+    let sc::Record::Request(submitted) = claim(&submitted) else {
+        panic!("not request")
+    };
+    answer.answer_to(&submitted).unwrap();
+    let mut kept = hold_trace.clone();
+    assert!(matches!(
+        kept.accept(&claim(&conflict)).unwrap(),
+        sc::Step::SubmissionConflict { .. }
+    ));
+    assert_eq!(kept, hold_trace);
     // The identical request: the kept claims, replayed unchanged.
     let replay = run.ask(&hold);
     assert_eq!(replay, held, "faithful replay");
     assert_eq!(run.inspect().input.state, sc::State::InputHeld);
 
-    let release = v2_request("k-release", "input_release", &authority);
+    let release = control_request("k-release", "input_release", &authority);
     let released = run.ask(&release);
     assert_eq!(released[2]["from"], "input_held");
     assert_eq!(released[2]["to"], "input_open");
@@ -5331,7 +5343,7 @@ fn ack_without_tagged_end_then_waited_exit_is_not_retirement() {
         value["event"] == "ack" && value["index"] == 0
     });
     let authority = serde_json::to_value(run.inspect().reporter).unwrap();
-    let closed = run.ask(&v2_request("k-close", "close", &authority));
+    let closed = run.ask(&control_request("k-close", "close", &authority));
     assert_eq!(closed[2]["to"], "closing");
     std::fs::write(&exit, b"").unwrap();
     let (terminal, status, seen) = run.terminal();
@@ -5431,7 +5443,7 @@ fn acknowledged_close_survives_owner_death_and_successor_attach() {
         entry["authority"], a1,
         "the store's last record is this owner"
     );
-    let close = v2_request("k-close", "close", &a1);
+    let close = control_request("k-close", "close", &a1);
     let closed = first.ask(&close);
     assert_eq!(
         kinds(&closed),
@@ -5439,7 +5451,7 @@ fn acknowledged_close_survives_owner_death_and_successor_attach() {
     );
 
     // A recover while this owner holds the root: refused, nothing written.
-    let recover_request = v2_request("k-recover", "recover", &a1);
+    let recover_request = control_request("k-recover", "recover", &a1);
     let request =
         json!({ "store": dir.store(), "recover": "continue-attached", "control": recover_request });
     let (terminal, status, seen) = Run::start(&dir, &request).terminal();
@@ -5499,7 +5511,7 @@ fn acknowledged_close_survives_owner_death_and_successor_attach() {
     let now = second.inspect();
     assert_eq!(now.lifecycle.state, sc::State::Closing);
     assert_eq!(trace(&close, &closed).relate(&now), sc::Relation::Current);
-    let stale = second.ask(&v2_request("k-stale", "input_hold", &a1));
+    let stale = second.ask(&control_request("k-stale", "input_hold", &a1));
     assert_eq!(stale[0]["reason"], "stale_authority");
     assert_eq!(stale[0]["responder"], a2);
     let replay = second.ask(&close);
@@ -5545,7 +5557,7 @@ fn recover_of_a_mismatched_incarnation_is_root_absent_before_effects() {
             [],
         )
         .unwrap();
-    let recover_request = v2_request("k-recover", "recover", &a1);
+    let recover_request = control_request("k-recover", "recover", &a1);
     let request =
         json!({ "store": dir.store(), "recover": "continue-attached", "control": recover_request });
     let (terminal, status, seen) = Run::start(&dir, &request).terminal();
