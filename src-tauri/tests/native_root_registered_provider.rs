@@ -3,7 +3,8 @@
 //! `describe`, `policy.evaluate` and `resident.prepare` over the provider
 //! contract, and its `resident.serve` runs the owner crate's deterministic
 //! ACP v2 peer as the root's harness. No native harness, model, credential
-//! or network; unprivileged user namespaces only.
+//! or network; unprivileged user namespaces only. The real-adapter control
+//! additionally serves finite fake natives through both delivered adapters.
 //!
 //! Ignored by default: it needs `oulipoly-root-supervisor`,
 //! `oulipoly-root-pid1`, `oulipoly-root-bash` and
@@ -268,7 +269,10 @@ fn wait_ended(pid: u64, what: &str) {
 }
 
 fn scratch() -> tempfile::TempDir {
-    tempfile::tempdir().unwrap()
+    match std::env::var_os("OULIPOLY_TEST_SCRATCH_DIR") {
+        Some(root) => tempfile::tempdir_in(root).unwrap(),
+        None => tempfile::tempdir().unwrap(),
+    }
 }
 
 /// An ordinary registered root: the provider is described, evaluated and
@@ -748,31 +752,61 @@ fn bad_preparation_is_a_setup_failure_with_provider_effects() {
     assert!(!dir.path().join("store").exists());
 }
 
-/// A fake native `claude -p --input-format stream-json --output-format
-/// stream-json` for a real Claude provider adapter: it echoes the submitted
-/// user record on the native session it was given and answers once. No real
-/// native harness or model runs.
-const FAKE_NATIVE_CLAUDE: &str = r#"#!/usr/bin/python3
-import json, os, sys
+/// Fake natives record their own proc view and the SDK's running actor before
+/// emitting provider-specific consumption evidence. They make no tool calls.
+const NATIVE_FACTS: &str = r#"#!/usr/bin/python3
+import glob, json, os, sys
 args = sys.argv[1:]
-line = sys.stdin.readline()
-with open(os.environ['CALLS'], 'a') as f:
-    f.write(json.dumps({'argv': args, 'tools': os.environ.get('OULIPOLY_TOOL_MEDIATION_V1')}) + '\n')
-message = json.loads(line)
-options, i = {}, 0
-while i < len(args):
-    if args[i] in ['--append-system-prompt', '--model', '--input-format', '--output-format', '--resume', '--session-id']:
-        options[args[i]] = args[i + 1]
-        i += 2
-    else:
-        i += 1
-session = options.get('--resume', options.get('--session-id'))
+pid = os.getpid()
+stat = open('/proc/self/stat').read()
+nspid = [line.split()[1:] for line in open('/proc/self/status') if line.startswith('NSpid:')][0]
+actors = []
+for path in glob.glob(os.environ['ACTOR_ROOT'] + '/**/*.json', recursive=True):
+    try:
+        record = json.load(open(path))
+    except (ValueError, OSError):
+        continue
+    if isinstance(record, dict) and record.get('actor_id') == pid:
+        actors.append({'path': path, 'incarnation': record.get('incarnation'), 'phase': record.get('phase')})
+facts = {'argv': args, 'pid': pid, 'pgid': os.getpgid(0),
+         'proc_self_link': os.readlink('/proc/self'), 'proc_self_pid': int(stat.split()[0]),
+         'start_ticks': stat.rsplit(')', 1)[1].split()[19], 'nspid': nspid,
+         'pidns': os.readlink('/proc/self/ns/pid'), 'boot_id': open('/proc/sys/kernel/random/boot_id').read().strip(),
+         'actors': actors, 'tools': os.environ.get('OULIPOLY_TOOL_MEDIATION_V1'),
+         'ingress': 'OULIPOLY_ROOT_BASH_V1' in os.environ, 'sentinel': os.environ.get('SENTINEL')}
 def emit(event):
     print(json.dumps(event), flush=True)
+def record(prompt, session):
+    facts.update(prompt=prompt, native_session=session)
+    with open(os.environ['CALLS'], 'a') as f:
+        f.write(json.dumps(facts) + '\n')
+"#;
+
+const FAKE_NATIVE_CLAUDE: &str = r#"
+message = json.loads(sys.stdin.readline())
+prompt = message['message']['content'][0]['text']
+options = {args[i]: args[i + 1] for i in range(len(args) - 1) if args[i] in ['--resume', '--session-id']}
+session = options.get('--resume', options.get('--session-id'))
+record(prompt, session)
 emit({'type': 'system', 'subtype': 'init', 'session_id': session, 'model': 'fixture'})
 emit({'type': 'user', 'uuid': message['uuid'], 'session_id': session, 'message': message['message']})
-emit({'type': 'assistant', 'parent_tool_use_id': None, 'message': {'content': [{'type': 'text', 'text': 'reply'}]}})
+emit({'type': 'assistant', 'parent_tool_use_id': None, 'message': {'content': [{'type': 'text', 'text': 'reply to %s' % prompt}]}})
 emit({'type': 'result', 'subtype': 'success', 'is_error': False, 'stop_reason': 'end_turn', 'session_id': session})
+"#;
+
+const FAKE_NATIVE_CODEX: &str = r#"
+prompt = sys.stdin.read()
+session = args[args.index('resume') + 1] if 'resume' in args else '11111111-2222-4333-8444-555555555555'
+# A genuine adapter prerequisite for resume is a rollout in this fake account.
+root = os.path.join(os.environ['CODEX_HOME'], 'sessions')
+os.makedirs(root, mode=0o700, exist_ok=True)
+with open(os.path.join(root, 'rollout-fixture.jsonl'), 'w') as f:
+    f.write(json.dumps({'type': 'session_meta', 'payload': {'id': session, 'cwd': os.getcwd()}}) + '\n')
+record(prompt, session)
+emit({'type': 'thread.started', 'thread_id': session})
+emit({'type': 'turn.started'})
+emit({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'reply to %s' % prompt}})
+emit({'type': 'turn.completed', 'usage': {'input_tokens': 1, 'output_tokens': 1}})
 "#;
 
 fn real_adapter(variable: &str) -> PathBuf {
@@ -781,91 +815,236 @@ fn real_adapter(variable: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// The real Claude provider adapter (`OULIPOLY_REAL_CLAUDE_ADAPTER`, built
-/// from its merged source) as a registered root, with a fake native: Runner
-/// describes it through the contract crate, evaluates its settings, adds its
-/// tool policy, has it prepare under the root's private data root, and the
-/// owner serves its resident endpoint as the root's harness, labelled with
-/// its declared id: ACP v2 and message-key dedup are negotiated and a native
-/// session is opened. Cancel then ends the root and its harness.
-///
-/// Native turns of a real adapter inside the owner's work namespace are not
-/// claimed here: the provider execution lifecycle identifies its native
-/// process through `/proc`, which in the work PID namespace is the host's.
-#[test]
-#[ignore = "needs OULIPOLY_REAL_CLAUDE_ADAPTER (a built agent-runner-claude) and the owner binaries beside the Runner"]
-fn real_claude_adapter_is_prepared_and_served_as_a_registered_root() {
-    let adapter = real_adapter("OULIPOLY_REAL_CLAUDE_ADAPTER");
-    let dir = scratch();
-    let native = dir.path().join("claude");
-    std::fs::write(&native, FAKE_NATIVE_CLAUDE).unwrap();
-    std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let home = dir.path().join("home");
-    std::fs::create_dir(&home).unwrap();
-    let mut value = request(dir.path(), &adapter, &[], "first");
-    value["provider"]["settings"] = json!({
-        "settings_id": "claude-witness",
-        "mode": "headless",
-        "model": { "name": "claude-opus", "provider_args": ["--model", "opus"],
-                   "inputs": { "prompt": null, "named": {} } },
-        "launch": { "command": native, "prompt_mode": "stdin",
-                    "env": { "CALLS": dir.path().join("native-calls") } },
-    });
-    value["provider"]["env"] = json!({ "HOME": home });
-    let mut run = Run::start(dir.path(), &value);
-    let described = run.entry("provider-described");
-    assert_eq!(described["provider_id"], "claude", "{described}");
-    assert_eq!(described["agreed_contract"], "oulipoly.provider/v1");
-    assert_eq!(described["resident_session"], 1);
-    let setup = run.entry("setup-completed");
-    let launch = &setup["launch"];
-    assert_eq!(
-        launch["argv"][0],
-        adapter.to_string_lossy().as_ref(),
-        "{setup}"
-    );
-    assert_eq!(launch["argv"][1], "resident.serve");
-    assert_eq!(launch["acp"]["protocol_version"], 2);
-    assert_eq!(
-        launch["template_env"],
-        json!(["CALLS", "OULIPOLY_TOOL_MEDIATION_V1"])
-    );
-    // The prepared configuration is private to the serving identity through
-    // its directories: the data root (this entry's, 0700) and the adapter's
-    // own configuration directory (0700).
-    let config = launch["argv"][3].as_str().unwrap();
-    assert!(
-        config.starts_with(dir.path().join("launch/provider").to_str().unwrap()),
-        "{config}"
-    );
-    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode(&dir.path().join("launch/provider")), 0o700);
-    assert_eq!(mode(Path::new(config).parent().unwrap()), 0o700, "{config}");
-    let recorded: Value = serde_json::from_str(&std::fs::read_to_string(config).unwrap()).unwrap();
-    let tools: Value = serde_json::from_str(
-        recorded["launch"]["env"]["OULIPOLY_TOOL_MEDIATION_V1"]
-            .as_str()
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(tools["bash"], json!({ "authority": "trusted-task" }));
+/// Copies a completed, discharged fixture only when a qualification caller
+/// asks to retain it. Production Runner never reads these native schemas.
+fn retain_turn_fixture(source: &Path, name: &str) {
+    fn copy(from: &Path, to: &Path) {
+        std::fs::create_dir(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy(&entry.path(), &target);
+            } else if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    if let Some(root) = std::env::var_os("OULIPOLY_REGISTERED_TURN_EVIDENCE") {
+        let root = PathBuf::from(root);
+        std::fs::create_dir_all(&root).unwrap();
+        copy(source, &root.join(name));
+    }
+}
 
-    let launched = run.event("launched");
-    assert_eq!(launched["harness"], "claude", "{launched}");
-    let serve_pid = launched["pid"].as_u64().unwrap();
-    let negotiated = run.event("negotiated");
-    assert_eq!(negotiated["dedup_contract"], true, "{negotiated}");
-    let opened = run.event("session-opened");
-    assert_eq!(opened["harness"], "claude");
-    run.control(json!({ "cmd": "cancel" }));
-    let (terminal, code, seen) = run.end();
-    assert_eq!(code, Some(82), "{terminal}");
-    let owner = seen
-        .iter()
-        .find(|value| value["event"] == "terminal")
-        .expect("owner terminal");
-    assert_eq!(owner["status"], "cancelled", "{owner}");
-    wait_ended(serve_pid, "resident harness");
+/// Both real adapter executables progress through registered administrative
+/// policy/prepare to two actual tool-free fake-native turns and clean close.
+/// The follow-up resumes the same native identity. Each running SDK actor
+/// matches the native's own boot/start and namespace-local proc facts.
+#[test]
+#[ignore = "needs OULIPOLY_REAL_{CLAUDE,CODEX}_ADAPTER, OULIPOLY_REAL_CODEX_MODELS, owner binaries beside Runner and unprivileged user namespaces"]
+fn real_adapters_serve_registered_turns_with_matching_native_actors() {
+    for (variable, id, fake) in [
+        ("OULIPOLY_REAL_CLAUDE_ADAPTER", "claude", FAKE_NATIVE_CLAUDE),
+        ("OULIPOLY_REAL_CODEX_ADAPTER", "codex", FAKE_NATIVE_CODEX),
+    ] {
+        for allow in [false, true] {
+            let adapter = real_adapter(variable);
+            let dir = scratch();
+            let native = dir.path().join(id);
+            std::fs::write(&native, format!("{NATIVE_FACTS}{fake}")).unwrap();
+            std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let home = dir.path().join("home");
+            std::fs::create_dir(&home).unwrap();
+            let mut value = request(dir.path(), &adapter, &[], "first");
+            if allow {
+                value["provider"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("bash_authority");
+                value["provider"]["bash_allow"] = json!(["printf allowed"]);
+            }
+            let env = json!({"CALLS": dir.path().join("native-calls"),
+                "ACTOR_ROOT": dir.path().join("launch/provider"), "SENTINEL": "opaque-env"});
+            value["provider"]["env"] = json!({"HOME": home});
+            value["provider"]["settings"] = if id == "claude" {
+                json!({"settings_id": "claude-witness", "mode": "headless",
+                    "model": {"name": "claude-opus", "provider_args": ["--model", "opus"], "inputs": {"prompt": null, "named": {}}},
+                    "launch": {"command": native, "prompt_mode": "stdin", "env": env}})
+            } else {
+                let config = dir.path().join("config/agent-runner-codex");
+                std::fs::create_dir_all(&config).unwrap();
+                let prompt = dir.path().join("system.md");
+                std::fs::write(&prompt, "tool-free fixture\n").unwrap();
+                std::fs::copy(
+                    std::env::var("OULIPOLY_REAL_CODEX_MODELS").unwrap(),
+                    dir.path().join("models.json"),
+                )
+                .unwrap();
+                // Deliberately absent legacy dependencies: selected mediation
+                // requires only native, prompt and the managed model catalog.
+                std::fs::write(config.join("config.toml"), format!(
+                    "codex_bin = {:?}\nbun_bin = {:?}\nbash_mcp_path = {:?}\nsystem_prompt_file = {:?}\nagent_bash_bin = {:?}\nagent_runner_bin = {:?}\n",
+                    native, dir.path().join("missing-bun"), dir.path().join("missing-mcp.ts"), prompt,
+                    dir.path().join("missing-agent-bash"), dir.path().join("missing-runner"))).unwrap();
+                value["provider"]["config_root"] = json!(dir.path().join("config"));
+                json!({"settings_id": "codex2", "mode": "stdin",
+                    "model": {"name": "gpt-astra-high", "provider_args": ["-m", "gpt-6-astra", "-c", "model_reasoning_effort=\"high\""], "inputs": {"prompt": "prepare sentinel", "named": {}}},
+                    "launch": {"argv": ["codex2", "exec", "--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-6-astra", "-c", "model_reasoning_effort=\"high\""], "env": env}})
+            };
+            let mut run = Run::start(dir.path(), &value);
+            let described = run.entry("provider-described");
+            assert_eq!(described["provider_id"], id, "{described}");
+            assert_eq!(described["agreed_contract"], "oulipoly.provider/v1");
+            assert_eq!(described["resident_session"], 1);
+            assert_eq!(described["tool_mediation"], 1);
+            let setup = run.entry("setup-completed");
+            let launch = &setup["launch"];
+            assert_eq!(
+                launch["argv"][0],
+                adapter.to_string_lossy().as_ref(),
+                "{setup}"
+            );
+            assert_eq!(launch["argv"][1], "resident.serve");
+            assert_eq!(launch["acp"]["protocol_version"], 2);
+            let config = launch["argv"][3].as_str().unwrap();
+            assert!(config.starts_with(dir.path().join("launch/provider").to_str().unwrap()));
+            let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&dir.path().join("launch/provider")), 0o700);
+            assert_eq!(mode(Path::new(config).parent().unwrap()), 0o700);
+            let recorded: Value =
+                serde_json::from_str(&std::fs::read_to_string(config).unwrap()).unwrap();
+            let policy = launch["tools"].clone();
+            let encoded = recorded["launch"]["env"]["OULIPOLY_TOOL_MEDIATION_V1"]
+                .as_str()
+                .unwrap();
+            assert_eq!(serde_json::from_str::<Value>(encoded).unwrap(), policy);
+            let bash = if allow {
+                json!({"allow": ["printf allowed"]})
+            } else {
+                json!({"authority": "trusted-task"})
+            };
+            assert_eq!(policy["bash"], bash);
+            assert_eq!(launch["effective_mediation"]["bash"], bash);
+            assert_eq!(policy["requester"], value["provider"]["agent_bash_bin"]);
+            assert_eq!(recorded["launch"]["env"]["SENTINEL"], "opaque-env");
+            let launched = run.event("launched");
+            assert_eq!(launched["harness"], id);
+            let serve_pid = launched["pid"].as_u64().unwrap();
+            let harness_ns = std::fs::read_link(format!("/proc/{serve_pid}/ns/pid")).unwrap();
+            let negotiated = run.event("negotiated");
+            assert_eq!(negotiated["dedup_contract"], true);
+            let opened = run.event("session-opened");
+            let mut turns = Vec::new();
+            for (index, prompt) in [(0, "first"), (1, "second")] {
+                if index == 1 {
+                    run.control(json!({"cmd": "send", "text": prompt, "ref": "f1"}));
+                    assert_eq!(run.event("follow-up-admitted")["input"], 1);
+                }
+                let ack = run.until("native ACK", |v| v["event"] == "ack" && v["index"] == index);
+                let reply = run.until("attributed reply", |v| {
+                    v["event"] == "agent-message" && v["input"] == index
+                });
+                let turn = run.until("attributed turn end", |v| {
+                    v["event"] == "turn-end" && v["input"] == index
+                });
+                assert_eq!(
+                    reply["text"].as_str().unwrap().trim_end(),
+                    format!("reply to {prompt}")
+                );
+                assert_eq!(ack["harness"], id);
+                for event in [&reply, &turn] {
+                    assert_eq!(event["harness"], id);
+                    assert_eq!(event["session"], opened["session"]);
+                }
+                assert_eq!(reply["parent_message_id"], ack["message_id"]);
+                assert_eq!(turn["message_id"], ack["message_id"]);
+                assert_eq!(turn["own_output"], true);
+                turns.push(turn);
+            }
+            assert_eq!(turns[1]["session"], turns[0]["session"]);
+            run.control(json!({"cmd": "close"}));
+            let (terminal, code, seen) = run.end();
+            assert_eq!(code, Some(87), "{terminal}");
+            let owner = seen.iter().find(|v| v["event"] == "terminal").unwrap();
+            assert_eq!(owner["status"], "closed");
+            assert_eq!(owner["owed"], 0);
+            assert_eq!(owner["all_harnesses_reaped"], true);
+            assert_eq!(owner["root_pid1"]["end_observed"], true);
+            assert_eq!(owner["root_pid1"]["status"], "code:0");
+            assert_eq!(owner["root_pid1"]["live"], json!([]));
+            let exited = seen.iter().find(|v| v["event"] == "exited").unwrap();
+            assert_eq!(exited["harness"], id);
+            assert_eq!(exited["namespace"]["drained"], true);
+            assert_eq!(exited["reaped"], "work-pid1-wait");
+            assert!(ended(serve_pid), "harness still live after terminal");
+            let natives: Vec<Value> = std::fs::read_to_string(dir.path().join("native-calls"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(natives.len(), 2, "{natives:?}");
+            let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+            for (index, call) in natives.iter().enumerate() {
+                println!("registered-native adapter={id} allow={allow} input={index}: {call}");
+                let pid = call["pid"].as_i64().unwrap();
+                assert_eq!(call["proc_self_link"], pid.to_string());
+                assert_eq!(call["proc_self_pid"], pid);
+                assert_eq!(call["nspid"], json!([pid.to_string()]));
+                assert_eq!(Path::new(call["pidns"].as_str().unwrap()), harness_ns);
+                assert_eq!(call["pgid"], pid);
+                assert_eq!(call["boot_id"], boot.trim());
+                let actors = call["actors"].as_array().unwrap();
+                assert_eq!(actors.len(), 1, "{call}");
+                assert_eq!(actors[0]["phase"], "running");
+                let settled: Value = serde_json::from_str(
+                    &std::fs::read_to_string(actors[0]["path"].as_str().unwrap()).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(settled["phase"], "complete");
+                assert_eq!(settled["exit_code"], 0);
+                assert!(settled["actor_id"].is_null());
+                assert!(settled["incarnation"].is_null());
+                assert_eq!(
+                    actors[0]["incarnation"],
+                    format!(
+                        "linux:{}:{}",
+                        boot.trim(),
+                        call["start_ticks"].as_str().unwrap()
+                    )
+                );
+                assert_eq!(
+                    serde_json::from_str::<Value>(call["tools"].as_str().unwrap()).unwrap(),
+                    policy
+                );
+                assert_eq!(call["ingress"], true);
+                assert_eq!(call["sentinel"], "opaque-env");
+                assert_eq!(call["prompt"], if index == 0 { "first" } else { "second" });
+            }
+            assert_ne!(
+                natives[1]["actors"][0]["path"],
+                natives[0]["actors"][0]["path"]
+            );
+            assert!(!natives[0]["native_session"].as_str().unwrap().is_empty());
+            assert_eq!(natives[1]["native_session"], natives[0]["native_session"]);
+            let argv = natives[1]["argv"].as_array().unwrap();
+            let resume = if id == "claude" { "--resume" } else { "resume" };
+            let at = argv
+                .iter()
+                .position(|arg| arg == resume)
+                .expect("follow-up resumes");
+            assert_eq!(argv[at + 1], natives[0]["native_session"]);
+            std::fs::write(
+                dir.path().join("events.json"),
+                serde_json::to_vec_pretty(&seen).unwrap(),
+            )
+            .unwrap();
+            retain_turn_fixture(
+                dir.path(),
+                &format!("{id}-{}", if allow { "allow" } else { "trusted" }),
+            );
+        }
+    }
 }
 
 /// A wrapper around a real provider adapter whose `describe` answer gains
