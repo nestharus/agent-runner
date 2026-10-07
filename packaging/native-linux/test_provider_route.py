@@ -218,6 +218,21 @@ elif op == "resident.serve":
 '''
 
 
+def stop(entry):
+    """Ends an entry still running after a failure through its own cancel, so
+    the owner settles its root before tearDown removes the store; a kill is
+    the last resort and can leave the root's harness running."""
+    if entry.poll() is not None:
+        return
+    try:
+        entry.stdin.write(b'{"cmd":"cancel"}\n')
+        entry.stdin.flush()
+        entry.wait(timeout=30)
+    except (BrokenPipeError, subprocess.TimeoutExpired):
+        entry.kill()
+        entry.wait()
+
+
 @unittest.skipUnless(RUNNER, "set OULIPOLY_RUNNER to a built oulipoly-agent-runner with the root supervisor binaries and deterministic peer beside it")
 class EntryContract(unittest.TestCase):
     def setUp(self):
@@ -291,9 +306,7 @@ class EntryContract(unittest.TestCase):
             self.lines_until(entry, lambda v: v.get("entry") == "terminal", seen)
             self.assertEqual(entry.wait(timeout=60), 87, seen)
         finally:
-            if entry.poll() is None:
-                entry.kill()
-                entry.wait()
+            stop(entry)
         setup = next(v for v in seen if v.get("entry") == "setup-completed")
         self.assertEqual(setup["harness"], "registered-provider")
         self.assertEqual(setup["launch"]["tools"]["bash"], {"allow": ["git status"]})
@@ -305,8 +318,11 @@ class EntryContract(unittest.TestCase):
     def test_provider_without_the_resident_capability_is_refused_after_it_ran(self):
         entry = self.entry(resident=False)
         seen = []
-        terminal = self.lines_until(entry, lambda v: v.get("entry") == "terminal", seen)
-        self.assertEqual(entry.wait(timeout=60), 65, seen)
+        try:
+            terminal = self.lines_until(entry, lambda v: v.get("entry") == "terminal", seen)
+            self.assertEqual(entry.wait(timeout=60), 65, seen)
+        finally:
+            stop(entry)
         self.assertEqual(terminal["stage"], "provider-refused")
         self.assertEqual(terminal["effects"], {"runner_setup": "none", "provider": "unknown: it ran"})
         self.assertEqual(self.calls(), ["describe"])
