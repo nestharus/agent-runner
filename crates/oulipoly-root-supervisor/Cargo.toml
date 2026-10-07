@@ -25,8 +25,8 @@ test = false
 name = "oulipoly-root-bash"
 path = "src/bin/root_bash.rs"
 
-# Prototype requester of a root's registered children (see `children`
-# module docs): what a parent's explore tool does, for process tests.
+# Production Linux requester of a root's registered children (see `children`
+# module docs), offered by the caller to a registered parent's explore bridge.
 [[bin]]
 name = "oulipoly-root-child"
 path = "src/bin/root_child.rs"

@@ -575,7 +575,7 @@ impl Peer {
     }
 }
 
-/// Asks for one registered child (`ROUTE:QUESTION`) through the prototype
+/// Asks for one registered child (`ROUTE:QUESTION`) through the production
 /// child requester and returns its stdout (the result or refusal line).
 fn run_child(request: &str) -> String {
     let client = std::env::current_exe()
