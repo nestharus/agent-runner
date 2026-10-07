@@ -4351,6 +4351,101 @@ fn continue_attached_with_an_unended_turn_is_unknown_and_close_is_not_applied() 
     assert_eq!(prompts(&dir), 1);
 }
 
+/// ROOT's gate-only recovery goal: a retry refusal cannot settle an earlier
+/// unknown insertion for admission or ordinary close, under either capability
+/// declaration. This exercises the owner that actually receives the refusal.
+#[test]
+fn retry_refusal_with_declared_reattach_keeps_prior_turn_unresolved() {
+    retry_refusal_keeps_prior_turn_unresolved(false);
+}
+
+#[test]
+fn retry_refusal_without_reattach_keeps_prior_turn_unresolved() {
+    retry_refusal_keeps_prior_turn_unresolved(true);
+}
+
+fn retry_refusal_keeps_prior_turn_unresolved(absent: bool) {
+    let dir = Scratch::new("retry-refusal-unknown");
+    let script = dir.0.join("peer.py");
+    std::fs::write(&script, include_str!("fixtures/unknown_turn_retry_peer.py")).unwrap();
+    let mut argv = vec![
+        "/usr/bin/python3".to_owned(),
+        script.display().to_string(),
+        dir.0.display().to_string(),
+    ];
+    if absent {
+        argv.push("--no-reattach".to_owned());
+    }
+    let mut first = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            3,
+            json!([{ "id": "h", "argv": argv, "messages": ["original"] }]),
+        ),
+    );
+    let pid = first.event("h", "launched")["pid"].as_u64().unwrap();
+    first.event("h", "session-opened");
+    wait_file(&dir.0.join("prior-insertion.json"));
+    first.kill();
+    assert!(alive(pid));
+
+    let mut second = Run::start(&dir, &recover_for(&dir, "continue-attached"));
+    assert_eq!(second.event("h", "rejected")["code"], -32011);
+    second.control(r#"{"cmd":"send","ref":"distinct","text":"new caller"}"#);
+    let decision = second.until("admission decision", |v| {
+        v["event"] == "follow-up-refused" || v["event"] == "follow-up-admitted"
+    });
+    assert_eq!(decision["event"], "follow-up-refused", "{decision}");
+    second.control(r#"{"cmd":"close"}"#);
+    assert_eq!(
+        second.event("h", "close-not-applied")["reason"],
+        "delivery-unresolved"
+    );
+    assert!(alive(pid), "ordinary close must preserve the unknown turn");
+    assert!(alive(u64::from(second.supervisor_pid())));
+    second.cancel();
+    let (terminal, status, seen) = second.terminal();
+    assert_eq!(status.code(), Some(2), "{terminal}");
+    assert_eq!(terminal["status"], "cancelled");
+    assert_eq!(harness(&terminal, "h")["close"], "not-stopped-by-close");
+    assert!(events(&seen, "h", "close-stopping").is_empty());
+    let conn = db(&dir);
+    assert_eq!(count(&conn, "SELECT count(*) FROM message"), 1);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM attempt WHERE outcome = 'unknown-prior-owner'"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM attempt WHERE outcome = 'rejected'"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM message WHERE ack_generation IS NOT NULL OR turn_end_generation IS NOT NULL"
+        ),
+        0
+    );
+    let wire = std::fs::read_to_string(dir.0.join("wire.jsonl")).unwrap();
+    let requests: Vec<Value> = wire
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|v| v["direction"] == "recv" && v["value"]["method"] == "session/prompt")
+        .collect();
+    assert_eq!(requests.len(), 2, "no new caller reached the peer");
+    assert_eq!(
+        requests[0]["value"]["params"]["_meta"],
+        requests[1]["value"]["params"]["_meta"]
+    );
+}
+
 /// The declaration recorded at the first negotiation is necessary, not
 /// sufficient: a harness that does not declare it again when the new owner
 /// negotiates is not conversed with (`capability-withdrawn`), and its
