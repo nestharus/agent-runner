@@ -37,7 +37,12 @@ fn sibling(name: &str) -> PathBuf {
 /// The stand-in provider. `edit` is Python run before it answers, with
 /// `op`, `request` and `caps` in scope. Its `resident.serve` reads the
 /// prepared configuration and runs the peer with the flags the policy put
-/// in its argv after `--peer`.
+/// in its argv after `--peer`. Selected, it advertises exploration, echoes
+/// an offer and reports `fake_explore` (a stand-in native name) for it;
+/// it records what each serve's configuration and process environment
+/// carry of an offer. The peer's `explore:` uses the `oulipoly-root-child`
+/// beside it, which a test offers as the requester: stand-in native and
+/// configuration evidence, not a provider's bridge.
 fn provider(dir: &Path, edit: &str) -> PathBuf {
     let path = dir.join("provider");
     let source = format!(
@@ -51,6 +56,9 @@ record = {{"op": op, "euid": os.geteuid(), "argv": sys.argv[1:], "cwd": os.getcw
 if op == "resident.serve":
     record["env"] = sorted(os.environ)
     record["declared"] = os.environ.get("REGISTERED_WITNESS")
+    record["process_offer"] = os.environ.get("OULIPOLY_EXPLORATION_V1")
+    served = json.loads(open(sys.argv[sys.argv.index("--config") + 1], "rb").read())
+    record["config_offer"] = (served.get("env") or {{}}).get("OULIPOLY_EXPLORATION_V1")
 with open(CALLS, "a") as f:
     f.write(json.dumps(record) + "\n")
 def answer(result):
@@ -69,6 +77,14 @@ marker.update(tool="fake_mediated_bash", native_tools=["fake_mediated_bash"])
 markers = [{{"name": "oulipoly.tool_mediation/v1", "value": marker}}]
 if request and request["host"].get("env", {{}}).get("OULIPOLY_HOST_TOOL_MEDIATION_V1") == "1":
     caps["tool_mediation_v1"] = True
+if request and request["host"].get("env", {{}}).get("OULIPOLY_HOST_EXPLORATION_V1") == "1":
+    caps["exploration_v1"] = True
+exploration_env = request and request["params"].get("launch", {{}}).get("env", {{}}).get("OULIPOLY_EXPLORATION_V1")
+if exploration_env:
+    offered = json.loads(exploration_env)
+    markers.append({{"name": "oulipoly.exploration/v1", "value": {{"protocol": offered["protocol"],
+        "routes": offered["routes"], "tool": "fake_explore", "ingress_env": offered["ingress_env"]}}}})
+    marker["native_tools"].append("fake_explore")
 {edit}
 if op == "describe":
     answer({{"provider_id": "stand-in-external", "display_name": "Stand-in external provider",
@@ -76,7 +92,10 @@ if op == "describe":
             "capabilities": caps}})
 elif op == "policy.evaluate":
     flags = request["params"]["launch"].get("peer_flags", [])
-    answer({{"accepted": True, "argv": ["native", "--peer"] + flags, "env": {{"NATIVE_POLICY": "1", "OULIPOLY_TOOL_MEDIATION_V1": mediation_env}},
+    env = {{"NATIVE_POLICY": "1", "OULIPOLY_TOOL_MEDIATION_V1": mediation_env}}
+    if exploration_env:
+        env["OULIPOLY_EXPLORATION_V1"] = exploration_env
+    answer({{"accepted": True, "argv": ["native", "--peer"] + flags, "env": env,
             "stdin": None, "prompt": None, "diagnostics": [], "markers": markers}})
 elif op == "resident.prepare":
     data = request["host"]["data_root"]
@@ -906,6 +925,357 @@ emit({'type': 'turn.started'})
 emit({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'reply to %s' % prompt}})
 emit({'type': 'turn.completed', 'usage': {'input_tokens': 1, 'output_tokens': 1}})
 "#;
+
+/// Copies a finished scenario's directory (request, provider calls,
+/// prepared configurations, store) to `OULIPOLY_TEST_RETAIN_DIR/<name>`
+/// when that is set, for later reading.
+fn retain(dir: &Path, name: &str) {
+    if let Some(root) = std::env::var_os("OULIPOLY_TEST_RETAIN_DIR") {
+        let to = Path::new(&root).join(name);
+        let status = Command::new("cp")
+            .args(["-a", "--no-dereference"])
+            .arg(dir)
+            .arg(&to)
+            .status()
+            .unwrap();
+        println!("retained {name} at {}: {status}", to.display());
+    }
+}
+
+/// A registered parent with one registered child route, the child being
+/// the same stand-in provider, offered through `oulipoly-root-child`.
+fn exploring(dir: &Path, executable: &Path, message: &str) -> Value {
+    let mut value = request(dir, executable, &[], message);
+    value["provider"]["root_child_bin"] = json!(sibling("oulipoly-root-child"));
+    value["children"] = json!({
+        "routes": { "luna": { "registered": {
+            "executable": executable,
+            "settings": value["provider"]["settings"].clone(),
+            "env": { "PROVIDER_ONLY": "1" },
+            "agent_bash_bin": value["provider"]["agent_bash_bin"].clone(),
+        }, "slots": 2 } },
+        "max_starts": 2, "max_concurrent": 1,
+    });
+    value
+}
+
+/// G2 join, as stand-in native and configuration evidence only: the
+/// stand-in provider and deterministic peer stand for a native CLI and
+/// provider bridge. A registered parent with child routes selects
+/// exploration and is offered exactly its configured route, the named
+/// requester and the owner's ingress; its prepared configuration carries
+/// that offer. Asking through that requester reaches the owner, which
+/// admits prepared slots in order, refuses the child's own request (depth)
+/// and refuses beyond the root's starts. The child's describe, policy and
+/// prepare select and carry no exploration, and its serving process and
+/// configuration carry no offer.
+#[test]
+#[ignore = "needs oulipoly-root-supervisor, oulipoly-root-pid1, oulipoly-root-bash, oulipoly-root-child and oulipoly-acp-deterministic-peer built beside the Runner (cargo build -p oulipoly-root-supervisor --bins) and unprivileged user namespaces"]
+fn registered_parent_explores_its_offered_route_through_the_owner() {
+    let dir = scratch();
+    let executable = provider(dir.path(), "");
+    let root_child = sibling("oulipoly-root-child");
+    let mut run = Run::start(
+        dir.path(),
+        &exploring(
+            dir.path(),
+            &executable,
+            "explore:luna:explore:luna:grandchild",
+        ),
+    );
+    let described = run.entry("provider-described");
+    assert_eq!(described["exploration"], 1, "{described}");
+    let child_described = run.until("child described", |value| {
+        value["entry"] == "provider-described" && value["child_route"] == "luna"
+    });
+    assert_eq!(child_described["exploration"], Value::Null);
+    let setup = run.entry("setup-completed");
+    let launch = &setup["launch"];
+    let offer = &launch["exploration"];
+    assert_eq!(offer["protocol"], "oulipoly.exploration/v1", "{setup}");
+    assert_eq!(offer["routes"], json!(["luna"]));
+    assert_eq!(offer["requester"], root_child.to_string_lossy().as_ref());
+    assert_eq!(offer["ingress_env"], "OULIPOLY_ROOT_BASH_V1");
+    assert_eq!(
+        offer["limits"],
+        json!({ "max_starts": 2, "max_concurrent": 1 })
+    );
+    assert_eq!(launch["exploration_version"], 1);
+    assert_eq!(launch["effective_exploration"]["tool"], "fake_explore");
+    assert_eq!(launch["effective_exploration"]["routes"], json!(["luna"]));
+    assert!(
+        launch["effective_mediation"]["native_tools"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("fake_explore"))
+    );
+    assert!(
+        launch["exploration_evidence"]
+            .as_str()
+            .unwrap()
+            .contains("not admission")
+    );
+    let child_receipt = &setup["children"]["luna"];
+    assert!(
+        child_receipt["exploration"]
+            .as_str()
+            .unwrap()
+            .starts_with("none offered or selected"),
+        "{child_receipt}"
+    );
+    assert_eq!(child_receipt["slots"].as_array().unwrap().len(), 2);
+
+    let parent = "stand-in-external";
+    let reply = |run: &mut Run, input: u64| {
+        let message = run.until("parent reply", move |value| {
+            value["harness"] == parent
+                && value["event"] == "agent-message"
+                && value["input"] == input
+        });
+        run.until("parent turn end", move |value| {
+            value["harness"] == parent && value["event"] == "turn-end" && value["input"] == input
+        });
+        message["text"].as_str().unwrap().to_owned()
+    };
+    // The child answered; its answer is its own refused request (depth).
+    let first = reply(&mut run, 0);
+    assert!(first.starts_with("exit=Some(0)"), "{first}");
+    assert!(first.contains(r#""outcome":"answered""#), "{first}");
+    assert!(
+        first.contains("exit=Some(65)") && first.contains("depth"),
+        "{first}"
+    );
+    run.control(json!({ "cmd": "send", "text": "explore:luna:echo:second", "ref": "e2" }));
+    let second = reply(&mut run, 1);
+    assert!(second.starts_with("exit=Some(0)"), "{second}");
+    assert!(second.contains(r#""answer":"second""#), "{second}");
+    // Beyond the root's starts: refused by the owner, nothing admitted.
+    run.control(json!({ "cmd": "send", "text": "explore:luna:echo:third", "ref": "e3" }));
+    let third = reply(&mut run, 2);
+    assert!(third.starts_with("exit=Some(65)"), "{third}");
+    run.control(json!({ "cmd": "close" }));
+    let (terminal, code, seen) = run.end();
+    assert_eq!(code, Some(87), "{terminal}");
+    let refusals: Vec<&Value> = seen
+        .iter()
+        .filter(|value| value["event"] == "child-refused")
+        .collect();
+    assert_eq!(refusals.len(), 2, "{refusals:?}");
+    let reason = |index: usize| refusals[index]["reason"].as_str().unwrap();
+    assert!(reason(0).starts_with("depth"), "{refusals:?}");
+    assert_ne!(refusals[0]["harness"], parent);
+    assert!(reason(1).starts_with("budget-starts"), "{refusals:?}");
+    assert_eq!(refusals[1]["harness"], parent);
+    let results: Vec<&Value> = seen
+        .iter()
+        .filter(|value| value["event"] == "child-result")
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|result| result["outcome"] == "answered"));
+
+    // Provider operations: the parent's three select exploration and its
+    // policy and prepare carry the offer; the child's four select nothing.
+    let calls = calls(dir.path());
+    let ops: Vec<&str> = calls
+        .iter()
+        .map(|call| call["op"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ops,
+        [
+            "describe",
+            "policy.evaluate",
+            "resident.prepare",
+            "describe",
+            "policy.evaluate",
+            "resident.prepare",
+            "resident.prepare",
+            "resident.serve",
+            "resident.serve",
+            "resident.serve",
+        ]
+    );
+    for call in &calls[..3] {
+        assert_eq!(
+            call["request"]["host"]["env"]["OULIPOLY_HOST_EXPLORATION_V1"],
+            "1"
+        );
+    }
+    for call in &calls[1..3] {
+        let carried: Value = serde_json::from_str(
+            call["request"]["params"]["launch"]["env"]["OULIPOLY_EXPLORATION_V1"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(&carried, offer);
+    }
+    for call in &calls[3..7] {
+        let text = call["request"].to_string();
+        assert!(!text.contains("EXPLORATION"), "child operation: {text}");
+    }
+    // Serving: the parent's configuration carries the offer; no serving
+    // process (parent or children) has it in its environment, and neither
+    // child's configuration has it.
+    let serves = &calls[7..];
+    let parent_serve = serves
+        .iter()
+        .find(|serve| {
+            serve["argv"][2]
+                .as_str()
+                .unwrap()
+                .contains("/launch/provider/")
+        })
+        .unwrap();
+    let served: Value =
+        serde_json::from_str(parent_serve["config_offer"].as_str().unwrap()).unwrap();
+    assert_eq!(&served, offer);
+    let child_serves: Vec<&Value> = serves
+        .iter()
+        .filter(|serve| {
+            serve["argv"][2]
+                .as_str()
+                .unwrap()
+                .contains("/child-slots/luna/")
+        })
+        .collect();
+    assert_eq!(child_serves.len(), 2);
+    for serve in serves {
+        assert_eq!(serve["process_offer"], Value::Null, "{serve}");
+        assert!(
+            serve["env"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("OULIPOLY_ROOT_BASH_V1"))
+        );
+    }
+    for serve in &child_serves {
+        assert_eq!(serve["config_offer"], Value::Null, "{serve}");
+    }
+    // Durable owner records: two children on the route, in slot order.
+    let db = rusqlite::Connection::open_with_flags(
+        dir.path().join("store/intent.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let rows: Vec<(String, String)> = db
+        .prepare("SELECT route, outcome FROM child ORDER BY rowid")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("luna".to_owned(), "answered".to_owned()),
+            ("luna".to_owned(), "answered".to_owned())
+        ]
+    );
+    drop(db);
+    retain(dir.path(), "explores-offered-route");
+}
+
+/// Explicit refusals of the exploration join, with what ran: a parent with
+/// routes but no requester, a caller's own offer in the root's environment
+/// or a child's settings run nothing (64); a provider without exploration
+/// is refused after describe alone, and a marker contradicting the offer
+/// after policy, before any setup (65).
+#[test]
+#[ignore = "needs oulipoly-root-supervisor, oulipoly-root-pid1, oulipoly-root-bash, oulipoly-root-child and oulipoly-acp-deterministic-peer built beside the Runner (cargo build -p oulipoly-root-supervisor --bins) and unprivileged user namespaces"]
+fn exploration_join_refusals_say_what_ran() {
+    let refuse = |name: &str, edit: &dyn Fn(&mut Value), python: &str, code: i32, ran: &[&str]| {
+        let dir = scratch();
+        let executable = provider(dir.path(), python);
+        let mut value = exploring(dir.path(), &executable, "echo:never");
+        edit(&mut value);
+        let run = Run::start(dir.path(), &value);
+        let (terminal, status, _) = run.end();
+        assert_eq!(status, Some(code), "{name}: {terminal}");
+        assert_eq!(ops(dir.path()), ran, "{name}");
+        assert!(!dir.path().join("launch").exists(), "{name}");
+        assert!(!dir.path().join("store").exists(), "{name}");
+        retain(dir.path(), &format!("refusal-{name}"));
+        terminal
+    };
+    let missing = refuse(
+        "no-requester",
+        &|value| {
+            value["provider"]
+                .as_object_mut()
+                .unwrap()
+                .remove("root_child_bin");
+        },
+        "",
+        64,
+        &[],
+    );
+    assert!(
+        missing["reason"]
+            .as_str()
+            .unwrap()
+            .contains("root_child_bin"),
+        "{missing}"
+    );
+    let ambient = refuse(
+        "root-env-offer",
+        &|value| value["env"]["OULIPOLY_EXPLORATION_V1"] = json!("{}"),
+        "",
+        64,
+        &[],
+    );
+    assert!(
+        ambient["reason"].as_str().unwrap().contains("to offer"),
+        "{ambient}"
+    );
+    let child = refuse(
+        "child-settings-offer",
+        &|value| {
+            value["children"]["routes"]["luna"]["registered"]["settings"]["launch"]["env"] =
+                json!({ "OULIPOLY_EXPLORATION_V1": "{}" })
+        },
+        "",
+        64,
+        &[],
+    );
+    assert!(
+        child["reason"]
+            .as_str()
+            .unwrap()
+            .contains("this entry's to set"),
+        "{child}"
+    );
+    let undeclared = refuse(
+        "no-exploration",
+        &|_| {},
+        "caps.pop('exploration_v1', None)",
+        65,
+        &["describe"],
+    );
+    assert_eq!(undeclared["operation"], "describe");
+    assert!(
+        undeclared["reason"]
+            .as_str()
+            .unwrap()
+            .contains("declares no exploration"),
+        "{undeclared}"
+    );
+    let contradicted = refuse(
+        "marker-routes",
+        &|_| {},
+        "if op == 'policy.evaluate':\n    markers[-1]['value']['routes'] = ['other']",
+        65,
+        &["describe", "policy.evaluate"],
+    );
+    assert_eq!(contradicted["operation"], "policy.evaluate");
+    assert!(
+        contradicted["reason"]
+            .as_str()
+            .unwrap()
+            .contains("effective exploration"),
+        "{contradicted}"
+    );
+}
 
 fn real_adapter(variable: &str) -> PathBuf {
     let path = std::env::var(variable)
