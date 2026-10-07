@@ -1550,6 +1550,7 @@ impl Worker {
         let session = session.to_owned();
         let position = self.position;
         let mut seen = client.events().len();
+        let mut close_unknown_reported = false;
         self.inbox.open();
         'conversation: loop {
             while let Some(index) = self.head() {
@@ -1656,9 +1657,9 @@ impl Worker {
                     self.report(json!({
                         "event": "rejected", "index": index, "code": code, "durable": true,
                     }));
-                    // Conclusive rejection ends this logical input without an
-                    // ACK or turn end. Release it only after durable resolution;
-                    // unknown delivery remains open and never licenses replay.
+                    // This refusal resolves only its own attempt. Remove its
+                    // attribution entry after durable resolution; historical
+                    // uncertainty still gates admission and close below.
                     self.view(|view| view.open.retain(|input| input.index != index));
                     if let Some(work) = self.completion_of.remove(&index) {
                         self.settle_async(work, "undelivered", Some("not-acknowledged: rejected"));
@@ -1683,12 +1684,18 @@ impl Worker {
                 // Close waits for owed background completions as well: the
                 // harness stays live until each one's carrying turn ended or
                 // it was settled undelivered (cancel/deadline end it sooner).
-                if self.closing.requested()
-                    && !self.close_stop_attempted
-                    && self.no_open_input()
-                    && self.owed_async() == 0
-                {
-                    self.stop_for_close(live);
+                if self.closing.requested() && !self.close_stop_attempted {
+                    if self.no_open_input() && self.owed_async() == 0 {
+                        self.stop_for_close(live);
+                    } else if !close_unknown_reported && let Err(reason) = self.settled_turns() {
+                        self.report(json!({
+                                "event": "close-not-applied",
+                                "work": live.work,
+                                "reason": reason,
+                                "meaning": "a close never cuts an unresolved turn; this conversation stays live until its end is reported or the caller cancels",
+                            }));
+                        close_unknown_reported = true;
+                    }
                 }
                 observed.wake_armed.set(true);
                 // Publish on event arrival while the turn is still open.
@@ -1722,14 +1729,18 @@ impl Worker {
         }
     }
 
-    /// Whether every input on this session has a tagged turn end or a
-    /// durably resolved conclusive rejection (neither proves processing).
+    /// No input is open in this connection or unresolved in its durable
+    /// history. A refusal of a retry cannot settle an earlier unknown
+    /// insertion. This same floor gates caller/held-completion admission
+    /// and ordinary close (neither tagged ends nor refusals prove processing).
     fn no_open_input(&self) -> bool {
-        self.views
-            .lock()
-            .expect("views")
-            .get(self.position)
-            .is_none_or(|view| view.open.is_empty())
+        self.settled_turns().is_ok()
+            && self
+                .views
+                .lock()
+                .expect("views")
+                .get(self.position)
+                .is_none_or(|view| view.open.is_empty())
     }
 
     /// The caller closed the conversation and no logical input or async
