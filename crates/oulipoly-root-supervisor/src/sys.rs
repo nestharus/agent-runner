@@ -75,7 +75,8 @@ pub fn pidfd_exited(fd: &OwnedFd, timeout_ms: i32) -> io::Result<bool> {
 }
 
 /// The pid named by a pidfd in the PID namespace of the mounted `/proc`
-/// (the host's, for every process here).
+/// (the host's, for the owner, root PID 1 and work PID 1s; only a work's
+/// own processes see a `/proc` of their own).
 pub fn pidfd_host_pid(fd: &OwnedFd) -> io::Result<i32> {
     let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd()))?;
     info.lines()
