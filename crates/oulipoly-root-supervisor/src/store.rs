@@ -64,6 +64,15 @@
 //!   settlement. Earlier unresolved recipient obligations remain explicitly
 //!   unknown across owner churn, including after run end. No recipient is
 //!   reconstructed. Other schemas are refused, not migrated.
+//! * Version 11 links an owner completion message to the Bash work it
+//!   completes (`completion_work`, unique): at most one logical admission per
+//!   accepted completion in the root, across every generation. A later owner
+//!   reconciles a linked message whose ACK and tagged turn end are durable
+//!   (`turn-ended`), offers a never-admitted known async completion once to
+//!   the same requester work when that conversation is recovered live-usable,
+//!   leaves an admitted one whose insertion or turn is unresolved unknown, and
+//!   records a never-admitted one undelivered once its requester work's end is
+//!   recorded. No migration: other schemas are refused.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -82,7 +91,7 @@ pub(crate) const LOCK_FILE: &str = "owner.lock";
 pub(crate) const DB_FILE: &str = "intent.sqlite3";
 /// Version of this new per-root lineage. There is no migration chain: a
 /// store of any other version is refused.
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 /// How long a write waits for a foreign SQLite lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -148,6 +157,7 @@ CREATE TABLE message (
     producer TEXT CHECK (producer IN ('caller', 'owner')),
     admitted_generation INTEGER,
     turn_end_generation INTEGER,
+    completion_work INTEGER UNIQUE REFERENCES bash_run(work),
     PRIMARY KEY (harness, idx)
 );
 CREATE TABLE root (
@@ -307,6 +317,8 @@ pub(crate) struct DurableMessage {
     pub(crate) unknown_attempts: u32,
     /// A tagged idle covered its acknowledged insertion (durably recorded).
     pub(crate) turn_ended: bool,
+    /// The Bash work whose completion this owner message carries.
+    pub(crate) completion_work: Option<i64>,
 }
 
 /// An earlier admission of the same caller `ref` in this root.
@@ -326,6 +338,22 @@ pub(crate) enum Admission {
     Admitted(usize, OutboundMessage),
     /// The same caller `ref` was already admitted: nothing was written.
     Duplicate(EarlierRef),
+    /// An owner completion that is not admitted again, and why: an earlier
+    /// admission of it, a recorded resolution, or another requester work.
+    /// Nothing was written.
+    NotReoffered(String),
+}
+
+/// A known async completion accepted by an earlier owner generation whose
+/// run has ended and which no generation ever admitted as an input.
+#[derive(Debug, Clone)]
+pub(crate) struct RecoverableCompletion {
+    pub(crate) work: i64,
+    pub(crate) accepted_generation: i64,
+    pub(crate) argv: Vec<String>,
+    /// The run's recorded end, and its observer when it was a waiter's.
+    pub(crate) outcome: String,
+    pub(crate) observer: Option<String>,
 }
 
 pub(crate) struct DurableHarness {
@@ -409,6 +437,12 @@ pub(crate) struct Claimed {
     pub(crate) harnesses: Vec<DurableHarness>,
     /// Earlier-generation attempts this claim classified as unknown.
     pub(crate) classified_unknown: u32,
+    /// Completions whose linked message's ACK and tagged turn end were
+    /// durable while the completion itself was unresolved: now `turn-ended`.
+    pub(crate) completions_reconciled: Vec<i64>,
+    /// Never-admitted completions whose requester work's end was recorded:
+    /// now `undelivered` (`requester-ended-before-admission`).
+    pub(crate) completions_requester_ended: Vec<i64>,
     pub(crate) root_id: String,
     /// The latest root PID 1 incarnation not recorded as ended, if any.
     pub(crate) live_incarnation: Option<IncarnationRow>,
@@ -498,6 +532,8 @@ impl Store {
              WHERE outcome IS NULL AND generation < ?2",
             params![UNKNOWN_PRIOR_OWNER, generation],
         )?;
+        let completions_reconciled = reconcile_completions(&tx, generation)?;
+        let completions_requester_ended = orphaned_completions(&tx, generation, None)?;
         let existing: Option<(u32, u32, String, String, Option<String>)> = tx
             .query_row(
                 "SELECT outage_closure_cap, delivery_attempt_cap, cwd, workload, children FROM intent",
@@ -640,6 +676,8 @@ impl Store {
             workload,
             harnesses,
             classified_unknown: u32::try_from(classified_unknown).unwrap_or(u32::MAX),
+            completions_reconciled,
+            completions_requester_ended,
             root_id,
             live_incarnation,
             open_bash,
@@ -759,6 +797,12 @@ impl Store {
     /// Returns its index and the message to deliver, or, for a caller's
     /// input (`by_ref`) whose `ref` was already admitted in this root (by
     /// any generation), that earlier admission, writing nothing.
+    ///
+    /// An owner completion (`completion`: its Bash work, and the requester
+    /// work it must still belong to when recovered) is linked to that work
+    /// in the same commit. It is not admitted again once any generation
+    /// admitted it or its completion was resolved, and a recovered one only
+    /// for its own requester work.
     pub(crate) fn admit_follow_up(
         &mut self,
         harness: usize,
@@ -766,9 +810,15 @@ impl Store {
         caller_ref: Option<&str>,
         text: &str,
         by_ref: bool,
+        completion: Option<(i64, Option<i64>)>,
     ) -> Result<Admission, StoreError> {
         let generation = self.generation;
         self.write(|tx| {
+            if let Some((work, recipient)) = completion
+                && let Some(reason) = completion_not_admissible(tx, work, recipient)?
+            {
+                return Ok(Admission::NotReoffered(reason));
+            }
             if let Some(earlier) = caller_ref
                 .filter(|_| by_ref)
                 .map(|caller_ref| earlier_ref(tx, caller_ref))
@@ -785,8 +835,8 @@ impl Store {
             let message = OutboundMessage::fresh_recorded(text, |key: &MessageKey| {
                 tx.execute(
                     "INSERT INTO message (harness, idx, key, text, origin, control, caller_ref,
-                                          admitted_generation, producer)
-                     VALUES (?1, ?2, ?3, ?4, 'follow-up', ?5, ?6, ?7, ?8)",
+                                          admitted_generation, producer, completion_work)
+                     VALUES (?1, ?2, ?3, ?4, 'follow-up', ?5, ?6, ?7, ?8, ?9)",
                     params![
                         int(harness),
                         idx,
@@ -795,7 +845,8 @@ impl Store {
                         int(control),
                         caller_ref,
                         generation,
-                        if by_ref { "caller" } else { "owner" }
+                        if by_ref { "caller" } else { "owner" },
+                        completion.map(|(work, _)| work)
                     ],
                 )
                 .map(drop)
@@ -974,6 +1025,25 @@ impl Store {
         })
     }
 
+    /// Resolves `turn-ended` a completion whose linked message's ACK and
+    /// tagged turn end are now durable, if it is still unresolved. Returns
+    /// whether it was.
+    pub(crate) fn reconcile_completion(&mut self, work: i64) -> Result<bool, StoreError> {
+        let generation = self.generation;
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE bash_run SET completion_outcome = 'turn-ended',
+                         completion_reason = 'reconciled-durable-ack-and-tagged-turn-end',
+                         completion_generation = ?2
+                 WHERE work = ?1 AND delivery_mode = 'async' AND completion_outcome IS NULL
+                   AND EXISTS (SELECT 1 FROM message m WHERE m.completion_work = ?1
+                               AND m.ack_label IS NOT NULL AND m.turn_end_generation IS NOT NULL)",
+                params![work, generation],
+            )
+            .map(|changed| changed > 0)
+        })
+    }
+
     /// All earlier-generation recipient facts, including ended runs and
     /// previously recorded losses. NULL mode stays unknown; no legacy guess.
     pub(crate) fn inherited_completions(
@@ -983,15 +1053,28 @@ impl Store {
         self.conn.prepare(
             "SELECT w.id, w.harness, h.id, w.generation, b.requester_work,
                     b.delivery_mode, b.completion_outcome, b.completion_reason,
-                    b.completion_generation, w.outcome
+                    b.completion_generation, w.outcome,
+                    m.idx, m.admitted_generation, m.ack_label IS NOT NULL,
+                    m.turn_end_generation, m.stop
              FROM bash_run b JOIN work w ON w.id = b.work
              JOIN harness h ON h.position = w.harness
+             LEFT JOIN message m ON m.completion_work = b.work
              WHERE w.generation < ?1 AND b.requester_work IS NOT NULL
                AND (b.delivery_mode = 'async' OR b.delivery_mode IS NULL)
                AND (?2 IS NULL OR w.harness = ?2) ORDER BY w.id"
         )?.query_map(params![self.generation, harness.map(int)], |row| {
             let mode: Option<String> = row.get(5)?;
             let outcome: Option<String> = row.get(6)?;
+            let admission = match row.get::<_, Option<i64>>(10)? {
+                None => serde_json::json!({ "state": "never-admitted" }),
+                Some(input) => serde_json::json!({
+                    "state": "admitted", "input": input,
+                    "admitted_generation": row.get::<_, Option<i64>>(11)?,
+                    "acknowledged": row.get::<_, bool>(12)?,
+                    "turn_end_generation": row.get::<_, Option<i64>>(13)?,
+                    "stop": row.get::<_, Option<String>>(14)?,
+                }),
+            };
             Ok(serde_json::json!({
                 "work": row.get::<_, i64>(0)?, "harness_position": row.get::<_, i64>(1)?,
                 "harness": row.get::<_, String>(2)?, "accepted_generation": row.get::<_, i64>(3)?,
@@ -1001,9 +1084,90 @@ impl Store {
                 "reason": row.get::<_, Option<String>>(7)?,
                 "resolved_generation": row.get::<_, Option<i64>>(8)?,
                 "run_outcome": row.get::<_, Option<String>>(9)?,
-                "recipient_reconstructed": false,
+                "admission": admission,
             }))
         })?.collect()
+    }
+
+    /// Known async completions owed to `requester_work`, accepted by an
+    /// earlier generation, whose run's end is recorded and which no
+    /// generation admitted as an input, in acceptance order.
+    pub(crate) fn recoverable_completions(
+        &self,
+        requester_work: i64,
+    ) -> rusqlite::Result<Vec<RecoverableCompletion>> {
+        self.recoverable("b.requester_work = ?1", requester_work)
+    }
+
+    /// The same, for one Bash work, if it is one.
+    pub(crate) fn recoverable_completion(
+        &self,
+        work: i64,
+    ) -> rusqlite::Result<Option<RecoverableCompletion>> {
+        Ok(self.recoverable("b.work = ?1", work)?.pop())
+    }
+
+    fn recoverable(&self, filter: &str, key: i64) -> rusqlite::Result<Vec<RecoverableCompletion>> {
+        self.conn
+            .prepare(&format!(
+                "SELECT w.id, w.generation, b.argv, w.outcome, w.observer
+                 FROM bash_run b JOIN work w ON w.id = b.work
+                 WHERE {filter} AND b.delivery_mode = 'async'
+                   AND b.completion_outcome IS NULL AND w.outcome IS NOT NULL
+                   AND w.generation < ?2
+                   AND NOT EXISTS (SELECT 1 FROM message m WHERE m.completion_work = b.work)
+                 ORDER BY w.id"
+            ))?
+            .query_map(params![key, self.generation], |row| {
+                let argv: String = row.get(2)?;
+                Ok(RecoverableCompletion {
+                    work: row.get(0)?,
+                    accepted_generation: row.get(1)?,
+                    argv: serde_json::from_str(&argv).unwrap_or_default(),
+                    outcome: row.get(3)?,
+                    observer: row.get(4)?,
+                })
+            })?
+            .collect()
+    }
+
+    /// The run's recorded end and accepting generation, for a completion
+    /// recovered while its run was live under this owner.
+    /// `None` unless it is a known async completion still unresolved and
+    /// never admitted.
+    pub(crate) fn completion_origin(
+        &self,
+        work: i64,
+    ) -> rusqlite::Result<Option<(i64, Vec<String>)>> {
+        self.conn
+            .query_row(
+                "SELECT w.generation, b.argv FROM bash_run b JOIN work w ON w.id = b.work
+                 WHERE b.work = ?1 AND b.delivery_mode = 'async' AND b.completion_outcome IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM message m WHERE m.completion_work = b.work)",
+                params![work],
+                |row| {
+                    let argv: String = row.get(1)?;
+                    Ok((row.get(0)?, serde_json::from_str(&argv).unwrap_or_default()))
+                },
+            )
+            .optional()
+    }
+
+    /// This root's stable identity.
+    pub(crate) fn root_id(&self) -> rusqlite::Result<String> {
+        self.conn
+            .query_row("SELECT root_id FROM root", [], |row| row.get(0))
+    }
+
+    /// Records undelivered every earlier-generation, never-admitted known
+    /// async completion owed to `requester_work`, whose end is recorded:
+    /// nothing was sent to it and that recipient can no longer take input.
+    pub(crate) fn settle_orphaned_completions(
+        &mut self,
+        requester_work: i64,
+    ) -> Result<Vec<i64>, StoreError> {
+        let generation = self.generation;
+        self.write(|tx| orphaned_completions(tx, generation, Some(requester_work)))
     }
 
     /// Commits a registered child in one transaction: its harness row (the
@@ -1315,6 +1479,103 @@ fn earlier_ref(conn: &Connection, caller_ref: &str) -> rusqlite::Result<Option<E
     .optional()
 }
 
+/// Why an owner completion of `work` is not admitted now, if it is not.
+fn completion_not_admissible(
+    tx: &Transaction<'_>,
+    work: i64,
+    recipient: Option<i64>,
+) -> rusqlite::Result<Option<String>> {
+    if let Some((idx, admitted)) = tx
+        .query_row(
+            "SELECT idx, admitted_generation FROM message WHERE completion_work = ?1",
+            params![work],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?
+    {
+        return Ok(Some(format!(
+            "already-admitted: input {idx}, generation {}",
+            admitted.map_or_else(|| "unknown".to_owned(), |g| g.to_string())
+        )));
+    }
+    let run: Option<(Option<String>, Option<String>, Option<i64>)> = tx
+        .query_row(
+            "SELECT delivery_mode, completion_outcome, requester_work FROM bash_run WHERE work = ?1",
+            params![work],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    Ok(match run {
+        None => Some("no-such-run".to_owned()),
+        Some((mode, _, _)) if mode.as_deref() != Some("async") => Some(format!(
+            "not-async: {}",
+            mode.as_deref().unwrap_or("unknown")
+        )),
+        Some((_, Some(outcome), _)) => Some(format!("already-resolved: {outcome}")),
+        Some((_, None, requester)) if recipient.is_some() && requester != recipient => {
+            Some("requester-work-differs".to_owned())
+        }
+        Some(_) => None,
+    })
+}
+
+/// Resolves `turn-ended` each unresolved completion whose linked owner
+/// message has a durable ACK and tagged turn end (an owner lost between
+/// those writes and the completion's own). Transport only.
+fn reconcile_completions(tx: &Transaction<'_>, generation: i64) -> rusqlite::Result<Vec<i64>> {
+    let works = tx
+        .prepare(
+            "SELECT b.work FROM bash_run b JOIN message m ON m.completion_work = b.work
+             WHERE b.delivery_mode = 'async' AND b.completion_outcome IS NULL
+               AND m.ack_label IS NOT NULL AND m.turn_end_generation IS NOT NULL
+             ORDER BY b.work",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<i64>>>()?;
+    for work in &works {
+        tx.execute(
+            "UPDATE bash_run SET completion_outcome = 'turn-ended',
+                     completion_reason = 'reconciled-durable-ack-and-tagged-turn-end',
+                     completion_generation = ?2
+             WHERE work = ?1 AND completion_outcome IS NULL",
+            params![work, generation],
+        )?;
+    }
+    Ok(works)
+}
+
+/// Resolves `undelivered` each never-admitted known async completion of an
+/// earlier generation whose requester work's end is recorded (one requester
+/// work, or all).
+fn orphaned_completions(
+    tx: &Transaction<'_>,
+    generation: i64,
+    requester_work: Option<i64>,
+) -> rusqlite::Result<Vec<i64>> {
+    let works = tx
+        .prepare(
+            "SELECT b.work FROM bash_run b JOIN work w ON w.id = b.work
+             JOIN work r ON r.id = b.requester_work
+             WHERE b.delivery_mode = 'async' AND b.completion_outcome IS NULL
+               AND w.generation < ?1 AND r.outcome IS NOT NULL
+               AND (?2 IS NULL OR b.requester_work = ?2)
+               AND NOT EXISTS (SELECT 1 FROM message m WHERE m.completion_work = b.work)
+             ORDER BY b.work",
+        )?
+        .query_map(params![generation, requester_work], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<i64>>>()?;
+    for work in &works {
+        tx.execute(
+            "UPDATE bash_run SET completion_outcome = 'undelivered',
+                     completion_reason = 'requester-ended-before-admission',
+                     completion_generation = ?2
+             WHERE work = ?1 AND completion_outcome IS NULL",
+            params![work, generation],
+        )?;
+    }
+    Ok(works)
+}
+
 fn int<N: TryInto<i64>>(value: N) -> i64 {
     value.try_into().unwrap_or(i64::MAX)
 }
@@ -1408,6 +1669,7 @@ fn create_intent(
                 prior_unknown: 0,
                 unknown_attempts: 0,
                 turn_ended: false,
+                completion_work: None,
             });
         }
         harnesses.push(DurableHarness {
@@ -1447,7 +1709,8 @@ fn load_intent(tx: &Transaction<'_>, generation: i64) -> Result<Vec<DurableHarne
                 m.origin,
                 (SELECT count(*) FROM attempt a WHERE a.harness = m.harness AND a.idx = m.idx
                     AND (a.outcome IS NULL OR a.outcome = ?2)),
-                m.turn_end_generation IS NOT NULL
+                m.turn_end_generation IS NOT NULL,
+                m.completion_work
          FROM message m WHERE m.harness = ?1 ORDER BY m.idx",
     )?;
     let mut work_rows = tx.prepare(
@@ -1491,6 +1754,7 @@ fn load_intent(tx: &Transaction<'_>, generation: i64) -> Result<Vec<DurableHarne
                     prior_unknown: row.get(10)?,
                     unknown_attempts: row.get(12)?,
                     turn_ended: row.get(13)?,
+                    completion_work: row.get(14)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1635,7 +1899,7 @@ mod tests {
         let dir = Dir::new("follow");
         let mut store = Store::claim(&dir.0, Some(&intent())).unwrap().store;
         let Admission::Admitted(idx, mut message) = store
-            .admit_follow_up(0, 4, Some("r1"), "again", true)
+            .admit_follow_up(0, 4, Some("r1"), "again", true, None)
             .unwrap()
         else {
             panic!("first admission of r1");
@@ -1684,7 +1948,7 @@ mod tests {
         let mut store = Store::claim(&dir.0, Some(&intent())).unwrap().store;
         assert!(matches!(
             store
-                .admit_follow_up(0, 2, Some("r1"), "once", true)
+                .admit_follow_up(0, 2, Some("r1"), "once", true, None)
                 .unwrap(),
             Admission::Admitted(1, _)
         ));
@@ -1696,7 +1960,7 @@ mod tests {
         assert!(!messages[1].turn_ended);
         let mut store = claimed.store;
         let Admission::Duplicate(earlier) = store
-            .admit_follow_up(0, 7, Some("r1"), "again", true)
+            .admit_follow_up(0, 7, Some("r1"), "again", true, None)
             .unwrap()
         else {
             panic!("second admission of r1");
@@ -1707,7 +1971,9 @@ mod tests {
         assert_eq!(store.earlier_ref("r1").unwrap().unwrap().input, 1);
         assert!(store.earlier_ref("r2").unwrap().is_none());
         assert!(matches!(
-            store.admit_follow_up(0, 8, None, "unnamed", true).unwrap(),
+            store
+                .admit_follow_up(0, 8, None, "unnamed", true, None)
+                .unwrap(),
             Admission::Admitted(2, _)
         ));
         let conn = Connection::open(dir.0.join(DB_FILE)).unwrap();
@@ -1723,7 +1989,7 @@ mod tests {
         let mut store = Store::claim(&dir.0, Some(&intent())).unwrap().store;
         assert!(matches!(
             store
-                .admit_follow_up(0, 0, Some("bash-completion:2"), "owner", false)
+                .admit_follow_up(0, 0, Some("bash-completion:2"), "owner", false, None)
                 .unwrap(),
             Admission::Admitted(1, _)
         ));
@@ -1732,14 +1998,21 @@ mod tests {
         assert!(store.earlier_ref("bash-completion:2").unwrap().is_none());
         assert!(matches!(
             store
-                .admit_follow_up(0, 1, Some("bash-completion:2"), "caller", true)
+                .admit_follow_up(0, 1, Some("bash-completion:2"), "caller", true, None)
                 .unwrap(),
             Admission::Admitted(2, _)
         ));
         drop(store);
         let mut store = Store::claim(&dir.0, None).unwrap().store;
         let Admission::Duplicate(prior) = store
-            .admit_follow_up(0, 2, Some("bash-completion:2"), "different-body", true)
+            .admit_follow_up(
+                0,
+                2,
+                Some("bash-completion:2"),
+                "different-body",
+                true,
+                None,
+            )
             .unwrap()
         else {
             panic!("caller retry must deduplicate");
@@ -1808,6 +2081,82 @@ mod tests {
         assert_eq!(records[0]["accepted_generation"], 1);
         assert_eq!(records[1]["reason"], "recipient-not-in-conversation");
         assert_eq!(records[3]["delivery_mode"], "unknown");
+    }
+
+    /// One logical admission per accepted completion, across generations;
+    /// an admitted completion with ACK and tagged turn end recorded but
+    /// unresolved is reconciled by the next claim; a never-admitted one is
+    /// recorded undelivered once its requester work's end is recorded.
+    #[test]
+    fn completion_identity_reconciles_and_never_readmits() {
+        let dir = Dir::new("completion-identity");
+        let mut store = Store::claim(&dir.0, Some(&intent())).unwrap().store;
+        let incarnation = store
+            .begin_incarnation("token", "unprivileged-userns")
+            .unwrap();
+        let parent = store.begin_work(0, incarnation).unwrap();
+        let run = |store: &mut Store| {
+            store
+                .begin_bash(0, parent, incarnation, 1, "[]", &["x".into()], "/", true)
+                .unwrap()
+        };
+        let (admitted, orphan) = (run(&mut store), run(&mut store));
+        let Admission::Admitted(idx, _) = store
+            .admit_follow_up(0, 0, Some("c"), "owner", false, Some((admitted, None)))
+            .unwrap()
+        else {
+            panic!("first admission");
+        };
+        let attempt = store.begin_attempt(0, idx).unwrap();
+        let ack = DurableAck {
+            label: "accepted".into(),
+            basis: None,
+            recovered: false,
+            generation: 1,
+            message_id: Some("m".into()),
+        };
+        store.record_ack(0, idx, attempt, &ack).unwrap();
+        store.record_turn_end(0, idx).unwrap();
+        drop(store);
+        let claimed = Store::claim(&dir.0, None).unwrap();
+        assert_eq!(claimed.completions_reconciled, vec![admitted]);
+        assert!(claimed.completions_requester_ended.is_empty());
+        let mut store = claimed.store;
+        assert!(matches!(
+            store.admit_follow_up(0, 0, Some("c"), "owner", false, Some((admitted, Some(parent)))),
+            Ok(Admission::NotReoffered(reason)) if reason.starts_with("already-admitted")
+        ));
+        assert!(matches!(
+            store.admit_follow_up(0, 0, Some("c"), "owner", false, Some((orphan, Some(parent + 9)))),
+            Ok(Admission::NotReoffered(reason)) if reason == "requester-work-differs"
+        ));
+        assert!(
+            store.recoverable_completions(parent).unwrap().is_empty(),
+            "run not ended"
+        );
+        store
+            .resolve_work(orphan, "code:0", Some("work-pid1-wait"))
+            .unwrap();
+        assert_eq!(
+            store.recoverable_completions(parent).unwrap()[0].work,
+            orphan
+        );
+        store
+            .resolve_work(parent, "code:0", Some("work-pid1-wait"))
+            .unwrap();
+        assert_eq!(
+            store.settle_orphaned_completions(parent).unwrap(),
+            vec![orphan]
+        );
+        let records = store.inherited_completions(None).unwrap();
+        assert_eq!(records[0]["completion"], "turn-ended");
+        assert_eq!(
+            records[0]["reason"],
+            "reconciled-durable-ack-and-tagged-turn-end"
+        );
+        assert_eq!(records[0]["admission"]["admitted_generation"], 1);
+        assert_eq!(records[1]["completion"], "undelivered");
+        assert_eq!(records[1]["admission"]["state"], "never-admitted");
     }
 
     /// Fresh-only schema: a store of the previous version is refused, not
