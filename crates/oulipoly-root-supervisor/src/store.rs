@@ -105,6 +105,62 @@ pub(crate) const OUTAGE: &str = "outage";
 /// attempts among them stay unknown; this is not an outage or a closure.
 pub(crate) const ATTEMPTS_EXHAUSTED: &str = "attempts-exhausted";
 
+/// What one recorded attempt establishes about insertion. Refusal applies
+/// only to that attempt; it cannot erase an earlier unresolved submission.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttemptOutcome {
+    Refused,
+    NotSent,
+    Acknowledged,
+    Unresolved,
+}
+
+impl AttemptOutcome {
+    pub(crate) fn classify(outcome: Option<&str>) -> Self {
+        match outcome {
+            Some("rejected") => Self::Refused,
+            Some("not-sent") => Self::NotSent,
+            Some("ack:accepted" | "ack:duplicate-unknown") => Self::Acknowledged,
+            // NULL, unknown-prior-owner, invalid/closed responses, and any
+            // unfamiliar label supply no conclusive insertion outcome.
+            _ => Self::Unresolved,
+        }
+    }
+
+    pub(crate) fn unresolved(self) -> bool {
+        self == Self::Unresolved
+    }
+
+    fn not_inserted(self) -> bool {
+        matches!(self, Self::Refused | Self::NotSent)
+    }
+}
+
+struct AttemptAccount {
+    unresolved: u32,
+    all_not_inserted: bool,
+}
+
+/// Reads every attempt, including earlier generations. Settlement and
+/// restore use the same classifier as the live worker's current account.
+fn attempt_account(conn: &Connection, harness: i64, idx: i64) -> rusqlite::Result<AttemptAccount> {
+    let mut statement =
+        conn.prepare("SELECT outcome FROM attempt WHERE harness = ?1 AND idx = ?2")?;
+    let outcomes =
+        statement.query_map(params![harness, idx], |row| row.get::<_, Option<String>>(0))?;
+    let mut account = AttemptAccount {
+        unresolved: 0,
+        all_not_inserted: true,
+    };
+    for outcome in outcomes {
+        let outcome = outcome?;
+        let fact = AttemptOutcome::classify(outcome.as_deref());
+        account.unresolved += u32::from(fact.unresolved());
+        account.all_not_inserted &= fact.not_inserted();
+    }
+    Ok(account)
+}
+
 const SCHEMA: &str = "
 CREATE TABLE owner (
     generation INTEGER PRIMARY KEY,
@@ -313,7 +369,7 @@ pub(crate) struct DurableMessage {
     pub(crate) attempts: u32,
     /// Earlier attempts this instance classified as unknown.
     pub(crate) prior_unknown: u32,
-    /// Attempts of any generation whose outcome is unknown or unrecorded.
+    /// Attempts of any generation classified insertion-unresolved.
     pub(crate) unknown_attempts: u32,
     /// A tagged idle covered its acknowledged insertion (durably recorded).
     pub(crate) turn_ended: bool,
@@ -747,7 +803,7 @@ impl Store {
                 "UPDATE attempt SET outcome = ?2, resolved_generation = ?3 WHERE id = ?1",
                 params![attempt, outcome, generation],
             )?;
-            if outcome == "rejected" {
+            if AttemptOutcome::classify(Some(outcome)) == AttemptOutcome::Refused {
                 // Conclusive refusal is not replayable on recovery. Commit
                 // this stop together with resolution, without creating an ACK.
                 tx.execute(
@@ -1016,6 +1072,17 @@ impl Store {
     ) -> Result<bool, StoreError> {
         let generation = self.generation;
         self.write(|tx| {
+            let admission = tx
+                .query_row(
+                    "SELECT harness, idx FROM message WHERE completion_work = ?1",
+                    [work],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?;
+            let all_not_inserted = match admission {
+                Some((harness, idx)) => attempt_account(tx, harness, idx)?.all_not_inserted,
+                None => true,
+            };
             tx.execute(
                 "UPDATE bash_run SET completion_outcome = ?2, completion_reason = ?3,
                                  completion_generation = ?4
@@ -1026,11 +1093,8 @@ impl Store {
                  OR (?2 = 'undelivered' AND (
                      NOT EXISTS (SELECT 1 FROM message m WHERE m.completion_work = ?1)
                      OR EXISTS (SELECT 1 FROM message m WHERE m.completion_work = ?1
-                       AND m.ack_label IS NULL AND m.stop = 'rejected'
-                       AND NOT EXISTS (SELECT 1 FROM attempt a
-                         WHERE a.harness = m.harness AND a.idx = m.idx
-                           AND (a.outcome IS NULL OR a.outcome NOT IN ('rejected', 'not-sent')))))))",
-                params![work, outcome, reason, generation],
+                       AND m.ack_label IS NULL AND m.stop = 'rejected' AND ?5))))",
+                params![work, outcome, reason, generation, all_not_inserted],
             )
             .map(|changed| changed > 0)
         })
@@ -1718,8 +1782,7 @@ fn load_intent(tx: &Transaction<'_>, generation: i64) -> Result<Vec<DurableHarne
                 (SELECT count(*) FROM attempt a WHERE a.harness = m.harness AND a.idx = m.idx
                     AND a.outcome = ?2 AND a.resolved_generation = ?3),
                 m.origin,
-                (SELECT count(*) FROM attempt a WHERE a.harness = m.harness AND a.idx = m.idx
-                    AND (a.outcome IS NULL OR a.outcome = ?2)),
+                m.idx,
                 m.turn_end_generation IS NOT NULL,
                 m.completion_work
          FROM message m WHERE m.harness = ?1 ORDER BY m.idx",
@@ -1763,7 +1826,7 @@ fn load_intent(tx: &Transaction<'_>, generation: i64) -> Result<Vec<DurableHarne
                     },
                     attempts: row.get(9)?,
                     prior_unknown: row.get(10)?,
-                    unknown_attempts: row.get(12)?,
+                    unknown_attempts: attempt_account(tx, position, row.get(12)?)?.unresolved,
                     turn_ended: row.get(13)?,
                     completion_work: row.get(14)?,
                 })
@@ -2298,7 +2361,14 @@ mod tests {
     /// uncertain attempt on that logical completion input.
     #[test]
     fn completion_rejection_does_not_erase_prior_uncertainty() {
-        for uncertain in [false, true] {
+        for prior_outcome in [
+            Some("not-sent"),
+            Some("no-ack:invalid-response"),
+            Some("no-ack:transport-closed"),
+            Some("unfamiliar-response"),
+            None,
+        ] {
+            let uncertain = prior_outcome != Some("not-sent");
             let dir = Dir::new("completion-rejection");
             let mut store = Store::claim(&dir.0, Some(&intent())).unwrap().store;
             let incarnation = store
@@ -2314,11 +2384,9 @@ mod tests {
             else {
                 panic!("first admission")
             };
-            if uncertain {
-                let prior = store.begin_attempt(0, idx).unwrap();
-                store
-                    .resolve_attempt(prior, "no-ack:invalid-response")
-                    .unwrap();
+            let prior = store.begin_attempt(0, idx).unwrap();
+            if let Some(outcome) = prior_outcome {
+                store.resolve_attempt(prior, outcome).unwrap();
             }
             let rejected = store.begin_attempt(0, idx).unwrap();
             store.resolve_attempt(rejected, "rejected").unwrap();
@@ -2329,7 +2397,12 @@ mod tests {
                 !uncertain
             );
             drop(store);
-            let store = Store::claim(&dir.0, None).unwrap().store;
+            let claimed = Store::claim(&dir.0, None).unwrap();
+            let message = &claimed.harnesses[0].messages[idx];
+            assert_eq!(message.unknown_attempts, u32::from(uncertain));
+            assert_eq!(message.attempts, 2);
+            assert_eq!(message.stop.as_deref(), Some("rejected"));
+            let store = claimed.store;
             assert_eq!(
                 store.inherited_completions(None).unwrap()[0]["completion"],
                 if uncertain {
@@ -2338,6 +2411,13 @@ mod tests {
                     "undelivered"
                 }
             );
+            drop(store);
+            let claimed = Store::claim(&dir.0, None).unwrap();
+            assert_eq!(
+                claimed.harnesses[0].messages[idx].unknown_attempts,
+                u32::from(uncertain)
+            );
+            assert_eq!(claimed.harnesses[0].messages[idx].attempts, 2);
         }
     }
 

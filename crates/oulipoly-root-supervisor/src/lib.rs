@@ -194,8 +194,9 @@
 //!   A close is not durable: a recovery after owner death knows nothing of it.
 //! * `rejected` with `durable: true` reports a conclusive refusal only after
 //!   the attempt outcome and message stop commit together without an ACK.
-//!   That logical input no longer holds close or later eligible input. The
-//!   event describes this attempt, not every historical attempt or recipient
+//!   It stops further resubmission of that logical input, but an earlier
+//!   unresolved attempt still holds close and later input admission. The
+//!   event's `scope: this-attempt` describes this attempt, not every historical attempt or recipient
 //!   processing. Before commit, owner loss or a failed write leaves delivery
 //!   unresolved and publishes no conclusive rejection; existing capped recovery
 //!   may resubmit the same key with its prior history unknown. Commit followed
@@ -313,6 +314,15 @@
 //! Durable storage does not make a restored key or session string a
 //! receiver-continuity proof.
 //!
+//! One attempt-outcome classification backs completion non-delivery, restored
+//! and current turn accounts, close and reporting. `rejected` and `not-sent`
+//! establish non-insertion for that attempt; recorded insertion ACKs establish
+//! insertion. Missing, invalid, closed and unfamiliar responses are unresolved.
+//! A later refusal cannot erase any earlier unresolved attempt. An exact linked
+//! ACK and tagged end can settle the logical input while the earlier physical
+//! attempts remain in history. Neither that reconciliation nor resubmission
+//! establishes at-most-once native processing.
+//!
 //! Attempt counts, closures and the `outage` / `attempts-exhausted` stops
 //! persist, so a restart never resets either cap. They are separate facts:
 //! a closure is an observed harness exit, while an attempt is a durable
@@ -427,6 +437,11 @@
 //!   and a conclusively resolved `rejected` attempt; the
 //!   others end this instance's attempts and a later recovery retries the
 //!   message. Rejection remains unacknowledged and is never replayed.
+//!   Terminal `owed` / `known_owed` and message state `owed` have explicit
+//!   `owed_scope: insertion-ack-absence`: they are not replay permission or
+//!   the async completion debt counter. `unresolved_attempts` retains all
+//!   insertion-unresolved attempts, including earlier recorded invalid/closed
+//!   responses. It remains visible beside a later `rejected` label or ACK.
 //! * A **closure** is a no-acknowledgement end whose harness exit was
 //!   reported by that harness's actual waiter (its work PID 1). Only closures
 //!   count toward [`Intent::outage_closure_cap`]. Rejections and negotiation
@@ -448,7 +463,8 @@
 //! * `closed`: the caller's `close` was followed through: every launched
 //!   or reattached harness's end was reported (those stopped for the close
 //!   by their work PID 1's kill, with `close` saying so), and any remaining
-//!   unacknowledged debt is conclusively rejected (exit 7). The rejection
+//!   unacknowledged input is rejected with no earlier insertion-unresolved
+//!   attempt (exit 7). Physical reaping alone does not settle that uncertainty. The rejection
 //!   and delivery debt remain in the report/store. It says how the run ended,
 //!   not that any input was
 //!   processed: a harness stopped for the close ended by a signal.
@@ -1604,6 +1620,8 @@ fn unattached_report(harnesses: &[store::DurableHarness], reason: &str) -> (Valu
                     "index": index,
                     "state": if message.ack.is_some() { "acknowledged" } else { "owed" },
                     "label": message.ack.as_ref().map_or("owned-unattached", |ack| ack.label.as_str()),
+                    "unresolved_attempts": message.unknown_attempts,
+                    "owed_scope": "insertion-ack-absence",
                     "completion": "not-observed",
                 })).collect::<Vec<_>>(),
             })
@@ -1622,6 +1640,7 @@ fn unattached_report(harnesses: &[store::DurableHarness], reason: &str) -> (Valu
             "cancel_requested": false,
             "owed": known_owed,
             "known_owed": known_owed,
+            "owed_scope": "insertion-ack-absence",
             "owed_history": "retained-in-store",
             "records_complete": false,
             "all_harnesses_reaped": false,
@@ -1675,7 +1694,9 @@ fn terminal_report(
             || records
                 .iter()
                 .flat_map(|record| &record.messages)
-                .any(|message| message.owed && message.label != "rejected"))
+                .any(|message| {
+                    message.owed && (message.label != "rejected" || message.unresolved_attempts > 0)
+                }))
     {
         ("ended-owed", EXIT_ENDED_OWED)
     } else if close_requested {
@@ -1699,6 +1720,7 @@ fn terminal_report(
         "close_requested": close_requested,
         "owed": records_complete.then_some(known_owed),
         "known_owed": known_owed,
+        "owed_scope": "insertion-ack-absence",
         "owed_history": owed_history,
         "records_complete": records_complete,
         "all_harnesses_reaped": all_reaped,
@@ -1910,11 +1932,31 @@ mod tests {
             ack_generation: None,
             attempts: 1,
             prior_unknown: 0,
+            unresolved_attempts: 0,
             closures: 1,
             follow_up: false,
             turn_ended: false,
         });
         record
+    }
+
+    #[test]
+    fn reaped_refusal_cannot_report_closed_with_unresolved_insertion() {
+        let mut record = owed_record();
+        record.messages[0].label = "rejected".into();
+        record.messages[0].unresolved_attempts = 1;
+        let (report, code) = terminal_report(&expected(1), &[record.clone()], false, true, None);
+        assert_eq!(code, EXIT_ENDED_OWED);
+        assert_eq!(report["all_harnesses_reaped"], true);
+        assert_eq!(
+            report["harnesses"][0]["messages"][0]["unresolved_attempts"],
+            1
+        );
+        assert_eq!(report["owed_scope"], "insertion-ack-absence");
+        record.messages[0].unresolved_attempts = 0;
+        let (report, code) = terminal_report(&expected(1), &[record], false, true, None);
+        assert_eq!(code, EXIT_CLOSED);
+        assert_eq!(report["owed"], 1, "ACK absence is distinct from async debt");
     }
 
     #[test]

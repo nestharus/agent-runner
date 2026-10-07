@@ -25,7 +25,9 @@ use crate::children::{ChildLink, Registry};
 use crate::conversation::{Closing, FollowUp, Inbox};
 use crate::custody::{self, Adopted, PidNs, ReceiptWait, Root, RootSlot, SpawnError, WorkStdio};
 use crate::live::Custody;
-use crate::store::{Admission, DurableAck, DurableHarness, EarlierRef, Store, StoreError};
+use crate::store::{
+    Admission, AttemptOutcome, DurableAck, DurableHarness, EarlierRef, Store, StoreError,
+};
 use crate::transport::{self, HarnessTransport, Observed};
 use crate::{Endpoint, Event};
 
@@ -69,6 +71,9 @@ pub struct MessageRecord {
     /// Earlier-owner attempts with no outcome, classified unknown by this
     /// instance. Each may or may not have been sent or inserted.
     pub prior_unknown: u32,
+    /// All attempts with unresolved insertion outcomes, including recorded
+    /// invalid/closed responses. A later refusal does not remove them.
+    pub unresolved_attempts: u32,
     /// Observed no-acknowledgement closures charged to this message, by
     /// every generation.
     pub closures: u32,
@@ -152,6 +157,8 @@ impl HarnessRecord {
                 "ack_generation": message.ack_generation,
                 "attempts": message.attempts,
                 "prior_unknown": message.prior_unknown,
+                "unresolved_attempts": message.unresolved_attempts,
+                "owed_scope": "insertion-ack-absence",
                 "closures": message.closures,
                 "turn_end": if message.turn_ended { "tagged-idle-recorded" } else { "not-recorded" },
                 "completion": "not-observed",
@@ -169,11 +176,21 @@ struct Tracked {
     closures: u32,
     attempts: u32,
     prior_unknown: u32,
-    /// Attempts of any generation whose outcome is unknown or unrecorded.
+    /// Attempts of any generation classified insertion-unresolved.
     unknown_attempts: u32,
     /// A tagged idle covering its insertion is durably recorded.
     turn_ended: bool,
     follow_up: bool,
+}
+
+impl Tracked {
+    /// Called only after the attempt's resolution commits. A failed write
+    /// keeps the attempt unresolved in both the live and restored accounts.
+    fn resolve_attempt(&mut self, outcome: &str) {
+        if !AttemptOutcome::classify(Some(outcome)).unresolved() {
+            self.unknown_attempts -= 1;
+        }
+    }
 }
 
 /// How one connection to a launched harness stopped being driven.
@@ -1725,6 +1742,7 @@ impl Worker {
                     return ConnEnd::Stop;
                 };
                 self.tracked[index].attempts += 1;
+                self.tracked[index].unknown_attempts += 1;
                 // Open for Bash attribution from before the send: the harness may
                 // act on it as soon as it is inserted, before this owner reads
                 // the acknowledgement. Its id is known only from the ACK.
@@ -1760,6 +1778,7 @@ impl Worker {
                         {
                             return ConnEnd::Stop;
                         }
+                        self.tracked[index].resolve_attempt(&format!("ack:{}", ack.label));
                         self.report(json!({
                             "event": "ack",
                             "index": index,
@@ -1813,6 +1832,7 @@ impl Worker {
                 {
                     return ConnEnd::Stop;
                 }
+                self.tracked[index].resolve_attempt(resolution);
                 if let DeliveryOutcome::Rejected { code, .. } = outcome {
                     // A public conclusive rejection must survive owner loss.
                     // A failed resolution leaves this attempt unknown, just as
@@ -1820,6 +1840,8 @@ impl Worker {
                     self.tracked[index].label = Some("rejected".to_owned());
                     self.report(json!({
                         "event": "rejected", "index": index, "code": code, "durable": true,
+                        "scope": "this-attempt",
+                        "unresolved_attempts": self.tracked[index].unknown_attempts,
                     }));
                     // This refusal resolves only its own attempt. Remove its
                     // attribution entry after durable resolution; historical
@@ -2304,6 +2326,7 @@ impl Worker {
                     ack_generation: ack.map(|ack| ack.generation),
                     attempts: tracked.attempts,
                     prior_unknown: tracked.prior_unknown,
+                    unresolved_attempts: tracked.unknown_attempts,
                     closures: tracked.closures,
                     follow_up: tracked.follow_up,
                     turn_ended: tracked.turn_ended,
