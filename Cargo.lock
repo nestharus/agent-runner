@@ -9,6 +9,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "agent-provider-contract"
+version = "0.2.0"
+source = "git+https://github.com/nestharus/agent-provider-sdk.git#827b4115e0a5240f8b5fc14062246443b78e9b38"
+dependencies = [
+ "base64 0.22.1",
+ "jsonschema",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3045,6 +3057,7 @@ dependencies = [
 name = "oulipoly-agent-runner"
 version = "0.1.0"
 dependencies = [
+ "agent-provider-contract",
  "base64 0.22.1",
  "cap-fs-ext",
  "cap-std",

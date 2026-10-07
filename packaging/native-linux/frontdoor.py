@@ -5,7 +5,11 @@ one task, cwd/policy/env/deadline, optional inline access-only credential.
 No requester credential path or raw native-root fields are read. A Claude
 route (`harness: claude`) takes no credential: Claude Code runs as the
 requester against the route's store below the requester's home, which this
-process names but never reads.
+process names but never reads. A registered provider route (`harness:
+provider`) names a root-owned provider executable and its opaque settings;
+the Runner entry resolves, prepares and starts that provider's own resident
+harness, and the requester's tool policy reaches it as Runner's neutral
+tool policy. It takes no credential here.
 
 Nonblocking control/output queues keep timers independent of consumers.
 Early close/cancel arms a grace-relative kill; absent controls the backstop
@@ -35,6 +39,7 @@ contract, limits and prepared ROOT operations: share/README.md.
 import ctypes
 from collections import deque
 import fcntl
+import hashlib
 import json
 import os
 import pwd
@@ -259,7 +264,7 @@ def load_site(path):
     if not isinstance(routes, dict) or not routes:
         raise Refused("site config: routes")
     for name, route in routes.items():
-        if not (opencode_route(route) or claude_route(route)):
+        if not (opencode_route(route) or claude_route(route) or provider_route(route)):
             raise Refused(f"site config: route {name}")
     check_site_children(site)
     return site
@@ -324,6 +329,57 @@ def claude_route(route):
         and not os.path.normpath(store).startswith("..")
         and os.path.normpath(store) != "."
     )
+
+
+def provider_route(route):
+    """A registered external provider route: the provider's absolute
+    executable (root-owned custody is checked at each admission), its
+    `settings` (provider/v1 `policy.evaluate` params, opaque here), an
+    optional absolute `config_root` and `env` for the provider's own
+    operations. No credential."""
+    if not isinstance(route, dict) or route.get("harness") != "provider":
+        return False
+    executable = route.get("executable")
+    settings = route.get("settings")
+    env = route.get("env", {})
+    config_root = route.get("config_root", "/")
+    return (
+        not set(route) - {"harness", "executable", "settings", "config_root", "env", "credential", "children"}
+        and {"harness", "executable", "settings", "credential"} <= set(route)
+        and route["credential"] == "none"
+        and isinstance(executable, str)
+        and executable.startswith("/")
+        and "\0" not in executable
+        and os.path.normpath(executable) == executable
+        and isinstance(settings, dict)
+        and {"settings_id", "mode", "model"} <= set(settings)
+        and not set(settings) - {"settings_id", "mode", "model", "launch"}
+        and isinstance(config_root, str)
+        and config_root.startswith("/")
+        and isinstance(env, dict)
+        and all(
+            isinstance(name, str) and ENV_NAME.fullmatch(name) and not name.startswith("OULIPOLY_")
+            and isinstance(value, str) and "\0" not in value
+            for name, value in env.items()
+        )
+    )
+
+
+def check_provider_executable(route):
+    """A provider route's executable: root's custody (the file and every
+    directory above it) and an executable regular file. Checked at each
+    admission, before any effect; the entry checks it again and binds it to
+    what it runs."""
+    if route.get("harness") != "provider":
+        return
+    path = route["executable"]
+    try:
+        check_owned(path)
+        st = os.stat(path)
+    except OSError as error:
+        raise Refused(f"provider: {path}: {type(error).__name__}") from None
+    if not stat.S_ISREG(st.st_mode) or not st.st_mode & 0o111:
+        raise Refused(f"provider: {path} is not an executable file")
 
 
 # The requester and its request.
@@ -446,9 +502,10 @@ def check_children(route, request, credential, deadline, site, now):
     grant = None
     if providers:
         (provider,) = providers
-        if route.get("harness") == "claude":
+        if route.get("harness") in ("claude", "provider"):
+            # A parent with no grant of its own: its children take a separate one.
             if "child_credential" not in request:
-                raise Refused("request: a Claude parent's children need child_credential (access-only, the child provider's)")
+                raise Refused("request: this parent's children need child_credential (access-only, the child provider's)")
             pseudo = {"model": provider + "/child", "credential": "required"}
             grant = check_credential(pseudo, request["child_credential"], deadline, site, now)
             grant = (grant[0], dict(grant[1], source="separate-child-grant"))
@@ -467,11 +524,11 @@ def check_credential(route, credential, deadline, site, now):
     """An access-only OAuth entry for the route's provider, fresh enough
     for the deadline and the site margin, or None. Reasons never carry any
     part of it."""
-    provider = route["model"].split("/", 1)[0]
     if route["credential"] == "none":
         if credential is not None:
             raise Refused("request: this route takes no credential")
         return None
+    provider = route["model"].split("/", 1)[0]
     if not isinstance(credential, dict) or set(credential) != {provider}:
         raise Refused(f"request: credential must be one {provider} entry")
     entry = credential[provider]
@@ -718,6 +775,17 @@ def entry_request(package, run, user, checked, env, authenticated):
         "workload": {"isolation": "host-root", "user": user.pw_name},
         **children_request(package, run, checked),
     }
+    if route.get("harness") == "provider":
+        provider = {
+            "executable": route["executable"],
+            "settings": route["settings"],
+            "env": route.get("env", {}),
+            "agent_bash_bin": os.path.join(package, BASH_BIN),
+            **checked["policy"],
+        }
+        if "config_root" in route:
+            provider["config_root"] = route["config_root"]
+        return dict(common, provider=provider)
     if route.get("harness") == "claude":
         # Named only: the requester's own store, never read here.
         return dict(common, claude={
@@ -1595,11 +1663,26 @@ def admit(argv, environ, stdin_fd, now):
     except ValueError:
         raise Refused("request is not JSON") from None
     checked = check_request(request, site, now)
+    check_provider_executable(checked["route"])
     env = root_env(user, site, checked["extra_env"])
     check_cwd_as(user, checked["cwd"])
     if checked["credential"] is not None:
         checked["credential"] = check_credential(checked["route"], checked["credential"][0], checked["deadline"], site, time.time())
     return package, site, user, checked, env, rest
+
+
+def harness_report(route):
+    """The admitted line's harness fields: a provider route's executable and
+    the digest of its opaque settings, else the embedded harness's model."""
+    harness = route.get("harness", "opencode")
+    if harness == "provider":
+        settings = json.dumps(route["settings"], sort_keys=True, separators=(",", ":")).encode()
+        return {"harness": harness, "model": None, "provider": {
+            "executable": route["executable"],
+            "settings_sha256": hashlib.sha256(settings).hexdigest(),
+            "resolved_by": "the entry: provider describe, policy.evaluate, resident.prepare",
+        }}
+    return {"harness": harness, "model": route["model"]}
 
 
 def run_locked(argv, environ, stdin_fd=0):
@@ -1654,8 +1737,7 @@ def run_locked(argv, environ, stdin_fd=0):
             "run_dir": run_dir,
             "requester": {"user": user.pw_name, "uid": user.pw_uid},
             "route": checked["route_name"],
-            "harness": checked["route"].get("harness", "opencode"),
-            "model": checked["route"]["model"],
+            **harness_report(checked["route"]),
             "bash": "trusted-task" if "bash_authority" in checked["policy"] else {"allow": checked["policy"]["bash_allow"]},
             "env_names": sorted(env),
             "credential": credential_public,

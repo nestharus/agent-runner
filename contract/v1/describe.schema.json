@@ -38,6 +38,10 @@
           "type": "boolean",
           "description": "Advertises bounded oulipoly.session_turn_pages/v1 support for session.read_turns. A provider must omit this property unless selected with host.env.OULIPOLY_HOST_SESSION_TURN_PAGES_V1=1."
         },
+        "resident_session_v1": {
+          "type": "boolean",
+          "description": "Advertises the oulipoly.resident_session/v1 extension: the resident.prepare subcommand and the resident ACP v2 session endpoint it prepares (contract/extensions/resident-session). A provider must omit this property unless selected with host.env.OULIPOLY_HOST_RESIDENT_SESSION_V1=1. A host offers each resident-session version it supports with its own selector and uses the highest version it offered that the provider advertises; a provider advertises only offered versions it supports."
+        },
         "session_enumerate": { "type": "boolean" },
         "terminal": { "type": "boolean" },
         "rotation": { "type": "boolean" },
@@ -60,7 +64,11 @@
         "setup",
         "migration"
       ],
-      "additionalProperties": false
+      "additionalProperties": true
+    },
+    "AdvertisedContractVersion": {
+      "type": "string",
+      "pattern": "^oulipoly\\.provider/v[1-9][0-9]*$"
     },
     "DescribeResult": {
       "type": "object",
@@ -69,10 +77,10 @@
         "display_name": { "type": "string", "minLength": 1 },
         "contract_versions": {
           "type": "array",
-          "items": { "$ref": "common.schema.json#/$defs/ContractVersion" },
+          "items": { "$ref": "#/$defs/AdvertisedContractVersion" },
           "minItems": 1
         },
-        "preferred_contract": { "$ref": "common.schema.json#/$defs/ContractVersion" },
+        "preferred_contract": { "$ref": "#/$defs/AdvertisedContractVersion" },
         "capabilities": { "$ref": "#/$defs/Capabilities" },
         "settings_schema_id": { "type": "string" },
         "concurrency": {

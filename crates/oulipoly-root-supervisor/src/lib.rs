@@ -10,17 +10,18 @@
 //!
 //! A real launchable OS process (the `oulipoly-root-supervisor` binary)
 //! owning every harness of one root concurrently, never one wrapper per
-//! agent. It is **unwired**: nothing on the installed route launches it,
-//! and it touches no Broker State, opcode, admission record, global debt or
-//! fence, guardian, driver or Bash path. Its harnesses in this crate's tests
-//! are the deterministic peer binary, not a real harness, except one
-//! ignored-by-default test (`tests/native_opencode.rs`) that owns a real,
-//! model-less OpenCode host (see Endpoints). Its one caller is the Runner's
-//! opt-in `native-root` entry (Linux, source build), which provisions a
-//! native OpenCode host with [`native::provision_opencode`] or a native
-//! Claude Code harness with [`native_claude::provision_claude`] and starts
-//! this process for one fresh root with only the environment the request
-//! declares.
+//! agent. It touches no Broker State, opcode, admission record, global
+//! debt or fence, guardian, driver or Bash path. Its harnesses in this
+//! crate's tests are the deterministic peer binary, not a real harness,
+//! except one ignored-by-default test (`tests/native_opencode.rs`) that owns
+//! a real, model-less OpenCode host (see Endpoints). Its one caller is the
+//! Runner's `native-root` entry (Linux), which provisions a native OpenCode
+//! host with [`native::provision_opencode`] or a native Claude Code harness
+//! with [`native_claude::provision_claude`] and starts this process for one
+//! fresh root with only the environment the request declares. In source,
+//! that entry is reached from ordinary Linux `agents` launches with native
+//! configuration, through the packaged native caller and front door
+//! (`packaging/native-linux`); this crate does not say what is installed.
 //!
 //! Absorption target: later slices make this lineage the root's
 //! harness-delivery owner, replacing the resume-plus-prompt path for the
