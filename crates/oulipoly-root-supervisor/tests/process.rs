@@ -2632,6 +2632,123 @@ fn unknown_session_updates_without_ack_leave_input_owed() {
     assert_eq!(read_state(&state)["prompts"].as_array().unwrap().len(), 1);
 }
 
+/// A conclusive ordinary rejection ends its logical input without inventing
+/// an ACK or turn end. Close must stop and drain the idle live recipient.
+#[test]
+fn rejected_ordinary_input_allows_close_without_ack_or_replay() {
+    rejected_ordinary_input_progresses(false);
+}
+
+/// The next eligible input reaches the same session after rejection, with
+/// its own ACK/turn end; the rejected input is never inserted or retried.
+#[test]
+fn rejected_ordinary_input_allows_follow_up_on_same_session() {
+    rejected_ordinary_input_progresses(true);
+}
+
+fn rejected_ordinary_input_progresses(follow_up: bool) {
+    let dir = Scratch::new("rejected-ordinary");
+    let state = dir.state("a");
+    let mut run = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            1,
+            json!([{
+                "id": "a", "argv": peer(&state, &["--reject-prompt-once"]),
+                "messages": ["rejected"]
+            }]),
+        ),
+    );
+    assert_eq!(run.event("a", "rejected")["code"], -32011);
+    if follow_up {
+        run.control(r#"{"cmd":"send","text":"echo:NEXT"}"#);
+        let decision = run.until("next admission decision", |v| {
+            v["event"] == "follow-up-admitted" || v["event"] == "follow-up-refused"
+        });
+        assert_eq!(decision["event"], "follow-up-admitted", "{decision}");
+        assert_eq!(decision["input"], 1);
+        let ack = run.event("a", "ack");
+        assert_eq!(ack["index"], 1);
+        assert_eq!(ack["durable"], true);
+        let reply = run.event("a", "agent-message");
+        assert_eq!(reply["input"], 1);
+        assert_eq!(reply["text"], "NEXT");
+        let turn = run.event("a", "turn-end");
+        assert_eq!(turn["input"], 1);
+        assert_eq!(turn["message_id"], ack["message_id"]);
+        assert_eq!(turn["session"], "sess-1");
+    }
+    run.control(r#"{"cmd":"close"}"#);
+    let (terminal, status, seen) = run.terminal();
+    eprintln!("rejection-consequence: {terminal}");
+    assert_eq!(status.code(), Some(7), "{terminal}");
+    assert_eq!(terminal["status"], "closed");
+    // Delivery is still unacknowledged. Physical close is not success.
+    assert_eq!(terminal["owed"], 1);
+    assert_eq!(terminal["cancel_requested"], false);
+    assert_eq!(terminal["all_harnesses_reaped"], true);
+    assert_eq!(terminal["root_pid1"]["end_observed"], true);
+    let a = harness(&terminal, "a");
+    assert_eq!(a["launches"], 1);
+    assert_eq!(a["exits"], json!(["signal:9"]));
+    let rejected = &a["messages"][0];
+    assert_eq!(rejected["state"], "owed");
+    assert_eq!(rejected["label"], "rejected");
+    assert_eq!(rejected["attempts"], 1);
+    assert_eq!(rejected["at_most_once"], false);
+    assert!(rejected["ack_generation"].is_null());
+    assert_eq!(rejected["completion"], "not-observed");
+    assert_eq!(events(&seen, "a", "ack").len(), usize::from(follow_up));
+    assert_eq!(events(&seen, "a", "turn-end").len(), usize::from(follow_up));
+    assert_eq!(events(&seen, "a", "rejected").len(), 1);
+    assert_eq!(events(&seen, "a", "close-stopping").len(), 1);
+    let exit = events(&seen, "a", "exited")[0];
+    assert_eq!(exit["reaped"], "work-pid1-wait");
+    assert_eq!(exit["namespace"]["drained"], true);
+    let conn = db(&dir);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM attempt WHERE idx = 0 AND outcome = 'rejected' AND resolved_generation = 1"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM message WHERE idx = 0 AND ack_label IS NOT NULL"
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM message WHERE idx = 0 AND stop = 'rejected'"
+        ),
+        1
+    );
+    // Recovery reads the durable stop: it cannot launch or replay rejection.
+    let resumed = Run::start(&dir, &json!({ "store": dir.store() }));
+    let (recovered, _, recovered_seen) = resumed.terminal();
+    eprintln!("rejection-recovery: {recovered}");
+    assert_eq!(recovered["owed"], 1);
+    assert_eq!(harness(&recovered, "a")["messages"][0]["label"], "rejected");
+    assert_eq!(harness(&recovered, "a")["messages"][0]["attempts"], 1);
+    assert!(events(&recovered_seen, "a", "launched").is_empty());
+    assert!(events(&recovered_seen, "a", "ack").is_empty());
+    let peer = read_state(&state);
+    assert_eq!(peer["sessions"], json!(["sess-1"]));
+    assert_eq!(
+        peer["prompts"].as_array().unwrap().len(),
+        1 + usize::from(follow_up)
+    );
+    assert_eq!(
+        peer["insertions"].as_array().unwrap().len(),
+        usize::from(follow_up)
+    );
+}
+
 /// Live follow-up: a further caller input reaches the same live harness
 /// and session, durably admitted before it is reported, with its own
 /// correlated ack and turn end. Malformed controls admit nothing. `close`
