@@ -21,6 +21,13 @@
 //!   and connection can still ask, within the budget, until its work's
 //!   receipt, its requester's loss, a stop or the deadline. Nothing is
 //!   retried; a refusal records and starts nothing.
+//! * **Prepared slots.** On a [`ChildRoute::Prepared`] route (a registered
+//!   provider prepared by the trusted entry before this owner started),
+//!   admission also takes the route's next unused slot: the k-th admission
+//!   on the route, every generation counted from the durable lineage, takes
+//!   slot k and no other admission ever does. With the route's slots used,
+//!   it refuses (`route-slots-used`), recording and starting nothing. This
+//!   owner runs only the slot's prepared argv; it prepares nothing.
 //! * **Budget.** `max_concurrent` charges every admitted child until its
 //!   end and its attributed Bash runs' ends are positively observed. A
 //!   child whose launch or end is unknown (possible start, failed waiter,
@@ -122,13 +129,37 @@ pub enum ChildRoute {
         #[serde(default)]
         endpoint: Endpoint,
     },
+    /// A registered provider's resident harness, prepared by the trusted
+    /// entry before this owner started: one slot per possible admission on
+    /// the route, each with its own fresh provider data root. The k-th
+    /// admission on the route (every generation counted) takes slot k; a
+    /// slot is never taken twice, and a route whose slots are used up
+    /// refuses. An unused slot is setup, not a start or an admission.
+    Prepared {
+        /// The provider's declared id, a label only.
+        provider: String,
+        slots: Vec<PreparedSlot>,
+        #[serde(default)]
+        endpoint: Endpoint,
+    },
+}
+
+/// One prepared launch of a [`ChildRoute::Prepared`] route.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedSlot {
+    /// The resident serve argv the provider prepared.
+    pub argv: Vec<String>,
+    /// The provider data root it was prepared in, for audit; this owner
+    /// neither reads nor makes it.
+    pub data_root: String,
 }
 
 impl ChildRoute {
     fn endpoint(&self) -> Endpoint {
         match self {
             Self::Opencode { .. } => Endpoint::UnixSocket,
-            Self::Fixed { endpoint, .. } => *endpoint,
+            Self::Fixed { endpoint, .. } | Self::Prepared { endpoint, .. } => *endpoint,
         }
     }
 
@@ -156,7 +187,7 @@ impl ChildRoute {
                 auth: auth.clone(),
                 explore: None,
             }),
-            Self::Fixed { .. } => None,
+            Self::Fixed { .. } | Self::Prepared { .. } => None,
         }
     }
 }
@@ -177,6 +208,7 @@ impl ChildPolicy {
         if !self.launch_base.starts_with('/') || self.launch_base.contains('\0') {
             return Err("children: launch_base must be absolute".to_owned());
         }
+        let mut data_roots = std::collections::BTreeSet::new();
         for (name, route) in &self.routes {
             if name.is_empty()
                 || name.len() > 64
@@ -191,6 +223,26 @@ impl ChildPolicy {
                     return Err(format!("children: route {name}: argv is empty"));
                 }
                 ChildRoute::Fixed { .. } => {}
+                ChildRoute::Prepared { slots, .. } => {
+                    if slots.is_empty() || slots.len() > self.max_starts as usize {
+                        return Err(format!(
+                            "children: route {name}: slots must be 1..=max_starts"
+                        ));
+                    }
+                    for slot in slots {
+                        if slot.argv.is_empty() {
+                            return Err(format!("children: route {name}: a slot argv is empty"));
+                        }
+                        // Each slot's state is its own: no two share a root.
+                        if !slot.data_root.starts_with('/')
+                            || !data_roots.insert(slot.data_root.as_str())
+                        {
+                            return Err(format!(
+                                "children: route {name}: slot data roots must be absolute and distinct"
+                            ));
+                        }
+                    }
+                }
                 ChildRoute::Opencode { .. } => {
                     let setup = route
                         .opencode_setup(format!("{}/check", self.launch_base))
@@ -227,6 +279,8 @@ struct Tracked {
 struct State {
     /// Admissions over the root's life (every generation).
     starts: u32,
+    /// The same, by route: a prepared route's next slot.
+    route_starts: BTreeMap<String, u32>,
     live: Vec<Tracked>,
     /// No further admission: the root is closing, stopping or cancelled.
     closed: Option<&'static str>,
@@ -255,6 +309,7 @@ impl Registry {
         policy: Option<ChildPolicy>,
         first_child: usize,
         starts: u32,
+        route_starts: BTreeMap<String, u32>,
         custody: Arc<Mutex<Custody>>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -263,6 +318,7 @@ impl Registry {
             custody,
             state: Mutex::new(State {
                 starts,
+                route_starts,
                 ..State::default()
             }),
         })
@@ -714,6 +770,7 @@ pub(crate) fn serve(
         id,
         message,
         route,
+        slot,
         accepted,
     } = admitted;
     sink.send(&accepted);
@@ -755,7 +812,7 @@ pub(crate) fn serve(
         });
         (done, handle)
     };
-    let argv = launch_argv(ctx, position, &route);
+    let argv = launch_argv(ctx, position, &route, slot);
     let record = match argv {
         Ok(argv) => {
             let _ = ctx
@@ -856,6 +913,7 @@ pub(crate) fn serve(
         "id": id,
         "position": position,
         "route": request.route,
+        "slot": slot,
         "parent": who.harness,
         "parent_work": who.harness_work,
         "outcome": outcome,
@@ -889,6 +947,8 @@ struct Admitted {
     id: String,
     message: oulipoly_acp::OutboundMessage,
     route: ChildRoute,
+    /// The prepared slot this admission took, on a prepared route.
+    slot: Option<usize>,
     accepted: Value,
 }
 
@@ -930,6 +990,18 @@ fn admit(
             policy.max_concurrent, state.unknown
         ));
     }
+    // A prepared route's slot: the next unused one, or a refusal.
+    let route_used = state.route_starts.get(&request.route).copied().unwrap_or(0);
+    let slot = match route {
+        ChildRoute::Prepared { slots, .. } => {
+            let index = route_used as usize;
+            if index >= slots.len() {
+                return Err(format!("route-slots-used: {route_used} of {}", slots.len()));
+            }
+            Some(index)
+        }
+        _ => None,
+    };
     let mut views = ctx.views.lock().expect("views");
     // The parent attributed before the request was read must still be
     // the same live work now, at commit.
@@ -985,6 +1057,7 @@ fn admit(
     };
     drop(views);
     state.starts += 1;
+    *state.route_starts.entry(request.route.clone()).or_default() += 1;
     state.live.push(Tracked {
         position,
         parent_work: who.harness_work,
@@ -1014,6 +1087,22 @@ fn admit(
         "concurrent": { "live": state.live.len(), "unknown_charged": state.unknown, "max": policy.max_concurrent },
         "meaning": "durably admitted; not a start",
     });
+    let mut accepted = accepted;
+    if let (
+        Some(index),
+        ChildRoute::Prepared {
+            provider, slots, ..
+        },
+    ) = (slot, route)
+    {
+        accepted["slot"] = json!({
+            "index": index,
+            "of": slots.len(),
+            "provider": provider,
+            "data_root": slots[index].data_root,
+            "meaning": "the route's next unused prepared slot, taken by this admission only; prepared before the owner started",
+        });
+    }
     drop(state);
     drop(custody);
     Ok(Admitted {
@@ -1021,12 +1110,13 @@ fn admit(
         id,
         message,
         route: route.clone(),
+        slot,
         accepted,
     })
 }
 
-/// The child's harness argv: a fixed one, or a fresh OpenCode launch
-/// provisioned now. `Err((reason, setup_effects))`: no process was started
+/// The child's harness argv: a fixed one, its admission's prepared slot,
+/// or a fresh OpenCode launch provisioned now. `Err((reason, setup_effects))`: no process was started
 /// either way; `setup_effects` is `"none"` only when setup refused before
 /// any write, else `"possible"` (files, a copied credential among them, can
 /// remain under the launch base until the caller retires the run).
@@ -1034,9 +1124,14 @@ fn launch_argv(
     ctx: &Context<'_>,
     position: usize,
     route: &ChildRoute,
+    slot: Option<usize>,
 ) -> Result<Vec<String>, (String, &'static str)> {
     match route {
         ChildRoute::Fixed { argv, .. } => Ok(argv.clone()),
+        ChildRoute::Prepared { slots, .. } => slot
+            .and_then(|index| slots.get(index))
+            .map(|slot| slot.argv.clone())
+            .ok_or(("no prepared slot was taken".to_owned(), "none")),
         ChildRoute::Opencode { .. } => {
             let policy = ctx
                 .registry
@@ -1136,6 +1231,10 @@ mod tests {
     }
 
     fn fixture(name: &str, starts: u32) -> Fixture {
+        fixture_with(name, &|dir| policy(dir, starts))
+    }
+
+    fn fixture_with(name: &str, policy: &dyn Fn(&std::path::Path) -> ChildPolicy) -> Fixture {
         let dir = Dir(std::env::temp_dir().join(format!(
             "children-{name}-{}",
             crate::sys::random_hex().unwrap()
@@ -1153,7 +1252,7 @@ mod tests {
                 messages: vec!["m".into()],
             }],
             workload: crate::Workload::UnprivilegedUserns {},
-            children: Some(policy(&dir.0, starts)),
+            children: Some(policy(&dir.0)),
         };
         let mut claimed = Store::claim(&dir.0.join("store"), Some(&intent)).unwrap();
         claimed.store.begin_incarnation("t", "test").unwrap();
@@ -1168,7 +1267,13 @@ mod tests {
             Some(root),
         ));
         let custody = Arc::new(Mutex::new(Custody::new(stop)));
-        let registry = Registry::new(Some(policy(&dir.0, starts)), 1, 0, Arc::clone(&custody));
+        let registry = Registry::new(
+            Some(policy(&dir.0)),
+            1,
+            0,
+            BTreeMap::new(),
+            Arc::clone(&custody),
+        );
         let views: Views = Arc::new(Mutex::new(vec![View {
             id: "p".into(),
             session: Some("s".into()),
@@ -1298,6 +1403,109 @@ mod tests {
         assert_eq!(closing, "closing: root-closing");
     }
 
+    /// A prepared route of two slots beside a fixed one, four starts.
+    fn prepared_policy(dir: &std::path::Path) -> ChildPolicy {
+        let mut policy = policy(dir, 4);
+        policy.routes.insert(
+            "luna".to_owned(),
+            ChildRoute::Prepared {
+                provider: "fake".to_owned(),
+                slots: (0..2)
+                    .map(|index| PreparedSlot {
+                        argv: vec![format!("serve-{index}")],
+                        data_root: format!("/slots/{index}/provider"),
+                    })
+                    .collect(),
+                endpoint: Endpoint::Stdio,
+            },
+        );
+        policy
+    }
+
+    fn luna() -> ChildRequest {
+        ChildRequest {
+            route: "luna".into(),
+            prompt: "where is X?".into(),
+        }
+    }
+
+    /// Each admission on a prepared route takes the route's next slot once,
+    /// whatever other routes do; with its slots used the route refuses
+    /// (recording and starting nothing) while the start budget still has
+    /// room; a later owner of the same store continues from the durable
+    /// admissions and never takes a used slot again.
+    #[test]
+    fn prepared_slots_are_taken_once_in_order_across_owners() {
+        let f = fixture_with("slots", &prepared_policy);
+        let first = admit(&ctx(&f), &who(0, f.parent), 7, &luna()).unwrap();
+        assert_eq!(first.slot, Some(0));
+        assert_eq!(first.accepted["slot"]["index"], 0);
+        assert_eq!(first.accepted["slot"]["of"], 2);
+        assert_eq!(first.accepted["slot"]["data_root"], "/slots/0/provider");
+        assert_eq!(
+            launch_argv(&ctx(&f), first.position, &first.route, first.slot).unwrap(),
+            vec!["serve-0".to_owned()]
+        );
+        f.registry.finish(first.position, json!({}), false);
+        let fixed = admit(&ctx(&f), &who(0, f.parent), 7, &request()).unwrap();
+        assert_eq!(fixed.slot, None);
+        assert!(fixed.accepted.get("slot").is_none());
+        f.registry.finish(fixed.position, json!({}), false);
+        let second = admit(&ctx(&f), &who(0, f.parent), 7, &luna()).unwrap();
+        assert_eq!(second.slot, Some(1));
+        assert_eq!(
+            launch_argv(&ctx(&f), second.position, &second.route, second.slot).unwrap(),
+            vec!["serve-1".to_owned()]
+        );
+        f.registry.finish(second.position, json!({}), false);
+        let used = admit(&ctx(&f), &who(0, f.parent), 7, &luna())
+            .err()
+            .unwrap();
+        assert_eq!(used, "route-slots-used: 2 of 2");
+        assert_eq!(children_rows(&f), 3);
+        assert_eq!(f.registry.state.lock().unwrap().starts, 3);
+        // A taken slot never launches without its admission's index.
+        assert!(launch_argv(&ctx(&f), 9, &second.route, None).is_err());
+        // A later owner of this store: the per-route count is durable.
+        let Fixture { _dir, store, .. } = f;
+        drop(store);
+        let claimed = Store::claim(&_dir.0.join("store"), None).unwrap();
+        assert_eq!(
+            claimed.child_route_starts,
+            BTreeMap::from([("echo".to_owned(), 1), ("luna".to_owned(), 2)])
+        );
+        assert_eq!(claimed.child_starts, 3);
+    }
+
+    /// Slots are finite (at most the start budget) and never share state.
+    #[test]
+    fn prepared_routes_are_bounded_and_their_data_roots_distinct() {
+        let dir = std::path::Path::new("/r");
+        prepared_policy(dir).validate().unwrap();
+        let mut over = prepared_policy(dir);
+        over.max_starts = 1;
+        assert!(
+            over.validate()
+                .unwrap_err()
+                .contains("slots must be 1..=max_starts")
+        );
+        let mut empty = prepared_policy(dir);
+        if let Some(ChildRoute::Prepared { slots, .. }) = empty.routes.get_mut("luna") {
+            slots.clear();
+        }
+        assert!(empty.validate().unwrap_err().contains("slots must be"));
+        let mut shared = prepared_policy(dir);
+        if let Some(ChildRoute::Prepared { slots, .. }) = shared.routes.get_mut("luna") {
+            slots[1].data_root = slots[0].data_root.clone();
+        }
+        assert!(shared.validate().unwrap_err().contains("distinct"));
+        let mut relative = prepared_policy(dir);
+        if let Some(ChildRoute::Prepared { slots, .. }) = relative.routes.get_mut("luna") {
+            slots[0].data_root = "slots/0".to_owned();
+        }
+        assert!(relative.validate().unwrap_err().contains("absolute"));
+    }
+
     /// D2/D3: a child whose end is unknown (or one of whose Bash runs
     /// ended unknown) keeps its concurrency charge after it is finished;
     /// a known end releases it. Unknowns can exhaust the root's capacity.
@@ -1425,7 +1633,7 @@ mod tests {
         };
         let base = std::path::Path::new(&f.registry.policy.as_ref().unwrap().launch_base);
         assert!(!base.exists());
-        let (reason, effects) = launch_argv(&ctx(&f), 1, &route).unwrap_err();
+        let (reason, effects) = launch_argv(&ctx(&f), 1, &route, None).unwrap_err();
         assert!(reason.starts_with("setup-refused:"), "{reason}");
         assert!(base.is_dir());
         assert!(!base.join("c1").exists());

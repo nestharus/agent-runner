@@ -889,6 +889,7 @@ where
         claimed.children.clone(),
         claimed.harnesses.len(),
         claimed.child_starts,
+        claimed.child_route_starts.clone(),
         Arc::clone(&custody),
     );
     let inboxes = match (0..expected.len())
