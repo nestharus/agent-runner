@@ -36,9 +36,15 @@
 //! * Every run's output is also retained by this owner (the
 //!   [`crate::retention`] module) and sealed before its `end` is sent; the
 //!   `end` (and the owner's `bash-ended`) carry the sealed identity as
-//!   `retained`. Two more ops on the same socket, attributed the same way,
+//!   `retained`. Three read/accept ops on the same socket, attributed the same way,
 //!   serve only the attributed harness's own runs (another harness's run,
 //!   or a work that is not a Bash run of this root, is `unknown-work`):
+//!   - `{"v":1,"op":"result","root_id":..,"work":N}` returns `work-result`:
+//!     the original accepted work/incarnation/generation, physical end,
+//!     retention, publication and completion knowledge. It reads the existing
+//!     store only; a missing publication stays missing and never runs work.
+//!     `oulipoly-root-bash --result rv1w:ROOT:WORK` is its in-root reader.
+//!     References end with the root store; explicit discard expires them.
 //!   - `{"v":1,"op":"output","root_id":..,"work":N,"offset":O,"length":L}`,
 //!     optionally with the `bytes` and `sha256` the requester holds: one
 //!     line `output-range` with the sealed identity and the retained bytes
@@ -613,6 +619,16 @@ impl Ingress {
                 }
                 self.leave_retained();
             }
+            Request::Result { root_id, work } => {
+                if let Err(reason) = self.enter_retained() {
+                    return self.refused(&stream, peer, reason);
+                }
+                match self.result_inner(&attributed, &root_id, work, Some(&cred)) {
+                    Ok(reply) => Sink(Some(stream)).send(&reply),
+                    Err(reason) => self.refused(&stream, peer, &reason),
+                }
+                self.leave_retained();
+            }
             Request::Child(request) => {
                 let ctx = crate::children::Context {
                     root_id: &self.root_id,
@@ -817,12 +833,38 @@ impl Ingress {
                 } else {
                     "launch-unknown"
                 };
+                let mut end = json!({ "event": event, "reason": reason.reason(), "not_started": not_started });
                 if not_started {
-                    let _ = self.store.lock().expect("store lock").resolve_work(
+                    end["observer"] = json!("root-pid1-no-start-reply");
+                    end["output"] = json!({"state":"not-started","delivery":"none"});
+                    end["retained"] = json!({"state":"not-applicable"});
+                    let resolved = self.store.lock().expect("store lock").resolve_work(
                         work,
                         "launch-refused",
                         Some("root-pid1-no-start-reply"),
                     );
+                    let publication = match &resolved {
+                        Ok(()) => self
+                            .store
+                            .lock()
+                            .expect("store lock")
+                            .publish_bash_result(work, &end)
+                            .map_err(|error| error.label()),
+                        Err(_) => Err("outcome-not-persisted"),
+                    };
+                    end["persistence"] = json!({
+                        "outcome": resolved.as_ref().map(|()| "stored").unwrap_or_else(|e| e.label()),
+                        "publication": publication.as_ref().map(|()| "published").unwrap_or_else(|e| *e),
+                    });
+                    if resolved.is_err() || publication.is_err() {
+                        self.store.lock().expect("store lock").note_required(
+                            "bash-failure",
+                            json!({
+                                "work":work,"incarnation":root.incarnation,"physical":"no-start",
+                                "end":end,"private_details":"withheld",
+                            }),
+                        );
+                    }
                 }
                 // Unknown stays unresolved for a successor; never retry here.
                 // A child's possible run keeps that child charged.
@@ -836,7 +878,7 @@ impl Ingress {
                 if let Some(interleave) = self.after_spawn_error_unlock.lock().unwrap().take() {
                     interleave();
                 }
-                sink.send(&json!({ "event": event, "reason": reason.reason(), "not_started": not_started }));
+                sink.send(&end);
                 if let Some(tap) = tap {
                     tap.finish(json!({
                         "event": "ended",
@@ -847,7 +889,10 @@ impl Ingress {
                         "meaning": "no output was relayed for this run",
                     }));
                 }
-                self.report(json!({ "event": format!("bash-{event}"), "work": work, "reason": reason.reason(), "not_started": not_started }));
+                let mut owner = end;
+                owner["event"] = json!(format!("bash-{event}"));
+                owner["work"] = json!(work);
+                self.report(owner);
                 self.leave(if not_started {
                     Outcome::NotRun
                 } else {
@@ -859,11 +904,17 @@ impl Ingress {
         let token = custody.register(Arc::clone(&root), work);
         self.children.add_run(who.position, &root, work);
         drop(custody);
-        let _ = self
+        let spawn_record = self
             .store
             .lock()
             .expect("store lock")
             .record_work_spawned(work, spawned.harness_host_pid);
+        if let Err(error) = spawn_record {
+            self.store.lock().expect("store lock").note_required("bash-spawn-record-error", json!({
+                "work":work,"incarnation":root.incarnation,"error":error.label(),"physical":"started",
+                "private_details":"withheld",
+            }));
+        }
         sink.send(&json!({
             "event": "started",
             "pid": spawned.harness_host_pid,
@@ -939,45 +990,56 @@ impl Ingress {
             tap.as_ref(),
         );
         let (retained, sealed) = retainer.seal_recorded(&output, &self.store, &self.root_id);
-        // Whether this run's end is in the store: the live view's only
-        // basis for a custody-owner terminal.
+        // Actual physical receipt and each persistence step have separate
+        // witnesses. Optional live capture is never their required home.
         let mut recorded = Err("no-durable-end".to_owned());
+        let mut physical = "unresolved";
+        let mut physical_receipt = Value::Null;
         let (mut event, outcome) = match root.wait_receipt(work) {
-            ReceiptWait::Receipt(receipt) => match receipt["harness"].as_str() {
-                Some(status) => {
-                    recorded = self
-                        .store
-                        .lock()
-                        .expect("store lock")
-                        .resolve_work(work, status, Some("work-pid1-wait"))
-                        .map_err(|error| error.label().to_owned());
-                    (
-                        json!({
-                            "event": "end",
-                            "status": status,
-                            "observer": "work-pid1-wait",
-                            "work_pid1": receipt["work_pid1"],
-                        }),
-                        Outcome::Ended,
-                    )
+            ReceiptWait::Receipt(receipt) => {
+                physical_receipt = json!({
+                    "harness":receipt["harness"],"harness_observer":receipt["harness_observer"],
+                    "work_pid1":receipt["work_pid1"],"namespace":receipt["namespace"],
+                    "stop_requested":receipt["stop_requested"],
+                });
+                match receipt["harness"].as_str() {
+                    Some(status) => {
+                        physical = "waited";
+                        recorded = self
+                            .store
+                            .lock()
+                            .expect("store lock")
+                            .resolve_work(work, status, Some("work-pid1-wait"))
+                            .map_err(|error| error.label().to_owned());
+                        (
+                            json!({
+                                "event": "end",
+                                "status": status,
+                                "observer": "work-pid1-wait",
+                                "work_pid1": receipt["work_pid1"],
+                            }),
+                            Outcome::Ended,
+                        )
+                    }
+                    None => {
+                        physical = "namespace-ended-status-unknown";
+                        recorded = self
+                            .store
+                            .lock()
+                            .expect("store lock")
+                            .resolve_work(work, "ended-with-work-namespace-status-unknown", None)
+                            .map_err(|error| error.label().to_owned());
+                        (
+                            json!({
+                                "event": "end-unknown",
+                                "reason": "ended-with-work-namespace-status-unknown",
+                                "work_pid1": receipt["work_pid1"],
+                            }),
+                            Outcome::Unknown,
+                        )
+                    }
                 }
-                None => {
-                    recorded = self
-                        .store
-                        .lock()
-                        .expect("store lock")
-                        .resolve_work(work, "ended-with-work-namespace-status-unknown", None)
-                        .map_err(|error| error.label().to_owned());
-                    (
-                        json!({
-                            "event": "end-unknown",
-                            "reason": "ended-with-work-namespace-status-unknown",
-                            "work_pid1": receipt["work_pid1"],
-                        }),
-                        Outcome::Unknown,
-                    )
-                }
-            },
+            }
             ReceiptWait::Lost => (
                 json!({ "event": "end-unknown", "reason": "root-pid1-connection-lost" }),
                 Outcome::Unknown,
@@ -986,13 +1048,36 @@ impl Ingress {
         };
         event["output"] = output;
         event["retained"] = retained;
+        event["physical_receipt"] = physical_receipt;
+        let resolution = recorded.clone();
+        let mut publication = Err(if sealed {
+            "outcome-not-persisted"
+        } else {
+            "seal-not-persisted"
+        }
+        .to_owned());
         if recorded.is_ok() && sealed {
-            recorded = self
+            publication = self
                 .store
                 .lock()
                 .expect("store lock")
                 .publish_bash_result(work, &event)
-                .map_err(|error| format!("{error:?}"));
+                .map_err(|error| error.label().to_owned());
+        }
+        recorded = publication.clone();
+        event["persistence"] = json!({
+            "outcome": resolution.as_ref().map(|()| "stored").unwrap_or_else(|e| e.as_str()),
+            "seal": if sealed {"stored"} else {"not-stored"},
+            "publication": publication.as_ref().map(|()| "published").unwrap_or_else(|e| e.as_str()),
+        });
+        if resolution.is_err() || publication.is_err() || event["retained"]["state"] != "complete" {
+            self.store.lock().expect("store lock").note_required(
+                "bash-failure",
+                json!({
+                    "work":work,"incarnation":root.incarnation,"physical":physical,
+                    "end":event,"private_details":"withheld",
+                }),
+            );
         }
         self.custody.lock().expect("custody lock").release(token);
         self.children
@@ -1415,6 +1500,32 @@ impl Ingress {
                         not an insertion ACK, processing, remote settlement or drain",
         }))
     }
+
+    fn result_inner(
+        &self,
+        who: &Attributed,
+        root_id: &str,
+        work: i64,
+        peer: Option<&libc::ucred>,
+    ) -> Result<Value, String> {
+        let custody = self.custody.lock().expect("custody lock");
+        if let Some(reason) = custody.reason() {
+            return Err(format!("owner-stopping: {reason}"));
+        }
+        self.retained_current(who, peer)?;
+        if root_id != self.root_id {
+            return Err("wrong-root".into());
+        }
+        let witness = self
+            .store
+            .lock()
+            .expect("store lock")
+            .bash_witness(work, who.position)
+            .map_err(|_| "store-failed")?
+            .ok_or("unknown-work")?;
+        self.retained_current(who, peer)?;
+        Ok(json!({"event":"work-result","witness":witness}))
+    }
     fn retained_current(&self, who: &Attributed, peer: Option<&libc::ucred>) -> Result<(), String> {
         if let Some(peer) = peer {
             let now = self.attribute(peer)?;
@@ -1652,6 +1763,7 @@ enum Request {
     Run(RunRequest),
     Child(crate::children::ChildRequest),
     Retained(RetainedRequest),
+    Result { root_id: String, work: i64 },
 }
 
 fn parse_retained(value: &Value) -> Result<RetainedRequest, String> {
@@ -1787,6 +1899,18 @@ fn read_request(stream: &UnixStream) -> Result<Request, String> {
     }
     if value["op"] == "output" || value["op"] == "accept" {
         return parse_retained(&value).map(Request::Retained);
+    }
+    if value["op"] == "result" {
+        let root_id = value["root_id"]
+            .as_str()
+            .filter(|s| s.len() <= 128)
+            .ok_or("bad-identity")?
+            .to_owned();
+        let work = value["work"]
+            .as_i64()
+            .filter(|work| *work > 0)
+            .ok_or("bad-identity")?;
+        return Ok(Request::Result { root_id, work });
     }
     if value["op"] != "run" {
         return Err("unknown-op".to_owned());
@@ -2206,6 +2330,237 @@ mod tests {
         drop(sink);
         let events = reader.join().unwrap();
         (work, events)
+    }
+
+    #[test]
+    fn required_account_keeps_wait_and_each_failed_persistence_step_without_live_capture() {
+        for fault in ["resolve", "seal", "publish", "account"] {
+            let dir = Fixture::new();
+            let (ingress, root, far, parent) = fixture(&dir.0);
+            let conn = rusqlite::Connection::open(dir.0.join("store").join(crate::store::DB_FILE))
+                .unwrap();
+            let trigger = match fault {
+                "resolve" => {
+                    "CREATE TRIGGER fault BEFORE UPDATE OF outcome ON work WHEN OLD.kind='bash' BEGIN SELECT RAISE(ABORT,'private resolve sentinel'); END;"
+                }
+                "seal" => {
+                    "CREATE TRIGGER fault BEFORE INSERT ON bash_output BEGIN SELECT RAISE(ABORT,'private seal sentinel'); END;"
+                }
+                "publish" => {
+                    "CREATE TRIGGER fault BEFORE UPDATE OF result ON bash_run BEGIN SELECT RAISE(ABORT,'private publish sentinel'); END;"
+                }
+                _ => {
+                    "CREATE TRIGGER fault BEFORE UPDATE OF required_account ON root BEGIN SELECT RAISE(ABORT,'private account sentinel'); END; CREATE TRIGGER fault2 BEFORE UPDATE OF outcome ON work WHEN OLD.kind='bash' BEGIN SELECT RAISE(ABORT,'private resolve sentinel'); END;"
+                }
+            };
+            conn.execute_batch(trigger).unwrap();
+            let (work, events) =
+                finished_run(&ingress, &root, &far, &dir.0, parent, b"kept", "code:7");
+            let end = events.iter().find(|v| v["event"] == "end").unwrap();
+            eprintln!("fault-result: fault={fault} end={end}");
+            assert_eq!(end["status"], "code:7");
+            assert_eq!(end["physical_receipt"]["work_pid1"], "code:0");
+            assert_ne!(end["persistence"]["publication"], "published");
+            let guard = ingress.store.lock().unwrap();
+            let account = guard.required_account();
+            eprintln!("fault-account: fault={fault} account={account}");
+            assert_eq!(account["counts"]["bash-failure"], 1);
+            assert_eq!(account["records"][0]["work"], work);
+            assert_eq!(account["records"][0]["physical"], "waited");
+            assert_eq!(account["records"][0]["incarnation"], 1);
+            assert!(!account.to_string().contains("private "));
+            let facts = guard.settlement_facts().unwrap();
+            assert_eq!(
+                facts.works_open, 1,
+                "only the fixture parent, never the waited Bash run"
+            );
+            assert_eq!(
+                facts.works_observed_unpersisted,
+                i64::from(matches!(fault, "resolve" | "account"))
+            );
+            let stored: Option<String> = conn
+                .query_row("SELECT required_account FROM root", [], |r| r.get(0))
+                .unwrap();
+            if fault == "account" {
+                assert!(stored.is_none());
+                assert_eq!(account["persistence"], "store-failed");
+            } else {
+                assert!(stored.unwrap().contains("bash-failure"));
+                assert_eq!(account["persistence"], "stored");
+            }
+            drop(guard);
+            let who = Attributed {
+                position: 0,
+                harness: "h".into(),
+                harness_work: parent,
+                session: None,
+                open: vec![],
+            };
+            let witness = ingress
+                .result_inner(&who, &ingress.root_id, work, None)
+                .unwrap();
+            assert_eq!(witness["witness"]["publication"], "missing");
+            assert_eq!(
+                witness["witness"]["required_observations"][0]["end"]["status"],
+                "code:7"
+            );
+        }
+    }
+
+    #[test]
+    fn required_no_start_survives_failed_outcome_and_account_writes_without_sealing_or_retry() {
+        for failed in [false, true] {
+            let dir = Fixture::new();
+            let (ingress, _root, far, parent) = fixture(&dir.0);
+            let conn = rusqlite::Connection::open(dir.0.join("store").join(crate::store::DB_FILE))
+                .unwrap();
+            if failed {
+                conn.execute_batch("CREATE TRIGGER fail_result BEFORE UPDATE OF outcome ON work WHEN OLD.kind='bash' BEGIN SELECT RAISE(ABORT,'private'); END; CREATE TRIGGER fail_account BEFORE UPDATE OF required_account ON root BEGIN SELECT RAISE(ABORT,'private'); END;").unwrap();
+            }
+            let replier = thread::spawn(move || {
+                let (bytes, _) = sys::recv(&far).unwrap().unwrap();
+                let req: Value = serde_json::from_slice(&bytes).unwrap();
+                sys::send(&far,json!({"req":req["req"],"event":"refused","reason":"synthetic-no-start","not_started":true}).to_string().as_bytes(),&[]).unwrap();
+            });
+            let (near, far) = UnixStream::pair().unwrap();
+            let who = Attributed {
+                position: 0,
+                harness: "h".into(),
+                harness_work: parent,
+                session: None,
+                open: vec![],
+            };
+            ingress.run(
+                &who,
+                1,
+                &RunRequest {
+                    argv: vec!["fixture".into()],
+                    cwd: dir.0.display().to_string(),
+                    background: false,
+                },
+                &mut Sink(Some(near)),
+            );
+            replier.join().unwrap();
+            let events: Vec<Value> = BufReader::new(far)
+                .lines()
+                .map(|s| serde_json::from_str(&s.unwrap()).unwrap())
+                .collect();
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[1]["event"], "launch-failed");
+            assert_eq!(events[1]["not_started"], true);
+            assert_eq!(events[1]["retained"]["state"], "not-applicable");
+            let guard = ingress.store.lock().unwrap();
+            eprintln!(
+                "no-start-account: events={} account={}",
+                serde_json::to_string(&events).unwrap(),
+                guard.required_account()
+            );
+            if failed {
+                assert_eq!(
+                    guard.required_account()["records"][0]["physical"],
+                    "no-start"
+                );
+                assert_eq!(guard.required_account()["persistence"], "store-failed");
+            } else {
+                let witness = guard
+                    .bash_witness(events[0]["work"].as_i64().unwrap(), 0)
+                    .unwrap()
+                    .unwrap();
+                eprintln!("no-start-published-witness: {witness}");
+                assert_eq!(witness["publication"], "published");
+                assert_eq!(witness["result"]["not_started"], true);
+                assert_eq!(witness["result"]["retained"]["state"], "not-applicable");
+                assert!(
+                    guard.required_account()["records"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            assert_eq!(guard.settlement_facts().unwrap().works_open, 1);
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM bash_run", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM bash_output", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(ingress.summary()["not_run"], 1);
+        }
+    }
+
+    #[test]
+    fn work_result_reader_preserves_original_witness_and_refuses_other_or_stale_harnesses() {
+        let dir = Fixture::new();
+        let (ingress, root, far, parent) = fixture(&dir.0);
+        let (work, _) = finished_run(
+            &ingress,
+            &root,
+            &far,
+            &dir.0,
+            parent,
+            b"payload",
+            "signal:15",
+        );
+        let who = Attributed {
+            position: 0,
+            harness: "h".into(),
+            harness_work: parent,
+            session: None,
+            open: vec![],
+        };
+        let witness = ingress
+            .result_inner(&who, &ingress.root_id, work, None)
+            .unwrap();
+        assert_eq!(witness["witness"]["result"]["status"], "signal:15");
+        assert_eq!(witness["witness"]["publication"], "published");
+        assert_eq!(witness["witness"]["accepted_generation"], 1);
+        assert_eq!(witness["witness"]["requester_work"], parent);
+        assert_eq!(
+            witness["witness"]["result"]["physical_receipt"]["work_pid1"],
+            "code:0"
+        );
+        assert_eq!(
+            witness["witness"]["result"]["retained"]["state"],
+            "complete"
+        );
+        assert_eq!(
+            ingress
+                .result_inner(&who, "wrong-root", work, None)
+                .unwrap_err(),
+            "wrong-root"
+        );
+        // A second current harness cannot read this harness's run.
+        ingress.views.lock().unwrap().push(View {
+            id: "other".into(),
+            works: vec![(99, PidNs { dev: 0, ino: 0 })],
+            ..View::default()
+        });
+        let other = Attributed {
+            position: 1,
+            harness: "other".into(),
+            harness_work: 99,
+            session: None,
+            open: vec![],
+        };
+        assert_eq!(
+            ingress
+                .result_inner(&other, &ingress.root_id, work, None)
+                .unwrap_err(),
+            "unknown-work"
+        );
+        ingress.views.lock().unwrap()[0].works.clear();
+        assert_eq!(
+            ingress
+                .result_inner(&who, &ingress.root_id, work, None)
+                .unwrap_err(),
+            "parent-not-current"
+        );
+        assert_eq!(ingress.summary()["ended"], 1, "queries never run work");
     }
 
     fn read_request(root_id: &str, work: i64, offset: u64, length: u64) -> RetainedRequest {

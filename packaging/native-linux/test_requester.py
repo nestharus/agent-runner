@@ -23,6 +23,7 @@ class Requester(unittest.TestCase):
             with mock.patch.object(build_package, "run", side_effect=lambda argv, *a, **kw: calls.append(argv)):
                 build_package.build_binaries(root, "/runner", "/bash-source", "/log")
             self.assertIn("oulipoly-root-child", calls[0])
+            self.assertIn("oulipoly-root-bash", calls[0])
             self.assertIn("--locked", calls[0])
             self.assertIn("--release", calls[0])
             for target, product in build_package.BINARIES:
@@ -34,6 +35,9 @@ class Requester(unittest.TestCase):
             stage = os.path.join(root, "specimen")
             build_package.stage_binaries(root, stage)
             files = build_package.manifest_files(stage)
+            reader = files["bin/oulipoly-root-bash"]
+            self.assertEqual(reader["mode"], "0o755")
+            self.assertEqual(reader["sha256"], build_package.sha256(os.path.join(root, "target/release/oulipoly-root-bash")))
             entry = files["bin/oulipoly-root-child"]
             self.assertEqual(entry["mode"], "0o755")
             self.assertEqual(entry["sha256"], build_package.sha256(os.path.join(root, "target/release/oulipoly-root-child")))

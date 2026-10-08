@@ -637,6 +637,7 @@
 //!   or the caller cancels. While no owner is attached, nothing drains a
 //!   survivor's stdout.
 
+mod account;
 pub mod bash;
 pub mod children;
 pub mod control;
@@ -1485,6 +1486,8 @@ where
                                 }
                                 let mut event =
                                     json!({ "event": "settlement", "control": controls });
+                                event["required_account"] =
+                                    store.lock().expect("store lock").required_account();
                                 if let (Some(event), Some(summary)) =
                                     (event.as_object_mut(), summary.as_object())
                                 {
@@ -1502,10 +1505,14 @@ where
                                     );
                                 }
                             }
-                            Err(error) => emit(
-                                &mut out,
-                                &json!({ "event": "settlement", "control": controls, "evidence": "unavailable", "reason": error.to_string() }),
-                            ),
+                            Err(error) => {
+                                let account = guard.required_account();
+                                drop(guard);
+                                emit(
+                                    &mut out,
+                                    &json!({ "event": "settlement", "control": controls, "evidence": "unavailable", "reason": error.to_string(), "required_account":account }),
+                                );
+                            }
                         }
                     }
                     _ => emit(
@@ -1592,6 +1599,7 @@ where
         }
     }
     report["bash"] = ingress.summary();
+    report["required_account"] = store.lock().expect("store lock").required_account();
     if let Some(live) = live.flatten() {
         report["live_output"] = live.summary();
     }

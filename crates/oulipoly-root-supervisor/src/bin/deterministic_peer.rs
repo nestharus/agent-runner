@@ -691,10 +691,38 @@ fn run_bash(command: &str) -> String {
     let client = std::env::current_exe()
         .expect("own path")
         .with_file_name("oulipoly-root-bash");
-    match std::process::Command::new(client)
+    let query = command.strip_prefix("read-result:");
+    let command = query.unwrap_or(command);
+    let output = std::process::Command::new(&client)
         .args(["--", "/bin/sh", "-c", command])
-        .output()
+        .current_dir(std::env::current_dir().expect("absolute fixture cwd"))
+        .output();
+    if query.is_some()
+        && let Ok(output) = &output
     {
+        let accepted = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter_map(|line| line.strip_prefix("oulipoly-root-bash: "))
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|v| v["event"] == "accepted")
+            .expect("accepted fixture run");
+        let reference = format!(
+            "rv1w:{}:{}",
+            accepted["root_id"].as_str().unwrap(),
+            accepted["work"]
+        );
+        let read = std::process::Command::new(&client)
+            .args(["--result", &reference])
+            .current_dir(std::env::current_dir().expect("absolute fixture cwd"))
+            .output()
+            .expect("query requester");
+        return format!(
+            "query_exit={:?}\n{}",
+            read.status.code(),
+            String::from_utf8_lossy(&read.stdout)
+        );
+    }
+    match output {
         Ok(output) => format!(
             "exit={:?}\nstdout={}\nstderr={}",
             output.status.code(),

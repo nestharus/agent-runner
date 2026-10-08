@@ -1,7 +1,8 @@
 //! Per-root durable intent: one private directory per root, owned by that
 //! root's supervisor. See the crate docs for the labels it backs.
 //!
-//! * Version 14 persists the SDK resident declaration for each harness.
+//! * Version 15 keeps bounded required failure observations in this same
+//!   root store. Version 14 added each harness's SDK resident declaration.
 //!   This per-root store refuses other versions; it is separate from the
 //!   shared StateDb migration chain and performs no legacy migration.
 //! * `owner.lock` is held with an exclusive `flock` for the life of the
@@ -104,7 +105,7 @@ pub(crate) const LOCK_FILE: &str = "owner.lock";
 pub(crate) const DB_FILE: &str = "intent.sqlite3";
 /// Version of this new per-root lineage. There is no migration chain: a
 /// store of any other version is refused.
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 /// How long a write waits for a foreign SQLite lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -242,7 +243,8 @@ CREATE TABLE message (
 );
 CREATE TABLE root (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    root_id TEXT NOT NULL
+    root_id TEXT NOT NULL,
+    required_account TEXT
 );
 CREATE TABLE incarnation (
     id INTEGER PRIMARY KEY,
@@ -547,6 +549,8 @@ pub(crate) struct Claimed {
 pub(crate) struct Store {
     conn: Connection,
     generation: i64,
+    root_id: String,
+    account: crate::account::Account,
     /// This claim's random owner identity (`owner.token`).
     owner_token: String,
     _lock: File,
@@ -710,6 +714,8 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let root_id: String = tx.query_row("SELECT root_id FROM root", [], |row| row.get(0))?;
+        let required_account: Option<String> =
+            tx.query_row("SELECT required_account FROM root", [], |row| row.get(0))?;
         let live_incarnation = tx
             .query_row(
                 "SELECT id, token, host_pid, start_time, boot_id FROM incarnation
@@ -752,6 +758,8 @@ impl Store {
             store: Store {
                 conn,
                 generation,
+                root_id: root_id.clone(),
+                account: crate::account::Account::load(required_account),
                 owner_token,
                 _lock: lock,
             },
@@ -833,7 +841,92 @@ impl Store {
     /// What the store says now about each logical input and the root's
     /// physical custody (see [`SettlementFacts`]).
     pub(crate) fn settlement_facts(&self) -> rusqlite::Result<SettlementFacts> {
-        settlement_facts(&self.conn)
+        let mut facts = settlement_facts(&self.conn)?;
+        facts.required_account_incomplete = self.account.physical_incomplete();
+        // A failed outcome write is not evidence that a positively waited
+        // or positively unstarted work is still live. Only this owner's
+        // actual observation may refine an open row; historical repair is
+        // deliberately outside this ordinary-flow account.
+        let mut refined = std::collections::HashSet::new();
+        for record in &self.account.records {
+            if record["observed_generation"].as_i64() != Some(self.generation)
+                || record["kind"] != "bash-failure"
+            {
+                continue;
+            }
+            let Some(work) = record["work"].as_i64() else {
+                continue;
+            };
+            if !refined.insert(work) {
+                continue;
+            }
+            let open: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM work WHERE id=?1 AND kind='bash' AND outcome IS NULL)",
+                [work],
+                |r| r.get(0),
+            )?;
+            if open
+                && matches!(
+                    record["physical"].as_str(),
+                    Some("waited" | "no-start" | "namespace-ended-status-unknown")
+                )
+            {
+                facts.works_open -= 1;
+                facts.works_observed_unpersisted += 1;
+                if record["physical"] == "namespace-ended-status-unknown" {
+                    facts.works_unknown += 1;
+                }
+            }
+        }
+        Ok(facts)
+    }
+
+    /// Observe first, then try fenced persistence. A failed transaction
+    /// cannot erase what this owner knows from its required terminal.
+    pub(crate) fn note_required(&mut self, kind: &'static str, mut record: serde_json::Value) {
+        if let Some(work) = record["work"].as_i64() {
+            match self.conn.query_row(
+                "SELECT generation,incarnation,harness FROM work WHERE id=?1",
+                [work],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            ) {
+                Ok((generation, incarnation, harness)) => {
+                    record["accepted_generation"] = serde_json::json!(generation);
+                    record["incarnation"] = serde_json::json!(incarnation);
+                    record["harness_position"] = serde_json::json!(harness);
+                }
+                Err(_) => record["stored_work_provenance"] = serde_json::json!("unavailable"),
+            }
+        }
+        record["root_id"] = serde_json::json!(self.root_id);
+        record["observed_generation"] = serde_json::json!(self.generation);
+        record["source"] = serde_json::json!("Runner-owner-observation");
+        self.account.note(kind, record);
+        let encoded = self.account.encoded();
+        let result = self.write(|tx| {
+            let rows = tx.execute("UPDATE root SET required_account=?1", [&encoded])?;
+            let readback: String =
+                tx.query_row("SELECT required_account FROM root", [], |r| r.get(0))?;
+            Ok(rows == 1 && readback == encoded)
+        });
+        match result {
+            Ok(true) => self.account.saved(),
+            Ok(false) => self.account.failed("account-write-unconfirmed"),
+            Err(error) => self.account.failed(error.label()),
+        }
+    }
+
+    pub(crate) fn required_account(&self) -> serde_json::Value {
+        let mut snapshot = self.account.snapshot();
+        snapshot["root_id"] = serde_json::json!(self.root_id);
+        snapshot["reporting_generation"] = serde_json::json!(self.generation);
+        snapshot
     }
 
     /// Runs `write` in one transaction only while this instance is still
@@ -1466,6 +1559,7 @@ impl Store {
     ) -> Result<(), StoreError> {
         let outcome = match end["event"].as_str() {
             Some("end") => end["status"].as_str(),
+            Some("launch-failed") if end["not_started"] == true => Some("launch-refused"),
             Some("end-unknown") if end["reason"] == "ended-with-work-namespace-status-unknown" => {
                 Some("ended-with-work-namespace-status-unknown")
             }
@@ -1486,8 +1580,12 @@ impl Store {
                     sha256:r.get(2)?,state:r.get(3)?,losses:r.get(4)? }),
             ).optional()?;
             let root: String = tx.query_row("SELECT root_id FROM root", [], |r|r.get(0))?;
-            if actual != Some((outcome.to_owned(), observer.map(str::to_owned), generation)) ||
-                seal.as_ref().is_none_or(|r| crate::retention::record_json(&root, work, r) != end["retained"]) {
+            let seal_matches = if outcome == "launch-refused" {
+                seal.is_none() && end["retained"]["state"] == "not-applicable"
+            } else {
+                seal.as_ref().is_some_and(|r| crate::retention::record_json(&root, work, r) == end["retained"])
+            };
+            if actual != Some((outcome.to_owned(), observer.map(str::to_owned), generation)) || !seal_matches {
                 return Ok(false);
             }
             let rows = tx.execute("UPDATE bash_run SET result=?2 WHERE work=?1 AND result IS NULL", params![work,encoded])?;
@@ -1501,6 +1599,72 @@ impl Store {
                 "no matching Bash result published".into(),
             ))
         }
+    }
+
+    /// The local witness behind rv1w. A missing publication stays missing;
+    /// reading never writes, recovers, seals or launches work. Authorizing
+    /// the connecting live harness remains the ingress's responsibility.
+    pub(crate) fn bash_witness(
+        &self,
+        work: i64,
+        harness: usize,
+    ) -> rusqlite::Result<Option<serde_json::Value>> {
+        use serde_json::{Value, json};
+        let row = self.conn.query_row(
+            "SELECT w.generation,w.incarnation,w.outcome,w.observer,w.resolved_generation,
+                    b.requester_work,b.inputs_open,b.delivery_mode,b.completion_outcome,b.completion_reason,b.result
+             FROM work w JOIN bash_run b ON b.work=w.id WHERE w.id=?1 AND w.kind='bash' AND w.harness=?2",
+            params![work,int(harness)], |r| Ok((
+                r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,
+                r.get::<_,Option<i64>>(4)?,r.get::<_,Option<i64>>(5)?,r.get::<_,String>(6)?,
+                r.get::<_,Option<String>>(7)?,r.get::<_,Option<String>>(8)?,r.get::<_,Option<String>>(9)?,r.get::<_,Option<String>>(10)?
+            ))).optional()?;
+        let Some((
+            accepted,
+            incarnation,
+            outcome,
+            observer,
+            resolved,
+            requester_work,
+            inputs,
+            delivery,
+            completion,
+            completion_reason,
+            result,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let decode = |encoded: &str| {
+            serde_json::from_str::<Value>(encoded).map_err(|_| rusqlite::Error::InvalidQuery)
+        };
+        let result = result.as_deref().map(decode).transpose()?;
+        let retained = self
+            .output(work)?
+            .and_then(|lookup| lookup.record)
+            .map(|record| crate::retention::record_json(&self.root_id, work, &record));
+        let observations: Vec<_> = self
+            .account
+            .records
+            .iter()
+            .filter(|r| r["work"].as_i64() == Some(work))
+            .cloned()
+            .collect();
+        Ok(Some(json!({
+            "reference": format!("rv1w:{}:{work}",self.root_id),
+            "root_id": self.root_id, "work":work, "harness_position":harness,
+            "requester_work":requester_work,"accepted_generation":accepted,"incarnation":incarnation,
+            "resolved_generation":resolved,"reporting_generation":self.generation,
+            "recorded_outcome":outcome,"recorded_observer":observer,
+            "inputs_open_at_acceptance":decode(&inputs)?,
+            "delivery":delivery,"completion_outcome":completion,"completion_reason":completion_reason,
+            "publication":if result.is_some() {"published"} else {"missing"},
+            "result":result,"retained":retained,
+            "required_observations":observations,
+            "observation_details_complete":self.account.snapshot()["details_complete"],
+            "lifetime":"this root store; explicit discard expires this reference",
+            "retry":"not-authorized",
+        })))
     }
 
     /// Commits a run's sealed retained output, once.
@@ -1736,6 +1900,10 @@ pub(crate) struct SettlementFacts {
     pub(crate) works_open: i64,
     /// Launches whose end is recorded without their actual waiter's report.
     pub(crate) works_unknown: i64,
+    /// Open durable rows refined by this owner's positive physical
+    /// observations despite their failed outcome writes.
+    pub(crate) works_observed_unpersisted: i64,
+    pub(crate) required_account_incomplete: bool,
     /// Incarnations not recorded ended.
     pub(crate) incarnations_open: i64,
     /// Incarnations recorded ended by an exit observation without a wait.
@@ -1789,6 +1957,8 @@ fn settlement_facts(conn: &Connection) -> rusqlite::Result<SettlementFacts> {
              AND (observer IS NULL OR observer <> 'work-pid1-wait')
              AND outcome NOT IN ('launch-refused', 'never-launched')",
         )?,
+        works_observed_unpersisted: 0,
+        required_account_incomplete: false,
         incarnations_open: count("SELECT count(*) FROM incarnation WHERE ended IS NULL")?,
         incarnations_observed: count(
             "SELECT count(*) FROM incarnation WHERE ended LIKE '%exit-observed%'",

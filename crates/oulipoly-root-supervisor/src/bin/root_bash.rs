@@ -7,6 +7,11 @@
 //! through the ingress named by `OULIPOLY_ROOT_BASH_V1`, writes the run's
 //! output (stderr joined) to stdout, and says on stderr, one JSON line each
 //! prefixed `oulipoly-root-bash: `, how it was accepted and how it ended.
+//! `--result rv1w:ROOT:WORK` instead reads that harness's original work
+//! witness through the same positively attributed socket. JSON goes to
+//! stdout; query exit 0 means a witness was read, not that the work succeeded.
+//! Query usage/refusal/uncertainty use 64/69/75. Explicit root-store discard
+//! expires the reference. A query never runs a command or authorizes retry.
 //!
 //! Exit: the run's own exit code; 128+N for signal N; 69 when there is no
 //! ingress, connection failed before sending, or it refused (nothing ran);
@@ -43,6 +48,9 @@ fn say(value: &Value) {
 
 fn main() -> ExitCode {
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().is_some_and(|arg| arg == "--result") {
+        return ExitCode::from(read_result(&argv));
+    }
     if argv.first().is_some_and(|arg| arg == "--") {
         argv.remove(0);
     }
@@ -76,6 +84,51 @@ fn main() -> ExitCode {
         .is_ok();
     let mut stdout = std::io::stdout().lock();
     ExitCode::from(receive(BufReader::new(stream), &mut stdout, sent))
+}
+
+/// An actual in-root consumer of a finalized local work reference. The
+/// reference is a locator; authorization is still live harness attribution
+/// at the owner socket. A query never reexecutes the original command.
+fn read_result(argv: &[String]) -> u8 {
+    let Some(reference) = argv.get(1).filter(|_| argv.len() == 2) else {
+        say(&json!({"outcome":"usage","detail":"--result rv1w:ROOT:WORK"}));
+        return 64;
+    };
+    let parts: Vec<_> = reference.split(':').collect();
+    let work = parts
+        .get(2)
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|n| *n > 0);
+    if parts.len() != 3 || parts[0] != "rv1w" || parts[1].is_empty() || work.is_none() {
+        say(&json!({"outcome":"bad-reference"}));
+        return 64;
+    }
+    let Some(path) = std::env::var_os(BASH_ENV) else {
+        return EX_UNAVAILABLE;
+    };
+    let Ok(mut stream) = UnixStream::connect(path) else {
+        return EX_UNAVAILABLE;
+    };
+    let request = json!({"v":PROTOCOL,"op":"result","root_id":parts[1],"work":work});
+    let _ = writeln!(stream, "{request}").and_then(|()| stream.flush());
+    let mut line = String::new();
+    // A bounded witness is not an arbitrary output stream.
+    use std::io::Read;
+    if BufReader::new(stream.take(1 << 20))
+        .read_line(&mut line)
+        .is_err()
+    {
+        return EX_TEMPFAIL;
+    }
+    let Ok(reply) = serde_json::from_str::<Value>(&line) else {
+        return EX_TEMPFAIL;
+    };
+    if reply["event"] != "work-result" {
+        say(&reply);
+        return EX_UNAVAILABLE;
+    }
+    println!("{reply}");
+    0
 }
 
 fn receive(reader: impl BufRead, stdout: &mut impl Write, sent: bool) -> u8 {
