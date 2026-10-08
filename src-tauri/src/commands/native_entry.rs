@@ -248,7 +248,10 @@ fn run_selected(cli: &Cli, config: &NativeEntryConfig) -> Result<i32, String> {
             lookup(config, &agent.model)
                 .map_err(|error| format!("{error} (selected by agent '{}')", agent.name))?;
             let inputs = crate::cli::inputs::parse_inputs(&cli.inputs)?;
-            let raw = crate::cli::inputs::resolve_prompt(cli, false)?;
+            // With -a the file already selects the agent, so Clap's first
+            // positional `agent` slot is part of the prompt. Named-agent
+            // invocation consumes that slot as its selector instead.
+            let raw = crate::cli::inputs::resolve_prompt(cli, cli.agent_file.is_some())?;
             let prompt = crate::cli::inputs::format_agent_prompt_with_inputs(&agent, raw, &inputs)?;
             (agent.model, prompt)
         }

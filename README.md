@@ -216,6 +216,13 @@ Subcommands:
 
 **Prompt resolution priority:** `--file` > positional arguments > stdin
 
+With `--agent-file` or `--model`, all positional arguments are prompt text,
+including the first. A named-agent invocation consumes its first positional
+argument as the agent name. Agent instructions precede the resolved prompt;
+the agent's frontmatter selects the model unless `--model` explicitly overrides
+it. On the Linux native entry, the selected model must have an explicit route
+mapping or the invocation is refused without a substitute.
+
 ### Examples
 
 ```bash
@@ -229,6 +236,9 @@ oulipoly-agent-runner --model claude-haiku "Explain monads in one sentence"
 oulipoly-agent-runner code-reviewer "Review this function"
 
 # Agent file from any path
+oulipoly-agent-runner --agent-file ./my-agent.md "Do the thing"
+
+# Explicit model override with the same agent instructions
 oulipoly-agent-runner --agent-file ./my-agent.md --model claude-haiku "Do the thing"
 
 # Pipe prompt from stdin
