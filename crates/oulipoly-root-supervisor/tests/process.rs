@@ -2098,6 +2098,58 @@ fn in_root_bash_reaches_its_own_owner_with_attributed_output_and_waited_end() {
     );
 }
 
+#[test]
+fn in_root_result_reader_retrieves_the_original_work_without_reexecution_or_live_capture() {
+    let dir = Scratch::new("result-reader");
+    let marker = dir.0.join("effects");
+    let run = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            1,
+            json!([{
+                "id":"a","argv":peer(&dir.state("a"),&["--exit-after-acks","1"]),
+                "messages":[format!("bash:read-result:printf x >> '{}'; printf payload; exit 7",marker.display())],
+            }]),
+        ),
+    );
+    let (terminal, status, seen) = run.terminal();
+    eprintln!(
+        "result-reader-account: status={status:?} terminal={terminal} events={}",
+        serde_json::to_string(&seen).unwrap()
+    );
+    assert_eq!(status.code(), Some(0));
+    assert_eq!(terminal["bash"]["accepted"], 1);
+    assert_eq!(terminal["bash"]["output_requests"], 1);
+    assert_eq!(
+        std::fs::read(&marker).unwrap(),
+        b"x",
+        "one native command effect despite result retrieval"
+    );
+    let text = events(&seen, "a", "agent-message")[0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.starts_with("query_exit=Some(0)"), "{text}");
+    let result: Value = serde_json::from_str(text.lines().nth(1).unwrap()).unwrap();
+    let witness = &result["witness"];
+    let accepted = owner_event(&seen, "bash-accepted")[0];
+    assert_eq!(witness["root_id"], accepted["root_id"]);
+    assert_eq!(witness["work"], accepted["work"]);
+    assert_eq!(witness["requester_work"], accepted["harness_work"]);
+    assert_eq!(witness["publication"], "published");
+    assert_eq!(witness["result"]["status"], "code:7");
+    assert_eq!(witness["result"]["physical_receipt"]["work_pid1"], "code:0");
+    assert_eq!(witness["result"]["retained"]["state"], "complete");
+    assert_eq!(witness["accepted_generation"], 1);
+    assert_eq!(witness["incarnation"], 1);
+    assert!(
+        witness["lifetime"]
+            .as_str()
+            .unwrap()
+            .contains("discard expires")
+    );
+}
+
 /// U7 refusal: a process outside every harness namespace of the root (this
 /// test) is refused visibly and nothing is recorded or run; there is no
 /// fallback. The refusal is reported by the owner.
@@ -2118,6 +2170,7 @@ fn bash_from_outside_every_harness_namespace_is_refused_and_nothing_runs() {
     for request in [
         json!({ "v": 1, "op": "run", "argv": ["/bin/touch", marker], "cwd": "/" }),
         json!({ "v": 1, "op": "output", "root_id": "supplied-marker", "work": 2 }),
+        json!({ "v": 1, "op": "result", "root_id": "supplied-marker", "work": 2 }),
         json!({ "v": 1, "op": "accept", "root_id": "supplied-marker", "work": 2, "bytes": 0, "sha256": "0".repeat(64) }),
     ] {
         let mut stream =
@@ -2139,7 +2192,7 @@ fn bash_from_outside_every_harness_namespace_is_refused_and_nothing_runs() {
     assert_eq!(refused["peer"]["pid"], std::process::id());
     run.cancel();
     let (terminal, _, seen) = run.terminal();
-    assert_eq!(terminal["bash"]["refused"], 3, "{terminal}");
+    assert_eq!(terminal["bash"]["refused"], 4, "{terminal}");
     assert_eq!(terminal["bash"]["accepted"], 0);
     assert!(owner_event(&seen, "bash-accepted").is_empty());
     assert!(owner_event(&seen, "bash-output-accepted").is_empty());
@@ -2682,6 +2735,17 @@ fn sdk_resident_rejected_turn_preserves_uncertainty_and_blocks_replay() {
         run.cancel();
         let (terminal, status, seen) = run.terminal();
         assert_eq!(status.code(), Some(2));
+        let account = &terminal["required_account"];
+        assert_eq!(account["counts"]["endpoint-record-error"], 1);
+        assert_eq!(account["persistence"], "stored");
+        assert_eq!(account["records"][0]["attribution"], "endpoint-rpc-error");
+        assert_eq!(account["records"][0]["message_id"], "unacked-fixture");
+        assert_eq!(account["records"][0]["input"], 0);
+        assert_eq!(account["records"][0]["private_details"], "withheld");
+        assert_eq!(
+            account["records"][0]["canonical_publication"],
+            "not-established"
+        );
         let message = &harness(&terminal, "h")["messages"][0];
         assert_eq!(message["state"], "owed");
         assert_eq!(message["label"], "rejected-unresolved");

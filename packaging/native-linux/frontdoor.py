@@ -534,7 +534,7 @@ def root_terminal(run):
         return unknown_root_terminal()
 
 
-def retire(run, retention, account_unavailable=False):
+def retire(run, retention, account_unavailable=False, required_account=None):
     """Remove package scratch after physical entry termination. Logical
     retirement stays in the returned account; removal never settles it.
     Keep preserves the store and adapter diagnostics. This layer knows no
@@ -542,6 +542,11 @@ def retire(run, retention, account_unavailable=False):
     """
     removed = None
     account = unknown_root_terminal() if account_unavailable else root_terminal(run)
+    if required_account is not None:
+        # The relay observed this required account even if its private-file
+        # replacement failed. Preserve it without upgrading logical knowledge.
+        account["required_account"] = required_account
+        account["account_publication"] = "unavailable" if account_unavailable or account.get("knowledge") == "unknown" else "file-published"
     if retention == "discard":
         try:
             if not shutil.rmtree.avoids_symlink_attacks:
@@ -767,6 +772,7 @@ class Relay:
         # The owner's described retirement eligibility, from its terminal.
         self.retirement = None
         self.terminal_account_unavailable = False
+        self.required_account = None
         self.close_waiting = False
         self.why = None
         self.stdout_gone = False
@@ -857,7 +863,8 @@ class Relay:
             return
         retirement = (value.get("session_control") or {}).get("retirement") or {}
         self.retirement = retirement.get("eligible") is True
-        account = {key: value[key] for key in ("status", "control", "session_control") if key in value}
+        account = {key: value[key] for key in ("status", "control", "session_control", "required_account") if key in value}
+        self.required_account = value.get("required_account")
         if "session_control" not in account:
             account["knowledge"] = "unknown"
         path = os.path.join(self.run, "private", ROOT_TERMINAL)
@@ -1428,7 +1435,7 @@ def live_daemon(package, site, checked, run_id, run_dir, request_path, user, lis
     relay.stop_listening(socket_path)
     os.close(alive)
     code = entry_exit(status, relay.killed)
-    retired = retire(run_dir, checked["retention"], relay.terminal_account_unavailable) if status is not None else {"ok": False, "stop": "unknown", "run_removed": False}
+    retired = retire(run_dir, checked["retention"], relay.terminal_account_unavailable, relay.required_account) if status is not None else {"ok": False, "stop": "unknown", "run_removed": False}
     if relay.collection_errors:
         code = EXIT_UNKNOWN
     if status is not None and not retired["ok"]:
@@ -1751,7 +1758,7 @@ def run_locked(argv, environ, stdin_fd=0):
         status = relay.run_to_end(stdin_fd)
         os.close(alive)
         code = entry_exit(status, relay.killed)
-        retired = retire(run_dir, checked["retention"], relay.terminal_account_unavailable) if status is not None else {"ok": False, "stop": "unknown", "run_removed": False}
+        retired = retire(run_dir, checked["retention"], relay.terminal_account_unavailable, relay.required_account) if status is not None else {"ok": False, "stop": "unknown", "run_removed": False}
         if relay.collection_errors:
             code = EXIT_UNKNOWN
         if status is not None and (not retired["ok"] or any(not record["ok"] for record in swept)):
@@ -1783,7 +1790,7 @@ def run_locked(argv, environ, stdin_fd=0):
             while entry.poll() is None and time.monotonic() < end:
                 time.sleep(0.01)
             status = entry.poll()
-        retired = retire(run_dir, checked["retention"], relay.terminal_account_unavailable if relay is not None else False) if entry is None or status is not None else {"ok": False, "stop": "unknown"}
+        retired = retire(run_dir, checked["retention"], relay.terminal_account_unavailable if relay is not None else False, relay.required_account if relay is not None else None) if entry is None or status is not None else {"ok": False, "stop": "unknown"}
         stage = "run-failed" if isinstance(failure, RunFailed) else "front-door-failed"
         emit({
             "frontdoor": "terminal",

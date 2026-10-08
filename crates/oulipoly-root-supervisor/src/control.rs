@@ -982,7 +982,13 @@ impl Face {
         } else {
             sc::LogicalSettlementState::Settled
         };
-        let physical = if facts.works_open > 0 || facts.incarnations_open > 0 {
+        let physical = if facts.required_account_incomplete {
+            blocking.push(
+                "required failure account detail incomplete; physical aggregation is unsettled"
+                    .into(),
+            );
+            sc::PhysicalCustodyState::Unsettled
+        } else if facts.works_open > 0 || facts.incarnations_open > 0 {
             sc::PhysicalCustodyState::Live
         } else if facts.works_unknown > 0 || facts.incarnations_unknown > 0 {
             sc::PhysicalCustodyState::Unsettled
@@ -993,6 +999,12 @@ impl Face {
         } else {
             sc::PhysicalCustodyState::ExitedWaited
         };
+        if facts.works_observed_unpersisted > 0 {
+            blocking.push(format!(
+                "{} Bash physical observation(s) not persisted in work outcomes",
+                facts.works_observed_unpersisted
+            ));
+        }
         if !matches!(
             physical,
             sc::PhysicalCustodyState::ExitedWaited | sc::PhysicalCustodyState::Missing
@@ -1033,9 +1045,11 @@ impl Face {
             "subjects": subjects,
             "recorded_actor_custody": {
                 "state": physical,
-                "basis": "Runner aggregation of fenced store records for all recorded launches and incarnations; not SDK one-reference knowledge or proof of actor completeness",
+                "basis": "Runner aggregation of fenced store records plus this owner's positive Bash wait/no-start observations when outcome writes failed; not SDK one-reference knowledge or proof of actor completeness",
                 "works_open": facts.works_open,
                 "works_unknown": facts.works_unknown,
+                "works_observed_unpersisted": facts.works_observed_unpersisted,
+                "required_account_incomplete": facts.required_account_incomplete,
                 "incarnations": facts.incarnations,
                 "incarnations_open": facts.incarnations_open,
                 "incarnations_observed": facts.incarnations_observed,
@@ -1179,6 +1193,21 @@ mod tests {
 
     fn face(store: &Store) -> Face {
         Face::load(store, "root-1", "uid:7", Some(1), Arc::default()).unwrap()
+    }
+
+    #[test]
+    fn omitted_physical_failure_detail_cannot_be_read_as_live_or_retirable() {
+        let dir = dir("omitted-physical");
+        let claimed = Store::claim(&dir.0, Some(&intent())).unwrap();
+        let face = face(&claimed.store);
+        let facts = SettlementFacts {
+            works_open: 1,
+            required_account_incomplete: true,
+            ..Default::default()
+        };
+        let (_, reading) = face.settlement(&facts, vec![]);
+        assert_eq!(reading["recorded_actor_custody"]["state"], "unsettled");
+        assert_eq!(reading["retirement"]["eligible"], false);
     }
 
     fn request(face: &Face, key: &str, operation: sc::Operation) -> sc::Request {

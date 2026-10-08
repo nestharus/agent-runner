@@ -176,7 +176,7 @@ waits for viewers and may cut an optional tail/terminal short.
 
 `finalized` names `rv1w:<root>:<work>` only after an exact matching durable
 Bash result is published with its actual work and sealed-output classifications.
-The per-root store schema is 13; older stores are refused, without migration.
+The per-root store schema is 15; older stores are refused, without migration.
 The result keeps command-wait knowledge, root PID1's wait of work PID1, and
 complete/partial/unsealed retention separately. Finalization promises neither
 success, full/readable bytes, report delivery/ACK nor outside retained read.
@@ -189,6 +189,37 @@ The parent receives root-child only when child routes exist. The generic
 owner still accepts trusted Fixed child intents; package sites select only
 registered routes. Generic root-child ingress, Agent Bash, retention,
 root/per-work PID1 and logical/custody ownership remain.
+
+An authorized live owning harness can read the original work witness using
+`oulipoly-root-bash --result rv1w:<root>:<work>`, or the local Bash socket's
+`{"v":1,"op":"result","root_id":"…","work":N}` operation. This reads
+original work/incarnation/generation, command wait or proven no-start,
+retention, publication and completion knowledge without executing anything.
+The command's exit 0 is query success, separate from the returned work status.
+Other harnesses and outside peers are refused; references last only as long
+as the private root store and expire on explicit discard. Missing publication
+is reported, never reconstructed by this reader or used to permit retry.
+Package construction includes the Runner reader in `bin/oulipoly-root-bash`;
+use the selected package's absolute path from the authorized harness. It
+does not add a provider tool declaration or change the external Bash adapter.
+
+Owner terminal and inspect reports carry `required_account`, also saved in
+the fenced root row. It retains host-observed Bash outcome/seal/publication
+failures and endpoint record-error diagnostics independently of optional
+events or live output. Physical receipts remain distinct from persistence;
+an observed wait or no-start whose outcome write failed is not classified as
+an open live Bash work in this owner's settlement. Endpoint observations keep
+bounded tags and contrary-diagnostic provenance, with raw details withheld;
+they establish no canonical publication and change no ACK, tagged end, input
+debt, control or physical closure. Detail is bounded to 64 records of 4096
+bytes each; counts include omitted details and overflow makes completeness
+false. Store/account write failures are reported from owner memory, without
+claiming durability. The frontdoor carries the latest observed required
+account through its retirement report even if its private account file write
+failed. After explicit discard, that report lives only in the opening caller's
+capture under its existing limits; unattended live reports and sweep delivery
+retain their existing gaps. Owner death before delivery can lose unsaved
+observations. No second registry, recovery actor or replay permission is added.
 
 The frontdoor does not read, convert, stage, refresh or scrub native credential
 files. Keep retains adapter state. Discard removes the package run tree with

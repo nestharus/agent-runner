@@ -730,6 +730,28 @@ impl Worker {
             value["child"] = link.marker();
             link.observe(&value);
         }
+        if value["event"] == "endpoint-record-error" {
+            let work = self
+                .views
+                .lock()
+                .expect("views")
+                .get(self.position)
+                .and_then(|view| view.works.last().map(|(work, _)| *work));
+            // Store only a recognized contrary diagnostic and bounded opaque
+            // tags. Neither private endpoint error text nor the raw SDK update
+            // enters the required account. This does not change ACK/end debt.
+            self.store.lock().expect("store lock").note_required("endpoint-record-error", json!({
+                "work":work,"harness_position":self.position,
+                "harness":crate::account::tag(Some(&self.id)),
+                "session":crate::account::tag(value["session"].as_str()),
+                "message_id":crate::account::tag(value["message_id"].as_str()),
+                "input":value["input"],"attribution":if value["attribution"] == "endpoint-rpc-error" {"endpoint-rpc-error"} else {"endpoint-native-tag"},
+                "endpoint_durability":"contrary-diagnostic",
+                "canonical_publication":"not-established","private_details":"withheld",
+                "endpoint_tag_complete":value["session"].as_str().is_some_and(|s| crate::account::tag(Some(s)).is_string())
+                    && value["message_id"].as_str().is_some_and(|s| crate::account::tag(Some(s)).is_string()),
+            }));
+        }
         let _ = self.tx.send(Event::Report(value));
     }
 
@@ -1847,6 +1869,21 @@ impl Worker {
                     }
                     None => client.submit(&session, &mut self.tracked[index].message),
                 };
+                if let DeliveryOutcome::Rejected {
+                    data: Some(data), ..
+                } = &outcome
+                    && let Some(error) = data.get("recordError")
+                {
+                    // Observe the contrary endpoint record before any host
+                    // attempt/stop transaction can fail. It remains a report,
+                    // never proof of non-insertion or permission to resend.
+                    self.report(json!({
+                        "event":"endpoint-record-error","session":session,"input":index,
+                        "message_id":crate::account::tag(error.get("message_id").and_then(Value::as_str)),
+                        "attribution":"endpoint-rpc-error","endpoint_durability":"contrary-diagnostic",
+                        "canonical_publication":"not-established","private_details":"withheld",
+                    }));
+                }
                 let (resolution, end) = match &outcome {
                     DeliveryOutcome::Accepted(acceptance)
                     | DeliveryOutcome::DuplicateUnknown(acceptance) => {

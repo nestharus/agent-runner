@@ -417,6 +417,25 @@ class RelayTest(Scratch):
         self.assertFalse(relay.terminal_account_unavailable)
         self.assertEqual(frontdoor.root_terminal(run)["session_control"], owed["session_control"])
 
+    def test_required_failure_account_survives_file_publication_failure_and_physical_discard(self):
+        relay, entry, run, _, _ = self.relay("ignore", 60, 5)
+        required = {"records": [{"kind": "endpoint-record-error", "message_id": "synthetic-tag",
+                                  "private_details": "withheld"}], "persistence": "store-failed"}
+        terminal = {"event": "terminal", "status": "closed", "required_account": required,
+                    "session_control": {"retirement": {"eligible": True}}}
+        with mock.patch.object(frontdoor.os, "replace", side_effect=OSError("synthetic publication failure")):
+            relay.note_owner_terminal(json.dumps(terminal).encode())
+        entry.kill()
+        self.assertEqual(entry.wait(timeout=5), -9)
+        retired = frontdoor.retire(run, "discard", relay.terminal_account_unavailable, relay.required_account)
+        self.assertTrue(retired["run_removed"])
+        self.assertFalse(os.path.exists(run))
+        self.assertEqual(retired["root_terminal"]["required_account"], required)
+        self.assertEqual(retired["root_terminal"]["account_publication"], "unavailable")
+        self.assertEqual(retired["root_terminal"]["knowledge"], "unknown")
+        self.assertFalse(retired["root_terminal"]["session_control"]["retirement"]["eligible"])
+        self.assertEqual(retired["retry"], "do-not-replay")
+
     def test_signal_is_abandonment(self):
         relay, entry, run, (out_r, out_w), (in_r, in_w) = self.relay("obey", 60, 5)
         relay.signals.append(15)

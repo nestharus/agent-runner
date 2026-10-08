@@ -36,6 +36,7 @@ BINARIES = (
     ("bin/oulipoly-root-supervisor", "target/release/oulipoly-root-supervisor"),
     ("bin/oulipoly-root-pid1", "target/release/oulipoly-root-pid1"),
     ("bin/oulipoly-root-child", "target/release/oulipoly-root-child"),
+    ("bin/oulipoly-root-bash", "target/release/oulipoly-root-bash"),
     ("agent-bash/agent-bash", "agent-bash-target/release/agent-bash"),
 )
 ASSETS = (
@@ -109,7 +110,7 @@ def build_binaries(build, runner_repo, bash_source, log):
     env = dict(os.environ, CARGO_HOME=os.path.join(build, "cargo-home"))
     run(["cargo", "build", "--release", "--locked", "-p", "oulipoly-root-supervisor",
          "--bin", "oulipoly-root-supervisor", "--bin", "oulipoly-root-pid1",
-         "--bin", "oulipoly-root-child"],
+         "--bin", "oulipoly-root-child", "--bin", "oulipoly-root-bash"],
         log, cwd=runner_repo, env=dict(env, CARGO_TARGET_DIR=os.path.join(build, "target")))
     # Default features only: never `age319-closed-fresh` or a fixture feature.
     run(["cargo", "build", "--release", "--locked", "-p", "oulipoly-agent-runner",
