@@ -434,6 +434,7 @@ class EntryRequest(unittest.TestCase):
         self.assertEqual(value["store"], "/var/r/1000/run/store")
         self.assertEqual(value["launch_dir"], "/var/r/1000/run/launch")
         self.assertEqual(value["workload"], {"isolation": "host-root", "user": "nes"})
+        self.assertEqual(value["live_output"], {"grant": "uid:1000"})
         self.assertEqual(value["provider"]["bash_authority"], "trusted-task")
         self.assertEqual(value["provider"]["executable"], PROVIDER["executable"])
         self.assertNotIn("fixture-access-marker", json.dumps(value))

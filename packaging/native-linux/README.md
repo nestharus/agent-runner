@@ -143,7 +143,12 @@ credential_margin_s or credential route fields, even `credential: "none"`.
 Adapter-specific settings/env remain the adapter's own surface.
 
 Admission fixes requester identity from sudo, checks allowed users, package
-and provider custody, cwd access, bounded environment and deadline. Run
+and provider custody, cwd access, bounded environment and deadline. The
+entry request grants the owner's optional live view of the root's Bash
+output to exactly that requester (`live_output`); the owner serves it at
+`<launch>/ipc/live.sock` (handed to that uid, 0600) only to that kernel uid
+from outside the root, and its `live-output` event names the socket. It is
+optional observation: it never gates or changes Bash, retention or ends. Run
 store stays root-private; IPC/work data are handed to the work UID. The
 entry negotiates provider describe, policy.evaluate and resident.prepare.
 Prepared child slots use fresh data roots and inherit the parent tool policy.
