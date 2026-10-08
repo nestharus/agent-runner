@@ -71,9 +71,41 @@ jobs:
         env:
           # Same test runner as ci.yml: the runtime unit harness needs a TTY.
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: bash ${{ github.workspace }}/.github/scripts/ci-test-runner.sh
+        shell: bash
+        # Coverage measures which code the suite exercises; the pass/fail
+        # gate for tests is ci.yml. --ignore-run-fail runs every target and
+        # still produces the report when some tests fail. The failing tests
+        # are counted, listed in the job summary and flagged as a warning,
+        # not hidden. A run in which no test result is reported (for example
+        # a build failure) still fails this step.
         run: |
           mkdir -p coverage
-          cargo llvm-cov --workspace --no-report --no-fail-fast
+          cargo llvm-cov --workspace --no-report --ignore-run-fail 2>&1 | tee coverage/test-output.log
+          sed 's/\x1b\[[0-9;]*m//g' coverage/test-output.log > coverage/test-output.txt
+          rm coverage/test-output.log
+          results=$(grep -c '^test result:' coverage/test-output.txt || true)
+          passed=$(awk '/^test result:/ {n += $4} END {print n + 0}' coverage/test-output.txt)
+          failed=$(awk '/^test result:/ {n += $6} END {print n + 0}' coverage/test-output.txt)
+          if [ "$results" -eq 0 ]; then
+            echo "::error title=Coverage::no test results were reported; see the log for build errors"
+            exit 1
+          fi
+          {
+            echo "### Rust coverage test run"
+            echo
+            echo "Test targets: $results. Passed: $passed. Failed: $failed."
+            if [ "$failed" -gt 0 ]; then
+              echo
+              echo "Failing tests (first 200):"
+              echo
+              echo '```'
+              grep -E '^test .+ \.\.\. FAILED$' coverage/test-output.txt | sort -u | head -200
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$failed" -gt 0 ]; then
+            echo "::warning title=Failing tests::$failed of $((passed + failed)) tests failed during the coverage run; the coverage report is still produced. See the job summary."
+          fi
           cargo llvm-cov report --lcov --output-path coverage/lcov.info
           cargo llvm-cov report --cobertura --output-path coverage/coverage.xml
           cargo llvm-cov report --json --summary-only --output-path coverage/coverage-summary.json
