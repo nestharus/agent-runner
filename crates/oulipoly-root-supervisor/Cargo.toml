@@ -44,7 +44,6 @@ test = false
 # the resolved source as provenance only.
 agent-provider-contract = { git = "https://github.com/nestharus/agent-provider-sdk.git" }
 libc.workspace = true
-oulipoly-acp = { path = "../oulipoly-acp" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

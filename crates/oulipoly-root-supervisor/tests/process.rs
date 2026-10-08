@@ -137,7 +137,10 @@ impl Scratch {
     }
 
     fn state(&self, harness: &str) -> PathBuf {
-        self.0.join(format!("{harness}.json"))
+        self.0
+            .canonicalize()
+            .unwrap()
+            .join(format!("{harness}.json"))
     }
 
     /// This root's private store directory (created by the supervisor).
@@ -2632,146 +2635,203 @@ fn unknown_session_updates_without_ack_leave_input_owed() {
     assert_eq!(read_state(&state)["prompts"].as_array().unwrap().len(), 1);
 }
 
-/// A conclusive ordinary rejection ends its logical input without inventing
-/// an ACK or turn end. Close must stop and drain the idle live recipient.
+/// A rejected RPC is no proof of non-insertion. It blocks ordinary
+/// admission/close, creates no ACK, and never grants replay on recovery.
 #[test]
-fn rejected_ordinary_input_allows_close_without_ack_or_replay() {
-    rejected_ordinary_input_progresses(false);
-}
-
-/// The next eligible input reaches the same session after rejection, with
-/// its own ACK/turn end; the rejected input is never inserted or retried.
-#[test]
-fn rejected_ordinary_input_allows_follow_up_on_same_session() {
-    rejected_ordinary_input_progresses(true);
-}
-
-fn rejected_ordinary_input_progresses(follow_up: bool) {
-    let dir = Scratch::new("rejected-ordinary");
-    let state = dir.state("a");
-    let mut run = Run::start(
-        &dir,
-        &spec(
-            &dir,
-            1,
-            json!([{
-                "id": "a", "argv": peer(&state, &["--reject-prompt-once"]),
-                "messages": ["rejected"]
-            }]),
-        ),
+fn sdk_resident_rejected_turn_preserves_uncertainty_and_blocks_replay() {
+    let dir = Scratch::new("sdk-rejected");
+    let state = dir.state("h");
+    let prepared = agent_provider_contract::resident_session::ResidentPrepareResult::v1(
+        vec!["resident.serve".to_owned()],
+        "1".repeat(64),
     );
-    let rejection = run.event("a", "rejected");
-    assert_eq!(rejection["code"], -32011);
-    assert_eq!(rejection["durable"], true);
-    // At the public outcome, both resolution facts already exist without ACK.
+    let mut request = spec(
+        &dir,
+        3,
+        json!([{
+            "id":"h", "argv":peer(&state, &["--resident-evidence", "rejected"]),
+            "messages":["synthetic prompt"], "resident":prepared,
+        }]),
+    );
+    request["intent"]["cwd"] = json!(std::env::current_dir().unwrap());
+    let mut run = Run::start(&dir, &request);
+    assert_eq!(
+        run.event("h", "resident-session-started")["canonical_binding"],
+        "unbound"
+    );
+    let rejected = run.event("h", "rejected");
+    assert_eq!(rejected["code"], -32011);
+    assert_eq!(rejected["insertion"], "unresolved");
+    assert_eq!(rejected["retry"], "not-authorized");
+    assert_eq!(rejected["native_report"]["custody"], "complete");
+    assert_eq!(rejected["native_report"]["status_code"], 0);
+    assert_eq!(rejected["endpoint_record_error"], true);
+    assert_eq!(rejected["unresolved_attempts"], 1);
+    run.control(r#"{"cmd":"send","text":"must not reach peer"}"#);
+    assert_eq!(run.event("h", "follow-up-refused")["reason"], "input-open");
+    run.control(r#"{"cmd":"close"}"#);
+    run.event("h", "close-not-applied");
+    run.cancel();
+    let (terminal, status, seen) = run.terminal();
+    assert_eq!(status.code(), Some(2));
+    let message = &harness(&terminal, "h")["messages"][0];
+    assert_eq!(message["state"], "owed");
+    assert_eq!(message["label"], "rejected-unresolved");
+    assert_eq!(message["unresolved_attempts"], 1);
+    assert_eq!(message["turn_end"], "not-recorded");
+    assert!(events(&seen, "h", "ack").is_empty());
+    assert!(events(&seen, "h", "turn-end").is_empty());
+    assert!(
+        !serde_json::to_string(&seen)
+            .unwrap()
+            .contains("PRIVATE-RESIDENT-PAYLOAD")
+    );
     let conn = db(&dir);
     assert_eq!(
         count(
             &conn,
-            "SELECT count(*) FROM attempt WHERE idx = 0 AND outcome = 'rejected' AND resolved_generation = 1"
+            "SELECT count(*) FROM attempt WHERE outcome = 'rejected-unresolved'"
         ),
         1
     );
     assert_eq!(
         count(
             &conn,
-            "SELECT count(*) FROM message WHERE idx = 0 AND stop = 'rejected' AND ack_label IS NULL"
+            "SELECT count(*) FROM message WHERE stop = 'rejected-unresolved' AND ack_label IS NULL"
         ),
         1
     );
     drop(conn);
-    if follow_up {
-        run.control(r#"{"cmd":"send","text":"echo:NEXT"}"#);
-        let decision = run.until("next admission decision", |v| {
-            v["event"] == "follow-up-admitted" || v["event"] == "follow-up-refused"
-        });
-        assert_eq!(decision["event"], "follow-up-admitted", "{decision}");
-        assert_eq!(decision["input"], 1);
-        let ack = run.event("a", "ack");
-        assert_eq!(ack["index"], 1);
-        assert_eq!(ack["durable"], true);
-        let reply = run.event("a", "agent-message");
-        assert_eq!(reply["input"], 1);
-        assert_eq!(reply["text"], "NEXT");
-        let turn = run.event("a", "turn-end");
-        assert_eq!(turn["input"], 1);
-        assert_eq!(turn["message_id"], ack["message_id"]);
-        assert_eq!(turn["session"], "sess-1");
-    }
-    run.control(r#"{"cmd":"close"}"#);
-    let (terminal, status, seen) = run.terminal();
-    eprintln!("rejection-consequence: {terminal}");
-    assert_eq!(status.code(), Some(7), "{terminal}");
-    assert_eq!(terminal["status"], "closed");
-    // Delivery is still unacknowledged. Physical close is not success.
-    assert_eq!(terminal["owed"], 1);
-    assert_eq!(terminal["cancel_requested"], false);
-    assert_eq!(terminal["all_harnesses_reaped"], true);
-    assert_eq!(terminal["root_pid1"]["end_observed"], true);
-    let a = harness(&terminal, "a");
-    assert_eq!(a["launches"], 1);
-    assert_eq!(a["exits"], json!(["signal:9"]));
-    let rejected = &a["messages"][0];
-    assert_eq!(rejected["state"], "owed");
-    assert_eq!(rejected["label"], "rejected");
-    assert_eq!(rejected["attempts"], 1);
-    assert_eq!(rejected["at_most_once"], false);
-    assert!(rejected["ack_generation"].is_null());
-    assert_eq!(rejected["completion"], "not-observed");
-    assert_eq!(events(&seen, "a", "ack").len(), usize::from(follow_up));
-    assert_eq!(events(&seen, "a", "turn-end").len(), usize::from(follow_up));
-    assert_eq!(events(&seen, "a", "rejected").len(), 1);
-    assert_eq!(events(&seen, "a", "close-stopping").len(), 1);
-    let exit = events(&seen, "a", "exited")[0];
-    assert_eq!(exit["reaped"], "work-pid1-wait");
-    assert_eq!(exit["namespace"]["drained"], true);
-    let conn = db(&dir);
-    assert_eq!(
-        count(
-            &conn,
-            "SELECT count(*) FROM attempt WHERE idx = 0 AND outcome = 'rejected' AND resolved_generation = 1"
-        ),
-        1
-    );
-    assert_eq!(
-        count(
-            &conn,
-            "SELECT count(*) FROM message WHERE idx = 0 AND ack_label IS NOT NULL"
-        ),
-        0
-    );
-    assert_eq!(
-        count(
-            &conn,
-            "SELECT count(*) FROM message WHERE idx = 0 AND stop = 'rejected'"
-        ),
-        1
-    );
-    // Recovery reads the durable stop: it cannot launch or replay rejection.
-    let resumed = Run::start(&dir, &json!({ "store": dir.store() }));
-    let (recovered, _, recovered_seen) = resumed.terminal();
-    eprintln!("rejection-recovery: {recovered}");
-    assert_eq!(recovered["owed"], 1);
-    assert_eq!(harness(&recovered, "a")["messages"][0]["label"], "rejected");
-    assert_eq!(harness(&recovered, "a")["messages"][0]["attempts"], 1);
-    assert!(events(&recovered_seen, "a", "launched").is_empty());
-    assert!(events(&recovered_seen, "a", "ack").is_empty());
-    let peer = read_state(&state);
-    assert_eq!(peer["sessions"], json!(["sess-1"]));
-    assert_eq!(
-        peer["prompts"].as_array().unwrap().len(),
-        1 + usize::from(follow_up)
-    );
-    assert_eq!(
-        peer["insertions"].as_array().unwrap().len(),
-        usize::from(follow_up)
-    );
+    let recovered = Run::start(&dir, &recover(&dir));
+    let (terminal, _, _) = recovered.terminal();
+    assert_eq!(harness(&terminal, "h")["launches"], 0);
+    assert_eq!(read_state(&state)["prompts"].as_array().unwrap().len(), 1);
 }
 
-/// Live follow-up: a further caller input reaches the same live harness
-/// and session, durably admitted before it is reported, with its own
-/// correlated ack and turn end. Malformed controls admit nothing. `close`
-/// stops the harness through its work PID 1 after the turn ended: status
+/// SDK resume consumes the stored native session after an observed peer
+/// exit. Same-key dedup is transport evidence, not native at-most-once proof.
+#[test]
+fn sdk_resident_resume_keeps_session_and_transport_history() {
+    let dir = Scratch::new("sdk-resume");
+    let state = dir.state("h");
+    let prepared = agent_provider_contract::resident_session::ResidentPrepareResult::v1(
+        vec!["resident.serve".to_owned()],
+        "3".repeat(64),
+    );
+    let mut request = spec(
+        &dir,
+        3,
+        json!([{
+            "id":"h", "argv":peer(&state, &["--resident-evidence","absent", "--mode","exit-before-ack-once", "--exit-after-acks","1"]),
+            "messages":["synthetic prompt"], "resident":prepared,
+        }]),
+    );
+    request["intent"]["cwd"] = json!(std::env::current_dir().unwrap());
+    let (terminal, status, seen) = Run::start(&dir, &request).terminal();
+    assert_eq!(status.code(), Some(0), "{terminal}");
+    let starts = events(&seen, "h", "resident-session-started");
+    assert_eq!(starts.len(), 2);
+    assert_eq!(starts[0]["resumed"], false);
+    assert_eq!(starts[1]["resumed"], true);
+    assert_eq!(starts[0]["session"], starts[1]["session"]);
+    assert!(starts.iter().all(|s| s["canonical_binding"] == "unbound"));
+    assert_eq!(read_state(&state)["prompts"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        read_state(&state)["insertions"].as_array().unwrap().len(),
+        1
+    );
+    let message = &harness(&terminal, "h")["messages"][0];
+    assert_eq!(message["state"], "acknowledged");
+    assert_eq!(message["attempts"], 2);
+    assert_eq!(message["closures"], 1);
+}
+
+/// Real host transport and owner: safe evidence projections, own versus
+/// covering tags, contradictory post-idle publication diagnostics, and
+/// continued host admission when a bounded quiet window expires.
+#[test]
+fn sdk_resident_turn_evidence_and_late_diagnostics_keep_their_scope() {
+    for (shape, report_state) in [
+        ("late", "valid"),
+        ("later", "valid"),
+        ("covering", "valid"),
+        ("incomplete", "valid"),
+        ("absent", "absent"),
+        ("null", "null"),
+        ("invalid", "invalid-or-unsupported"),
+    ] {
+        let dir = Scratch::new(shape);
+        let state = dir.state("h");
+        let prepared = agent_provider_contract::resident_session::ResidentPrepareResult::v1(
+            vec!["resident.serve".to_owned()],
+            "2".repeat(64),
+        );
+        let mut request = spec(
+            &dir,
+            3,
+            json!([{
+                "id":"h", "argv":peer(&state, &["--resident-evidence",shape]),
+                "messages":["synthetic prompt"], "resident":prepared,
+            }]),
+        );
+        request["intent"]["cwd"] = json!(std::env::current_dir().unwrap());
+        let mut run = Run::start(&dir, &request);
+        let start = run.event("h", "resident-session-started");
+        assert_eq!(start["canonical_binding"], "unbound");
+        assert_eq!(start["canonical_publication"], "not-established");
+        let ack = run.event("h", "ack");
+        let end = run.event("h", "turn-end");
+        assert_eq!(end["message_id"], ack["message_id"]);
+        assert_eq!(end["native_report"]["state"], report_state);
+        assert_eq!(end["own_turn_end"], shape != "covering");
+        assert_eq!(end["native_report_for"], end["last_user_message_id"]);
+        assert_eq!(end["endpoint_durability"], "not-established");
+        assert_eq!(end["canonical_publication"], "not-established");
+        if shape == "incomplete" {
+            assert_eq!(end["native_report"]["custody"], "incomplete");
+        }
+        if shape == "late" {
+            let diagnostic = run.event("h", "endpoint-record-error");
+            assert_eq!(diagnostic["message_id"], ack["message_id"]);
+            assert_eq!(diagnostic["input"], 0);
+            assert_eq!(diagnostic["endpoint_durability"], "contrary-diagnostic");
+        }
+        // Silence after idle must not demand an endless diagnostic wait.
+        run.control(r#"{"cmd":"send","text":"echo:NEXT"}"#);
+        assert_eq!(run.event("h", "follow-up-admitted")["input"], 1);
+        run.until("second tagged end", |v| {
+            v["event"] == "turn-end" && v["input"] == 1
+        });
+        if shape == "later" {
+            let diagnostic = events(&run.seen, "h", "endpoint-record-error");
+            assert_eq!(diagnostic.len(), 1);
+            assert_eq!(diagnostic[0]["message_id"], ack["message_id"]);
+            assert_eq!(
+                diagnostic[0]["input"], 0,
+                "later report belongs to first input"
+            );
+        }
+        run.control(r#"{"cmd":"close"}"#);
+        let (terminal, status, seen) = run.terminal();
+        assert_eq!(status.code(), Some(7), "{terminal}");
+        assert!(
+            !serde_json::to_string(&seen)
+                .unwrap()
+                .contains("PRIVATE-RESIDENT-PAYLOAD")
+        );
+        assert_eq!(read_state(&state)["prompts"].as_array().unwrap().len(), 2);
+        let prepared_saved: String = db(&dir)
+            .query_row("SELECT resident FROM harness WHERE position=0", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&prepared_saved).unwrap(),
+            serde_json::to_value(prepared).unwrap()
+        );
+    }
+}
+
 /// `closed` (7), the harness's actual end a signal, never `cancelled`.
 #[test]
 fn follow_up_reaches_the_same_session_and_close_is_not_cancel() {
@@ -4426,7 +4486,7 @@ fn retry_refusal_keeps_prior_turn_unresolved(absent: bool) {
     assert_eq!(
         count(
             &conn,
-            "SELECT count(*) FROM attempt WHERE outcome = 'rejected'"
+            "SELECT count(*) FROM attempt WHERE outcome = 'rejected-unresolved'"
         ),
         1
     );

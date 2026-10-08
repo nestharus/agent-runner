@@ -11,7 +11,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "agent-provider-contract"
 version = "0.3.0"
-source = "git+https://github.com/nestharus/agent-provider-sdk.git#e19b11234ddc8bc6c55ca75c69912e6f0c203f51"
+source = "git+https://github.com/nestharus/agent-provider-sdk.git#44f1bbe814cd27d4e5e89afad1c6fb4627a493b6"
 dependencies = [
  "base64 0.22.1",
  "jsonschema",
@@ -3028,14 +3028,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oulipoly-acp"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "oulipoly-agent-messenger"
 version = "0.1.0"
 dependencies = [
@@ -3188,7 +3180,6 @@ version = "0.1.0"
 dependencies = [
  "agent-provider-contract",
  "libc",
- "oulipoly-acp",
  "rusqlite",
  "serde",
  "serde_json",

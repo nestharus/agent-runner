@@ -12,7 +12,6 @@ members = [
     "crates/oulipoly-agent-scratchpad",
     "crates/oulipoly-agent-messenger",
     "crates/oulipoly-kernel-broker",
-    "crates/oulipoly-acp",
     "crates/oulipoly-root-supervisor",
 ]
 default-members = [
@@ -27,7 +26,6 @@ default-members = [
     "crates/oulipoly-agent-scratchpad",
     "crates/oulipoly-agent-messenger",
     "crates/oulipoly-kernel-broker",
-    "crates/oulipoly-acp",
     "crates/oulipoly-root-supervisor",
 ]
 

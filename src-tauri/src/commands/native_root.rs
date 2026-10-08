@@ -450,12 +450,18 @@ fn run_registered(
         "setup": "retained",
         "retry": "do-not-replay",
     });
-    let owner_request = owner_request(
+    let mut owner_request = owner_request(
         request,
         (declared.provider_id.as_str(), Endpoint::Stdio),
         prepared.argv,
         Some(&child_routes),
     );
+    owner_request
+        .intent
+        .as_mut()
+        .expect("create intent")
+        .harnesses[0]
+        .resident = Some(prepared.result);
     start_owner(out, owner, &request.env, &owner_request, &context)
 }
 
@@ -547,6 +553,7 @@ fn child_policy(
                         slots: (0..slot_count(children, route))
                             .map(|index| PreparedSlot {
                                 argv: vec!["/usr/bin/env".to_owned()],
+                                resident: None,
                                 data_root: slot_dir(request, name, index)
                                     .join("provider")
                                     .to_string_lossy()
@@ -700,6 +707,7 @@ fn prepare_children(
             slots.push(PreparedSlot {
                 argv: prepared.argv,
                 data_root: prepared.data_root.to_string_lossy().into_owned(),
+                resident: Some(prepared.result),
             });
         }
         receipt.insert(
@@ -1071,6 +1079,7 @@ fn owner_request(
                 argv,
                 endpoint,
                 session: None,
+                resident: None,
                 messages: request.messages.clone(),
             }],
             workload: match &request.workload {

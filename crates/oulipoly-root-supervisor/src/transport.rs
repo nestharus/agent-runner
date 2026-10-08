@@ -12,8 +12,9 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
-use oulipoly_acp::{Incoming, PeerClosed, Transport};
+use agent_provider_contract::acp::{Incoming, PeerClosed, Transport};
 
 use crate::conversation::Inbox;
 
@@ -39,6 +40,9 @@ pub(crate) struct Observed {
     /// The last read returned because the bell rang, not because of the
     /// harness. Not an end and not a fault; any partial line is kept.
     pub(crate) woken: Cell<bool>,
+    /// Host's bounded diagnostic collection, never an endpoint-end signal.
+    pub(crate) read_deadline: Cell<Option<Instant>>,
+    pub(crate) timed_out: Cell<bool>,
 }
 
 /// Run-level detach: once triggered, every blocked harness read returns
@@ -106,11 +110,21 @@ enum Ready {
     File,
     Detached,
     Bell,
+    TimedOut,
 }
 
 /// Blocks until `file` is readable, the run detached, or (when given) the
 /// bell rang. The harness's own data and a detach come first.
 fn ready(stop: &StopSignal, file: &File, bell: Option<&OwnedFd>) -> io::Result<Ready> {
+    ready_until(stop, file, bell, None)
+}
+
+fn ready_until(
+    stop: &StopSignal,
+    file: &File,
+    bell: Option<&OwnedFd>,
+    deadline: Option<Instant>,
+) -> io::Result<Ready> {
     let pollfd = |fd: i32| libc::pollfd {
         fd,
         events: libc::POLLIN,
@@ -123,7 +137,18 @@ fn ready(stop: &StopSignal, file: &File, bell: Option<&OwnedFd>) -> io::Result<R
     ];
     loop {
         // SAFETY: poll over three pollfds; a negative fd is ignored.
-        if unsafe { libc::poll(polls.as_mut_ptr(), 3, -1) } >= 0 {
+        let timeout = match deadline {
+            None => -1,
+            Some(end) => match end.checked_duration_since(Instant::now()) {
+                None => return Ok(Ready::TimedOut),
+                Some(left) => i32::try_from(left.as_millis().saturating_add(1)).unwrap_or(i32::MAX),
+            },
+        };
+        let result = unsafe { libc::poll(polls.as_mut_ptr(), 3, timeout) };
+        if result == 0 {
+            return Ok(Ready::TimedOut);
+        }
+        if result > 0 {
             break;
         }
         let error = io::Error::last_os_error();
@@ -188,11 +213,23 @@ impl Read for Polled {
             .as_deref()
             .filter(|_| self.observed.wake_armed.get())
             .map(Inbox::bell);
-        match ready(&self.stop, &self.file, bell)? {
+        match ready_until(
+            &self.stop,
+            &self.file,
+            bell,
+            self.observed.read_deadline.get(),
+        )? {
             Ready::File => self.file.read(buf),
             Ready::Detached => {
                 self.observed.detached.set(true);
                 Err(io::Error::other("detached"))
+            }
+            Ready::TimedOut => {
+                self.observed.timed_out.set(true);
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "host diagnostic window ended",
+                ))
             }
             Ready::Bell => {
                 self.observed.woken.set(true);
@@ -268,7 +305,10 @@ impl Transport for HarnessTransport {
                 }
                 Err(_) => {
                     // A woken read keeps what it read of the line so far.
-                    if !self.observed.detached.get() && !self.observed.woken.get() {
+                    if !self.observed.detached.get()
+                        && !self.observed.woken.get()
+                        && !self.observed.timed_out.get()
+                    {
                         self.observed.read_fault.set(true);
                     }
                     return Incoming::Closed;
@@ -299,6 +339,36 @@ impl Transport for HarnessTransport {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// A host diagnostic deadline can interrupt even a partial line. It
+    /// neither declares EOF nor loses the later contradictory evidence.
+    #[test]
+    fn diagnostic_deadline_keeps_partial_line_without_declaring_end() {
+        let (read, write) = crate::sys::pipe().unwrap();
+        let mut harness = File::from(write);
+        let observed = Rc::new(Observed::default());
+        let mut transport = HarnessTransport::new(
+            File::from(read),
+            File::open("/dev/null").unwrap(),
+            Rc::clone(&observed),
+            Arc::new(StopSignal::new().unwrap()),
+            None,
+        );
+        observed
+            .read_deadline
+            .set(Some(Instant::now() + std::time::Duration::from_millis(10)));
+        harness.write_all(br#"{"late":"#).unwrap();
+        assert!(matches!(transport.recv(), Incoming::Closed));
+        assert!(observed.timed_out.get());
+        assert!(!observed.eof.get() && !observed.read_fault.get());
+        observed.read_deadline.set(None);
+        observed.timed_out.set(false);
+        harness.write_all(b"true}\n").unwrap();
+        match transport.recv() {
+            Incoming::Message(value) => assert_eq!(value, serde_json::json!({"late": true})),
+            _ => panic!("diagnostic bytes lost"),
+        }
+    }
 
     /// A bell that rings mid-line interrupts the read without claiming an
     /// end or a fault, and the line's bytes already read are kept.

@@ -134,6 +134,8 @@ pub struct PreparedSlot {
     /// The provider data root it was prepared in, for audit; this owner
     /// neither reads nor makes it.
     pub data_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resident: Option<agent_provider_contract::resident_session::ResidentPrepareResult>,
 }
 
 impl ChildRoute {
@@ -184,6 +186,19 @@ impl ChildPolicy {
                     for slot in slots {
                         if slot.argv.is_empty() {
                             return Err(format!("children: route {name}: a slot argv is empty"));
+                        }
+                        if let Some(resident) = &slot.resident {
+                            agent_provider_contract::acp::resident::PreparedEndpoint::agree(
+                                resident,
+                            )
+                            .map_err(|_| {
+                                format!("children: route {name}: unsupported resident declaration")
+                            })?;
+                            if !matches!(route.endpoint(), Endpoint::Stdio) {
+                                return Err(format!(
+                                    "children: route {name}: resident requires stdio"
+                                ));
+                            }
                         }
                         // Each slot's state is its own: no two share a root.
                         if !slot.data_root.starts_with('/')
@@ -751,15 +766,22 @@ pub(crate) fn serve(
     let argv = launch_argv(&route, slot);
     let record = match argv {
         Ok(argv) => {
-            let _ = ctx
-                .store
-                .lock()
-                .expect("store lock")
-                .set_harness_argv(position, &argv);
+            let resident = match &route {
+                ChildRoute::Prepared { slots, .. } => slot
+                    .and_then(|i| slots.get(i))
+                    .and_then(|slot| slot.resident.clone()),
+                _ => None,
+            };
+            let _ = ctx.store.lock().expect("store lock").set_harness_launch(
+                position,
+                &argv,
+                resident.as_ref(),
+            );
             let harness = DurableHarness {
                 id: id.clone(),
                 argv,
                 endpoint: route.endpoint(),
+                resident,
                 session: None,
                 messages: vec![DurableMessage {
                     message,
@@ -884,7 +906,7 @@ pub(crate) fn serve(
 struct Admitted {
     position: usize,
     id: String,
-    message: oulipoly_acp::OutboundMessage,
+    message: agent_provider_contract::acp::OutboundMessage,
     route: ChildRoute,
     /// The prepared slot this admission took, on a prepared route.
     slot: Option<usize>,
@@ -1136,6 +1158,7 @@ mod tests {
                 argv: vec!["peer".into()],
                 endpoint: Endpoint::Stdio,
                 session: None,
+                resident: None,
                 messages: vec!["m".into()],
             }],
             workload: crate::Workload::UnprivilegedUserns {},
@@ -1301,6 +1324,7 @@ mod tests {
                     .map(|index| PreparedSlot {
                         argv: vec![format!("serve-{index}")],
                         data_root: format!("/slots/{index}/provider"),
+                        resident: None,
                     })
                     .collect(),
                 endpoint: Endpoint::Stdio,

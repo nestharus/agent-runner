@@ -1913,6 +1913,7 @@ mod tests {
                 argv: vec!["peer".into()],
                 endpoint: Endpoint::Stdio,
                 session: None,
+                resident: None,
                 messages: vec!["one".into()],
             }],
             workload: crate::Workload::UnprivilegedUserns {},

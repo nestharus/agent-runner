@@ -36,7 +36,7 @@
 //! `--reject-prompt-once` rejects the first ordinary prompt with -32011
 //! before insertion, then stays alive for later inputs.
 //!
-//! `--reject-completion-once` conclusively rejects the first background
+//! `--reject-completion-once` rejects the first background
 //! completion with -32001 before insertion, then stays alive for later inputs.
 //!
 //! `--live-reattach` declares the live reattachment contract in every
@@ -86,7 +86,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
-use oulipoly_acp::{
+use agent_provider_contract::acp::{
     DEDUP_CONTRACT_META, DUPLICATE_META, LIVE_REATTACH_META, MESSAGE_KEY_META, PARENT_MESSAGE_META,
     TURN_INPUT_META,
 };
@@ -111,6 +111,7 @@ struct Args {
     off_session_turn: Option<String>,
     off_session_after_ack: bool,
     turn_gate: Option<PathBuf>,
+    resident_evidence: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -132,10 +133,14 @@ fn parse_args() -> Args {
         off_session_turn: None,
         off_session_after_ack: false,
         turn_gate: None,
+        resident_evidence: None,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            "--resident-evidence" => {
+                args.resident_evidence = Some(iter.next().expect("evidence shape"))
+            }
             "--state" => args.state = iter.next().expect("--state path").into(),
             "--mode" => args.mode = iter.next().expect("--mode value"),
             "--launch-modes" => args.launch_modes = iter.next().expect("--launch-modes value"),
@@ -308,6 +313,11 @@ impl Peer {
                     {
                         meta.insert(LIVE_REATTACH_META.to_owned(), json!({ "version": 1 }));
                     }
+                    if args.resident_evidence.is_some() {
+                        meta.insert(agent_provider_contract::acp::RESIDENT_SESSION_META.to_owned(), json!({
+                            "protocol": "oulipoly.resident_session/v1", "acp_schema": agent_provider_contract::acp::pin::SCHEMA_TAG,
+                        }));
+                    }
                     if !meta.is_empty() {
                         result["_meta"] = Value::Object(meta);
                     }
@@ -367,6 +377,17 @@ impl Peer {
                         _ => {}
                     }
                     let text = params["prompt"][0]["text"].as_str().unwrap_or_default();
+                    if args.resident_evidence.as_deref() == Some("rejected") {
+                        send(
+                            out,
+                            &json!({"jsonrpc":"2.0", "id":id, "error": {
+                                "code": -32011, "message": "PRIVATE-RESIDENT-PAYLOAD",
+                                "data": {"nativeTurn": {"request_id":"fixture", "custody":"complete", "status":{"code":0}},
+                                         "recordError":{"message_id":"unacked-fixture", "record_error":"PRIVATE-RESIDENT-PAYLOAD"}}
+                            }}),
+                        );
+                        continue;
+                    }
                     if args.reject_prompt_once
                         && !text.starts_with("[Background Bash completion]")
                         && state["fault_used"] == false
@@ -431,6 +452,19 @@ impl Peer {
                     if args.dedup {
                         result["_meta"] =
                             json!({ MESSAGE_KEY_META: key, DUPLICATE_META: duplicate });
+                    }
+                    // Deterministic beyond-window diagnostic: only after the
+                    // host admitted and sent the next turn, for the first tag.
+                    if args.resident_evidence.as_deref() == Some("later") && *acks > 0 {
+                        let first_id = &state["insertions"][0]["messageId"];
+                        send(
+                            out,
+                            &json!({"jsonrpc":"2.0", "method":"session/update", "params": {
+                                "sessionId":session_id, "update":{"sessionUpdate":"session_info_update", "_meta": {
+                                    agent_provider_contract::acp::NATIVE_TURN_META: {"message_id":first_id, "record_error":"PRIVATE-RESIDENT-PAYLOAD"}
+                                }}
+                            }}),
+                        );
                     }
                     if *acks == 0 && !args.off_session_after_ack {
                         if let Some(other) = &args.off_session_turn {
@@ -545,6 +579,24 @@ impl Peer {
                     if args.tagged {
                         idle["_meta"] = json!({ TURN_INPUT_META: message_id });
                     }
+                    if let Some(shape) = args.resident_evidence.as_deref() {
+                        let report = match shape {
+                            "null" => Value::Null,
+                            "invalid" => {
+                                json!({"custody":"future", "private":"PRIVATE-RESIDENT-PAYLOAD"})
+                            }
+                            "incomplete" => json!({"request_id":"fixture", "custody":"incomplete"}),
+                            _ => {
+                                json!({"request_id":"fixture", "custody":"complete", "status":{"code":0}})
+                            }
+                        };
+                        if shape != "absent" {
+                            idle["_meta"][agent_provider_contract::acp::NATIVE_TURN_META] = report;
+                        }
+                        if shape == "covering" {
+                            idle["_meta"][TURN_INPUT_META] = json!("zz-covering-tag");
+                        }
+                    }
                     if args.idle {
                         send(
                             out,
@@ -553,6 +605,16 @@ impl Peer {
                                 "method": "session/update",
                                 "params": { "sessionId": session_id, "update": idle },
                             }),
+                        );
+                    }
+                    if args.resident_evidence.as_deref() == Some("late") {
+                        send(
+                            out,
+                            &json!({"jsonrpc":"2.0", "method":"session/update", "params": {
+                                "sessionId":session_id, "update":{"sessionUpdate":"session_info_update", "_meta": {
+                                    agent_provider_contract::acp::NATIVE_TURN_META: {"message_id":message_id, "record_error":"PRIVATE-RESIDENT-PAYLOAD"}
+                                }}
+                            }}),
                         );
                     }
                     if args.turn_before_ack {
