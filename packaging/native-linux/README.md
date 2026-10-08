@@ -203,6 +203,19 @@ Package construction includes the Runner reader in `bin/oulipoly-root-bash`;
 use the selected package's absolute path from the authorized harness. It
 does not add a provider tool declaration or change the external Bash adapter.
 
+The local result query has one five-second socket deadline, including connect,
+request write and partial reply reads. Timeout (75) or unavailable ingress (69)
+means unknown query knowledge; neither infers command failure, output or
+publication, and neither grants work retry. A successful query (0) reads a
+witness whose original command can have a nonzero exit.
+
+The owner checks terminal report write and flush. Failure returns 74 after
+cleanup and attempts `terminal-delivery-failed` on stderr with the original
+report and original supervisor exit. That diagnostic is best effort: if both
+channels fail, only 74 remains observable to a waiter. Successful flush means
+sink acceptance, not recipient consumption or hardware durability. Optional
+capture/viewer availability is independent of this path.
+
 Owner terminal and inspect reports carry `required_account`, also saved in
 the fenced root row. It retains host-observed Bash outcome/seal/publication
 failures and endpoint record-error diagnostics independently of optional

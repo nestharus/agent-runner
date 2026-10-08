@@ -10,7 +10,10 @@
 //! `--result rv1w:ROOT:WORK` instead reads that harness's original work
 //! witness through the same positively attributed socket. JSON goes to
 //! stdout; query exit 0 means a witness was read, not that the work succeeded.
-//! Query usage/refusal/uncertainty use 64/69/75. Explicit root-store discard
+//! One five-second deadline bounds socket connect, request write and reply
+//! read, including partial replies. Timeout is unknown query knowledge, never
+//! a command failure or permission to retry work. Query output failure uses
+//! 74; usage/refusal/uncertainty use 64/69/75. Explicit root-store discard
 //! expires the reference. A query never runs a command or authorizes retry.
 //!
 //! Exit: the run's own exit code; 128+N for signal N; 69 when there is no
@@ -30,12 +33,19 @@
 //! that error's exit 71. Ordinary code:127 remains exit 127, with no inference
 //! about start. Numeric process exits alone cannot distinguish these facts.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use oulipoly_root_supervisor::bash::{BASH_ENV, PROTOCOL, unbase64};
 use serde_json::{Value, json};
+
+const RESULT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_RESULT_BYTES: usize = 1 << 20;
 
 const EX_UNAVAILABLE: u8 = 69;
 const EX_OSERR: u8 = 71;
@@ -103,32 +113,188 @@ fn read_result(argv: &[String]) -> u8 {
         say(&json!({"outcome":"bad-reference"}));
         return 64;
     }
+    let unknown = |stage: &str, error: Option<&io::Error>| {
+        say(&json!({
+            "outcome": "result-query-unavailable",
+            "reference": reference,
+            "stage": stage,
+            "error_kind": error.map(|e| format!("{:?}", e.kind())),
+            "knowledge": "unknown",
+            "meaning": "no work outcome, output or publication inferred; query never authorizes work retry",
+        }));
+    };
     let Some(path) = std::env::var_os(BASH_ENV) else {
+        unknown("no-ingress", None);
         return EX_UNAVAILABLE;
     };
-    let Ok(mut stream) = UnixStream::connect(path) else {
-        return EX_UNAVAILABLE;
+    let deadline = Instant::now() + RESULT_QUERY_TIMEOUT;
+    let mut socket = match ResultSocket::connect(Path::new(&path), deadline) {
+        Ok(socket) => socket,
+        Err(error) => {
+            unknown("connect", Some(&error));
+            return if error.kind() == io::ErrorKind::TimedOut {
+                EX_TEMPFAIL
+            } else {
+                EX_UNAVAILABLE
+            };
+        }
     };
     let request = json!({"v":PROTOCOL,"op":"result","root_id":parts[1],"work":work});
-    let _ = writeln!(stream, "{request}").and_then(|()| stream.flush());
-    let mut line = String::new();
-    // A bounded witness is not an arbitrary output stream.
-    use std::io::Read;
-    if BufReader::new(stream.take(1 << 20))
-        .read_line(&mut line)
-        .is_err()
-    {
-        return EX_TEMPFAIL;
-    }
-    let Ok(reply) = serde_json::from_str::<Value>(&line) else {
-        return EX_TEMPFAIL;
+    let reply = match socket.exchange(&request) {
+        Ok(reply) => reply,
+        Err(error) => {
+            unknown("exchange", Some(&error));
+            return EX_TEMPFAIL;
+        }
     };
     if reply["event"] != "work-result" {
         say(&reply);
         return EX_UNAVAILABLE;
     }
-    println!("{reply}");
+    if writeln!(std::io::stdout().lock(), "{reply}")
+        .and_then(|()| std::io::stdout().flush())
+        .is_err()
+    {
+        unknown("local-output", None);
+        return EX_IOERR;
+    }
     0
+}
+
+/// Single-query socket lifetime. All readiness waits share one deadline;
+/// partial progress and interruptions cannot renew it. Dropping it cancels
+/// only this query connection, with no launch/recovery or signal operation.
+struct ResultSocket {
+    stream: UnixStream,
+    deadline: Instant,
+}
+
+impl ResultSocket {
+    fn connect(path: &Path, deadline: Instant) -> io::Result<Self> {
+        let bytes = path.as_os_str().as_bytes();
+        // SAFETY: zero is a valid initial sockaddr_un representation.
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        if bytes.is_empty() || bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+            *slot = *byte as libc::c_char;
+        }
+        // Nonblocking from creation: even a full listen backlog cannot trap
+        // the caller inside connect. EAGAIN is unavailable, with no retry.
+        // SAFETY: socket has integer arguments and returns a new owned fd.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the newly created descriptor has no other owner.
+        let socket = Self {
+            stream: unsafe { UnixStream::from_raw_fd(fd) },
+            deadline,
+        };
+        let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+        // SAFETY: address is initialized and length covers its pathname + NUL.
+        if unsafe { libc::connect(fd, (&raw const address).cast(), length as libc::socklen_t) } < 0
+        {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINPROGRESS) {
+                return Err(error);
+            }
+            socket.wait(libc::POLLOUT)?;
+            if let Some(error) = socket.stream.take_error()? {
+                return Err(error);
+            }
+        }
+        Ok(socket)
+    }
+
+    fn wait(&self, events: libc::c_short) -> io::Result<()> {
+        loop {
+            let remaining = self
+                .deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or(io::ErrorKind::TimedOut)?;
+            let millis = remaining
+                .as_millis()
+                .saturating_add(1)
+                .min(i32::MAX as u128) as i32;
+            let mut poll = libc::pollfd {
+                fd: self.stream.as_raw_fd(),
+                events,
+                revents: 0,
+            };
+            // SAFETY: poll receives one valid descriptor and a bounded wait.
+            let ready = unsafe { libc::poll(&mut poll, 1, millis) };
+            if ready > 0 {
+                return Ok(());
+            }
+            if ready == 0 {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    fn exchange(&mut self, request: &Value) -> io::Result<Value> {
+        let request = format!("{request}\n");
+        let mut pending = request.as_bytes();
+        while !pending.is_empty() {
+            self.wait(libc::POLLOUT)?;
+            match self.stream.write(pending) {
+                Ok(0) => break,
+                Ok(n) => pending = &pending[n..],
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
+                // The owner can refuse and close its read side before the
+                // request write. Preserve a positive refusal already waiting;
+                // failed send alone supplies no result knowledge.
+                Err(_) => break,
+            }
+        }
+        let mut reply = Vec::new();
+        let mut chunk = [0; 4096];
+        loop {
+            self.wait(libc::POLLIN)?;
+            match self.stream.read(&mut chunk) {
+                Ok(0) if reply.is_empty() => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(0) => {
+                    return serde_json::from_slice(&reply)
+                        .map_err(|_| io::ErrorKind::InvalidData.into());
+                }
+                Ok(n) => {
+                    let end = chunk[..n].iter().position(|byte| *byte == b'\n');
+                    reply.extend_from_slice(&chunk[..end.unwrap_or(n)]);
+                    if reply.len() >= MAX_RESULT_BYTES {
+                        return Err(io::ErrorKind::InvalidData.into());
+                    }
+                    if end.is_some() {
+                        return serde_json::from_slice(&reply)
+                            .map_err(|_| io::ErrorKind::InvalidData.into());
+                    }
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
 }
 
 fn receive(reader: impl BufRead, stdout: &mut impl Write, sent: bool) -> u8 {
@@ -290,6 +456,125 @@ fn receive(reader: impl BufRead, stdout: &mut impl Write, sent: bool) -> u8 {
 mod tests {
     use super::*;
     use std::io::{self, Cursor};
+
+    #[test]
+    fn result_query_preserves_a_positive_refusal_after_request_write_failure() {
+        let (client, mut peer) = UnixStream::pair().unwrap();
+        client.set_nonblocking(true).unwrap();
+        peer.shutdown(std::net::Shutdown::Read).unwrap();
+        peer.write_all(b"{\"event\":\"refused\",\"reason\":\"peer-unattributed\"}\n")
+            .unwrap();
+        let mut socket = ResultSocket {
+            stream: client,
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        assert_eq!(
+            socket.stream.write(b"request").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe,
+            "actual send failure"
+        );
+        let reply = socket.exchange(&json!({"op":"result"})).unwrap();
+        assert_eq!(reply["event"], "refused");
+        assert_eq!(reply["reason"], "peer-unattributed");
+    }
+
+    #[test]
+    fn result_query_deadline_cancels_a_peer_that_withholds_the_line_end() {
+        let (client, mut peer) = UnixStream::pair().unwrap();
+        client.set_nonblocking(true).unwrap();
+        let mut socket = ResultSocket {
+            stream: client,
+            deadline: Instant::now() + Duration::from_millis(120),
+        };
+        let server = std::thread::spawn(move || {
+            let mut request = String::new();
+            BufReader::new(&mut peer).read_line(&mut request).unwrap();
+            let request: Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["op"], "result");
+            peer.write_all(b"{\"event\":\"work-result\"").unwrap();
+            // Keep the peer open and genuinely wait for client cancellation.
+            let mut byte = [0];
+            assert_eq!(peer.read(&mut byte).unwrap(), 0);
+        });
+        let start = Instant::now();
+        let error = socket
+            .exchange(&json!({"v":PROTOCOL,"op":"result","root_id":"original","work":7}))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        drop(socket);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn result_query_deadline_also_bounds_a_peer_that_never_reads_the_request() {
+        let (client, peer) = UnixStream::pair().unwrap();
+        client.set_nonblocking(true).unwrap();
+        let buffer: libc::c_int = 4096;
+        // SAFETY: setsockopt reads one initialized integer for this owned fd.
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    client.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&raw const buffer).cast(),
+                    std::mem::size_of_val(&buffer) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        let mut socket = ResultSocket {
+            stream: client,
+            deadline: Instant::now() + Duration::from_millis(120),
+        };
+        let error = socket
+            .exchange(&json!({"op":"result","root_id":"x".repeat(1 << 20),"work":7}))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        drop(socket);
+        drop(peer);
+    }
+
+    #[test]
+    fn result_query_partial_progress_does_not_renew_the_deadline() {
+        let (client, mut peer) = UnixStream::pair().unwrap();
+        client.set_nonblocking(true).unwrap();
+        let mut socket = ResultSocket {
+            stream: client,
+            deadline: Instant::now() + Duration::from_millis(150),
+        };
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let mut request = String::new();
+            BufReader::new(&mut peer).read_line(&mut request).unwrap();
+            let mut chunks = 0;
+            // An authored slow reply: continuing socket progress without a
+            // newline. This tests the total bound, not a missing-work claim.
+            loop {
+                if peer.write_all(b" ").is_err() {
+                    break;
+                }
+                chunks += 1;
+                if stopped.recv_timeout(Duration::from_millis(20)).is_ok() {
+                    break;
+                }
+            }
+            chunks
+        });
+        let start = Instant::now();
+        assert_eq!(
+            socket.exchange(&json!({"op":"result"})).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+        drop(socket);
+        let _ = stop.send(());
+        assert!(
+            server.join().unwrap() >= 2,
+            "actual partial progress occurred"
+        );
+    }
 
     struct FaultWriter {
         flush: bool,

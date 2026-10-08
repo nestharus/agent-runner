@@ -182,7 +182,12 @@
 //! report. Exit
 //! codes: [`EXIT_ENDED`], [`EXIT_ENDED_OWED`], [`EXIT_CANCELLED`],
 //! [`EXIT_INCOMPLETE`], [`EXIT_STORE_LOST`], [`EXIT_ROOT_ABSENT`],
-//! [`EXIT_CLOSED`], [`EXIT_SPEC_REFUSED`], [`EXIT_STORE_REFUSED`].
+//! [`EXIT_CLOSED`], [`EXIT_SPEC_REFUSED`], [`EXIT_STORE_REFUSED`], and
+//! [`EXIT_TERMINAL_OUTPUT_FAILED`] when the terminal write or flush fails.
+//! In that case stderr attempts a `terminal-delivery-failed` diagnostic with
+//! the unchanged report and original exit. If stderr also fails, only 74
+//! remains observable. A flush is sink acceptance, not recipient consumption
+//! or hardware durability; output failure never authorizes replay.
 //!
 //! # Live conversation
 //!
@@ -699,6 +704,10 @@ pub const EXIT_SPEC_REFUSED: u8 = 64;
 /// not private, or a store error); nothing was launched.
 pub const EXIT_STORE_REFUSED: u8 = 65;
 
+/// Terminal report write or flush failed, after the original disposition.
+/// Best-effort stderr retains that disposition; no work replay is authorized.
+pub const EXIT_TERMINAL_OUTPUT_FAILED: u8 = 74;
+
 /// The first stdin line.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -937,11 +946,22 @@ pub(crate) enum Event {
     Admitted(usize),
 }
 
-/// Runs one supervisor to its terminal report and returns the exit code.
-pub fn run<R, W>(mut input: R, mut out: W) -> u8
+/// Runs one supervisor through cleanup and its terminal report. A terminal
+/// write/flush failure returns 74 and attempts a separate stderr diagnostic;
+/// neither a successful flush nor the exit attests recipient consumption.
+pub fn run<R, W>(input: R, out: W) -> u8
 where
     R: BufRead + Send + 'static,
     W: Write,
+{
+    run_with_diagnostics(input, out, std::io::stderr())
+}
+
+fn run_with_diagnostics<R, W, E>(mut input: R, mut out: W, mut diagnostics: E) -> u8
+where
+    R: BufRead + Send + 'static,
+    W: Write,
+    E: Write,
 {
     let mut first = String::new();
     let request = match input.read_line(&mut first) {
@@ -952,11 +972,12 @@ where
     let request = match request {
         Ok(request) => request,
         Err(reason) => {
-            emit(
+            return emit_terminal(
                 &mut out,
+                &mut diagnostics,
                 &json!({ "event": "terminal", "status": "spec-refused", "reason": reason }),
+                EXIT_SPEC_REFUSED,
             );
-            return EXIT_SPEC_REFUSED;
         }
     };
     if request.intent.is_some() {
@@ -977,11 +998,12 @@ where
             {
                 emit_line(&mut out, &refusal);
             }
-            emit(
+            return emit_terminal(
                 &mut out,
+                &mut diagnostics,
                 &json!({ "event": "terminal", "status": "store-refused", "reason": error.reason() }),
+                EXIT_STORE_REFUSED,
             );
-            return EXIT_STORE_REFUSED;
         }
     };
     let generation = claimed.store.generation();
@@ -1022,8 +1044,9 @@ where
     {
         Ok(resolved) => Arc::new(resolved),
         Err(reason) => {
-            emit(
+            return emit_terminal(
                 &mut out,
+                &mut diagnostics,
                 &json!({
                     "event": "terminal",
                     "status": "workload-refused",
@@ -1031,8 +1054,8 @@ where
                     "launched": false,
                     "store": "claimed; intent and owed work retained",
                 }),
+                EXIT_SPEC_REFUSED,
             );
-            return EXIT_SPEC_REFUSED;
         }
     };
     emit(
@@ -1043,11 +1066,12 @@ where
     let stop = match transport::StopSignal::new() {
         Ok(stop) => Arc::new(stop),
         Err(error) => {
-            emit(
+            return emit_terminal(
                 &mut out,
+                &mut diagnostics,
                 &json!({ "event": "terminal", "status": "incomplete", "reason": format!("stop-signal: {error}") }),
+                EXIT_INCOMPLETE,
             );
-            return EXIT_INCOMPLETE;
         }
     };
     let mut store = claimed.store;
@@ -1076,11 +1100,12 @@ where
     ) {
         Ok(face) => face,
         Err(error) => {
-            emit(
+            return emit_terminal(
                 &mut out,
+                &mut diagnostics,
                 &json!({ "event": "terminal", "status": "store-failed", "reason": format!("control records: {error}") }),
+                EXIT_STORE_LOST,
             );
-            return EXIT_STORE_LOST;
         }
     };
     emit(&mut out, &face.announcement());
@@ -1108,8 +1133,7 @@ where
     }
     if let Some(reason) = recovery.unattached {
         let (report, code) = unattached_report(&claimed.harnesses, &reason);
-        emit(&mut out, &report);
-        return code;
+        return emit_terminal(&mut out, &mut diagnostics, &report, code);
     }
     let root_absent = request.recover.is_some() && recovery.root.is_none();
     let mut priors = recovery.priors;
@@ -1134,11 +1158,12 @@ where
     {
         Ok(inboxes) => inboxes,
         Err(error) => {
-            emit(
+            return emit_terminal(
                 &mut out,
+                &mut diagnostics,
                 &json!({ "event": "terminal", "status": "incomplete", "reason": format!("inbox: {error}") }),
+                EXIT_INCOMPLETE,
             );
-            return EXIT_INCOMPLETE;
         }
     };
     let closing = Arc::new(conversation::Closing::default());
@@ -1607,8 +1632,7 @@ where
     report["async"]["inherited"] = bash::inherited_summary(&store, None);
     report["children"] = registry.summary();
     report["root_pid1"] = root_pid1;
-    emit(&mut out, &report);
-    code
+    emit_terminal(&mut out, &mut diagnostics, &report, code)
 }
 
 /// What this owner found of its root's earlier custody on starting.
@@ -2192,6 +2216,37 @@ impl RootControl<'_> {
     }
 }
 
+/// A failed terminal sink is an output failure, not a new work disposition.
+/// Cleanup and factual settlement precede this call. The fallback preserves
+/// the report without claiming that either output reached a recipient.
+fn emit_terminal(
+    out: &mut impl Write,
+    diagnostics: &mut impl Write,
+    report: &Value,
+    code: u8,
+) -> u8 {
+    let failure = match writeln!(out, "{report}") {
+        Err(error) => Some(("write", error)),
+        Ok(()) => out.flush().err().map(|error| ("flush", error)),
+    };
+    let Some((stage, error)) = failure else {
+        return code;
+    };
+    let diagnostic = json!({
+        "event": "terminal-delivery-failed",
+        "stage": stage,
+        "error_kind": format!("{:?}", error.kind()),
+        "terminal": report,
+        "supervisor_exit": code,
+        "retry": "not-authorized",
+        "meaning": "terminal output unproven; original work facts unchanged; this diagnostic is best effort, not recipient consumption or hardware durability",
+    });
+    // If both sinks fail, only exit 74 remains observable to a waiter. There
+    // is no third output home, account rewrite, replay or delivery promise.
+    let _ = writeln!(diagnostics, "{diagnostic}").and_then(|()| diagnostics.flush());
+    EXIT_TERMINAL_OUTPUT_FAILED
+}
+
 /// Writes one already serialized JSON line (a `session_control` record).
 fn emit_line<W: Write>(out: &mut W, line: &str) {
     let _ = writeln!(out, "{line}").and_then(|()| out.flush());
@@ -2206,6 +2261,91 @@ fn emit<W: Write>(out: &mut W, value: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FailedSink {
+        write_fails: bool,
+        bytes: Vec<u8>,
+    }
+    impl Write for FailedSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.write_fails {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            } else {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    #[test]
+    fn terminal_sink_failure_preserves_original_facts_and_refusal() {
+        let report = json!({
+            "event":"terminal", "status":"cancelled", "owed":1,
+            "root_pid1":{"end_observed":true,"status":"code:0"},
+            "required_account":{"records":[{"kind":"bash-failure","work":3}],"persistence":"store-failed"},
+            "bash":{"accepted":1,"ended":1},
+        });
+        for write_fails in [true, false] {
+            let mut sink = FailedSink {
+                write_fails,
+                bytes: Vec::new(),
+            };
+            let mut diagnostics = Vec::new();
+            assert_eq!(
+                emit_terminal(&mut sink, &mut diagnostics, &report, EXIT_CANCELLED),
+                74
+            );
+            let returned: Value = serde_json::from_slice(&diagnostics).unwrap();
+            assert_eq!(returned["event"], "terminal-delivery-failed");
+            assert_eq!(
+                returned["stage"],
+                if write_fails { "write" } else { "flush" }
+            );
+            assert_eq!(returned["terminal"], report);
+            assert_eq!(returned["supervisor_exit"], EXIT_CANCELLED);
+            assert_eq!(returned["retry"], "not-authorized");
+            if !write_fails {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&sink.bytes).unwrap(),
+                    report
+                );
+            }
+            let mut fallback = FailedSink {
+                write_fails: true,
+                bytes: Vec::new(),
+            };
+            assert_eq!(
+                emit_terminal(&mut sink, &mut fallback, &report, EXIT_CANCELLED),
+                74
+            );
+            assert!(
+                fallback.bytes.is_empty(),
+                "no claim of a delivered fallback"
+            );
+
+            // Exercise the real run terminal, including failure at flush;
+            // a refusal stays a refusal in the surviving diagnostic.
+            diagnostics.clear();
+            assert_eq!(
+                run_with_diagnostics(std::io::Cursor::new(b"{}\n"), &mut sink, &mut diagnostics),
+                74
+            );
+            let returned: Value = serde_json::from_slice(&diagnostics).unwrap();
+            assert_eq!(returned["terminal"]["status"], "spec-refused");
+            assert_eq!(returned["supervisor_exit"], EXIT_SPEC_REFUSED);
+        }
+        let mut good = Vec::new();
+        let mut diagnostics = Vec::new();
+        assert_eq!(
+            emit_terminal(&mut good, &mut diagnostics, &report, EXIT_CANCELLED),
+            EXIT_CANCELLED
+        );
+        assert_eq!(serde_json::from_slice::<Value>(&good).unwrap(), report);
+        assert!(diagnostics.is_empty());
+    }
 
     fn request(store: &str, harness: Value) -> Result<(), String> {
         let line = json!({

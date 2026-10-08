@@ -2150,6 +2150,83 @@ fn in_root_result_reader_retrieves_the_original_work_without_reexecution_or_live
     );
 }
 
+/// Real terminal syscall failure after real one-effect work. Redirect only
+/// the owned supervisor's stdout to /dev/full; stderr remains the collected
+/// fallback. No provider/native installation or optional capture is involved.
+#[test]
+fn terminal_write_failure_returns_the_account_after_owned_work_cleanup() {
+    let dir = Scratch::new("terminal-write-failed");
+    let marker = dir.0.join("effects");
+    let spec = spec(
+        &dir,
+        1,
+        json!([{
+            "id":"a", "argv":peer(&dir.state("a"), &["--exit-after-acks","1"]),
+            "messages":[format!("bash:printf x >> '{}'; exit 7", marker.display())],
+        }]),
+    );
+    let argv = vec![
+        "/usr/bin/python3".to_owned(), "-c".to_owned(),
+        "import os,sys; os.dup2(1,2); fd=os.open('/dev/full',os.O_WRONLY); os.dup2(fd,1); os.close(fd); os.execv(sys.argv[1],sys.argv[1:])".to_owned(),
+        SUPERVISOR.to_owned(),
+    ];
+    let mut run = Run::start_in(&dir, &spec, &argv);
+    let returned = run.until("terminal output failure", |value| {
+        value["event"] == "terminal-delivery-failed"
+    });
+    let status = run.child.wait().unwrap();
+    let report = &returned["terminal"];
+    eprintln!("failed-terminal-account: exit={status:?} fallback={returned}");
+    // The missing stdout launch records do not give fixture custody. Recover
+    // just this fixture's recorded PID1 identity before making assertions.
+    let conn = db(&dir);
+    let (pid, recorded): (i32, i64) = conn
+        .query_row(
+            "SELECT host_pid,start_time FROM incarnation WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    stamp(pid, recorded);
+    if let Some(fd) = pidfd(pid) {
+        if start_time(pid) == Some(recorded) {
+            let ended = exited(&fd, 0);
+            dir.1.lock().unwrap().push(RootWatch { pid, fd });
+            assert!(ended, "root PID1 already ended before terminal failure");
+        }
+    }
+    assert_eq!(status.code(), Some(74));
+    assert_eq!(returned["stage"], "write");
+    assert_eq!(returned["supervisor_exit"], 0);
+    assert_eq!(returned["retry"], "not-authorized");
+    assert_eq!(report["status"], "ended");
+    assert_eq!(report["all_harnesses_reaped"], true);
+    assert_eq!(report["root_pid1"]["end_observed"], true);
+    assert_eq!(report["bash"]["accepted"], 1);
+    assert_eq!(report["bash"]["ended"], 1);
+    assert_eq!(report["bash"]["open"], 0);
+    assert!(report["required_account"].is_object());
+    assert_eq!(
+        std::fs::read(&marker).unwrap(),
+        b"x",
+        "exactly one command effect"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM work WHERE kind='bash' AND outcome='code:7' AND observer='work-pid1-wait'"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM incarnation WHERE ended='released-exit-waited:code:0'"
+        ),
+        1
+    );
+}
+
 /// U7 refusal: a process outside every harness namespace of the root (this
 /// test) is refused visibly and nothing is recorded or run; there is no
 /// fallback. The refusal is reported by the owner.
@@ -2188,11 +2265,25 @@ fn bash_from_outside_every_harness_namespace_is_refused_and_nothing_runs() {
             "peer-unattributed: outside-every-harness-namespace"
         );
     }
+    let query = Command::new(env!("CARGO_BIN_EXE_oulipoly-root-bash"))
+        .args(["--result", "rv1w:supplied-marker:2"])
+        .env("OULIPOLY_ROOT_BASH_V1", listening["path"].as_str().unwrap())
+        .output()
+        .unwrap();
+    eprintln!(
+        "outside-cli-query: exit={:?} stdout={:?} stderr={}",
+        query.status.code(),
+        query.stdout,
+        String::from_utf8_lossy(&query.stderr)
+    );
+    assert_eq!(query.status.code(), Some(69));
+    assert!(query.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&query.stderr).contains("outside-every-harness-namespace"));
     let refused = run.until("bash refused", |value| value["event"] == "bash-refused");
     assert_eq!(refused["peer"]["pid"], std::process::id());
     run.cancel();
     let (terminal, _, seen) = run.terminal();
-    assert_eq!(terminal["bash"]["refused"], 4, "{terminal}");
+    assert_eq!(terminal["bash"]["refused"], 5, "{terminal}");
     assert_eq!(terminal["bash"]["accepted"], 0);
     assert!(owner_event(&seen, "bash-accepted").is_empty());
     assert!(owner_event(&seen, "bash-output-accepted").is_empty());
