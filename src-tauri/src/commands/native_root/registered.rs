@@ -570,6 +570,15 @@ impl Registration {
     }
 }
 
+/// Only recognized structural codes may leave the private provider payload.
+/// Code-shaped arbitrary text is still private; this is not a character filter.
+fn public_refusal_code(code: &str) -> Option<&str> {
+    match code {
+        "missing_prompt" | "invalid_resident_argv" | "invalid_request" => Some(code),
+        _ => None,
+    }
+}
+
 impl Admitted<'_> {
     fn host(&self, data_root: Option<&Path>, selectors: bool) -> HostContext {
         let mut env = self.registration.env.clone();
@@ -627,8 +636,13 @@ impl Admitted<'_> {
             .invoke_json(operation, request, env)
             .map_err(|error| {
                 format!(
-                    "provider: {operation} failed: {} (private details withheld)",
-                    error.transport_kind()
+                    "provider: {operation} failed: {}{} (private details withheld)",
+                    error.transport_kind(),
+                    error
+                        .provider_error_code()
+                        .and_then(public_refusal_code)
+                        .map(|code| format!("; endpoint code: {code}"))
+                        .unwrap_or_default()
                 )
             })
     }
@@ -744,8 +758,10 @@ impl Admitted<'_> {
             resident_session::template_from_policy(&settings, &policy).map_err(|error| {
                 failed(match error {
                     resident_session::TemplateRefusal::NotAccepted(_) => {
-                        "provider: policy refused the settings (diagnostic text withheld)"
-                            .to_owned()
+                        format!(
+                            "provider: policy refused the settings; endpoint codes: {:?} (diagnostic text withheld)",
+                            policy.diagnostics.iter().filter_map(|d| d.code.as_deref().and_then(public_refusal_code)).collect::<Vec<_>>()
+                        )
                     }
                     resident_session::TemplateRefusal::MissingArgv => {
                         "provider: policy named no argv".to_owned()
@@ -1527,7 +1543,7 @@ else:
         let dir = scratch();
         let fake = fake_provider(
             dir.path(),
-            "if op == 'resident.prepare':\n    print(json.dumps({'contract':'oulipoly.provider/v1','request_id':request['request_id'],'ok':False,'error':{'code':'invalid_request','category':'invalid_request','message':'PRIVATE-PROMPT-PAYLOAD','retryable':False}}))\n    sys.exit(0)",
+            "if op == 'resident.prepare':\n    print(json.dumps({'contract':'oulipoly.provider/v1','request_id':request['request_id'],'ok':False,'error':{'code':'invalid_resident_argv','category':'invalid_request','message':'PRIVATE-PROMPT-PAYLOAD','retryable':False}}))\n    sys.exit(0)",
         );
         let registered = registration(dir.path(), &fake);
         let admitted = synthetic_admitted(&registered);
@@ -1541,8 +1557,38 @@ else:
             Failure::Setup { provider: true, reason }
                 if reason.contains("resident.prepare failed: provider_capability")
         ));
+        assert!(format!("{failure:?}").contains("endpoint code: invalid_resident_argv"));
         assert!(!format!("{failure:?}").contains("PRIVATE-PROMPT-PAYLOAD"));
         assert_eq!(calls(dir.path()).len(), 3);
+    }
+
+    #[test]
+    fn structural_refusal_codes_are_attributed_but_arbitrary_codes_stay_private() {
+        for code in [
+            "missing_prompt",
+            "invalid_resident_argv",
+            "PRIVATE-CODE-PAYLOAD",
+        ] {
+            let dir = scratch();
+            let fake = fake_provider(
+                dir.path(),
+                &format!(
+                    "if op == 'policy.evaluate':\n    answer({{'accepted':False,'stdin':None,'prompt':None,'diagnostics':[{{'code':{code:?},'message':'PRIVATE-PROMPT-PAYLOAD','severity':'error'}}],'markers':[]}})\n    sys.exit(0)"
+                ),
+            );
+            let registered = registration(dir.path(), &fake);
+            let admitted = admit(&registered, None).unwrap();
+            admitted.describe().unwrap();
+            let failure = admitted.template().unwrap_err();
+            let text = format!("{failure:?}");
+            assert_eq!(
+                text.contains(code),
+                code != "PRIVATE-CODE-PAYLOAD",
+                "{text}"
+            );
+            assert!(!text.contains("PRIVATE-PROMPT-PAYLOAD"));
+            assert_eq!(calls(dir.path()).len(), 2);
+        }
     }
 
     #[test]

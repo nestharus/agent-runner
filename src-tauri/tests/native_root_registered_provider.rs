@@ -119,7 +119,7 @@ elif op == "resident.serve":
     argv = json.loads(config)["argv"]
     flags = argv[argv.index("--peer") + 1:]
     state = os.path.join(os.path.dirname(os.path.dirname(path)), "peer-state.json")
-    os.execv(PEER, [PEER, "--state", state] + flags)
+    os.execv(PEER, [PEER, "--resident-evidence", "absent", "--state", state] + flags)
 else:
     sys.exit(3)
 "#,

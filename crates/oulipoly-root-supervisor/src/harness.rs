@@ -1746,10 +1746,12 @@ impl Worker {
                     self.started = Some(started);
                     Ok(id)
                 }
+                Err(resident::StartRefusal::Request(error)) => Err(error),
                 Err(_) => {
-                    self.report(
-                        json!({"event": "resident-start-refused", "private_details": "withheld"}),
-                    );
+                    self.report(json!({
+                        "event": "resident-start-refused", "label": "resident-start-refused",
+                        "private_details": "withheld",
+                    }));
                     self.label_remaining("resident-start-refused");
                     return ConnEnd::Stop;
                 }
@@ -1779,7 +1781,10 @@ impl Worker {
                 "event": "session-resumed",
                 "session": self.session,
             })),
-            Err(RequestFailure::PeerGone) => return self.gone_or_drained(),
+            Err(RequestFailure::PeerGone) => {
+                self.report(json!({"event": "session-peer-gone", "phase": "start"}));
+                return self.gone_or_drained();
+            }
             Err(failure) => {
                 let label = match failure {
                     RequestFailure::Rejected { code, .. } => format!("session-rejected-{code}"),
@@ -1930,6 +1935,13 @@ impl Worker {
                         "event": "rejected", "index": index, "code": code,
                         "durable": true, "scope": "rpc-attempt",
                         "insertion": "unresolved", "retry": "not-authorized",
+                        "endpoint_declaration": if *code == agent_provider_contract::acp::code::INPUT_NOT_INSERTED {
+                            "not-inserted"
+                        } else { "no-non-insertion-declaration" },
+                        "declaration_attribution": "endpoint-rpc-code",
+                        "physical_non_insertion": "not-established",
+                        "hold": "unresolved-input", "exit": "cancel-or-peer-exit",
+                        "detail": "insertion unresolved; no automatic retry; input and close held until cancel or peer exit",
                         "unresolved_attempts": self.tracked[index].unknown_attempts,
                         "native_report": native_summary(data.as_ref().and_then(|d| d.get("nativeTurn"))),
                         "endpoint_record_error": data.as_ref().is_some_and(|d| d.get("recordError").is_some()),

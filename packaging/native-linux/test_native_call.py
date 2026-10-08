@@ -35,7 +35,13 @@ FAKE_FRONTDOOR = textwrap.dedent("""
         say({"frontdoor": "terminal", "stage": "refused", "reason": "x", "effects": "none"}); sys.exit(90)
     say({"frontdoor": "admitted", "run": "r1"})
     say({"entry": "setup-completed", "launch": {}})
-    say({"event": "ack", "index": 0, "label": "accepted", "message_id": "m1"})
+    if mode == "rejected":
+        say({"event":"rejected", "index":0, "code":-32010, "durable":True,
+             "insertion":"unresolved", "retry":"not-authorized", "endpoint_declaration":"not-inserted",
+             "declaration_attribution":"endpoint-rpc-code", "physical_non_insertion":"not-established",
+             "hold":"unresolved-input", "exit":"cancel-or-peer-exit"})
+    else:
+        say({"event": "ack", "index": 0, "label": "accepted", "message_id": "m1"})
     absent_account = mode in ("async-no-account-initial", "async-no-account-eventual")
     if mode.startswith("async-"):
         if not absent_account:
@@ -130,6 +136,20 @@ class Calls(Scratch):
     def seen(self):
         with open(self.path("fd", "seen.json")) as file:
             return json.load(file)
+
+    def test_rejection_is_exported_without_close_or_retry_and_deadline_cancels(self):
+        code, out, result = self.call("rejected", "--deadline", "1")
+        self.assertEqual((code, result["class"]), (5, "cancelled"))
+        self.assertEqual(list(result["sends"]), ["cancel"])
+        self.assertFalse(result["answer"]["present"])
+        self.assertIsNone(result["answer"]["turn_end"])
+        rejection, = result["rejections"]
+        self.assertEqual(rejection["insertion"], "unresolved")
+        self.assertEqual(rejection["retry"], "not-authorized")
+        self.assertEqual(rejection["endpoint_declaration"], "not-inserted")
+        self.assertEqual(rejection["physical_non_insertion"], "not-established")
+        self.assertEqual(rejection["exit"], "cancel-or-peer-exit")
+        self.assertFalse(os.path.exists(os.path.join(out, "final.md")))
 
     def test_answer_close_and_capture(self):
         source = self.write("auth.json", {"openai": {"type": "oauth", "refresh": "fixture-refresh-grant", "access": SECRET,
