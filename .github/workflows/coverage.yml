@@ -24,8 +24,17 @@ concurrency:
   group: coverage-${{ github.ref }}
   cancel-in-progress: true
 
+# Mirrors ci.yml's test environment: the workspace tests expect these
+# isolated data/config dirs, a TERM value, and bounded build parallelism.
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
+  TERM: xterm-256color
+  OULIPOLY_DATA_DIR: ${{ github.workspace }}/target/ci-data
+  OULIPOLY_DATA_HOME: ${{ github.workspace }}/target/ci-data-home
+  XDG_CONFIG_HOME: ${{ github.workspace }}/target/ci-config-home
+  XDG_DATA_HOME: ${{ github.workspace }}/target/ci-xdg-data
+  XDG_CACHE_HOME: ${{ github.workspace }}/target/ci-cache
 
 jobs:
   rust-coverage:
@@ -46,7 +55,7 @@ jobs:
       - name: Install system deps (Linux)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev ripgrep util-linux ncurses-bin
 
       - uses: taiki-e/install-action@v2
         with:
@@ -55,10 +64,16 @@ jobs:
       - name: Install pinned agent-bash
         uses: ./.github/actions/install-agent-bash
 
+      - run: rg --version && script --version && command -v tput
+
       - name: Generate coverage (lcov, cobertura, JSON summary)
+        timeout-minutes: 90
+        env:
+          # Same test runner as ci.yml: the runtime unit harness needs a TTY.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: bash ${{ github.workspace }}/.github/scripts/ci-test-runner.sh
         run: |
           mkdir -p coverage
-          cargo llvm-cov --workspace --no-report
+          cargo llvm-cov --workspace --no-report --no-fail-fast
           cargo llvm-cov report --lcov --output-path coverage/lcov.info
           cargo llvm-cov report --cobertura --output-path coverage/coverage.xml
           cargo llvm-cov report --json --summary-only --output-path coverage/coverage-summary.json
