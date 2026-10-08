@@ -293,7 +293,7 @@ elif op == "resident.prepare":
             "operations": ["initialize", "session/new", "session/prompt", "session/cancel", "session/close"]})
 elif op == "resident.serve":
     path = sys.argv[sys.argv.index("--config") + 1]
-    os.execv(PEER, [PEER, "--state", os.path.join(os.path.dirname(path), "peer.json")])
+    os.execv(PEER, [PEER, "--resident-evidence", "absent", "--state", os.path.join(os.path.dirname(path), "peer.json")])
 '''
 
 

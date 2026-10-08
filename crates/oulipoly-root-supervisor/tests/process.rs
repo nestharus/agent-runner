@@ -2639,73 +2639,82 @@ fn unknown_session_updates_without_ack_leave_input_owed() {
 /// admission/close, creates no ACK, and never grants replay on recovery.
 #[test]
 fn sdk_resident_rejected_turn_preserves_uncertainty_and_blocks_replay() {
-    let dir = Scratch::new("sdk-rejected");
-    let state = dir.state("h");
-    let prepared = agent_provider_contract::resident_session::ResidentPrepareResult::v1(
-        vec!["resident.serve".to_owned()],
-        "1".repeat(64),
-    );
-    let mut request = spec(
-        &dir,
-        3,
-        json!([{
-            "id":"h", "argv":peer(&state, &["--resident-evidence", "rejected"]),
-            "messages":["synthetic prompt"], "resident":prepared,
-        }]),
-    );
-    request["intent"]["cwd"] = json!(std::env::current_dir().unwrap());
-    let mut run = Run::start(&dir, &request);
-    assert_eq!(
-        run.event("h", "resident-session-started")["canonical_binding"],
-        "unbound"
-    );
-    let rejected = run.event("h", "rejected");
-    assert_eq!(rejected["code"], -32011);
-    assert_eq!(rejected["insertion"], "unresolved");
-    assert_eq!(rejected["retry"], "not-authorized");
-    assert_eq!(rejected["native_report"]["custody"], "complete");
-    assert_eq!(rejected["native_report"]["status_code"], 0);
-    assert_eq!(rejected["endpoint_record_error"], true);
-    assert_eq!(rejected["unresolved_attempts"], 1);
-    run.control(r#"{"cmd":"send","text":"must not reach peer"}"#);
-    assert_eq!(run.event("h", "follow-up-refused")["reason"], "input-open");
-    run.control(r#"{"cmd":"close"}"#);
-    run.event("h", "close-not-applied");
-    run.cancel();
-    let (terminal, status, seen) = run.terminal();
-    assert_eq!(status.code(), Some(2));
-    let message = &harness(&terminal, "h")["messages"][0];
-    assert_eq!(message["state"], "owed");
-    assert_eq!(message["label"], "rejected-unresolved");
-    assert_eq!(message["unresolved_attempts"], 1);
-    assert_eq!(message["turn_end"], "not-recorded");
-    assert!(events(&seen, "h", "ack").is_empty());
-    assert!(events(&seen, "h", "turn-end").is_empty());
-    assert!(
-        !serde_json::to_string(&seen)
-            .unwrap()
-            .contains("PRIVATE-RESIDENT-PAYLOAD")
-    );
-    let conn = db(&dir);
-    assert_eq!(
-        count(
-            &conn,
-            "SELECT count(*) FROM attempt WHERE outcome = 'rejected-unresolved'"
-        ),
-        1
-    );
-    assert_eq!(
-        count(
-            &conn,
-            "SELECT count(*) FROM message WHERE stop = 'rejected-unresolved' AND ack_label IS NULL"
-        ),
-        1
-    );
-    drop(conn);
-    let recovered = Run::start(&dir, &recover(&dir));
-    let (terminal, _, _) = recovered.terminal();
-    assert_eq!(harness(&terminal, "h")["launches"], 0);
-    assert_eq!(read_state(&state)["prompts"].as_array().unwrap().len(), 1);
+    for (shape, code, declaration) in [
+        ("rejected", -32011, "no-non-insertion-declaration"),
+        ("not-inserted", -32010, "not-inserted"),
+    ] {
+        let dir = Scratch::new(shape);
+        let state = dir.state("h");
+        let prepared = agent_provider_contract::resident_session::ResidentPrepareResult::v1(
+            vec!["resident.serve".to_owned()],
+            "1".repeat(64),
+        );
+        let mut request = spec(
+            &dir,
+            3,
+            json!([{
+                "id":"h", "argv":peer(&state, &["--resident-evidence", shape]),
+                "messages":["synthetic prompt"], "resident":prepared,
+            }]),
+        );
+        request["intent"]["cwd"] = json!(std::env::current_dir().unwrap());
+        let mut run = Run::start(&dir, &request);
+        assert_eq!(
+            run.event("h", "resident-session-started")["canonical_binding"],
+            "unbound"
+        );
+        let rejected = run.event("h", "rejected");
+        assert_eq!(rejected["code"], code);
+        assert_eq!(rejected["endpoint_declaration"], declaration);
+        assert_eq!(rejected["physical_non_insertion"], "not-established");
+        assert_eq!(rejected["hold"], "unresolved-input");
+        assert_eq!(rejected["exit"], "cancel-or-peer-exit");
+        assert_eq!(rejected["insertion"], "unresolved");
+        assert_eq!(rejected["retry"], "not-authorized");
+        assert_eq!(rejected["native_report"]["custody"], "complete");
+        assert_eq!(rejected["native_report"]["status_code"], 0);
+        assert_eq!(rejected["endpoint_record_error"], true);
+        assert_eq!(rejected["unresolved_attempts"], 1);
+        run.control(r#"{"cmd":"send","text":"must not reach peer"}"#);
+        assert_eq!(run.event("h", "follow-up-refused")["reason"], "input-open");
+        run.control(r#"{"cmd":"close"}"#);
+        run.event("h", "close-not-applied");
+        run.cancel();
+        let (terminal, status, seen) = run.terminal();
+        assert_eq!(status.code(), Some(2));
+        let message = &harness(&terminal, "h")["messages"][0];
+        assert_eq!(message["state"], "owed");
+        assert_eq!(message["label"], "rejected-unresolved");
+        assert_eq!(message["unresolved_attempts"], 1);
+        assert_eq!(message["turn_end"], "not-recorded");
+        assert!(events(&seen, "h", "ack").is_empty());
+        assert!(events(&seen, "h", "turn-end").is_empty());
+        assert!(
+            !serde_json::to_string(&seen)
+                .unwrap()
+                .contains("PRIVATE-RESIDENT-PAYLOAD")
+        );
+        let conn = db(&dir);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM attempt WHERE outcome = 'rejected-unresolved'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM message WHERE stop = 'rejected-unresolved' AND ack_label IS NULL"
+            ),
+            1
+        );
+        drop(conn);
+        let recovered = Run::start(&dir, &recover(&dir));
+        let (terminal, _, _) = recovered.terminal();
+        assert_eq!(harness(&terminal, "h")["launches"], 0);
+        assert_eq!(read_state(&state)["prompts"].as_array().unwrap().len(), 1);
+    }
 }
 
 /// SDK resume consumes the stored native session after an observed peer
@@ -4430,12 +4439,16 @@ fn retry_refusal_without_reattach_keeps_prior_turn_unresolved() {
 
 fn retry_refusal_keeps_prior_turn_unresolved(absent: bool) {
     let dir = Scratch::new("retry-refusal-unknown");
-    let script = dir.0.join("peer.py");
+    // A work changes cwd; /proc/self/cwd names that new cwd there. Use
+    // the physical owned path for the script and its data, retaining the
+    // short host IPC path independently.
+    let physical = dir.0.canonicalize().unwrap();
+    let script = physical.join("peer.py");
     std::fs::write(&script, include_str!("fixtures/unknown_turn_retry_peer.py")).unwrap();
     let mut argv = vec![
         "/usr/bin/python3".to_owned(),
         script.display().to_string(),
-        dir.0.display().to_string(),
+        physical.display().to_string(),
     ];
     if absent {
         argv.push("--no-reattach".to_owned());
@@ -6121,4 +6134,90 @@ fn live_prehello_and_quiet_followers_release_bounded_slots() {
     witness(&dir, work, &ended);
     run.cancel();
     run.terminal();
+}
+
+/// Start-time transport death takes existing relaunch policy; a session RPC
+/// refusal stops with its code. Neither case submits any native input first.
+#[test]
+fn sdk_resident_start_death_and_refusal_remain_distinct() {
+    for (mode, cap, launches, label) in [
+        ("exit-at-start", 2, 2, "outage"),
+        ("refuse-start", 2, 1, "session-rejected--32012"),
+    ] {
+        let dir = Scratch::new("sdk-start");
+        let state = dir.state("h");
+        let prepared = agent_provider_contract::resident_session::ResidentPrepareResult::v1(
+            vec!["resident.serve".into()],
+            "4".repeat(64),
+        );
+        let mut request = spec(
+            &dir,
+            cap,
+            json!([{
+                "id":"h", "argv":peer(&state, &["--resident-evidence", "absent", "--mode", mode]),
+                "messages":["synthetic prompt"], "resident":prepared,
+            }]),
+        );
+        request["intent"]["cwd"] = json!(std::env::current_dir().unwrap());
+        let mut run = Run::start(&dir, &request);
+        if mode == "refuse-start" {
+            assert_eq!(run.event("h", "session-failed")["label"], label);
+            run.cancel();
+        }
+        let (terminal, _, seen) = run.terminal();
+        assert_eq!(harness(&terminal, "h")["launches"], launches, "{terminal}");
+        assert_eq!(harness(&terminal, "h")["messages"][0]["label"], label);
+        assert_eq!(
+            events(&seen, "h", "session-peer-gone").len(),
+            if mode == "exit-at-start" { 2 } else { 0 }
+        );
+        assert_eq!(
+            events(&seen, "h", "session-failed").len(),
+            if mode == "refuse-start" { 1 } else { 0 }
+        );
+        assert!(events(&seen, "h", "resident-start-refused").is_empty());
+        assert!(events(&seen, "h", "ack").is_empty());
+        assert!(read_state(&state)["prompts"].as_array().unwrap().is_empty());
+        assert!(
+            !serde_json::to_string(&seen)
+                .unwrap()
+                .contains("PRIVATE-START-PAYLOAD")
+        );
+    }
+}
+
+/// A prepared resident child uses the shared declaration and its requester
+/// receives uncertainty and endpoint attribution, without gaining resend.
+#[test]
+fn sdk_resident_child_rejection_reaches_its_requester() {
+    let dir = Scratch::new("sdk-child");
+    let state = dir.state("child");
+    let prepared = agent_provider_contract::resident_session::ResidentPrepareResult::v1(
+        vec!["resident.serve".into()],
+        "5".repeat(64),
+    );
+    let mut request = child_spec(
+        &dir,
+        json!([{"id":"parent", "argv":peer(&dir.state("parent"), &[]),
+            "messages":["explore:echo:synthetic question"]}]),
+        json!({"echo": {"harness":"prepared", "provider":"synthetic", "endpoint":"stdio",
+            "slots":[{"argv":peer(&state, &["--resident-evidence", "not-inserted"]),
+                "data_root":dir.0.canonicalize().unwrap().join("prepared"), "resident":prepared}]}}),
+        1,
+        1,
+    );
+    request["intent"]["cwd"] = json!(std::env::current_dir().unwrap());
+    let mut run = Run::start(&dir, &request);
+    run.until("child accepted", |v| v["event"] == "child-accepted");
+    let rejected = run.event("child-1", "rejected");
+    assert_eq!(rejected["endpoint_declaration"], "not-inserted");
+    run.cancel();
+    let (terminal, _, seen) = run.terminal();
+    assert_eq!(terminal["all_harnesses_reaped"], true);
+    assert!(events(&seen, "child-1", "ack").is_empty());
+    assert_eq!(read_state(&state)["prompts"].as_array().unwrap().len(), 1);
+    // Requester-stream projection is separately asserted by the ChildLink
+    // socket control; this case exercises the prepared worker and custody.
+    let text = serde_json::to_string(&seen).unwrap();
+    assert!(!text.contains("PRIVATE-RESIDENT-PAYLOAD"));
 }

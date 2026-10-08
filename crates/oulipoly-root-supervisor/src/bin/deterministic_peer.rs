@@ -327,6 +327,16 @@ impl Peer {
                     );
                 }
                 Some("session/new") => {
+                    if args.mode == "exit-at-start" {
+                        std::process::exit(1);
+                    }
+                    if args.mode == "refuse-start" {
+                        send(
+                            out,
+                            &json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32012, "message":"PRIVATE-START-PAYLOAD"}}),
+                        );
+                        continue;
+                    }
                     let sessions = state["sessions"].as_array_mut().expect("sessions");
                     let session_id = format!("sess-{}", sessions.len() + 1);
                     sessions.push(Value::String(session_id.clone()));
@@ -377,11 +387,14 @@ impl Peer {
                         _ => {}
                     }
                     let text = params["prompt"][0]["text"].as_str().unwrap_or_default();
-                    if args.resident_evidence.as_deref() == Some("rejected") {
+                    if matches!(
+                        args.resident_evidence.as_deref(),
+                        Some("rejected" | "not-inserted")
+                    ) {
                         send(
                             out,
                             &json!({"jsonrpc":"2.0", "id":id, "error": {
-                                "code": -32011, "message": "PRIVATE-RESIDENT-PAYLOAD",
+                                "code": if args.resident_evidence.as_deref() == Some("not-inserted") { -32010 } else { -32011 }, "message": "PRIVATE-RESIDENT-PAYLOAD",
                                 "data": {"nativeTurn": {"request_id":"fixture", "custody":"complete", "status":{"code":0}},
                                          "recordError":{"message_id":"unacked-fixture", "record_error":"PRIVATE-RESIDENT-PAYLOAD"}}
                             }}),

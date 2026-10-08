@@ -146,6 +146,12 @@
 //! **Resident evidence.** Registered resident harnesses use the delivered
 //! SDK's prepared agreement, start/resume and turn helper. Their native
 //! session reference is deliberately Unbound to a canonical host session.
+//! If the owner dies after the wire error but before committing the durable
+//! rejection stop, successor recovery can resubmit the same owed key. This
+//! window establishes neither native at-most-once delivery nor retry authority.
+//! An endpoint's INPUT_NOT_INSERTED code is an attributed declaration, not
+//! physical proof; all RPC rejections retain the input/close hold until cancel
+//! or peer exit, with no automatic retry after the stop commits.
 //! A rejected prompt RPC leaves its attempt unresolved and durably stops
 //! automatic resend; it grants no ACK, undelivered classification or retry
 //! authority. Admission and ordinary close remain blocked by that history.

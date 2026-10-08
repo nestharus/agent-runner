@@ -642,8 +642,25 @@ impl ChildLink {
             "notice" => Some(
                 json!({ "event": "notice", "severity": report["severity"], "title": report["title"], "description": report["description"] }),
             ),
-            "negotiation-failed" | "session-failed" | "endpoint-failed" | "rejected"
-            | "invalid-response" | "outage" => Some(
+            "rejected" => Some(json!({
+                "event": "rejected", "detail": report["detail"], "code": report["code"],
+                "insertion": report["insertion"], "retry": report["retry"],
+                "endpoint_declaration": report["endpoint_declaration"],
+                "declaration_attribution": report["declaration_attribution"],
+                "physical_non_insertion": report["physical_non_insertion"],
+                "hold": report["hold"], "exit": report["exit"],
+                "native_report": report["native_report"],
+                "endpoint_record_error": report["endpoint_record_error"],
+                "endpoint_durability": report["endpoint_durability"],
+                "canonical_publication": report["canonical_publication"],
+            })),
+            "negotiation-failed"
+            | "session-failed"
+            | "endpoint-failed"
+            | "resident-start-refused"
+            | "session-peer-gone"
+            | "invalid-response"
+            | "outage" => Some(
                 json!({ "event": event, "detail": report.get("label").or(report.get("reason")).cloned() }),
             ),
             _ => None,
@@ -1251,6 +1268,56 @@ mod tests {
     }
 
     /// A parent attributed before its request was read, whose work is no
+    /// longer current at commit, is refused and nothing is recorded.
+    /// The actual requester sink preserves the rejection qualifications;
+    /// this is independent of the owner report tested by process fixtures.
+    #[test]
+    fn rejection_stage_keeps_uncertainty_at_the_requester_socket() {
+        let f = fixture("rejection-stage", 1);
+        let (stream, read) = UnixStream::pair().unwrap();
+        read.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let link = ChildLink {
+            position: 1,
+            id: "child-1".into(),
+            parent: "parent".into(),
+            route: "echo".into(),
+            registry: Arc::clone(&f.registry),
+            sink: Mutex::new(Sink::new(Some(stream))),
+            seen: Mutex::new(Seen::default()),
+        };
+        let report = json!({
+            "event":"rejected", "detail":"insertion unresolved; cancel or peer exit", "code":-32010,
+            "insertion":"unresolved", "retry":"not-authorized", "endpoint_declaration":"not-inserted",
+            "declaration_attribution":"endpoint-rpc-code", "physical_non_insertion":"not-established",
+            "hold":"unresolved-input", "exit":"cancel-or-peer-exit",
+            "native_report":{"state":"absent"}, "endpoint_record_error":false,
+            "endpoint_durability":"not-established", "canonical_publication":"not-established",
+            "message":"PRIVATE-PAYLOAD",
+        });
+        link.observe(&report);
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut BufReader::new(read), &mut line).unwrap();
+        let stage: Value = serde_json::from_str(&line).unwrap();
+        for key in [
+            "insertion",
+            "retry",
+            "endpoint_declaration",
+            "declaration_attribution",
+            "physical_non_insertion",
+            "hold",
+            "exit",
+            "native_report",
+            "endpoint_durability",
+            "canonical_publication",
+        ] {
+            assert_eq!(stage[key], report[key], "{key}");
+        }
+        assert!(!line.contains("PRIVATE-PAYLOAD"));
+        assert!(link.seen.lock().unwrap().acks.is_empty());
+    }
+
+    /// A parent attributed before the request was read, whose work is no
     /// longer current at commit, is refused and nothing is recorded.
     #[test]
     fn stale_parent_at_commit_is_refused_and_records_nothing() {

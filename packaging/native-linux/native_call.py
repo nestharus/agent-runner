@@ -156,6 +156,18 @@ def answer_of(events):
     return None, None, len(linked)
 
 
+def rejection_of(event):
+    """Owner's bounded rejection evidence, without arbitrary endpoint payload."""
+    return {key: event.get(key) for key in (
+        "index", "code", "durable", "insertion", "retry", "endpoint_declaration",
+        "declaration_attribution", "physical_non_insertion", "hold", "exit", "detail",
+        "native_report", "endpoint_record_error", "endpoint_durability", "canonical_publication")}
+
+
+def rejections_of(events):
+    return [rejection_of(e) for e in events if parent_event(e) and e.get("event") == "rejected"]
+
+
 def async_of(events):
     """Reconcile reports with the owner's terminal account. Missing trailing
     reports are not unsettled debt when the owner supplies its actual end
@@ -569,6 +581,7 @@ def main_checked(argv):
         "sends": call.sends,
         "answer": {"present": answer is not None, "linked_messages": linked, "turn_end": turn_end},
         "async": background,
+        "rejections": rejections_of(call.events),
         "turns": [{k: v for k, v in t.items() if k != "text"} | {"answered": t["text"] is not None} for t in turns],
         "counts": {
             "lines": len(call.events),
@@ -781,7 +794,7 @@ class Attached:
         """Waits for the caller's own input: admitted (by ref), ACK, its
         linked agent text and tagged turn end. Returns the account."""
         account = {"input": index, "ref": ref, "admitted": index is not None, "ack": None,
-                   "linked_messages": 0, "turn_end": None, "refused": None, "root_ended": None}
+                   "linked_messages": 0, "turn_end": None, "refused": None, "root_ended": None, "rejected": None}
         text = None
         while True:
             event = self.next_event(until)
@@ -802,6 +815,10 @@ class Attached:
                     break
             if account["input"] is None:
                 continue
+            if name == "rejected" and event.get("index") == account["input"]:
+                account["rejected"] = rejection_of(event)
+                account["stop"] = "rejected-unresolved"
+                break
             if name == "ack" and event.get("index") == account["input"] and event.get("message_id"):
                 account["ack"] = {k: event.get(k) for k in ("message_id", "label", "durable")}
             elif name == "agent-message" and event.get("input") == account["input"] and account["ack"] \

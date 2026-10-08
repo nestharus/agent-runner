@@ -670,5 +670,28 @@ class LiveRequest(unittest.TestCase):
             frontdoor.check_request(dict(base, live="yes"), site, test_frontdoor.NOW)
 
 
+class RejectionBoundary(unittest.TestCase):
+    def test_live_turn_returns_owner_rejection_without_waiting_for_idle(self):
+        child = {"event": "rejected", "index": 0, "child": {"id": "child-1"}}
+        rejection = {"event": "rejected", "index": 0, "code": -32010,
+                     "insertion": "unresolved", "retry": "not-authorized",
+                     "endpoint_declaration": "not-inserted", "declaration_attribution": "endpoint-rpc-code",
+                     "physical_non_insertion": "not-established", "hold": "unresolved-input",
+                     "exit": "cancel-or-peer-exit", "message": "PRIVATE-PAYLOAD"}
+        attached = native_call.Attached.__new__(native_call.Attached)
+        stream = iter([child, rejection])
+        attached.next_event = lambda until: next(stream)
+        account, text = attached.turn(0, None, 0)
+        self.assertIsNone(text)
+        self.assertIsNone(account["ack"])
+        self.assertIsNone(account["turn_end"])
+        self.assertEqual(account["stop"], "rejected-unresolved")
+        self.assertEqual(account["rejected"]["endpoint_declaration"], "not-inserted")
+        self.assertEqual(account["rejected"]["retry"], "not-authorized")
+        self.assertEqual(native_call.turn_class(account, text), "incomplete")
+        self.assertNotIn("PRIVATE-PAYLOAD", json.dumps(account))
+        self.assertEqual(native_call.rejections_of([child, rejection]), [account["rejected"]])
+
+
 if __name__ == "__main__":
     unittest.main()

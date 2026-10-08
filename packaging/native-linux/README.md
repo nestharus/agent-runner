@@ -224,6 +224,18 @@ capture at 64 MiB. Stop uncertainty remains incomplete; killing a helper does
 not prove a privileged namespace ended. Kernel/filesystem stalls remain
 outside these bounds.
 
+A prompt RPC rejection supplies no insertion ACK or retry authority. The
+owner keeps input and ordinary close on hold until cancel or peer exit, even
+when the endpoint declares `INPUT_NOT_INSERTED`: that declaration is attributed
+to the endpoint and is not physical non-insertion proof. The one-shot caller
+exports these reports in `result.json.rejections` and keeps its existing
+signal/deadline cancellation policy. A live turn returns immediately with
+`turn.rejected`, `stop: rejected-unresolved` and class `incomplete`/6; its root
+remains live. Use `--root HANDLE --stop` to cancel that root; do not resend the
+prompt based on the rejection. If the owner dies after the wire error but
+before its durable rejection stop commits, existing successor recovery can
+resubmit the same owed key. This window is not an at-most-once guarantee.
+
 The new 0700 output directory contains request.public.json, events.jsonl,
 stderr.log, caller.jsonl, result.json, children.json and final.md when linked
 parent text exists. Parent answer and automatic close ignore child-marked
