@@ -83,7 +83,7 @@ jobs:
           cargo llvm-cov --workspace --no-report --ignore-run-fail 2>&1 | tee coverage/test-output.log
           sed 's/\x1b\[[0-9;]*m//g' coverage/test-output.log > coverage/test-output.txt
           rm coverage/test-output.log
-          results=$(grep -c '^test result:' coverage/test-output.txt || true)
+          results=$(grep -ac '^test result:' coverage/test-output.txt || true)
           passed=$(awk '/^test result:/ {n += $4} END {print n + 0}' coverage/test-output.txt)
           failed=$(awk '/^test result:/ {n += $6} END {print n + 0}' coverage/test-output.txt)
           if [ "$results" -eq 0 ]; then
@@ -99,12 +99,31 @@ jobs:
               echo "Failing tests (first 200):"
               echo
               echo '```'
-              grep -E '^test .+ \.\.\. FAILED$' coverage/test-output.txt | sort -u | head -200
+              grep -aE '^test .+ \.\.\. FAILED$' coverage/test-output.txt | sort -u | head -200
               echo '```'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$failed" -gt 0 ]; then
             echo "::warning title=Failing tests::$failed of $((passed + failed)) tests failed during the coverage run; the coverage report is still produced. See the job summary."
+          fi
+          # A process killed while writing its profile (some tests kill
+          # agent-runner children on purpose) leaves a corrupt .profraw,
+          # and one corrupt file makes llvm-profdata refuse the whole merge.
+          # Drop unreadable profiles and say how many were dropped.
+          profdata="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-profdata"
+          total=0
+          dropped=0
+          while IFS= read -r -d '' f; do
+            total=$((total + 1))
+            if ! "$profdata" show "$f" > /dev/null 2>&1; then
+              echo "dropping unreadable profile: $f"
+              rm -f "$f"
+              dropped=$((dropped + 1))
+            fi
+          done < <(find . -path ./node_modules -prune -o -name '*.profraw' -print0)
+          echo "Profiles: $total found, $dropped unreadable and dropped." >> "$GITHUB_STEP_SUMMARY"
+          if [ "$dropped" -gt 0 ]; then
+            echo "::warning title=Coverage profiles::$dropped of $total .profraw files were unreadable and were left out of the report."
           fi
           cargo llvm-cov report --lcov --output-path coverage/lcov.info
           cargo llvm-cov report --cobertura --output-path coverage/coverage.xml
