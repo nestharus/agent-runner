@@ -434,12 +434,22 @@ class EntryRequest(unittest.TestCase):
         self.assertEqual(value["store"], "/var/r/1000/run/store")
         self.assertEqual(value["launch_dir"], "/var/r/1000/run/launch")
         self.assertEqual(value["workload"], {"isolation": "host-root", "user": "nes"})
-        self.assertEqual(value["live_output"], {"grant": "uid:1000"})
+        self.assertNotIn("live_output", value)
         self.assertEqual(value["provider"]["bash_authority"], "trusted-task")
         self.assertEqual(value["provider"]["executable"], PROVIDER["executable"])
         self.assertNotIn("fixture-access-marker", json.dumps(value))
         self.assertEqual(value["messages"], ["look"])
         self.assertNotIn("claude", value)
+    def test_live_output_is_explicit_and_malformed_offers_reach_view_admission(self):
+        user = types.SimpleNamespace(pw_name="nes", pw_uid=1207)
+        for offer in [17, [], {"oulipoly.live_stream/v2": {}}, {"oulipoly.live_stream/v3": 17}]:
+            req = request()
+            req["live_output"] = offer
+            checked = frontdoor.check_request(req, SITE, NOW)
+            value = frontdoor.entry_request("/opt/p", "/var/r/1207/run", user, checked, {})
+            self.assertEqual(value["live_output"], {"grant": "uid:1207", "advertisement": offer})
+            self.assertEqual(value["messages"], ["look"])
+
 
 
 

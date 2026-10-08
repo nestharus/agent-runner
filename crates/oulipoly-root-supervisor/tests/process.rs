@@ -5583,95 +5583,182 @@ fn recover_of_a_mismatched_incarnation_is_root_absent_before_effects() {
     assert_eq!(terminal["session_control"]["retirement"]["eligible"], false);
 }
 
-// Optional live view of Bash output (`live_output`).
-
 const ROOT_BASH: &str = env!("CARGO_BIN_EXE_oulipoly-root-bash");
 
+// Optional live v3 consumers. These use the shared decoder, selection and
+// follower, and actual retained/database witnesses, not a second test wire.
+use agent_provider_contract::live_stream::{self as live_wire, attachment as live_attach};
 fn own_uid() -> u32 {
-    // SAFETY: geteuid has no preconditions.
     unsafe { libc::geteuid() }
 }
-
+fn live_offer() -> live_wire::Offer {
+    live_wire::Offer {
+        channels: vec![live_wire::Channel::Combined, live_wire::Channel::Control],
+        audiences: vec![live_wire::Audience::Scoped],
+        max_data_bytes: 16 * 1024,
+    }
+}
 fn with_live(mut spec: Value, grant: &str) -> Value {
-    spec["live_output"] = json!({ "grant": grant });
+    spec["live_output"] =
+        json!({"grant":grant,"advertisement":live_wire::advertisement(&live_offer())});
     spec
 }
-
-/// Sends one request to the live endpoint and returns the connection.
-fn live_connect(path: &str, request: &Value) -> std::os::unix::net::UnixStream {
-    let mut conn = std::os::unix::net::UnixStream::connect(path).unwrap();
+fn live_read(conn: &mut BufReader<std::os::unix::net::UnixStream>) -> live_attach::Message {
+    let mut line = String::new();
+    assert!(
+        conn.read_line(&mut line).unwrap() > 0,
+        "unexpected live EOF"
+    );
+    live_attach::Message::decode_line(line.trim()).unwrap()
+}
+fn live_open(path: &str) -> BufReader<std::os::unix::net::UnixStream> {
+    let start = std::time::Instant::now();
+    let mut conn = loop {
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(c) => break c,
+            Err(e) => {
+                assert!(start.elapsed() < WATCHDOG, "live setup: {e}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
     conn.set_read_timeout(Some(WATCHDOG)).unwrap();
-    writeln!(conn, "{request}").unwrap();
-    conn
+    writeln!(
+        conn,
+        "{}",
+        live_attach::Message::Hello(live_attach::Hello::new(
+            live_attach::Role::Subscriber,
+            &live_offer()
+        ))
+        .encode_line()
+    )
+    .unwrap();
+    let mut reader = BufReader::new(conn);
+    let live_attach::Message::Hello(hello) = live_read(&mut reader) else {
+        panic!("broker hello");
+    };
+    hello
+        .select(live_attach::Role::Subscriber, &live_offer())
+        .unwrap();
+    reader
 }
-
-/// Every line the endpoint sends until it closes (test watchdog only).
-fn live_lines(conn: std::os::unix::net::UnixStream) -> Vec<Value> {
-    BufReader::new(conn)
-        .lines()
-        .map(|line| serde_json::from_str(&line.expect("live line within watchdog")).unwrap())
-        .collect()
+fn live_directory(path: &str) -> Vec<live_wire::Descriptor> {
+    let mut conn = live_open(path);
+    writeln!(
+        conn.get_mut(),
+        "{}",
+        live_attach::Message::List {}.encode_line()
+    )
+    .unwrap();
+    let live_attach::Message::Directory(d) = live_read(&mut conn) else {
+        panic!("directory");
+    };
+    d.streams
 }
-
-/// Checks a followed stream: after `attached` (and any discontinuity),
-/// data and gaps cover `[from, end)` exactly once in order, every data byte
-/// is the retained byte at that offset, and it ends with one terminal.
-fn check_follow(lines: &[Value], from: u64, retained: &[u8]) -> (u64, u64, Vec<String>, Value) {
-    assert_eq!(lines[0]["event"], "attached", "{lines:?}");
-    assert_eq!(lines[0]["origin"], "combined-stdout-stderr");
-    let (mut at, mut data, mut reasons) = (from, 0u64, Vec::new());
-    let body = &lines[1..lines.len() - 1];
-    for line in body {
-        match line["event"].as_str().unwrap() {
-            "discontinuity" => {}
-            "gap" => {
-                assert_eq!(line["from"], at, "gap starts where delivery is: {line}");
-                let to = line["to"].as_u64().unwrap();
-                assert!(to > at);
-                for reason in line["reasons"].as_array().unwrap() {
-                    reasons.push(reason.as_str().unwrap().to_owned());
-                }
-                at = to;
-            }
-            "data" => {
-                assert_eq!(line["offset"], at, "data starts where delivery is");
-                let bytes = oulipoly_root_supervisor::bash::unbase64(line["b64"].as_str().unwrap())
-                    .unwrap();
-                let start = usize::try_from(at).unwrap();
-                assert_eq!(
-                    &retained[start..start + bytes.len()],
-                    &bytes[..],
-                    "live bytes are the retained bytes at {at}"
-                );
-                at += bytes.len() as u64;
-                data += bytes.len() as u64;
-            }
-            other => panic!("unexpected {other}: {line}"),
+fn live_descriptor(path: &str, work: i64) -> live_wire::Descriptor {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(d) = live_directory(path).into_iter().find(|d| {
+            d.correlation.as_ref().unwrap().work.as_deref() == Some(work.to_string().as_str())
+        }) {
+            return d;
+        }
+        assert!(start.elapsed() < WATCHDOG, "optional work never registered");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+fn live_follow(
+    path: &str,
+    cursor: live_wire::Cursor,
+) -> (
+    BufReader<std::os::unix::net::UnixStream>,
+    live_wire::Follower,
+    Vec<live_wire::Record>,
+) {
+    let request = live_attach::Attach { cursor };
+    let mut conn = live_open(path);
+    writeln!(
+        conn.get_mut(),
+        "{}",
+        live_attach::Message::Attach(request.clone()).encode_line()
+    )
+    .unwrap();
+    let live_attach::Message::Attached(attached) = live_read(&mut conn) else {
+        panic!("attached");
+    };
+    let selected =
+        live_wire::select(&live_offer(), &live_wire::advertisement(&live_offer())).unwrap();
+    let (follower, _) = live_attach::follow_attached(&selected, &request, &attached).unwrap();
+    // Prefix knowledge arrived inside Attached; SDK setup consumed it.
+    (conn, follower, attached.plan.prefix)
+}
+fn live_collect(
+    mut conn: BufReader<std::os::unix::net::UnixStream>,
+    mut follower: live_wire::Follower,
+    mut records: Vec<live_wire::Record>,
+) -> Vec<live_wire::Record> {
+    if records.iter().any(|r| {
+        matches!(
+            r,
+            live_wire::Record::Finalized(_) | live_wire::Record::Ended(_)
+        )
+    }) {
+        return records;
+    }
+    loop {
+        let live_attach::Message::Record { record } = live_read(&mut conn) else {
+            panic!("record");
+        };
+        follower.accept(&record).unwrap();
+        let terminal = matches!(
+            record,
+            live_wire::Record::Finalized(_) | live_wire::Record::Ended(_)
+        );
+        records.push(record);
+        if terminal {
+            break;
         }
     }
-    let terminal = lines.last().unwrap().clone();
-    assert_eq!(
-        terminal["offset"], at,
-        "terminal at the end of what was covered"
-    );
-    (at, data, reasons, terminal)
+    records
+}
+fn live_bytes(records: &[live_wire::Record]) -> Vec<u8> {
+    records
+        .iter()
+        .filter_map(|r| match r {
+            live_wire::Record::Data(d) => Some(d.bytes().unwrap()),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+fn witness(dir: &Scratch, work: i64, ended: &Value) -> Value {
+    let db = rusqlite::Connection::open_with_flags(
+        dir.store().join("intent.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let stored: String = db
+        .query_row("SELECT result FROM bash_run WHERE work=?1", [work], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let stored: Value = serde_json::from_str(&stored).unwrap();
+    assert_eq!(stored["status"], ended["status"]);
+    assert_eq!(stored["work_pid1"], ended["work_pid1"]);
+    assert_eq!(stored["retained"], ended["retained"]);
+    assert_eq!(stored["output"], ended["output"]);
+    stored
 }
 
-/// The granted requester, from outside the root, follows a Bash run's
-/// combined output while it runs: every offset is delivered or covered by
-/// an exact gap, every delivered byte is the retained byte at that offset,
-/// and the stream ends only with a custody-owner `final` naming the
-/// durable end and seal. The same uid from inside the root's own work is
-/// refused, and the required relay, retention and end are unchanged.
 #[test]
 fn granted_requester_follows_combined_output_to_a_custody_owner_final() {
-    let dir = Scratch::new("live-follow");
+    let dir = Scratch::new("live-v3-follow");
     let go = dir.0.join("go");
     let socket = dir.store().join("live.sock");
     let command = format!(
-        r#"python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(b"{{\"v\":1,\"op\":\"list\"}}\n"); print("inner:"+s.recv(4096).decode().strip())' {socket}; while [ ! -e {go} ]; do sleep 0.02; done; seq 1 30000; echo err >&2; exit 3"#,
-        socket = socket.display(),
-        go = go.display(),
+        r#"python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(b"{{\"op\":\"list\"}}\n"); print("inner:"+s.recv(4096).decode().strip())' {}; while [ ! -e {} ]; do sleep 0.02; done; seq 1 30000; echo err >&2; exit 3"#,
+        socket.display(),
+        go.display()
     );
     let mut run = Run::start(
         &dir,
@@ -5679,114 +5766,79 @@ fn granted_requester_follows_combined_output_to_a_custody_owner_final() {
             spec(
                 &dir,
                 3,
-                json!([{
-                    "id": "a",
-                    "argv": peer(&dir.state("a"), &["--exit-after-acks", "1"]),
-                    "messages": [format!("bash:{command}")],
-                }]),
+                json!([{"id":"a","argv":peer(&dir.state("a"),&[]),"messages":[format!("bash:{command}")]}]),
             ),
             &format!("uid:{}", own_uid()),
         ),
     );
-    let live = run.until("live-output", |value| value["event"] == "live-output");
-    assert_eq!(live["listening"], true, "{live}");
-    assert_eq!(live["grant"], format!("uid:{}", own_uid()));
-    let path = live["path"].as_str().unwrap().to_owned();
-    let incarnation = live["incarnation"].as_str().unwrap().to_owned();
-    // Asking starts holding.
-    let listed = live_lines(live_connect(&path, &json!({ "v": 1, "op": "list" })));
-    assert_eq!(listed[0]["event"], "streams");
-    assert_eq!(listed[0]["incarnation"], incarnation);
-    let work = run.until("bash-accepted", |value| value["event"] == "bash-accepted")["work"]
+    let event = run.until("live configuration", |v| v["event"] == "live-output");
+    assert_eq!(event["configured"], true);
+    let path = event["path"].as_str().unwrap();
+    let work = run.until("bash acceptance", |v| v["event"] == "bash-accepted")["work"]
         .as_i64()
         .unwrap();
-    // The same uid inside the root is refused before anything is served.
-    let refused = run.until("inner refusal", |value| {
-        value["event"] == "live-output-refused"
-    });
-    assert_eq!(refused["reason"], "inside-observed-root", "{refused}");
-    let follower = {
-        let conn = live_connect(&path, &json!({ "v": 1, "op": "attach", "work": work }));
-        std::thread::spawn(move || live_lines(conn))
-    };
+    let d = live_descriptor(path, work);
+    assert_eq!(d.channels, live_offer().channels);
+    let (conn, follower, prefix) = live_follow(path, d.start());
+    let following = std::thread::spawn(move || live_collect(conn, follower, prefix));
     std::fs::write(&go, b"").unwrap();
-    let (terminal, status, seen) = run.terminal();
-    assert_eq!(terminal["status"], "ended", "{terminal}");
-    assert_eq!(status.code(), Some(0));
-    let lines = follower.join().unwrap();
-    // Required path unchanged.
-    let ended = owner_event(&seen, "bash-ended")[0];
-    assert_eq!(ended["status"], "code:3");
-    assert_eq!(ended["retained"]["state"], "complete", "{ended}");
-    let answer = events(&seen, "a", "agent-message")[0]["text"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert!(
-        answer.contains(r#"inner:{"event":"unavailable","reason":"inside-observed-root"}"#),
-        "{answer}"
-    );
+    let ended = run.until("bash end", |v| v["event"] == "bash-ended");
+    let records = following.join().unwrap();
+    assert!(matches!(
+        records.last(),
+        Some(live_wire::Record::Finalized(_))
+    ));
+    let stored = witness(&dir, work, &ended);
+    assert_eq!(stored["status"], "code:3");
+    assert_eq!(stored["retained"]["state"], "complete");
     let retained = std::fs::read(dir.store().join("output").join(work.to_string())).unwrap();
-    assert_eq!(ended["retained"]["bytes"], retained.len() as u64);
-    let (end, data, reasons, final_) = check_follow(&lines, 0, &retained);
-    assert_eq!(
-        end,
-        retained.len() as u64,
-        "the live end is everything the owner received"
+    assert!(retained.ends_with(b"30000\nerr\n"));
+    let text = String::from_utf8_lossy(&retained);
+    assert!(
+        text.contains("not_authorized") && text.contains("inside-observed-root"),
+        "{text}"
     );
-    assert!(data > 0, "something was held and delivered");
-    for reason in &reasons {
-        assert!(
-            ["not-captured", "capture-contention", "evicted"].contains(&reason.as_str()),
-            "{reason}"
+    let delivered = live_bytes(&records);
+    assert!(!delivered.is_empty());
+    for r in &records {
+        if let live_wire::Record::Data(d) = r {
+            let bytes = d.bytes().unwrap();
+            assert!(retained.windows(bytes.len()).any(|w| w == bytes));
+            assert_eq!(d.channel, live_wire::DataChannel::Combined);
+        }
+    }
+    assert!(records.iter().any(|r| matches!(
+        r,
+        live_wire::Record::Control(live_wire::ControlFrame {
+            fact: live_wire::ControlFact::ExitObserved { code: Some(3), .. },
+            ..
+        })
+    )));
+    if let Some(live_wire::Record::Finalized(f)) = records.last() {
+        assert_eq!(
+            f.durable_reference,
+            format!(
+                "rv1w:{}:{work}",
+                d.correlation.as_ref().unwrap().root.as_ref().unwrap()
+            )
         );
     }
-    assert_eq!(final_["event"], "final", "{final_}");
-    assert_eq!(final_["finalization"], "custody-owner");
-    assert_eq!(
-        final_["durable_reference"],
-        format!("rv1w:{}:{work}", terminal_root_id(&seen))
-    );
-    assert_eq!(final_["waits"]["command"]["status"], "code:3");
-    assert_eq!(final_["waits"]["command"]["observer"], "work-pid1-wait");
-    assert_eq!(
-        final_["retained"]["identity"],
-        ended["retained"]["identity"]
-    );
-    assert_eq!(final_["incarnation"], incarnation);
-    // The combined origin is preserved: stderr is in the same bytes.
-    assert!(retained.ends_with(b"30000\nerr\n"));
-    let account = &terminal["live_output"];
-    assert_eq!(account["grant"], format!("uid:{}", own_uid()));
-    assert!(account["subscribers"]["refused"].as_u64().unwrap() >= 1);
-    assert!(account["held"].as_u64().unwrap() <= account["bounds"]["per_root"].as_u64().unwrap());
+    run.cancel();
+    let (owner, status, _) = run.terminal();
+    assert_eq!(owner["status"], "cancelled");
+    assert_eq!(status.code(), Some(2));
 }
 
-fn terminal_root_id(seen: &[Value]) -> String {
-    owner_event(seen, "started")[0]["root_id"]
-        .as_str()
-        .unwrap()
-        .to_owned()
-}
-
-/// A subscriber that stops reading never holds up the relay: the run's
-/// several MiB pass, are retained whole and end while it is still
-/// connected. A later cursor behind the ring bound gets an exact
-/// `evicted` gap and then the held tail, byte-exact; a cursor of another
-/// incarnation gets a discontinuity; a cursor ahead is refused.
 #[test]
 fn stalled_subscriber_never_holds_up_the_relay_and_late_cursors_get_exact_gaps() {
-    let dir = Scratch::new("live-stall");
+    let dir = Scratch::new("live-v3-stall");
     let go = dir.0.join("go");
     let flow = dir.0.join("flow");
     const SIZE: usize = 4_000_000;
-    let inner = format!(
-        "while [ ! -e {flow} ]; do sleep 0.02; done; head -c {SIZE} /dev/zero | tr '\\0' a; echo done >&2",
-        flow = flow.display()
-    );
     let command = format!(
-        "while [ ! -e {go} ]; do sleep 0.02; done; {ROOT_BASH} -- /bin/sh -c \"{inner}\" > /dev/null 2>&1",
-        go = go.display()
+        "while [ ! -e {} ]; do sleep 0.02; done; {ROOT_BASH} -- /bin/sh -c \"while [ ! -e {} ]; do sleep 0.02; done; head -c {SIZE} /dev/zero | tr '\\0' a; echo done >&2\" > /dev/null 2>&1",
+        go.display(),
+        flow.display()
     );
     let mut run = Run::start(
         &dir,
@@ -5794,251 +5846,219 @@ fn stalled_subscriber_never_holds_up_the_relay_and_late_cursors_get_exact_gaps()
             spec(
                 &dir,
                 3,
-                json!([{
-                    "id": "a",
-                    "argv": peer(&dir.state("a"), &[]),
-                    "messages": [format!("spawn:{command}")],
-                }]),
+                json!([{"id":"a","argv":peer(&dir.state("a"),&[]),"messages":[format!("spawn:{command}")]}]),
             ),
             &format!("uid:{}", own_uid()),
         ),
     );
-    let live = run.until("live-output", |value| value["event"] == "live-output");
-    let path = live["path"].as_str().unwrap().to_owned();
-    let incarnation = live["incarnation"].as_str().unwrap().to_owned();
-    live_lines(live_connect(&path, &json!({ "v": 1, "op": "list" })));
+    let event = run.until("live configuration", |v| v["event"] == "live-output");
+    let path = event["path"].as_str().unwrap();
+    live_directory(path);
     std::fs::write(&go, b"").unwrap();
-    let work = run.until("bash-accepted", |value| value["event"] == "bash-accepted")["work"]
+    let work = run.until("bash acceptance", |v| v["event"] == "bash-accepted")["work"]
         .as_i64()
         .unwrap();
-    // Attached (its server is following) and never read again; only then
-    // does the output flow.
-    // The run's stream exists from its relay's start, just after `accepted`.
-    let stalled = loop {
-        let conn = live_connect(&path, &json!({ "v": 1, "op": "attach", "work": work }));
-        let mut conn = BufReader::new(conn);
-        let mut first = String::new();
-        conn.read_line(&mut first).unwrap();
-        let first: Value = serde_json::from_str(&first).unwrap();
-        if first["event"] == "attached" {
-            break conn;
-        }
-        assert_eq!(first["reason"], "unknown-work", "{first}");
-        std::thread::sleep(Duration::from_millis(10));
-    };
+    let d = live_descriptor(path, work);
+    let (stalled, _, _) = live_follow(path, d.start());
     std::fs::write(&flow, b"").unwrap();
-    let ended = run.until("bash-ended", |value| {
-        value["event"] == "bash-ended" && value["work"] == work
+    let ended = run.until("required end with nonreader", |v| {
+        v["event"] == "bash-ended"
     });
-    assert_eq!(ended["status"], "code:0", "{ended}");
-    assert_eq!(ended["output_bytes"], SIZE as u64 + 5);
+    assert_eq!(ended["output_bytes"], SIZE + 5);
     assert_eq!(ended["retained"]["state"], "complete");
+    witness(&dir, work, &ended);
     let retained = std::fs::read(dir.store().join("output").join(work.to_string())).unwrap();
     assert_eq!(retained.len(), SIZE + 5);
-    // A cursor at the start, after the run ended: the ring kept a tail.
-    let late = live_lines(live_connect(
-        &path,
-        &json!({ "v": 1, "op": "attach", "work": work, "cursor": { "incarnation": incarnation, "offset": 0 } }),
-    ));
-    let (end, data, reasons, final_) = check_follow(&late, 0, &retained);
-    assert_eq!(end, retained.len() as u64);
-    assert!(reasons.contains(&"evicted".to_owned()), "{reasons:?}");
-    assert!(data > 0 && data <= 1024 * 1024, "{data}");
+    let (conn, follower, prefix) = live_follow(path, d.start());
+    let late = live_collect(conn, follower, prefix);
+    assert!(late.iter().any(|r|matches!(r,live_wire::Record::Gap(g) if g.first==1 && g.reason==live_wire::GapReason::Evicted)));
+    let bytes = live_bytes(&late);
+    assert!(!bytes.is_empty() && bytes.len() <= 1024 * 1024);
+    assert!(retained.ends_with(&bytes));
+    let mut foreign = d.start();
+    foreign.incarnation = "0".repeat(32);
+    foreign.after_seq = 5;
+    let (conn, f, prefix) = live_follow(path, foreign);
+    let other = live_collect(conn, f, prefix);
     assert!(
-        late[1]["event"] == "gap" && late[1]["from"] == 0,
-        "{:?}",
-        late[1]
+        matches!(other.first(),Some(live_wire::Record::Discontinuity(d)) if d.previous_last_seq.is_none())
     );
-    assert_eq!(final_["event"], "final");
-    assert_eq!(final_["waits"]["command"]["status"], "code:0");
-    // Another incarnation's cursor.
-    let other = live_lines(live_connect(
-        &path,
-        &json!({ "v": 1, "op": "attach", "work": work, "cursor": { "incarnation": "0".repeat(32), "offset": 5 } }),
-    ));
-    assert_eq!(other[1]["event"], "discontinuity", "{:?}", other[1]);
-    assert_eq!(other[1]["lost"], "unknown");
-    check_follow(&other, 0, &retained);
-    // A cursor ahead of what was received.
-    let ahead = live_lines(live_connect(
-        &path,
-        &json!({ "v": 1, "op": "attach", "work": work, "cursor": { "incarnation": incarnation, "offset": SIZE as u64 + 6 } }),
-    ));
-    assert_eq!(
-        ahead,
-        vec![json!({ "event": "unavailable", "reason": "cursor-ahead" })]
+    let mut ahead = d.start();
+    ahead.after_seq = 100_000;
+    let mut conn = live_open(path);
+    writeln!(
+        conn.get_mut(),
+        "{}",
+        live_attach::Message::Attach(live_attach::Attach { cursor: ahead }).encode_line()
+    )
+    .unwrap();
+    assert!(
+        matches!(live_read(&mut conn),live_attach::Message::Unavailable{diagnostic} if diagnostic.reason==live_wire::UnavailableReason::ProtocolViolation)
     );
     drop(stalled);
     run.cancel();
     let (terminal, _, _) = run.terminal();
-    let account = &terminal["live_output"];
-    assert!(
-        account["bytes"]["evicted"].as_u64().unwrap() > 0,
-        "{account}"
-    );
-    assert!(account["held"].as_u64().unwrap() <= account["bounds"]["per_root"].as_u64().unwrap());
+    assert!(terminal["live_output"]["held"].as_u64().unwrap() <= 8 * 1024 * 1024);
 }
 
-/// A grant naming anyone but the root's attested requester disables only
-/// the live view; without a grant there is no endpoint at all. Bash runs
-/// either way.
 #[test]
 fn refused_or_absent_grant_disables_only_the_live_view() {
-    for grant in [Some(format!("uid:{}", own_uid() + 1)), None] {
-        let dir = Scratch::new("live-grant");
+    let uid = format!("uid:{}", own_uid());
+    for optional in [
+        None,
+        Some(json!(17)),
+        Some(json!({"grant":uid,"extra":true})),
+        Some(json!({"grant":uid,"advertisement":{"oulipoly.live_stream/v2":{}}})),
+        Some(json!({"grant":uid,"advertisement":{"oulipoly.live_stream/v3":17}})),
+        Some(
+            json!({"grant":format!("uid:{}",own_uid()+1),"advertisement":live_wire::advertisement(&live_offer())}),
+        ),
+    ] {
+        let dir = Scratch::new("live-v3-refused");
         let mut request = spec(
             &dir,
             3,
-            json!([{
-                "id": "a",
-                "argv": peer(&dir.state("a"), &["--exit-after-acks", "1"]),
-                "messages": ["bash:echo ok"],
-            }]),
+            json!([{"id":"a","argv":peer(&dir.state("a"),&["--exit-after-acks","1"]),"messages":["bash:echo ok"]}]),
         );
-        if let Some(grant) = &grant {
-            request = with_live(request, grant);
+        if let Some(value) = &optional {
+            request["live_output"] = value.clone();
         }
         let run = Run::start(&dir, &request);
         let (terminal, status, seen) = run.terminal();
-        assert_eq!(terminal["status"], "ended", "{terminal}");
         assert_eq!(status.code(), Some(0));
-        assert_eq!(owner_event(&seen, "bash-ended")[0]["status"], "code:0");
+        assert_eq!(terminal["status"], "ended");
+        let ended = owner_event(&seen, "bash-ended")[0];
+        assert_eq!(ended["status"], "code:0");
+        witness(&dir, ended["work"].as_i64().unwrap(), ended);
         let live = owner_event(&seen, "live-output");
-        match grant {
-            Some(_) => {
-                assert_eq!(live[0]["listening"], false);
-                assert_eq!(
-                    live[0]["reason"],
-                    "grant-refused: not this root's attested requester"
-                );
-            }
-            None => assert!(live.is_empty()),
+        if optional.is_some() {
+            assert_eq!(live[0]["listening"], false);
+        } else {
+            assert!(live.is_empty());
         }
-        assert!(terminal.get("live_output").is_none());
         assert!(!dir.store().join("live.sock").exists());
     }
 }
 
-/// A run taken over by a recovering owner is a new incarnation's stream
-/// (`from-takeover`): a cursor from the dead owner's incarnation gets a
-/// discontinuity with an unknown lost tail, then this owner's bytes from
-/// its zero, and the run still ends only with a custody-owner `final`
-/// whose retained state carries the takeover loss. The dead owner's
-/// followers saw no terminal.
 #[test]
 fn takeover_is_a_new_incarnation_and_old_cursors_get_a_discontinuity() {
-    let dir = Scratch::new("live-takeover");
+    let dir = Scratch::new("live-v3-takeover");
     let gate = dir.0.join("gate");
     let grant = format!("uid:{}", own_uid());
-    let command = format!(
-        "bash:echo before; while [ ! -e {} ]; do sleep 0.05; done; echo after",
-        gate.display()
-    );
     let mut first = Run::start(
         &dir,
         &with_live(
             spec(
                 &dir,
                 3,
-                json!([{ "id": "a", "argv": peer(&dir.state("a"), &["--exit-after-acks", "1"]), "messages": [command] }]),
+                json!([{"id":"a","argv":peer(&dir.state("a"),&[]),"messages":[format!("bash:echo before; while [ ! -e {} ]; do sleep 0.02; done; echo after",gate.display())]}]),
             ),
             &grant,
         ),
     );
-    let live = first.until("live-output", |value| value["event"] == "live-output");
-    let path = live["path"].as_str().unwrap().to_owned();
-    let old = live["incarnation"].as_str().unwrap().to_owned();
-    live_lines(live_connect(&path, &json!({ "v": 1, "op": "list" })));
-    let work = first.until("bash started", |value| value["event"] == "bash-started")["work"]
+    let event = first.until("live configuration", |v| v["event"] == "live-output");
+    let path = event["path"].as_str().unwrap();
+    let work = first.until("bash start", |v| v["event"] == "bash-started")["work"]
         .as_i64()
         .unwrap();
-    // Follow until "before" is delivered, then the owner dies.
-    let mut follower = loop {
-        let mut conn = BufReader::new(live_connect(
-            &path,
-            &json!({ "v": 1, "op": "attach", "work": work }),
-        ));
-        let mut line = String::new();
-        conn.read_line(&mut line).unwrap();
-        if serde_json::from_str::<Value>(&line).unwrap()["event"] == "attached" {
-            break conn;
-        }
-    };
-    let mut cursor = 0;
-    while cursor < 7 {
-        let mut line = String::new();
-        follower.read_line(&mut line).unwrap();
-        let line: Value = serde_json::from_str(&line).unwrap();
-        cursor = match line["event"].as_str().unwrap() {
-            "data" => {
-                line["offset"].as_u64().unwrap()
-                    + oulipoly_root_supervisor::bash::unbase64(line["b64"].as_str().unwrap())
-                        .unwrap()
-                        .len() as u64
-            }
-            "gap" => line["to"].as_u64().unwrap(),
-            other => panic!("{other}"),
+    let d = live_descriptor(path, work);
+    let (mut conn, mut follower, _) = live_follow(path, d.start());
+    while follower.cursor().after_seq == 0 {
+        let live_attach::Message::Record { record } = live_read(&mut conn) else {
+            panic!("record");
         };
+        follower.accept(&record).unwrap();
+        if follower.cursor().after_seq > 0 {
+            break;
+        }
     }
+    let cursor = follower.cursor().clone();
     first.kill();
-    let rest: Vec<String> = follower.lines().map_while(Result::ok).collect();
-    assert!(
-        rest.is_empty(),
-        "a dead owner's follower gets no terminal: {rest:?}"
-    );
-
-    let mut recover = recover(&dir);
-    recover["live_output"] = json!({ "grant": grant });
-    let mut second = Run::start(&dir, &recover);
-    let live = second.until("live-output", |value| value["event"] == "live-output");
-    let path = live["path"].as_str().unwrap().to_owned();
-    assert_ne!(live["incarnation"], old);
-    second.until("bash reattached", |value| {
-        value["event"] == "bash-reattached"
-    });
-    let followed = {
-        let path = path.clone();
-        let old = old.clone();
-        std::thread::spawn(move || {
-            loop {
-                let lines = live_lines(live_connect(
-                    &path,
-                    &json!({ "v": 1, "op": "attach", "work": work, "cursor": { "incarnation": old, "offset": cursor } }),
-                ));
-                if lines[0]["event"] == "attached" {
-                    break lines;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        })
-    };
-    std::thread::sleep(Duration::from_millis(300));
-    std::fs::write(&gate, b"").unwrap();
-    let (terminal, _, seen) = second.terminal();
-    assert_eq!(terminal["status"], "ended", "{terminal}");
-    let lines = followed.join().unwrap();
-    assert_eq!(lines[0]["basis"], "from-takeover");
-    assert_eq!(lines[1]["event"], "discontinuity");
-    assert_eq!(lines[1]["previous_incarnation"], old);
-    assert_eq!(lines[1]["previous_offset"], 7);
-    assert_eq!(lines[1]["lost"], "unknown");
-    let final_ = lines.last().unwrap();
-    assert_eq!(final_["event"], "final", "{final_}");
-    assert_eq!(final_["retained"]["state"], "partial");
-    assert_eq!(final_["retained"]["losses"][0]["reason"], "owner-changed");
-    let ended = owner_event(&seen, "bash-ended")[0];
+    let mut rest = String::new();
     assert_eq!(
-        final_["retained"]["identity"],
-        ended["retained"]["identity"]
+        conn.read_line(&mut rest).unwrap(),
+        0,
+        "owner death supplies no invented terminal"
     );
-    // This incarnation's zero is where the earlier owner stopped reading.
-    let delivered: Vec<u8> = lines
-        .iter()
-        .filter(|line| line["event"] == "data")
-        .flat_map(|line| {
-            oulipoly_root_supervisor::bash::unbase64(line["b64"].as_str().unwrap()).unwrap()
-        })
+    let mut request = recover(&dir);
+    request["live_output"] =
+        json!({"grant":grant,"advertisement":live_wire::advertisement(&live_offer())});
+    let mut second = Run::start(&dir, &request);
+    let event = second.until("live configuration", |v| v["event"] == "live-output");
+    let path = event["path"].as_str().unwrap();
+    second.until("reattached", |v| v["event"] == "bash-reattached");
+    let new = live_descriptor(path, work);
+    assert_eq!(new.stream_id, d.stream_id);
+    assert_ne!(new.incarnation, d.incarnation);
+    let (conn, follower, prefix) = live_follow(path, cursor);
+    let following = std::thread::spawn(move || live_collect(conn, follower, prefix));
+    std::fs::write(&gate, b"").unwrap();
+    let ended = second.until("bash end", |v| v["event"] == "bash-ended");
+    let records = following.join().unwrap();
+    assert!(
+        matches!(records.first(),Some(live_wire::Record::Discontinuity(d)) if d.previous_last_seq.is_none())
+    );
+    assert!(matches!(
+        records.last(),
+        Some(live_wire::Record::Finalized(_))
+    ));
+    let stored = witness(&dir, work, &ended);
+    assert_eq!(stored["retained"]["state"], "partial");
+    assert_eq!(stored["retained"]["losses"][0]["reason"], "owner-changed");
+    assert_eq!(live_bytes(&records), b"after\n");
+    second.cancel();
+    second.terminal();
+}
+
+#[test]
+fn live_prehello_and_quiet_followers_release_bounded_slots() {
+    let dir = Scratch::new("live-v3-slots");
+    let gate = dir.0.join("gate");
+    let mut run = Run::start(
+        &dir,
+        &with_live(
+            spec(
+                &dir,
+                3,
+                json!([{"id":"a","argv":peer(&dir.state("a"),&[]),"messages":[format!("bash:while [ ! -e {} ]; do sleep 0.02; done; echo done",gate.display())]}]),
+            ),
+            &format!("uid:{}", own_uid()),
+        ),
+    );
+    let event = run.until("configuration", |v| v["event"] == "live-output");
+    let path = event["path"].as_str().unwrap();
+    let work = run.until("acceptance", |v| v["event"] == "bash-accepted")["work"]
+        .as_i64()
+        .unwrap();
+    let d = live_descriptor(path, work);
+    let prehello: Vec<_> = (0..8)
+        .map(|_| std::os::unix::net::UnixStream::connect(path).unwrap())
         .collect();
-    assert_eq!(delivered, b"after\n");
-    assert_eq!(final_["offset"], 6);
+    std::thread::sleep(Duration::from_millis(250));
+    let mut ninth = std::os::unix::net::UnixStream::connect(path).unwrap();
+    ninth
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut byte = [0];
+    assert_eq!(
+        std::io::Read::read(&mut ninth, &mut byte).unwrap(),
+        0,
+        "capacity closes before creating a ninth worker"
+    );
+    drop(prehello);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(live_directory(path).len(), 1);
+    let followers: Vec<_> = (0..8).map(|_| live_follow(path, d.start()).0).collect();
+    drop(followers);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        live_directory(path).len(),
+        1,
+        "quiet EOF releases worker slots"
+    );
+    std::fs::write(&gate, b"").unwrap();
+    let ended = run.until("required end", |v| v["event"] == "bash-ended");
+    witness(&dir, work, &ended);
+    run.cancel();
+    run.terminal();
 }

@@ -779,7 +779,7 @@ impl Ingress {
         let tap = self
             .live
             .get()
-            .map(|live| live.register(work, "from-launch"));
+            .and_then(|live| live.register(work, "from-launch"));
         let attribution = json!({
             "root_id": self.root_id,
             "harness": who.harness,
@@ -930,7 +930,7 @@ impl Ingress {
         } else {
             "from-launch"
         };
-        let tap = self.live.get().map(|live| live.register(work, basis));
+        let tap = self.live.get().and_then(|live| live.register(work, basis));
         let (bytes, output) = relay_output(
             &self.slot.stop,
             stdout,
@@ -938,9 +938,6 @@ impl Ingress {
             &mut retainer,
             tap.as_ref(),
         );
-        if let Some(tap) = &tap {
-            tap.output_ended(&output);
-        }
         let (retained, sealed) = retainer.seal_recorded(&output, &self.store, &self.root_id);
         // Whether this run's end is in the store: the live view's only
         // basis for a custody-owner terminal.
@@ -989,6 +986,14 @@ impl Ingress {
         };
         event["output"] = output;
         event["retained"] = retained;
+        if recorded.is_ok() && sealed {
+            recorded = self
+                .store
+                .lock()
+                .expect("store lock")
+                .publish_bash_result(work, &event)
+                .map_err(|error| format!("{error:?}"));
+        }
         self.custody.lock().expect("custody lock").release(token);
         self.children
             .remove_run(work, matches!(outcome, Outcome::Ended));
