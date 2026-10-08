@@ -12,7 +12,9 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
-use oulipoly_acp::{AcpClient, ClientInfo, DeliveryOutcome, LineTransport, OutboundMessage};
+use agent_provider_contract::acp::{
+    AcpClient, ClientInfo, DeliveryOutcome, LineTransport, OutboundMessage,
+};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

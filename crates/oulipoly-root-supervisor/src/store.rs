@@ -1,6 +1,9 @@
 //! Per-root durable intent: one private directory per root, owned by that
 //! root's supervisor. See the crate docs for the labels it backs.
 //!
+//! * Version 14 persists the SDK resident declaration for each harness.
+//!   This per-root store refuses other versions; it is separate from the
+//!   shared StateDb migration chain and performs no legacy migration.
 //! * `owner.lock` is held with an exclusive `flock` for the life of the
 //!   owning process, so a second live instance is refused before it opens
 //!   the database. The kernel drops the lock when the owner dies.
@@ -92,7 +95,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use oulipoly_acp::{MessageKey, OutboundMessage};
+use agent_provider_contract::acp::{MessageKey, OutboundMessage};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::Intent;
@@ -101,7 +104,7 @@ pub(crate) const LOCK_FILE: &str = "owner.lock";
 pub(crate) const DB_FILE: &str = "intent.sqlite3";
 /// Version of this new per-root lineage. There is no migration chain: a
 /// store of any other version is refused.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 /// How long a write waits for a foreign SQLite lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -202,6 +205,7 @@ CREATE TABLE harness (
     argv TEXT NOT NULL,
     endpoint TEXT NOT NULL,
     session TEXT,
+    resident TEXT,
     kind TEXT NOT NULL DEFAULT 'intent' CHECK (kind IN ('intent', 'child'))
 );
 CREATE TABLE child (
@@ -437,6 +441,7 @@ pub(crate) struct DurableHarness {
     pub(crate) id: String,
     pub(crate) argv: Vec<String>,
     pub(crate) endpoint: crate::Endpoint,
+    pub(crate) resident: Option<agent_provider_contract::resident_session::ResidentPrepareResult>,
     pub(crate) session: Option<String>,
     pub(crate) messages: Vec<DurableMessage>,
     /// Launches with no recorded end, as `(work, incarnation)`.
@@ -884,14 +889,16 @@ impl Store {
                 "UPDATE attempt SET outcome = ?2, resolved_generation = ?3 WHERE id = ?1",
                 params![attempt, outcome, generation],
             )?;
-            if AttemptOutcome::classify(Some(outcome)) == AttemptOutcome::Refused {
-                // Conclusive refusal is not replayable on recovery. Commit
+            if AttemptOutcome::classify(Some(outcome)) == AttemptOutcome::Refused
+                || outcome == "rejected-unresolved"
+            {
+                // RPC rejection is not retry authority. Commit
                 // this stop together with resolution, without creating an ACK.
                 tx.execute(
-                    "UPDATE message SET stop = 'rejected'
+                    "UPDATE message SET stop = ?2
                      WHERE (harness, idx) =
                        (SELECT harness, idx FROM attempt WHERE id = ?1)",
-                    [attempt],
+                    params![attempt, outcome],
                 )?;
             }
             Ok(())
@@ -1370,17 +1377,20 @@ impl Store {
         })
     }
 
-    /// Records the argv a child's launch was provisioned with.
-    pub(crate) fn set_harness_argv(
+    /// Records the argv and negotiated resident declaration for a child launch.
+    pub(crate) fn set_harness_launch(
         &mut self,
         harness: usize,
         argv: &[String],
+        resident: Option<&agent_provider_contract::resident_session::ResidentPrepareResult>,
     ) -> Result<(), StoreError> {
+        let resident =
+            resident.map(|value| serde_json::to_string(value).expect("resident serializes"));
         let argv = serde_json::to_string(argv).expect("argv serializes");
         self.write(|tx| {
             tx.execute(
-                "UPDATE harness SET argv = ?2 WHERE position = ?1",
-                params![int(harness), argv],
+                "UPDATE harness SET argv = ?2, resident = ?3 WHERE position = ?1",
+                params![int(harness), argv, resident],
             )
             .map(drop)
         })
@@ -2016,14 +2026,19 @@ fn create_intent(
         let argv =
             serde_json::to_string(&spec.argv).map_err(|e| ClaimError::Store(e.to_string()))?;
         tx.execute(
-            "INSERT INTO harness (position, id, argv, endpoint, session)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO harness (position, id, argv, endpoint, session, resident)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 int(position),
                 spec.id,
                 argv,
                 spec.endpoint.label(),
-                spec.session
+                spec.session,
+                spec.resident
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| ClaimError::Store(e.to_string()))?
             ],
         )?;
         let mut messages = Vec::new();
@@ -2053,6 +2068,7 @@ fn create_intent(
             id: spec.id.clone(),
             argv: spec.argv.clone(),
             endpoint: spec.endpoint,
+            resident: spec.resident.clone(),
             session: spec.session.clone(),
             messages,
             open_works: Vec::new(),
@@ -2063,7 +2079,7 @@ fn create_intent(
 
 fn load_intent(tx: &Transaction<'_>, generation: i64) -> Result<Vec<DurableHarness>, ClaimError> {
     let mut harness_rows = tx.prepare(
-        "SELECT position, id, argv, endpoint, session FROM harness
+        "SELECT position, id, argv, endpoint, session, resident FROM harness
              WHERE kind = 'intent' ORDER BY position",
     )?;
     let rows = harness_rows
@@ -2074,6 +2090,7 @@ fn load_intent(tx: &Transaction<'_>, generation: i64) -> Result<Vec<DurableHarne
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2094,7 +2111,7 @@ fn load_intent(tx: &Transaction<'_>, generation: i64) -> Result<Vec<DurableHarne
          WHERE harness = ?1 AND kind = 'harness' AND outcome IS NULL ORDER BY id",
     )?;
     let mut harnesses = Vec::new();
-    for (position, id, argv, endpoint, session) in rows {
+    for (position, id, argv, endpoint, session, resident) in rows {
         let endpoint = crate::Endpoint::parse(&endpoint)
             .ok_or_else(|| ClaimError::Store(format!("unknown endpoint {endpoint}")))?;
         let open_works = work_rows
@@ -2138,6 +2155,10 @@ fn load_intent(tx: &Transaction<'_>, generation: i64) -> Result<Vec<DurableHarne
             id,
             argv,
             endpoint,
+            resident: resident
+                .map(|value| serde_json::from_str(&value))
+                .transpose()
+                .map_err(|e| ClaimError::Store(e.to_string()))?,
             session,
             messages,
             open_works,
@@ -2182,6 +2203,7 @@ mod tests {
                 argv: vec!["peer".into()],
                 endpoint: crate::Endpoint::Stdio,
                 session: None,
+                resident: None,
                 messages: vec!["one".into()],
             }],
             workload: crate::Workload::UnprivilegedUserns {},
@@ -2657,6 +2679,46 @@ mod tests {
                 assert_eq!(links, 1);
             }
         }
+    }
+
+    /// A first-attempt RPC refusal alone cannot make an async completion
+    /// undelivered, even when no earlier attempt adds uncertainty.
+    #[test]
+    fn rpc_refusal_keeps_completion_unknown_without_any_prior_attempt() {
+        let dir = Dir::new("rpc-completion");
+        let mut store = Store::claim(&dir.0, Some(&intent())).unwrap().store;
+        let incarnation = store
+            .begin_incarnation("token", "unprivileged-userns")
+            .unwrap();
+        let parent = store.begin_work(0, incarnation).unwrap();
+        let run = store
+            .begin_bash(0, parent, incarnation, 1, "[]", &["x".into()], "/", true)
+            .unwrap();
+        let Admission::Admitted(idx, _) = store
+            .admit_follow_up(0, 0, None, "completion", false, Some((run, None)))
+            .unwrap()
+        else {
+            panic!("admission")
+        };
+        let attempt = store.begin_attempt(0, idx).unwrap();
+        store
+            .resolve_attempt(attempt, "rejected-unresolved")
+            .unwrap();
+        assert!(
+            !store
+                .resolve_completion(run, "undelivered", Some("rejected"))
+                .unwrap()
+        );
+        drop(store);
+        let claimed = Store::claim(&dir.0, None).unwrap();
+        assert_eq!(
+            claimed.store.inherited_completions(None).unwrap()[0]["completion"],
+            "delivery-unknown"
+        );
+        let message = &claimed.harnesses[0].messages[idx];
+        assert_eq!(message.unknown_attempts, 1);
+        assert_eq!(message.stop.as_deref(), Some("rejected-unresolved"));
+        assert!(message.ack.is_none());
     }
 
     /// A rejection settles only conclusive non-insertion, never an earlier

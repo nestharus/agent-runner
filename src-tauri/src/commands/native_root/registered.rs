@@ -81,6 +81,7 @@ use std::path::{Component, Path, PathBuf};
 
 use agent_provider_contract::SchemaRegistry as ContractRegistry;
 use agent_provider_contract::exploration::{self, EffectiveExploration, Exploration, Limits};
+use agent_provider_contract::generated::PolicyEvaluateResult;
 use agent_provider_contract::negotiation::select_contract_version;
 use agent_provider_contract::operations::Describe;
 use agent_provider_contract::resident_session::{
@@ -91,9 +92,7 @@ use agent_provider_contract::tool_mediation::{
     self, BashPolicy, EffectiveMediation, ToolMediation,
 };
 use oulipoly_provider::client::{ProviderClient, ProviderClientOptions};
-use oulipoly_provider::generated::{
-    CONTRACT_VERSION, EmptyParams, HostContext, PolicyEvaluateResult, RequestEnvelope,
-};
+use oulipoly_provider::generated::{CONTRACT_VERSION, EmptyParams, HostContext, RequestEnvelope};
 use oulipoly_provider::resolver::ProviderArtifactRef;
 use oulipoly_root_supervisor::bash::BashAuthority;
 use oulipoly_root_supervisor::workload::Identity;
@@ -626,7 +625,12 @@ impl Admitted<'_> {
             .collect();
         self.client
             .invoke_json(operation, request, env)
-            .map_err(|error| format!("provider: {operation} failed: {error}"))
+            .map_err(|error| {
+                format!(
+                    "provider: {operation} failed: {} (private details withheld)",
+                    error.transport_kind()
+                )
+            })
     }
 
     /// Describes the provider and selects the contract and resident-session
@@ -732,27 +736,36 @@ impl Admitted<'_> {
             env.insert(exploration::ENV.to_owned(), json!(offer.encode()));
         }
         let result = self
-            .invoke("policy.evaluate", self.host(None, true), settings)
+            .invoke("policy.evaluate", self.host(None, true), settings.clone())
             .map_err(failed)?;
         let policy: PolicyEvaluateResult = serde_json::from_value(result)
-            .map_err(|error| failed(format!("provider: policy result: {error}")))?;
-        if !policy.accepted {
-            let reasons: Vec<&str> = policy
-                .diagnostics
-                .iter()
-                .map(|diagnostic| diagnostic.message.as_str())
-                .collect();
-            return Err(failed(format!(
-                "provider: policy refused the settings: {}",
-                reasons.join("; ")
-            )));
-        }
-        let argv = policy
-            .argv
-            .ok_or_else(|| failed("provider: policy named no argv".to_owned()))?;
-        let env = policy.env.unwrap_or_default();
-        let echoed = ToolMediation::from_env(Some(&env))
-            .map_err(|error| failed(format!("provider: evaluated mediation: {error}")))?;
+            .map_err(|_| failed("provider: policy result invalid (payload withheld)".to_owned()))?;
+        let template =
+            resident_session::template_from_policy(&settings, &policy).map_err(|error| {
+                failed(match error {
+                    resident_session::TemplateRefusal::NotAccepted(_) => {
+                        "provider: policy refused the settings (diagnostic text withheld)"
+                            .to_owned()
+                    }
+                    resident_session::TemplateRefusal::MissingArgv => {
+                        "provider: policy named no argv".to_owned()
+                    }
+                    resident_session::TemplateRefusal::Unhonourable(field) => {
+                        format!("provider: resident template cannot honour {field} transform")
+                    }
+                    resident_session::TemplateRefusal::Invalid(_) => {
+                        "provider: invalid resident launch template (payload withheld)".to_owned()
+                    }
+                })
+            })?;
+        let env = template
+            .launch
+            .env
+            .as_ref()
+            .expect("shared helper supplies env");
+        let echoed = ToolMediation::from_env(Some(&env)).map_err(|_| {
+            failed("provider: evaluated mediation invalid (payload withheld)".to_owned())
+        })?;
         if echoed.as_ref() != Some(&tools) {
             return Err(failed(
                 "provider: evaluated env omits or changes requester-owned mediation".to_owned(),
@@ -775,10 +788,13 @@ impl Admitted<'_> {
                 "provider: policy must report exactly one effective mediation marker".to_owned(),
             ));
         }
-        tool_mediation::validate("EffectiveMediation", &markers[0].value)
-            .map_err(|error| failed(format!("provider: effective mediation marker: {error}")))?;
+        tool_mediation::validate("EffectiveMediation", &markers[0].value).map_err(|_| {
+            failed("provider: effective mediation marker invalid (payload withheld)".to_owned())
+        })?;
         let effective: EffectiveMediation = serde_json::from_value(markers[0].value.clone())
-            .map_err(|error| failed(format!("provider: effective mediation marker: {error}")))?;
+            .map_err(|_| {
+                failed("provider: effective mediation marker invalid (payload withheld)".to_owned())
+            })?;
         if effective.protocol != tools.protocol
             || effective.bash != tools.bash
             || effective.ingress_env != tools.ingress_env
@@ -789,22 +805,11 @@ impl Admitted<'_> {
         let explored = self
             .explored(&env, &policy.markers, &effective)
             .map_err(failed)?;
-        let settings = &self.registration.settings;
-        let template = json!({
-            "settings_id": settings.get("settings_id"),
-            "mode": settings.get("mode"),
-            "model": settings.get("model"),
-            "argv": argv,
-            "env": env,
-        });
-        let params = json!({ "protocol": PROTOCOL, "launch": template });
-        resident_session::decode_prepare_params(&params)
-            .map(|params| Evaluated {
-                launch: params.launch,
-                effective,
-                exploration: explored,
-            })
-            .map_err(|error| failed(format!("provider: resident launch template: {error}")))
+        Ok(Evaluated {
+            launch: template.launch,
+            effective,
+            exploration: explored,
+        })
     }
 
     /// Prepares the resident harness under `<launch_dir>/provider`, which
@@ -838,10 +843,12 @@ impl Admitted<'_> {
                 params,
             )
             .map_err(failed)?;
-        let result = resident_session::decode_prepare_result(&result)
-            .map_err(|error| failed(format!("provider: resident.prepare result: {error}")))?;
-        let mut argv = vec![self.registration.executable.clone()];
-        argv.extend(result.invocation.args.iter().cloned());
+        let result = resident_session::decode_prepare_result(&result).map_err(|_| {
+            failed("provider: resident.prepare result invalid (payload withheld)".to_owned())
+        })?;
+        let endpoint = agent_provider_contract::acp::resident::PreparedEndpoint::agree(&result)
+            .map_err(|_| failed("provider: resident.prepare agreement refused".to_owned()))?;
+        let argv = endpoint.argv(&self.registration.executable);
         Ok(Prepared {
             argv,
             result,
@@ -860,11 +867,11 @@ impl Admitted<'_> {
     fn explored(
         &self,
         env: &BTreeMap<String, String>,
-        markers: &[oulipoly_provider::generated::Marker],
+        markers: &[agent_provider_contract::generated::Marker],
         mediation: &EffectiveMediation,
     ) -> Result<Option<EffectiveExploration>, String> {
         let echoed = Exploration::from_env(Some(env))
-            .map_err(|error| format!("provider: evaluated exploration: {error}"))?;
+            .map_err(|_| "provider: evaluated exploration invalid (payload withheld)".to_owned())?;
         if echoed != self.offer {
             return Err(match self.offer {
                 Some(_) => {
@@ -891,10 +898,13 @@ impl Admitted<'_> {
                 "provider: policy must report exactly one effective exploration marker".to_owned(),
             );
         };
-        exploration::validate("EffectiveExploration", &marker.value)
-            .map_err(|error| format!("provider: effective exploration marker: {error}"))?;
+        exploration::validate("EffectiveExploration", &marker.value).map_err(|_| {
+            "provider: effective exploration marker invalid (payload withheld)".to_owned()
+        })?;
         let effective: EffectiveExploration = serde_json::from_value(marker.value.clone())
-            .map_err(|error| format!("provider: effective exploration marker: {error}"))?;
+            .map_err(|_| {
+                "provider: effective exploration marker invalid (payload withheld)".to_owned()
+            })?;
         let routes = |routes: &[String]| {
             routes
                 .iter()
@@ -1434,6 +1444,107 @@ else:
         ));
     }
 
+    /// Synthetic policy/prepare fixture only: bypass ancestor custody, which
+    /// is tested separately. The mandated planning path has a writable
+    /// ancestor; these tests certify no production artifact admission.
+    fn synthetic_admitted(registration: &Registration) -> Admitted<'_> {
+        let path = Path::new(&registration.executable);
+        let assessed = identity(&File::open(path).unwrap()).unwrap();
+        Admitted {
+            registration,
+            client: pin(path, &assessed).unwrap(),
+            identity: assessed,
+            offer: None,
+        }
+    }
+
+    #[test]
+    fn shared_template_keeps_host_mediation_and_endpoint_guards() {
+        for edit in [
+            "markers = []",
+            "markers.append(markers[0])",
+            "marker['bash'] = {'allow': ['other-command']}",
+            "mediation['requester'] = '/other-requester'; mediation_env = json.dumps(mediation)",
+            "marker['native_tools'] = ['unrelated-tool']",
+            "answer({'accepted':True,'argv':['fake-native'],'env':{'OULIPOLY_TOOL_MEDIATION_V1':mediation_env,'OULIPOLY_ROOT_BASH_V1':'PRIVATE-ENDPOINT'},'stdin':None,'prompt':None,'diagnostics':[],'markers':markers}); sys.exit(0)",
+        ] {
+            let dir = scratch();
+            let fake = fake_provider(
+                dir.path(),
+                &format!("if op == 'policy.evaluate':\n    {edit}"),
+            );
+            let registered = registration(dir.path(), &fake);
+            let admitted = synthetic_admitted(&registered);
+            admitted.describe().unwrap();
+            assert!(
+                matches!(
+                    admitted.template(),
+                    Err(Failure::Provider {
+                        operation: "policy.evaluate",
+                        ..
+                    })
+                ),
+                "{edit}"
+            );
+            assert_eq!(calls(dir.path()).len(), 2, "no prepare after host refusal");
+        }
+    }
+
+    /// An echoed input can be removed from the resident template; a changed
+    /// input cannot. Neither case bypasses Runner's mediation admission.
+    #[test]
+    fn shared_template_accepts_echo_and_refuses_transform_without_private_text() {
+        for (answer_prompt, accepted) in [
+            ("request['params']['model']['inputs']['prompt']", true),
+            ("'PRIVATE-TRANSFORMED-PROMPT'", false),
+        ] {
+            let dir = scratch();
+            let fake = fake_provider(
+                dir.path(),
+                &format!(
+                    "if op == 'policy.evaluate':\n    answer({{'accepted': True, 'argv': ['fake-native'], 'env': {{'OULIPOLY_TOOL_MEDIATION_V1': mediation_env}}, 'stdin': None, 'prompt': {answer_prompt}, 'diagnostics': [], 'markers': markers}})\n    sys.exit(0)"
+                ),
+            );
+            let mut registered = registration(dir.path(), &fake);
+            registered.settings["model"]["inputs"]["prompt"] = json!("PRIVATE-ORIGINAL-PROMPT");
+            let admitted = synthetic_admitted(&registered);
+            admitted.describe().unwrap();
+            let template = admitted.template();
+            assert_eq!(template.is_ok(), accepted);
+            if let Err(failure) = template {
+                let text = format!("{failure:?}");
+                assert!(text.contains("cannot honour prompt transform"));
+                assert!(!text.contains("PRIVATE-"));
+            }
+            assert_eq!(calls(dir.path()).len(), 2, "no preparation after refusal");
+        }
+    }
+
+    /// Adapter refusal text may contain the person's prompt. The operation
+    /// is still attributed as having run, while public output withholds it.
+    #[test]
+    fn prepare_rpc_refusal_withholds_private_payload() {
+        let dir = scratch();
+        let fake = fake_provider(
+            dir.path(),
+            "if op == 'resident.prepare':\n    print(json.dumps({'contract':'oulipoly.provider/v1','request_id':request['request_id'],'ok':False,'error':{'code':'invalid_request','category':'invalid_request','message':'PRIVATE-PROMPT-PAYLOAD','retryable':False}}))\n    sys.exit(0)",
+        );
+        let registered = registration(dir.path(), &fake);
+        let admitted = synthetic_admitted(&registered);
+        admitted.describe().unwrap();
+        let template = admitted.template().unwrap();
+        let failure = admitted
+            .prepare(&dir.path().join("launch"), template)
+            .unwrap_err();
+        assert!(matches!(
+            &failure,
+            Failure::Setup { provider: true, reason }
+                if reason.contains("resident.prepare failed: provider_capability")
+        ));
+        assert!(!format!("{failure:?}").contains("PRIVATE-PROMPT-PAYLOAD"));
+        assert_eq!(calls(dir.path()).len(), 3);
+    }
+
     #[test]
     fn refused_policy_and_bad_prepare_results_say_the_provider_ran() {
         let dir = scratch();
@@ -1447,7 +1558,7 @@ else:
         admitted.describe().unwrap();
         let failure = admitted.template().unwrap_err();
         assert!(
-            matches!(&failure, Failure::Provider { operation: "policy.evaluate", reason } if reason.contains("no such route")),
+            matches!(&failure, Failure::Provider { operation: "policy.evaluate", reason } if reason.contains("policy refused")),
             "{failure:?}"
         );
 

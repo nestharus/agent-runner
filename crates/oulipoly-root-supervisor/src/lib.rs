@@ -1,7 +1,7 @@
 //! One host-side per-root owner **process** for one root tree: it keeps
 //! that root's PID 1 and one PID 1 per work in new PID namespaces, delivers
 //! the messages it originates to its ACP v2 harnesses through
-//! [`oulipoly_acp::AcpClient`], and keeps that root's delivery intent and
+//! [`agent_provider_contract::acp::AcpClient`], and keeps that root's delivery intent and
 //! custody record in its own private durable store, so that a restarted
 //! owner continues what an earlier one owed and takes back the harnesses
 //! that outlived it. Linux only.
@@ -59,7 +59,8 @@
 //! host-root semantics.
 //!
 //! **Owner death kills nothing.** No process here has a parent-death signal
-//! or a timer. When the owner dies, root PID 1 is reparented outside the
+//! or a work lifetime timer. The host bounds post-idle diagnostic reads
+//! separately (25 ms / 32 events); their expiry is no durability proof. When the owner dies, root PID 1 is reparented outside the
 //! owner (to the host's init or a subreaper) and keeps its work and the
 //! harnesses' stdio. It exits by itself only once it has neither live work
 //! nor an attached owner, after recording what its children's waits
@@ -142,6 +143,19 @@
 //! says which inputs were open (`single-open-input`, `ambiguous-open-inputs`
 //! or `no-open-input`); nothing finer is known.
 //!
+//! **Resident evidence.** Registered resident harnesses use the delivered
+//! SDK's prepared agreement, start/resume and turn helper. Their native
+//! session reference is deliberately Unbound to a canonical host session.
+//! A rejected prompt RPC leaves its attempt unresolved and durably stops
+//! automatic resend; it grants no ACK, undelivered classification or retry
+//! authority. Admission and ordinary close remain blocked by that history.
+//! Tagged idle coverage, an input's own end, native custody reports, endpoint
+//! durability and host canonical publication are separate observations.
+//! Public reports project safe native facts and attribute contrary record
+//! diagnostics without publishing arbitrary private payloads. Diagnostics
+//! beyond the bounded post-idle window can still arrive during ordinary
+//! reads; silence and owner close do not certify endpoint persistence.
+//!
 //! # Interface
 //!
 //! The first stdin line is a JSON [`Request`]: `{"store": dir, "intent":
@@ -203,15 +217,12 @@
 //!   An input without a tagged turn end holds this stop attempt while the
 //!   harness lives. A harness that ends naturally and is waited can also
 //!   close with no owed insertion, without a tagged idle or owner stop.
-//! * `rejected` with `durable: true` reports a conclusive refusal only after
-//!   the attempt outcome and message stop commit together without an ACK.
-//!   It stops further resubmission of that logical input, but an earlier
-//!   unresolved attempt still holds close and later input admission. The
-//!   event's `scope: this-attempt` describes this attempt, not every historical attempt or recipient
-//!   processing. Before commit, owner loss or a failed write leaves delivery
-//!   unresolved and publishes no conclusive rejection; existing capped recovery
-//!   may resubmit the same key with its prior history unknown. Commit followed
-//!   by owner loss before publication can leave a durable stop without an event.
+//! * `rejected` with `durable: true` reports an RPC refusal only after
+//!   its unresolved attempt and logical message stop commit together.
+//!   `scope: rpc-attempt`, `insertion: unresolved` and `retry: not-authorized`
+//!   preserve possible native effects. It blocks new input and ordinary
+//!   close, including with no earlier attempt. Commit followed by owner
+//!   loss can leave the durable stop without a public event.
 //! * `cancel` stays what it was, and outranks a close: this owner instance's
 //!   cancellation, after which a later recovery still owes the root's work.
 //!   The root's durable lifecycle cancel is the control face's `cancel`.
@@ -339,9 +350,12 @@
 //! receiver-continuity proof.
 //!
 //! One attempt-outcome classification backs completion non-delivery, restored
-//! and current turn accounts, close and reporting. `rejected` and `not-sent`
-//! establish non-insertion for that attempt; recorded insertion ACKs establish
-//! insertion. Missing, invalid, closed and unfamiliar responses are unresolved.
+//! and current turn accounts, close and reporting. Only `not-sent` establishes
+//! non-insertion without endpoint evidence; recorded insertion ACKs establish
+//! insertion. RPC rejection (`rejected-unresolved`), missing, invalid, closed
+//! and unfamiliar responses are unresolved. The legacy internal `rejected`
+//! classification is retained for already-conclusive fixture facts, never
+//! produced from current prompt RPC refusals.
 //! A later refusal cannot erase any earlier unresolved attempt. An exact linked
 //! ACK and tagged end can settle the logical input while the earlier physical
 //! attempts remain in history. Neither that reconciliation nor resubmission
@@ -374,7 +388,7 @@
 //!   stopped with no attempt of unknown outcome; a later refusal cannot
 //!   settle prior uncertainty), the store
 //!   has a session for the harness, and the harness of **this** work
-//!   declared the live reattachment contract (`oulipoly-acp`) when an owner
+//!   declared the live reattachment contract (the provider SDK) when an owner
 //!   negotiated with it. The owner then negotiates on the same live process
 //!   again (its retained stdio, or a new socket connection); the harness
 //!   must declare the contract again, and the recorded session must
@@ -423,8 +437,9 @@
 //! Fresh and recovered completions share the linked input's settlement
 //! premise: failed/no response or conversation end leaves an admitted
 //! completion unresolved while that input remains owed. Earlier attempt
-//! outcomes stay in the durable history. A conclusive rejection supports
-//! `undelivered` only without earlier uncertain insertion; ACK without a
+//! outcomes stay in the durable history. A prompt RPC refusal cannot support
+//! `undelivered`; a proven not-sent input may do so without prior uncertainty.
+//! ACK without a
 //! tagged end stays unresolved. Later exact-link ACK and tagged end reconcile
 //! transport completion without another logical admission.
 //! The inherited owed-input path still reinitializes/resubmits without a live
@@ -454,18 +469,18 @@
 //!   acknowledgement from the harness, with or without an at-most-once
 //!   basis. Insertion only: not turn completion, not drain, and never an end
 //!   condition by itself.
-//! * An owed message keeps its reason: `cancelled`, `outage`, `rejected`,
+//! * An owed message keeps its reason: `cancelled`, `outage`, `rejected-unresolved`,
 //!   `not-negotiated:*`, `session-*`, `invalid-response`, `launch-failed`,
 //!   `wait-unproven`, `authority-lost`, `store-failed`, `not-attempted`,
 //!   `attempts-exhausted`. Durable stops are `outage`, `attempts-exhausted`,
-//!   and a conclusively resolved `rejected` attempt; the
+//!   and a `rejected-unresolved` RPC attempt; the
 //!   others end this instance's attempts and a later recovery retries the
 //!   message. Rejection remains unacknowledged and is never replayed.
 //!   Terminal `owed` / `known_owed` and message state `owed` have explicit
 //!   `owed_scope: insertion-ack-absence`: they are not replay permission or
 //!   the async completion debt counter. `unresolved_attempts` retains all
 //!   insertion-unresolved attempts, including earlier recorded invalid/closed
-//!   responses. It remains visible beside a later `rejected` label or ACK.
+//!   responses. It remains visible beside a later refusal label or ACK.
 //! * A **closure** is a no-acknowledgement end whose harness exit was
 //!   reported by that harness's actual waiter (its work PID 1). Only closures
 //!   count toward [`Intent::outage_closure_cap`]. Rejections and negotiation
@@ -773,6 +788,10 @@ pub struct HarnessSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     pub messages: Vec<String>,
+    /// The registered adapter's prepared declaration; compatibility is
+    /// schemas/capabilities. Its config digest is attribution only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resident: Option<agent_provider_contract::resident_session::ResidentPrepareResult>,
 }
 
 /// How the owner reaches one harness's ACP v2 endpoint.
@@ -873,6 +892,13 @@ impl Intent {
         }
         let mut ids = HashSet::new();
         for harness in &self.harnesses {
+            if let Some(result) = &harness.resident {
+                agent_provider_contract::acp::resident::PreparedEndpoint::agree(result)
+                    .map_err(|_| format!("harness {}: resident agreement refused", harness.id))?;
+                if harness.endpoint != Endpoint::Stdio {
+                    return Err("prepared resident endpoint must use stdio".to_owned());
+                }
+            }
             if harness.argv.is_empty() {
                 return Err(format!("harness {}: argv is empty", harness.id));
             }
@@ -2330,6 +2356,7 @@ mod tests {
                 argv: vec!["x".into()],
                 endpoint: crate::Endpoint::Stdio,
                 session: None,
+                resident: None,
                 messages: vec![],
             }],
             workload: Workload::UnprivilegedUserns {},

@@ -7,8 +7,11 @@ on a 140-column × 40-row PTY. The history was freshly seeded by a separate host
 that exited before the TUI started. It was not an old user database or migration
 test. There is no runner-owner integration and no real model turn.
 
-The three proof sources are unchanged from that run. From the repository root,
-check them with `sha256sum -c tools/acp-v2-insertion-proof/SHA256SUMS`.
+The plugin and Python driver are unchanged from that run. The Rust driver now
+lives in `oulipoly-root-supervisor` and imports the shared SDK ACP client. Its
+current hash is a source check, not qualification of the earlier native witness
+against the new SDK. From the repository root, check the current fixture sources
+with `sha256sum -c tools/acp-v2-insertion-proof/SHA256SUMS`.
 
 ## Prerequisites
 
@@ -54,7 +57,7 @@ env -i PATH=/usr/bin:/bin HOME="$proof_dir/install-home" \
   --disable-pip-version-check --no-cache-dir --no-compile --no-deps \
   --only-binary=:all: --platform any --require-hashes \
   --target "$proof_dir/pydeps" -r "$fixture_dir/requirements.txt"
-cargo build --locked -p oulipoly-acp --example v2_socket_submit \
+cargo build --locked -p oulipoly-root-supervisor --example v2_socket_submit \
   --target-dir "$proof_dir/target"
 proof_opencode="$proof_dir/deps/node_modules/opencode-linux-x64/bin/opencode"
 proof_client="$proof_dir/target/debug/examples/v2_socket_submit"

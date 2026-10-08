@@ -12,9 +12,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use oulipoly_acp::{
+use agent_provider_contract::acp::resident::{
+    self, PreparedEndpoint, SessionStart, StartedSession,
+};
+use agent_provider_contract::acp::{
     AcpClient, AtMostOnceBasis, ClientInfo, DeliveryOutcome, IdleWaitFailure, NegotiationFailure,
     NoAckCause, OutboundMessage, RequestFailure, SessionEvent,
 };
@@ -229,6 +232,8 @@ struct Worker {
     id: String,
     argv: Vec<String>,
     endpoint: Endpoint,
+    resident: Option<agent_provider_contract::resident_session::ResidentPrepareResult>,
+    started: Option<StartedSession>,
     position: usize,
     cap: u32,
     attempt_cap: u32,
@@ -423,6 +428,8 @@ impl Worker {
             id: harness.id,
             argv: harness.argv,
             endpoint: harness.endpoint,
+            resident: harness.resident,
+            started: None,
             position,
             cap,
             attempt_cap,
@@ -948,6 +955,7 @@ impl Worker {
     /// succeed, takes the caller's new input in that conversation. A close
     /// or cancel can interrupt an unanswered negotiation.
     fn reopen(&mut self, live: Live, facts: Value) -> (ConnEnd, &'static str) {
+        self.started = None;
         let session = self.session.clone().expect("session checked");
         self.report(json!({ "event": "reopen-attempt", "work": live.work, "session": session, "replay": "none" }));
         let observed = Rc::new(Observed::default());
@@ -984,7 +992,31 @@ impl Worker {
                         "dedup_contract": peer.dedup_contract,
                         "live_reattach": true,
                     }));
-                    match client.resume_session(&session, &self.cwd) {
+                    let resumed = if let Some(result) = &self.resident {
+                        PreparedEndpoint::agree(result)
+                            .and_then(|endpoint| {
+                                resident::start_session(
+                                    &mut client,
+                                    &endpoint,
+                                    SessionStart::Resume {
+                                        session_id: session.clone(),
+                                        cwd: self.cwd.clone(),
+                                    },
+                                )
+                            })
+                            .map(|started| {
+                                self.started = Some(started);
+                            })
+                            .map_err(|failure| match failure {
+                                resident::StartRefusal::Request(error) => error,
+                                _ => RequestFailure::ProtocolViolation(
+                                    "resident resume refused".to_owned(),
+                                ),
+                            })
+                    } else {
+                        client.resume_session(&session, &self.cwd)
+                    };
+                    match resumed {
                         Ok(()) => None,
                         Err(RequestFailure::PeerGone) => {
                             Some(interrupted(&observed, "session-resume"))
@@ -1638,6 +1670,7 @@ impl Worker {
         observed: &Observed,
         live: &Live,
     ) -> ConnEnd {
+        self.started = None;
         match client.initialize() {
             Ok(peer) => {
                 self.report(json!({
@@ -1681,9 +1714,51 @@ impl Worker {
         if self.head().is_none() {
             return ConnEnd::Stop;
         }
-        let session = match self.session.clone() {
-            None => client.open_session(&self.cwd).map(Some),
-            Some(id) => client.resume_session(&id, &self.cwd).map(|()| None),
+        let session = if let Some(result) = &self.resident {
+            let endpoint = match PreparedEndpoint::agree(result) {
+                Ok(endpoint) => endpoint,
+                Err(_) => {
+                    self.label_remaining("resident-agreement-refused");
+                    return ConnEnd::Stop;
+                }
+            };
+            let start = match &self.session {
+                None => SessionStart::New {
+                    cwd: self.cwd.clone(),
+                },
+                Some(id) => SessionStart::Resume {
+                    session_id: id.clone(),
+                    cwd: self.cwd.clone(),
+                },
+            };
+            match resident::start_session(client, &endpoint, start) {
+                Ok(started) => {
+                    self.report(json!({
+                        "event": "resident-session-started",
+                        "session": started.native.session_id,
+                        "resumed": started.resumed,
+                        "canonical_binding": "unbound",
+                        "canonical_publication": "not-established",
+                        "agent_name": started.native.agent_name,
+                        "agent_version": started.native.agent_version,
+                    }));
+                    let id = (!started.resumed).then(|| started.native.session_id.clone());
+                    self.started = Some(started);
+                    Ok(id)
+                }
+                Err(_) => {
+                    self.report(
+                        json!({"event": "resident-start-refused", "private_details": "withheld"}),
+                    );
+                    self.label_remaining("resident-start-refused");
+                    return ConnEnd::Stop;
+                }
+            }
+        } else {
+            match self.session.clone() {
+                None => client.open_session(&self.cwd).map(Some),
+                Some(id) => client.resume_session(&id, &self.cwd).map(|()| None),
+            }
         };
         match session {
             Ok(Some(id)) => {
@@ -1760,7 +1835,13 @@ impl Worker {
                         });
                     }
                 });
-                let outcome = client.submit(&session, &mut self.tracked[index].message);
+                let outcome = match &self.started {
+                    Some(started) => {
+                        resident::send_turn(client, started, &mut self.tracked[index].message)
+                            .outcome
+                    }
+                    None => client.submit(&session, &mut self.tracked[index].message),
+                };
                 let (resolution, end) = match &outcome {
                     DeliveryOutcome::Accepted(acceptance)
                     | DeliveryOutcome::DuplicateUnknown(acceptance) => {
@@ -1809,7 +1890,7 @@ impl Worker {
                         self.report_turn(client, &mut seen);
                         continue;
                     }
-                    DeliveryOutcome::Rejected { .. } => ("rejected", None),
+                    DeliveryOutcome::Rejected { .. } => ("rejected-unresolved", None),
                     DeliveryOutcome::NotAcknowledged(NoAckCause::PeerGone) => {
                         ("no-ack:transport-closed", Some(ConnEnd::Gone))
                     }
@@ -1839,29 +1920,22 @@ impl Worker {
                     return ConnEnd::Stop;
                 }
                 self.tracked[index].resolve_attempt(resolution);
-                if let DeliveryOutcome::Rejected { code, .. } = outcome {
-                    // A public conclusive rejection must survive owner loss.
-                    // A failed resolution leaves this attempt unknown, just as
-                    // owner death before commit does; neither publishes rejection.
-                    self.tracked[index].label = Some("rejected".to_owned());
+                if let DeliveryOutcome::Rejected { code, data, .. } = &outcome {
+                    // The RPC error is not insertion evidence. In particular
+                    // INPUT_UNCERTAIN may accompany completed native work.
+                    // Stop this message durably: recovery must not authorize
+                    // a resend solely because the SDK still calls it owed.
+                    self.tracked[index].label = Some("rejected-unresolved".to_owned());
                     self.report(json!({
-                        "event": "rejected", "index": index, "code": code, "durable": true,
-                        "scope": "this-attempt",
+                        "event": "rejected", "index": index, "code": code,
+                        "durable": true, "scope": "rpc-attempt",
+                        "insertion": "unresolved", "retry": "not-authorized",
                         "unresolved_attempts": self.tracked[index].unknown_attempts,
+                        "native_report": native_summary(data.as_ref().and_then(|d| d.get("nativeTurn"))),
+                        "endpoint_record_error": data.as_ref().is_some_and(|d| d.get("recordError").is_some()),
+                        "endpoint_durability": "not-established",
+                        "canonical_publication": "not-established",
                     }));
-                    // This refusal resolves only its own attempt. Remove its
-                    // attribution entry after durable resolution; historical
-                    // uncertainty still gates admission and close below.
-                    self.view(|view| view.open.retain(|input| input.index != index));
-                    if let Some(&work) = self.completion_of.get(&index)
-                        && self.settle_async(
-                            work,
-                            "undelivered",
-                            Some("not-acknowledged: rejected"),
-                        )
-                    {
-                        self.completion_of.remove(&index);
-                    }
                 }
                 if let Some(end) = end {
                     return end;
@@ -1899,11 +1973,23 @@ impl Worker {
                 observed.wake_armed.set(false);
                 self.report_turn(client, &mut seen);
                 match idle {
-                    Ok(idle) => self.report(json!({
-                        "event": "idle",
-                        "meaning": "readiness-since-first-attempt",
-                        "stop_reason": idle.stop_reason,
-                    })),
+                    Ok(idle) => {
+                        self.report(json!({
+                            "event": "idle",
+                            "meaning": "readiness-since-first-attempt",
+                            "stop_reason": idle.stop_reason,
+                        }));
+                        // Idle may precede endpoint publication diagnostics.
+                        // A host-bounded window collects what arrives; ending
+                        // it proves neither absence nor durable completion.
+                        if let Err(failure) = self.collect_diagnostics(client, observed, &mut seen)
+                        {
+                            return match failure {
+                                IdleWaitFailure::PeerGone => ConnEnd::Drained,
+                                _ => ConnEnd::Stop,
+                            };
+                        }
+                    }
                     Err(IdleWaitFailure::PeerGone) if observed.woken.replace(false) => {
                         if !self.take_follow_ups() {
                             return ConnEnd::Stop;
@@ -1919,6 +2005,32 @@ impl Worker {
                 }
             }
         }
+    }
+
+    fn collect_diagnostics(
+        &mut self,
+        client: &mut AcpClient<HarnessTransport>,
+        observed: &Observed,
+        seen: &mut usize,
+    ) -> Result<(), IdleWaitFailure> {
+        let deadline = Instant::now() + Duration::from_millis(25);
+        observed.read_deadline.set(Some(deadline));
+        let mut result = Ok(());
+        for _ in 0..32 {
+            if Instant::now() >= deadline {
+                break;
+            }
+            match client.receive_event() {
+                Ok(_) => self.report_turn(client, seen),
+                Err(IdleWaitFailure::PeerGone) if observed.timed_out.replace(false) => break,
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            }
+        }
+        observed.read_deadline.set(None);
+        result
     }
 
     /// What an input admission or a close waits for now: an earlier input
@@ -2240,6 +2352,8 @@ impl Worker {
                     session_id,
                     stop_reason,
                     last_user_message_id: Some(last),
+                    native_turn_report,
+                    ..
                 } if self.session.as_deref() == Some(session_id.as_str()) => {
                     let mut covered = Vec::new();
                     self.view(|view| {
@@ -2270,6 +2384,11 @@ impl Worker {
                             "stop_reason": stop_reason,
                             "last_user_message_id": last,
                             "own_output": self.answered.contains(&message_id),
+                            "own_turn_end": message_id == *last,
+                            "native_report_for": last,
+                            "native_report": native_summary(native_turn_report.as_ref()),
+                            "endpoint_durability": "not-established",
+                            "canonical_publication": "not-established",
                             "meaning": "agent-idle-tagged-at-or-after-this-input",
                         }));
                         if let Some(&work) = self.completion_of.get(&index)
@@ -2277,6 +2396,31 @@ impl Worker {
                         {
                             self.reconcile_completion(work, index);
                         }
+                    }
+                }
+                SessionEvent::Other {
+                    session_id, update, ..
+                } => {
+                    // Retained raw SDK payloads stay private. Publish only a
+                    // recognized contrary fact and its native attribution.
+                    if let Some(report) = update
+                        .get("_meta")
+                        .and_then(|meta| meta.get(agent_provider_contract::acp::NATIVE_TURN_META))
+                        && report.get("record_error").is_some()
+                    {
+                        let message_id = report.get("message_id").and_then(Value::as_str);
+                        let input = message_id
+                            .filter(|_| self.session.as_deref() == Some(session_id))
+                            .and_then(|id| self.input_of(id));
+                        self.report(json!({
+                            "event": "endpoint-record-error", "session": session_id,
+                            "input": input,
+                            "message_id": message_id,
+                            "attribution": "endpoint-native-tag",
+                            "endpoint_durability": "contrary-diagnostic",
+                            "canonical_publication": "not-established",
+                            "private_details": "withheld",
+                        }));
                     }
                 }
                 SessionEvent::Notice {
@@ -2452,6 +2596,32 @@ impl HoldWatch {
     }
 }
 
+/// Safe projection: free-form report/status/failure text never becomes public.
+fn native_summary(raw: Option<&Value>) -> Value {
+    let state = match raw {
+        None => "absent",
+        Some(Value::Null) => "null",
+        Some(value) if agent_provider_contract::acp::NativeTurn::from_report(value).is_some() => {
+            "valid"
+        }
+        Some(_) => "invalid-or-unsupported",
+    };
+    let typed = raw.and_then(agent_provider_contract::acp::NativeTurn::from_report);
+    json!({
+        "state": state,
+        "custody": typed.as_ref().map(|turn| match turn.custody {
+            agent_provider_contract::acp::NativeCustody::Complete => "complete",
+            agent_provider_contract::acp::NativeCustody::NotAdmitted => "not-admitted",
+            agent_provider_contract::acp::NativeCustody::Reconciled => "reconciled",
+            agent_provider_contract::acp::NativeCustody::CompleteWithoutExit => "complete-without-exit",
+            agent_provider_contract::acp::NativeCustody::Incomplete => "incomplete",
+        }),
+        "status_code": typed.as_ref().and_then(|turn| turn.report.pointer("/status/code")).and_then(Value::as_i64),
+        "source": "endpoint-report",
+        "physical_custody": "not-certified-by-report",
+    })
+}
+
 fn basis_label(basis: AtMostOnceBasis) -> &'static str {
     match basis {
         AtMostOnceBasis::SingleAttempt => "single-attempt",
@@ -2488,6 +2658,7 @@ mod tests {
                 argv: vec![],
                 endpoint: crate::Endpoint::Stdio,
                 session: None,
+                resident: None,
                 messages: vec!["x".into()],
             }],
             workload: crate::Workload::UnprivilegedUserns {},
@@ -2501,6 +2672,7 @@ mod tests {
                 id: "test".into(),
                 argv: vec![],
                 endpoint: Endpoint::Stdio,
+                started: None,
                 position: 0,
                 cap: 3,
                 attempt_cap: 10,
@@ -2531,6 +2703,7 @@ mod tests {
                     })
                     .collect(),
                 session: None,
+                resident: None,
                 prior: None,
                 launches: 1,
                 reattached: 0,
