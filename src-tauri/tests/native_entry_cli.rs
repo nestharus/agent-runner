@@ -202,6 +202,176 @@ fn agent_frontmatter_model_selects_its_mapped_route() {
     assert!(fixture.legacy_untouched());
 }
 
+// Oracles: README CLI Usage's agent-file example and prompt-source priority;
+// ~/ai/AGENTS.md's defined-agent shape selects the frontmatter model without -m.
+fn prompt_selections(fixture: &Fixture) -> Vec<(Vec<String>, &'static str, &'static str)> {
+    let agent_file = fixture
+        .root
+        .join("config/oulipoly-agent-runner/agents/reviewer.md")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    vec![
+        (
+            vec!["-a".into(), agent_file.clone()],
+            "opus-medium",
+            "REVIEWER INSTRUCTIONS\n\n\n",
+        ),
+        (
+            vec!["reviewer".into()],
+            "opus-medium",
+            "REVIEWER INSTRUCTIONS\n\n\n",
+        ),
+        (vec!["-m".into(), "codex~high".into()], "sol-high", ""),
+        (
+            vec!["-a".into(), agent_file, "-m".into(), "codex~high".into()],
+            "sol-high",
+            "REVIEWER INSTRUCTIONS\n\n\n",
+        ),
+    ]
+}
+
+fn assert_prompt_request(fixture: &Fixture, output: &Output, route: &str, expected: &str) {
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(output));
+    assert_eq!(fixture.prompt(), expected);
+    assert_eq!(
+        value_after(&fixture.argv().unwrap(), "--route"),
+        Some(route)
+    );
+    assert!(fixture.legacy_untouched());
+}
+
+#[test]
+fn prompt_composition_preserves_first_and_remaining_positional_components() {
+    for words in [vec!["FIRST café\nline"], vec!["FIRST", "second", "第三"]] {
+        let fixture = Fixture::new(CONFIG);
+        for (mut args, route, prefix) in prompt_selections(&fixture) {
+            args.extend(words.iter().map(|word| (*word).to_owned()));
+            let output = fixture.command().args(&args).output().unwrap();
+            assert_prompt_request(
+                &fixture,
+                &output,
+                route,
+                &format!("{prefix}{}", words.join(" ")),
+            );
+        }
+    }
+}
+
+#[test]
+fn prompt_composition_file_takes_priority_over_positionals_and_stdin() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let fixture = Fixture::new(CONFIG);
+    let file = fixture.root.join("prompt.md");
+    let body = "FILE café\nsecond line\n";
+    fs::write(&file, body).unwrap();
+    for (mut args, route, prefix) in prompt_selections(&fixture) {
+        args.extend([
+            "-f".into(),
+            file.to_str().unwrap().into(),
+            "ignored first".into(),
+            "ignored tail".into(),
+        ]);
+        let mut child = fixture
+            .command()
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"ignored stdin")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_prompt_request(&fixture, &output, route, &format!("{prefix}{body}"));
+    }
+}
+
+#[test]
+fn prompt_composition_stdin_is_used_only_without_file_or_positionals() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let fixture = Fixture::new(CONFIG);
+    for (args, route, prefix) in prompt_selections(&fixture) {
+        for positional in [None, Some("FIRST positional")] {
+            let mut command = fixture.command();
+            command.args(&args);
+            if let Some(text) = positional {
+                command.arg(text);
+            }
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let body = "STDIN café\nsecond line\n";
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(body.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert_prompt_request(
+                &fixture,
+                &output,
+                route,
+                &format!("{prefix}{}", positional.unwrap_or(body)),
+            );
+        }
+    }
+}
+
+#[test]
+fn prompt_composition_missing_input_refuses_without_caller_artifacts() {
+    let fixture = Fixture::new(CONFIG);
+    for (args, _, _) in prompt_selections(&fixture) {
+        let output = fixture.command().args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+        assert!(
+            stderr(&output).contains("Empty prompt"),
+            "{}",
+            stderr(&output)
+        );
+        assert!(fixture.argv().is_none());
+        assert!(!fixture.root.join("runs").exists());
+        assert!(fixture.legacy_untouched());
+    }
+}
+
+#[test]
+fn prompt_composition_unmapped_agent_or_model_refuses_before_prompt_read() {
+    let fixture = Fixture::new(&CONFIG.replace("[models.\"opus~medium\"]", "[models.other]"));
+    let missing_prompt = fixture.root.join("absent-prompt.md");
+    for (mut args, route, _) in prompt_selections(&fixture) {
+        // Explicit -m keeps precedence over agent frontmatter but must map too.
+        if route == "sol-high" {
+            let model = args.iter().position(|arg| arg == "-m").unwrap() + 1;
+            args[model] = "unmapped-explicit".into();
+        }
+        args.extend(["-f".into(), missing_prompt.to_str().unwrap().into()]);
+        let output = fixture.command().args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+        let text = stderr(&output);
+        assert!(
+            text.contains("has no native route mapping") && text.contains("no substitute model"),
+            "{text}"
+        );
+        assert!(!text.contains("Failed to read prompt file"), "{text}");
+        assert!(fixture.argv().is_none());
+        assert!(!fixture.root.join("runs").exists());
+        assert!(fixture.legacy_untouched());
+    }
+}
+
 #[test]
 fn caller_outcome_is_returned_not_upgraded() {
     let fixture = Fixture::new(CONFIG);
