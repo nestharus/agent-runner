@@ -31,10 +31,10 @@
 //! door admits only registered routes. Neither children nor Bash can acquire
 //! another owner's custody. No embedded requester or auth files are staged.
 //!
-//! Optional `live_output` (`{"grant":"uid:<n>"}`, also on `--recover`) is
-//! passed to the owner unchanged: its explicit grant of the optional live
-//! view of the root's Bash output. The owner admits it only for the root's
-//! attested requester; a refused grant disables only that view.
+//! Optional `live_output` (raw JSON, also on `--recover`) is passed unchanged
+//! to separate view admission. Its grant and SDK advertisement must agree with
+//! the attested requester and shared live v3 capabilities. A malformed shape,
+//! unsupported agreement or refused grant disables only the view.
 //!
 //! The whole root environment is explicit; adapter operations use their own
 //! declared environment. This entry reports names, never secret values.
@@ -1669,13 +1669,17 @@ mod tests {
         let granted = request(Some(json!({ "grant": "uid:1000" }))).unwrap();
         assert_eq!(
             owner(&granted).live_output,
-            Some(LiveOutput {
-                grant: "uid:1000".into()
-            })
+            Some(LiveOutput(json!({"grant":"uid:1000"})))
         );
         assert_eq!(owner(&request(None).unwrap()).live_output, None);
-        let malformed = request(Some(json!({ "grant": "uid:1000", "uid": 0 }))).unwrap_err();
-        assert!(malformed.contains("unknown field"), "{malformed}");
+        for malformed in [
+            json!({"grant":"uid:1000", "uid":0}),
+            json!(17),
+            json!([false]),
+        ] {
+            let parsed = request(Some(malformed.clone())).unwrap();
+            assert_eq!(owner(&parsed).live_output, Some(LiveOutput(malformed)));
+        }
         assert!(!dir.path().join("launch").exists() && !dir.path().join("store").exists());
     }
 

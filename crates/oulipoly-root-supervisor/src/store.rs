@@ -79,6 +79,10 @@
 //!   committed, as the exact record line, in commit order. A later owner
 //!   reads them back as durable control intent (hold, close, cancel) and
 //!   replays them unchanged; it never rewrites one. No migration.
+//! * Version 13 keeps each Bash result as exact JSON in `bash_run.result`: command
+//!   wait knowledge, root-PID1 wait of work PID1, output and retained seal
+//!   classifications. It is published against the matching work and output
+//!   rows before any optional finalized claim. No migration.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -97,7 +101,7 @@ pub(crate) const LOCK_FILE: &str = "owner.lock";
 pub(crate) const DB_FILE: &str = "intent.sqlite3";
 /// Version of this new per-root lineage. There is no migration chain: a
 /// store of any other version is refused.
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 /// How long a write waits for a foreign SQLite lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -269,7 +273,8 @@ CREATE TABLE bash_run (
     delivery_mode TEXT CHECK (delivery_mode IN ('async', 'stream')),
     completion_outcome TEXT CHECK (completion_outcome IN ('turn-ended', 'undelivered')),
     completion_reason TEXT,
-    completion_generation INTEGER
+    completion_generation INTEGER,
+    result TEXT
 );
 CREATE TABLE bash_output (
     work INTEGER PRIMARY KEY REFERENCES bash_run(work),
@@ -1420,14 +1425,72 @@ impl Store {
         observer: Option<&str>,
     ) -> Result<(), StoreError> {
         let generation = self.generation;
-        self.write(|tx| {
-            tx.execute(
+        let matching = self.write(|tx| {
+            let rows = tx.execute(
                 "UPDATE work SET outcome = ?2, observer = ?3, resolved_generation = ?4
                  WHERE id = ?1 AND outcome IS NULL",
                 params![work, outcome, observer, generation],
-            )
-            .map(drop)
-        })
+            )?;
+            // A committed no-op is not this receipt's durable result. Read back
+            // inside the same fenced transaction, including observer/generation.
+            let found: Option<(String, Option<String>, i64)> = tx.query_row(
+                "SELECT outcome, observer, resolved_generation FROM work WHERE id=?1 AND outcome IS NOT NULL",
+                [work], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ).optional()?;
+            Ok(rows == 1 && found == Some((outcome.to_owned(), observer.map(str::to_owned), generation)))
+        })?;
+        if matching {
+            Ok(())
+        } else {
+            Err(StoreError::Failed("no matching work result written".into()))
+        }
+    }
+
+    /// Normal durable Bash-result publication, independent of optional capture.
+    /// Commits only an exact result matching this generation's resolved work
+    /// and the actual stored seal. Ok is a row/write/readback witness.
+    pub(crate) fn publish_bash_result(
+        &mut self,
+        work: i64,
+        end: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        let outcome = match end["event"].as_str() {
+            Some("end") => end["status"].as_str(),
+            Some("end-unknown") if end["reason"] == "ended-with-work-namespace-status-unknown" => {
+                Some("ended-with-work-namespace-status-unknown")
+            }
+            _ => None,
+        }
+        .ok_or_else(|| StoreError::Failed("no witnessed Bash receipt".into()))?;
+        let observer = end["observer"].as_str();
+        let generation = self.generation;
+        let encoded = end.to_string();
+        let matching = self.write(|tx| {
+            let actual: Option<(String, Option<String>, i64)> = tx.query_row(
+                "SELECT outcome, observer, resolved_generation FROM work WHERE id=?1 AND kind='bash' AND outcome IS NOT NULL",
+                [work], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+            ).optional()?;
+            let seal: Option<OutputRecord> = tx.query_row(
+                "SELECT received, retained, sha256, state, losses FROM bash_output WHERE work=?1",
+                [work], |r| Ok(OutputRecord { received:r.get::<_,Option<i64>>(0)?.map(|n|n as u64), retained:r.get::<_,i64>(1)? as u64,
+                    sha256:r.get(2)?,state:r.get(3)?,losses:r.get(4)? }),
+            ).optional()?;
+            let root: String = tx.query_row("SELECT root_id FROM root", [], |r|r.get(0))?;
+            if actual != Some((outcome.to_owned(), observer.map(str::to_owned), generation)) ||
+                seal.as_ref().is_none_or(|r| crate::retention::record_json(&root, work, r) != end["retained"]) {
+                return Ok(false);
+            }
+            let rows = tx.execute("UPDATE bash_run SET result=?2 WHERE work=?1 AND result IS NULL", params![work,encoded])?;
+            let readback: Option<String> = tx.query_row("SELECT result FROM bash_run WHERE work=?1", [work], |r|r.get(0)).optional()?.flatten();
+            Ok(rows == 1 && readback.as_deref() == Some(encoded.as_str()))
+        })?;
+        if matching {
+            Ok(())
+        } else {
+            Err(StoreError::Failed(
+                "no matching Bash result published".into(),
+            ))
+        }
     }
 
     /// Commits a run's sealed retained output, once.
@@ -2697,5 +2760,100 @@ mod tests {
             Err(ClaimError::NotPrivate(_))
         ));
         assert!(!dir.0.join(DB_FILE).exists());
+    }
+    #[test]
+    fn durable_bash_result_requires_matching_work_seal_and_exact_publication() {
+        use serde_json::json;
+        let dir = Dir::new("matching-bash-result");
+        let mut store = Store::claim(&dir.0, Some(&intent())).unwrap().store;
+        let root = store.root_id().unwrap();
+        let incarnation = store
+            .begin_incarnation("token", "unprivileged-userns")
+            .unwrap();
+        let parent = store.begin_work(0, incarnation).unwrap();
+        assert!(
+            store
+                .resolve_work(i64::MAX, "code:0", Some("work-pid1-wait"))
+                .is_err(),
+            "committed zero-row write is not a witness"
+        );
+        for state in ["complete", "partial", "unsealed"] {
+            let work = store
+                .begin_bash(
+                    0,
+                    parent,
+                    incarnation,
+                    1,
+                    "[]",
+                    &["fixture".into()],
+                    "/",
+                    false,
+                )
+                .unwrap();
+            let unknown = state == "unsealed";
+            let status = if unknown {
+                "ended-with-work-namespace-status-unknown"
+            } else {
+                "code:7"
+            };
+            let observer = if unknown {
+                None
+            } else {
+                Some("work-pid1-wait")
+            };
+            store.resolve_work(work, status, observer).unwrap();
+            assert!(
+                store
+                    .resolve_work(work, "code:0", Some("work-pid1-wait"))
+                    .is_err(),
+                "prior resolution cannot witness this new receipt"
+            );
+            let seal = OutputRecord {
+                received: Some(2),
+                retained: 2,
+                sha256: "a".repeat(64),
+                state: state.into(),
+                losses: "[]".into(),
+            };
+            let mut end = json!({"event":if unknown {"end-unknown"} else {"end"}, "output":{"state":"closed"}, "retained":crate::retention::record_json(&root,work,&seal), "work_pid1":"code:0"});
+            if unknown {
+                end["reason"] = json!(status);
+            } else {
+                end["status"] = json!(status);
+                end["observer"] = json!(observer);
+            }
+            assert!(
+                store.publish_bash_result(work, &end).is_err(),
+                "missing seal is not a final"
+            );
+            store.seal_output(work, &seal).unwrap();
+            let mut forged = end.clone();
+            forged["retained"]["bytes"] = json!(99);
+            assert!(
+                store.publish_bash_result(work, &forged).is_err(),
+                "nonmatching seal is not a final"
+            );
+            store.publish_bash_result(work, &end).unwrap();
+            let actual: String = store
+                .conn
+                .query_row("SELECT result FROM bash_run WHERE work=?1", [work], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&actual).unwrap(),
+                end
+            );
+            assert!(
+                store.publish_bash_result(work, &end).is_err(),
+                "second no-op publication is not a new witness"
+            );
+        }
+        // The same source fence controls canonical publication as other writes.
+        store.conn.execute("INSERT INTO owner(generation,pid,claimed_unix,token) SELECT generation+1,pid,claimed_unix,token FROM owner ORDER BY generation DESC LIMIT 1",[]).unwrap();
+        assert!(matches!(
+            store.resolve_work(parent, "code:0", Some("root-pid1-wait")),
+            Err(StoreError::FenceLost { .. })
+        ));
     }
 }

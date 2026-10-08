@@ -10,8 +10,8 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-provider-contract"
-version = "0.2.0"
-source = "git+https://github.com/nestharus/agent-provider-sdk.git#988119ef44e86fd17ddc5eb366ad891445476aa4"
+version = "0.3.0"
+source = "git+https://github.com/nestharus/agent-provider-sdk.git#e19b11234ddc8bc6c55ca75c69912e6f0c203f51"
 dependencies = [
  "base64 0.22.1",
  "jsonschema",

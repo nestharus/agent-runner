@@ -675,6 +675,8 @@ pub(crate) struct RootSlot {
     pub(crate) workload: Arc<Resolved>,
     pub(crate) stop: Arc<StopSignal>,
     root: Mutex<Option<Arc<Root>>>,
+    observed: std::sync::OnceLock<Arc<Root>>,
+    starting: std::sync::atomic::AtomicBool,
 }
 
 impl RootSlot {
@@ -685,13 +687,30 @@ impl RootSlot {
         stop: Arc<StopSignal>,
         attached: Option<Arc<Root>>,
     ) -> Self {
+        let observed = std::sync::OnceLock::new();
+        if let Some(root) = &attached {
+            let _ = observed.set(Arc::clone(root));
+        }
         Self {
             store_dir,
             generation,
             workload,
             stop,
             root: Mutex::new(attached),
+            observed,
+            starting: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Lock-free optional admission snapshot. Never joins launch serialization.
+    pub(crate) fn observed_root(&self) -> Result<Option<Arc<Root>>, String> {
+        if let Some(root) = self.observed.get() {
+            return Ok(Some(Arc::clone(root)));
+        }
+        if self.starting.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("root-starting-or-unavailable".into());
+        }
+        Ok(None)
     }
 
     pub(crate) fn current(&self) -> Option<Arc<Root>> {
@@ -709,6 +728,8 @@ impl RootSlot {
         if let Some(root) = slot.as_ref() {
             return Ok(Arc::clone(root));
         }
+        self.starting
+            .store(true, std::sync::atomic::Ordering::Release);
         let token = sys::random_hex().map_err(|error| Err(error.to_string()))?;
         let id = store
             .lock()
@@ -735,6 +756,7 @@ impl RootSlot {
         };
         // Held from here, so the run's end releases it whatever follows.
         *slot = Some(Arc::clone(&root));
+        let _ = self.observed.set(Arc::clone(&root));
         store
             .lock()
             .expect("store lock")

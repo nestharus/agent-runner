@@ -352,7 +352,7 @@ def check_request(request, site, now):
     if not isinstance(request, dict):
         raise Refused("request is not an object")
     known = {"v", "route", "message", "cwd", "bash", "env", "deadline_s", "retention",
-             "children", "live"}
+             "children", "live", "live_output"}
     if request.get("v") != 1:
         raise Refused("request: v must be 1")
     unknown = set(request) - known
@@ -406,6 +406,7 @@ def check_request(request, site, now):
         "retention": retention,
         "children": children,
         "live": live,
+        "live_output": request.get("live_output"),
     }
 
 
@@ -630,12 +631,13 @@ def entry_request(package, run, user, checked, env):
         "outage_closure_cap": 1,
         "delivery_attempt_cap": 1,
         "workload": {"isolation": "host-root", "user": user.pw_name},
-        # The owner's optional live view of this root's Bash output, granted
-        # explicitly to this sudo-attested requester; the owner admits only
-        # that uid, from outside the root, and only it.
-        "live_output": {"grant": control_requester(user.pw_uid)},
         **children_request(package, run, checked),
     }
+    if checked.get("live_output") is not None:
+        # Explicit opt-in advertisement, with authority fixed by this front door.
+        # Any malformed/unsupported advertisement is refused by viewing only.
+        common["live_output"] = {"grant": control_requester(user.pw_uid),
+                                 "advertisement": checked["live_output"]}
     provider = {
         "executable": route["executable"],
         "settings": route["settings"],

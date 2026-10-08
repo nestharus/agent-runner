@@ -144,11 +144,44 @@ Adapter-specific settings/env remain the adapter's own surface.
 
 Admission fixes requester identity from sudo, checks allowed users, package
 and provider custody, cwd access, bounded environment and deadline. The
-entry request grants the owner's optional live view of the root's Bash
-output to exactly that requester (`live_output`); the owner serves it at
-`<launch>/ipc/live.sock` (handed to that uid, 0600) only to that kernel uid
-from outside the root, and its `live-output` event names the socket. It is
-optional observation: it never gates or changes Bash, retention or ends. Run
+optional `live_output` request field is an SDK live-stream advertisement.
+It is absent by default. For example, opt in with
+`{"live_output":{"oulipoly.live_stream/v3":{"channels":["combined","control"],"audiences":["scoped"],"max_data_bytes":16384}}}`.
+The front door attaches a grant for exactly its attested requester; malformed
+or unsupported advertisements disable viewing only. The owner's `live-output`
+event announces a configured path, with `listening: null` because setup runs
+asynchronously. An unavailable socket means viewing is unavailable.
+`<launch>/ipc/live.sock` is handed to that UID at 0600. Kernel peer credentials
+and exclusion of this root's PID namespace tree govern admission. This grants
+that principal access to this root's registered Bash work, including children;
+it makes no per-app/session confidentiality promise.
+
+The sole live wire is SDK `oulipoly.live_stream/v3`: subscriber/broker hello,
+list/directory, attach/attached and record/unavailable messages. It uses genuine
+frame sequence cursors and opaque work correlations; combined bytes never
+become separate stdout or stderr. Required retained-byte offsets stay in the
+Bash ingress. The former `root_bash_live/v1` wire has no fallback.
+
+Optional registration and drain use nonblocking handoffs; terminal metadata
+has a separate slot. There are at most 32 registered streams and 8 connection
+workers, counted before admission. Requests have an absolute 5-second line
+deadline and writes a 2-second line deadline. Quiet EOF is polled; polling does
+not renew activity. Maintenance releases held bytes after one idle hour or
+30 seconds after a terminal, checked every 50 ms when scheduled. Finished
+metadata can disappear after grace; later attaches get `unknown_stream`.
+Payload plus 64 bytes per held chunk is bounded to 1 MiB per run / 8 MiB per
+owner; this is accounting, not an RSS or scheduling guarantee. Capacity or
+contention can omit registration or produce sequence gaps. Owner close never
+waits for viewers and may cut an optional tail/terminal short.
+
+`finalized` names `rv1w:<root>:<work>` only after an exact matching durable
+Bash result is published with its actual work and sealed-output classifications.
+The per-root store schema is 13; older stores are refused, without migration.
+The result keeps command-wait knowledge, root PID1's wait of work PID1, and
+complete/partial/unsealed retention separately. Finalization promises neither
+success, full/readable bytes, report delivery/ACK nor outside retained read.
+Missing `exit_observed` means only no exit fact delivered on this live plane.
+A vanished owner supplies no invented terminal. Run
 store stays root-private; IPC/work data are handed to the work UID. The
 entry negotiates provider describe, policy.evaluate and resident.prepare.
 Prepared child slots use fresh data roots and inherit the parent tool policy.

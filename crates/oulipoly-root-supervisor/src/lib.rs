@@ -120,15 +120,14 @@
 //! identity (`op` `accept`), see the [`bash`] module. Nested requests (from inside a Bash run's own namespace) are
 //! refused: they are not inside a harness namespace.
 //!
-//! **Live output (optional).** A request's `live_output`
-//! (`{"grant":"uid:<n>"}`) grants an optional view of every relayed Bash
-//! run's combined output to the root's attested requester only, from
-//! outside the root, at `live.sock` in the IPC directory (`live-output`
-//! reports where, or why not). It is a nonblocking, bounded, in-memory tap
-//! on the owner's relay after retention: it never changes, delays or fails
-//! the in-band output, retention, `end` or completions, loses data only as
-//! exact gaps, and sends a custody-owner `final` only after the run's end
-//! and seal are committed. See the `live_output` module.
+//! **Live output (optional).** `live_output` carries raw optional JSON with an
+//! attested requester grant and an SDK live-stream advertisement. Malformed or
+//! unsupported viewing disables only viewing. The configured socket is served
+//! asynchronously; SDK v3 messages select combined/control observation for the
+//! same kernel UID outside this root's PID namespace tree. Registration and
+//! drain never wait for viewer locks. A finalized reference requires matching
+//! durable Bash-result publication, not a report enqueue. Owner close can cut
+//! the optional tail short. See `live_output` for bounds and limits.
 //!
 //! **Per-input attribution.** Inputs are still submitted as soon as the
 //! previous one is acknowledged, so several can be open on one native
@@ -1220,7 +1219,7 @@ where
             })
             .and_then(|capture| {
                 capture
-                    .listen(Arc::clone(&slot), Arc::clone(&custody), tx.clone())
+                    .listen(Arc::clone(&slot))
                     .map(|path| (capture, path))
             });
         match started {
@@ -1230,7 +1229,8 @@ where
                     &mut out,
                     &json!({
                         "event": "live-output",
-                        "listening": true,
+                        "configured": true,
+                        "listening": null,
                         "path": path,
                         "protocol": live_output::PROTOCOL,
                         "origin": live_output::ORIGIN,
