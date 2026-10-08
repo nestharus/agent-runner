@@ -120,6 +120,16 @@
 //! identity (`op` `accept`), see the [`bash`] module. Nested requests (from inside a Bash run's own namespace) are
 //! refused: they are not inside a harness namespace.
 //!
+//! **Live output (optional).** A request's `live_output`
+//! (`{"grant":"uid:<n>"}`) grants an optional view of every relayed Bash
+//! run's combined output to the root's attested requester only, from
+//! outside the root, at `live.sock` in the IPC directory (`live-output`
+//! reports where, or why not). It is a nonblocking, bounded, in-memory tap
+//! on the owner's relay after retention: it never changes, delays or fails
+//! the in-band output, retention, `end` or completions, loses data only as
+//! exact gaps, and sends a custody-owner `final` only after the run's end
+//! and seal are committed. See the `live_output` module.
+//!
 //! **Per-input attribution.** Inputs are still submitted as soon as the
 //! previous one is acknowledged, so several can be open on one native
 //! session. Agent output names the input it answers only through the
@@ -615,6 +625,7 @@ mod conversation;
 mod custody;
 mod harness;
 mod live;
+mod live_output;
 mod retention;
 mod store;
 #[doc(hidden)]
@@ -634,6 +645,7 @@ use serde_json::{Value, json};
 
 pub use control::describe_entry;
 pub use harness::{HarnessRecord, MessageRecord, SOCKET_ENV};
+pub use live_output::LiveOutput;
 pub use store::{Described, describe};
 pub use transport::MAX_LINE_BYTES;
 pub use workload::Workload;
@@ -684,6 +696,11 @@ pub struct Request {
     /// the `control` module). Only with `recover`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control: Option<Value>,
+    /// The optional live view of this root's Bash output and whom this
+    /// owner grants it (see the `live_output` module). Absent: no capture
+    /// and no endpoint. A grant this owner refuses disables only the view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_output: Option<LiveOutput>,
 }
 
 /// What a recovery is for. Both act only on a surviving root PID 1 this
@@ -1186,6 +1203,54 @@ where
             &json!({ "event": "bash-ingress", "listening": false, "reason": reason }),
         ),
     }
+    // Before any run is taken over or launched, so every relayed run of
+    // this owner is captured once granted.
+    let live = request.live_output.as_ref().map(|live| {
+        let requester = format!("uid:{}", resolved.peer_uid());
+        let started = live
+            .admit(&requester)
+            .and_then(|()| {
+                live_output::Capture::new(
+                    claimed.root_id.clone(),
+                    generation,
+                    resolved.peer_uid(),
+                    live_output::LIMITS,
+                )
+                .map_err(|error| format!("incarnation: {error}"))
+            })
+            .and_then(|capture| {
+                capture
+                    .listen(Arc::clone(&slot), Arc::clone(&custody), tx.clone())
+                    .map(|path| (capture, path))
+            });
+        match started {
+            Ok((capture, path)) => {
+                ingress.capture_to(Arc::clone(&capture));
+                emit(
+                    &mut out,
+                    &json!({
+                        "event": "live-output",
+                        "listening": true,
+                        "path": path,
+                        "protocol": live_output::PROTOCOL,
+                        "origin": live_output::ORIGIN,
+                        "grant": requester,
+                        "incarnation": capture.incarnation(),
+                        "generation": generation,
+                        "meaning": "optional view of this root's Bash output for the granted requester from outside the root; holding starts when it first asks; never part of required output, retention or ends",
+                    }),
+                );
+                Some(capture)
+            }
+            Err(reason) => {
+                emit(
+                    &mut out,
+                    &json!({ "event": "live-output", "listening": false, "reason": reason, "effect": "live view disabled only" }),
+                );
+                None
+            }
+        }
+    });
     emit(
         &mut out,
         &json!({
@@ -1495,6 +1560,9 @@ where
         }
     }
     report["bash"] = ingress.summary();
+    if let Some(live) = live.flatten() {
+        report["live_output"] = live.summary();
+    }
     report["async"] = bash::async_summary(&views);
     report["async"]["inherited"] = bash::inherited_summary(&store, None);
     report["children"] = registry.summary();

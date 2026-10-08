@@ -31,6 +31,11 @@
 //! door admits only registered routes. Neither children nor Bash can acquire
 //! another owner's custody. No embedded requester or auth files are staged.
 //!
+//! Optional `live_output` (`{"grant":"uid:<n>"}`, also on `--recover`) is
+//! passed to the owner unchanged: its explicit grant of the optional live
+//! view of the root's Bash output. The owner admits it only for the root's
+//! attested requester; a refused grant disables only that view.
+//!
 //! The whole root environment is explicit; adapter operations use their own
 //! declared environment. This entry reports names, never secret values.
 //!
@@ -119,7 +124,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use agent_provider_contract::exploration::{self, Limits};
 use oulipoly_root_supervisor::bash::BashAuthority;
 use oulipoly_root_supervisor::children::{ChildPolicy, ChildRoute, PreparedSlot};
-use oulipoly_root_supervisor::{Endpoint, HarnessSpec, Intent, Recover, Request, Workload};
+use oulipoly_root_supervisor::{
+    Endpoint, HarnessSpec, Intent, LiveOutput, Recover, Request, Workload,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -165,6 +172,11 @@ pub(crate) struct NativeRootRequest {
     children: Option<ChildrenRequest>,
     /// Who the root's work runs as (see the module docs).
     workload: RequestWorkload,
+    /// Optional live view of the root's Bash output, granted by this
+    /// request's privileged caller; passed to the owner unchanged, which
+    /// admits it only for the root's attested requester.
+    #[serde(default)]
+    live_output: Option<LiveOutput>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,6 +224,9 @@ pub(crate) struct NativeRecoverRequest {
     /// what it found (see the owner crate's `control` module).
     #[serde(default)]
     control: Option<Value>,
+    /// The recovering owner's live-view grant (as at creation).
+    #[serde(default)]
+    live_output: Option<LiveOutput>,
 }
 
 /// Where this entry's own and relayed lines go.
@@ -745,6 +760,7 @@ pub(crate) fn recover(request_path: &Path) -> Result<i32, String> {
         intent: None,
         recover: Some(request.purpose),
         control: request.control.clone(),
+        live_output: request.live_output.clone(),
     };
     if let Err(reason) = owner_request.validate() {
         return Ok(refused(&out, format!("owner request: {reason}")));
@@ -1071,6 +1087,7 @@ fn owner_request(
         }),
         recover: None,
         control: None,
+        live_output: request.live_output.clone(),
     }
 }
 
@@ -1616,6 +1633,52 @@ mod tests {
         .validate()
         .unwrap();
     }
+    /// The live-view grant is passed to the owner unchanged (the owner,
+    /// not this entry, decides whether it names the attested requester);
+    /// absent stays absent and a malformed one is refused before effects.
+    #[test]
+    fn live_output_grant_reaches_the_owner_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = |live: Option<Value>| {
+            let mut value = json!({
+                "store": dir.path().join("store"),
+                "launch_dir": dir.path().join("launch"),
+                "cwd": "/",
+                "env": {},
+                "messages": ["m"],
+                "outage_closure_cap": 1,
+                "delivery_attempt_cap": 1,
+                "provider": provider_setup(),
+                "workload": { "isolation": "unprivileged-userns" },
+            });
+            if let Some(live) = live {
+                value["live_output"] = live;
+            }
+            let path = dir.path().join("request.json");
+            std::fs::write(&path, value.to_string()).unwrap();
+            read_request(&path)
+        };
+        let owner = |request: &NativeRootRequest| {
+            owner_request(
+                request,
+                harness_kind(request),
+                vec!["/usr/bin/env".to_owned()],
+                None,
+            )
+        };
+        let granted = request(Some(json!({ "grant": "uid:1000" }))).unwrap();
+        assert_eq!(
+            owner(&granted).live_output,
+            Some(LiveOutput {
+                grant: "uid:1000".into()
+            })
+        );
+        assert_eq!(owner(&request(None).unwrap()).live_output, None);
+        let malformed = request(Some(json!({ "grant": "uid:1000", "uid": 0 }))).unwrap_err();
+        assert!(malformed.contains("unknown field"), "{malformed}");
+        assert!(!dir.path().join("launch").exists() && !dir.path().join("store").exists());
+    }
+
     #[test]
     fn registered_request_refuses_embedded_shapes_before_effects() {
         let dir = tempfile::tempdir().unwrap();

@@ -630,6 +630,10 @@ def entry_request(package, run, user, checked, env):
         "outage_closure_cap": 1,
         "delivery_attempt_cap": 1,
         "workload": {"isolation": "host-root", "user": user.pw_name},
+        # The owner's optional live view of this root's Bash output, granted
+        # explicitly to this sudo-attested requester; the owner admits only
+        # that uid, from outside the root, and only it.
+        "live_output": {"grant": control_requester(user.pw_uid)},
         **children_request(package, run, checked),
     }
     provider = {

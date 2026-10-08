@@ -363,6 +363,9 @@ pub(crate) struct Ingress {
     /// run's completion is offered. Unset (no background runs) in tests
     /// that build an ingress alone.
     inboxes: std::sync::OnceLock<Vec<Arc<crate::conversation::Inbox>>>,
+    /// The optional live view of every run's output, when granted (the
+    /// [`crate::live_output`] module). Unset: no capture at all.
+    live: std::sync::OnceLock<Arc<crate::live_output::Capture>>,
     #[cfg(test)]
     pub(crate) after_spawn_error_unlock: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
@@ -418,6 +421,7 @@ impl Ingress {
             children,
             cwd,
             inboxes: std::sync::OnceLock::new(),
+            live: std::sync::OnceLock::new(),
             #[cfg(test)]
             after_spawn_error_unlock: Mutex::new(None),
         });
@@ -440,6 +444,11 @@ impl Ingress {
     /// Names where background completions go (top-level harnesses only).
     pub(crate) fn deliver_to(&self, inboxes: Vec<Arc<crate::conversation::Inbox>>) {
         let _ = self.inboxes.set(inboxes);
+    }
+
+    /// Captures every later relayed run for the granted live view.
+    pub(crate) fn capture_to(&self, capture: Arc<crate::live_output::Capture>) {
+        let _ = self.live.set(capture);
     }
 
     /// Why the harness at `position` cannot be owed a background
@@ -517,6 +526,9 @@ impl Ingress {
             let path = Self::socket_path(&self.slot.workload.ipc_dir);
             let _ = UnixStream::connect(&path);
             let _ = std::fs::remove_file(&path);
+            if let Some(live) = self.live.get() {
+                live.close();
+            }
         }
         true
     }
@@ -763,6 +775,11 @@ impl Ingress {
             }
         };
         self.gate.0.lock().expect("bash gate").accepted += 1;
+        // Attachable from `accepted` on; its relay continues this stream.
+        let tap = self
+            .live
+            .get()
+            .map(|live| live.register(work, "from-launch"));
         let attribution = json!({
             "root_id": self.root_id,
             "harness": who.harness,
@@ -820,6 +837,16 @@ impl Ingress {
                     interleave();
                 }
                 sink.send(&json!({ "event": event, "reason": reason.reason(), "not_started": not_started }));
+                if let Some(tap) = tap {
+                    tap.finish(json!({
+                        "event": "ended",
+                        "finalization": "none",
+                        "work": work,
+                        "reason": event,
+                        "not_started": not_started,
+                        "meaning": "no output was relayed for this run",
+                    }));
+                }
                 self.report(json!({ "event": format!("bash-{event}"), "work": work, "reason": reason.reason(), "not_started": not_started }));
                 self.leave(if not_started {
                     Outcome::NotRun
@@ -898,16 +925,35 @@ impl Ingress {
         recovered: Option<usize>,
     ) {
         let mut sink = sink;
-        let (bytes, output) = relay_output(&self.slot.stop, stdout, &mut sink, &mut retainer);
-        let retained = retainer.seal(&output, &self.store, &self.root_id);
+        let basis = if retainer.taken_over() {
+            "from-takeover"
+        } else {
+            "from-launch"
+        };
+        let tap = self.live.get().map(|live| live.register(work, basis));
+        let (bytes, output) = relay_output(
+            &self.slot.stop,
+            stdout,
+            &mut sink,
+            &mut retainer,
+            tap.as_ref(),
+        );
+        if let Some(tap) = &tap {
+            tap.output_ended(&output);
+        }
+        let (retained, sealed) = retainer.seal_recorded(&output, &self.store, &self.root_id);
+        // Whether this run's end is in the store: the live view's only
+        // basis for a custody-owner terminal.
+        let mut recorded = Err("no-durable-end".to_owned());
         let (mut event, outcome) = match root.wait_receipt(work) {
             ReceiptWait::Receipt(receipt) => match receipt["harness"].as_str() {
                 Some(status) => {
-                    let _ = self.store.lock().expect("store lock").resolve_work(
-                        work,
-                        status,
-                        Some("work-pid1-wait"),
-                    );
+                    recorded = self
+                        .store
+                        .lock()
+                        .expect("store lock")
+                        .resolve_work(work, status, Some("work-pid1-wait"))
+                        .map_err(|error| error.label().to_owned());
                     (
                         json!({
                             "event": "end",
@@ -919,11 +965,12 @@ impl Ingress {
                     )
                 }
                 None => {
-                    let _ = self.store.lock().expect("store lock").resolve_work(
-                        work,
-                        "ended-with-work-namespace-status-unknown",
-                        None,
-                    );
+                    recorded = self
+                        .store
+                        .lock()
+                        .expect("store lock")
+                        .resolve_work(work, "ended-with-work-namespace-status-unknown", None)
+                        .map_err(|error| error.label().to_owned());
                     (
                         json!({
                             "event": "end-unknown",
@@ -968,6 +1015,15 @@ impl Ingress {
             owner["inherited_async"] = inherited_summary(&self.store, None);
         }
         self.report(owner);
+        if let Some(tap) = tap {
+            tap.finish(crate::live_output::terminal(
+                &self.root_id,
+                work,
+                &end,
+                recorded,
+                sealed,
+            ));
+        }
         if let Some(completion) = completion {
             self.offer_completion(work, &completion, &end);
         } else if let Some(position) = recovered {
@@ -1516,6 +1572,7 @@ fn relay_output(
     mut stdout: File,
     sink: &mut Option<&mut Sink>,
     retainer: &mut Retainer<'_>,
+    tap: Option<&crate::live_output::Tap>,
 ) -> (u64, Value) {
     let mut bytes = 0u64;
     let mut buf = [0u8; 16 * 1024];
@@ -1534,6 +1591,10 @@ fn relay_output(
                 // Kept before it is sent: a chunk the requester saw is kept
                 // unless a recorded loss says otherwise.
                 retainer.take(&buf[..read]);
+                // Optional and never waiting (see `live_output`).
+                if let Some(tap) = tap {
+                    tap.push(&buf[..read]);
+                }
                 if let Some(sink) = sink.as_deref_mut() {
                     sink.send(&json!({ "event": "output", "b64": base64(&buf[..read]) }));
                 }

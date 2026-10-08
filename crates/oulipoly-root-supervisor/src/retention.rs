@@ -277,9 +277,24 @@ impl<'a> Retainer<'a> {
     /// Seals what was kept (see the module docs) and returns the identity
     /// the requester is told, or why there is none (`unsealed`). `stream`
     /// is the relay's own output state.
-    pub(crate) fn seal(mut self, stream: &Value, store: &Mutex<Store>, root_id: &str) -> Value {
+    pub(crate) fn seal(self, stream: &Value, store: &Mutex<Store>, root_id: &str) -> Value {
+        self.seal_recorded(stream, store, root_id).0
+    }
+
+    /// Whether this run's retention began with an earlier owner.
+    pub(crate) fn taken_over(&self) -> bool {
+        self.received.is_none() || self.sealed.is_some()
+    }
+
+    /// [`Self::seal`], and whether a seal record (any state) is in the store.
+    pub(crate) fn seal_recorded(
+        mut self,
+        stream: &Value,
+        store: &Mutex<Store>,
+        root_id: &str,
+    ) -> (Value, bool) {
         if let Some(record) = self.sealed.take() {
-            return record_json(root_id, self.work, &record);
+            return (record_json(root_id, self.work, &record), true);
         }
         if let Some(reason) = self.unsealable.take() {
             return self.failed_seal(&reason, store, root_id);
@@ -338,11 +353,11 @@ impl<'a> Retainer<'a> {
             .expect("store lock")
             .seal_output(self.work, &record)
         {
-            Ok(()) => record_json(root_id, self.work, &record),
-            Err(error) => unsealed(error.label()),
+            Ok(()) => (record_json(root_id, self.work, &record), true),
+            Err(error) => (unsealed(error.label()), false),
         }
     }
-    fn failed_seal(mut self, reason: &str, store: &Mutex<Store>, root_id: &str) -> Value {
+    fn failed_seal(mut self, reason: &str, store: &Mutex<Store>, root_id: &str) -> (Value, bool) {
         self.losses
             .push(json!({ "reason": "seal-failed", "detail": reason }));
         let record = OutputRecord {
@@ -357,8 +372,8 @@ impl<'a> Retainer<'a> {
             .expect("store lock")
             .seal_output(self.work, &record)
         {
-            Ok(()) => record_json(root_id, self.work, &record),
-            Err(error) => unsealed(error.label()),
+            Ok(()) => (record_json(root_id, self.work, &record), true),
+            Err(error) => (unsealed(error.label()), false),
         }
     }
 }
