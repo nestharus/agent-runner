@@ -140,6 +140,7 @@ pub struct ProviderCapabilityError {
     envelope: ErrorResponseEnvelope,
     diagnostics: Box<ProviderDiagnostics>,
     process_status: Option<Box<ProcessStatus>>,
+    provider_reported_process_status: Option<Box<ProcessStatus>>,
 }
 
 impl ProviderCapabilityError {
@@ -176,8 +177,11 @@ impl ProviderCapabilityError {
         &self.envelope.error
     }
 
+    /// The provider's `process_status` where it has the host's process-status
+    /// shape. The contract leaves this object open, so other schema-valid
+    /// values are admitted rather than rejected.
     pub fn provider_reported_process_status(&self) -> Option<&ProcessStatus> {
-        self.envelope.process_status.as_ref()
+        self.provider_reported_process_status.as_deref()
     }
 
     pub fn diagnostics(&self) -> &ProviderDiagnostics {
@@ -465,11 +469,17 @@ fn capability_error_from_envelope(
     diagnostics: ProviderDiagnostics,
     process_status: Option<ProcessStatus>,
 ) -> ProviderCapabilityError {
+    let provider_reported_process_status = envelope
+        .process_status
+        .clone()
+        .and_then(|status| serde_json::from_value(status).ok())
+        .map(Box::new);
     ProviderCapabilityError {
         subcommand,
         envelope,
         diagnostics: Box::new(diagnostics),
         process_status: process_status.map(Box::new),
+        provider_reported_process_status,
     }
 }
 

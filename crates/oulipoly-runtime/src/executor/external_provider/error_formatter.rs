@@ -1,7 +1,7 @@
 //! Role: formatter.
 
 use super::errors::ExternalProviderDispatchError;
-use oulipoly_provider::generated::Diagnostic;
+use oulipoly_provider::generated::{Diagnostic, diagnostic_severity_str};
 
 pub(crate) fn format_external_dispatch_error(error: ExternalProviderDispatchError) -> String {
     match error {
@@ -73,7 +73,7 @@ fn format_diagnostics(diagnostics: &[Diagnostic]) -> String {
 }
 
 fn format_diagnostic(diagnostic: &Diagnostic) -> String {
-    let mut parts = vec![diagnostic.severity.as_str()];
+    let mut parts = vec![diagnostic_severity_str(&diagnostic.severity)];
     if let Some(code) = diagnostic.code.as_deref() {
         parts.push(code);
     }

@@ -203,3 +203,50 @@ fn rewrite_common_refs(value: &mut Value) {
         _ => {}
     }
 }
+
+#[test]
+fn shared_contract_goldens_are_admitted_by_runner_registry() {
+    let registry = oulipoly_provider::schemas::SchemaRegistry::new();
+    let goldens = agent_provider_contract::fixtures::contract_v1();
+    let non_launch = goldens["non_launch"]
+        .as_object()
+        .expect("shared non-launch goldens");
+    for row in NON_LAUNCH_ROWS {
+        let cases = non_launch
+            .get(row.subcommand)
+            .unwrap_or_else(|| panic!("shared goldens lack {}", row.subcommand));
+        registry
+            .validate_request(row.subcommand, &cases["request"])
+            .unwrap_or_else(|error| panic!("{} request: {error}", row.subcommand));
+        registry
+            .validate_response(row.subcommand, &cases["success_response"])
+            .unwrap_or_else(|error| panic!("{} success: {error}", row.subcommand));
+        registry
+            .validate_error_response(row.subcommand, &cases["error_response"])
+            .unwrap_or_else(|error| panic!("{} error: {error}", row.subcommand));
+    }
+    registry
+        .validate_request("launch", &goldens["launch"]["request"])
+        .expect("shared launch request");
+    for row in LAUNCH_EVENT_ROWS {
+        registry
+            .validate_launch_event(row.kind, &goldens["launch"]["events"][row.kind])
+            .unwrap_or_else(|error| panic!("{} event: {error}", row.kind));
+    }
+}
+
+#[test]
+fn shared_contract_invalid_goldens_are_refused_by_runner_registry() {
+    let registry = oulipoly_provider::schemas::SchemaRegistry::new();
+    let invalid = agent_provider_contract::fixtures::invalid_contract_v1();
+    assert!(
+        registry
+            .validate_request("describe", &invalid["describe_request_wrong_contract"])
+            .is_err()
+    );
+    assert!(
+        registry
+            .validate_response("describe", &invalid["describe_response_wrong_ok"])
+            .is_err()
+    );
+}

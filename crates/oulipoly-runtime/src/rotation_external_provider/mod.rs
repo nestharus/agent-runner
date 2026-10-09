@@ -72,7 +72,7 @@ pub(crate) fn materialize_rotation_with_fence(
     let result = invoke_rotation_materialize(&identity, request)?;
     if !result.changed {
         crate::rotation_host_apply::validate_no_change_host_state_plan(
-            &result.host_state_plan,
+            &crate::rotation_host_apply::host_state_plan_value(&result),
             &result.artifacts,
             request,
             &identity,
@@ -83,7 +83,7 @@ pub(crate) fn materialize_rotation_with_fence(
     crate::rotation_host_apply::verify_rotation_artifacts(&result.artifacts)
         .map_err(error_formatter::artifact_verification_failure)?;
     crate::rotation_host_apply::validate_host_state_plan_with_fence(
-        &result.host_state_plan,
+        &crate::rotation_host_apply::host_state_plan_value(&result),
         &result.artifacts,
         request,
         &identity,

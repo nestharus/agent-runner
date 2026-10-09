@@ -2,8 +2,8 @@ use oulipoly_config::app::SetupBrainConfig;
 use oulipoly_provider::client::ProviderClient;
 use oulipoly_provider::error::ProviderClientError;
 use oulipoly_provider::generated::{
-    CONTRACT_VERSION, DiscoveryAccountsResult, DiscoveryObject, ErrorCategory, HostContext,
-    RequestEnvelope, SetupDetectResult, SetupInstallPlanResult, SetupObject, SetupSyncPlanResult,
+    CONTRACT_VERSION, DiscoveryAccountsResult, ErrorCategory, HostContext, RequestEnvelope,
+    SetupDetectResult, SetupInstallPlanResult, SetupSyncPlanResult,
 };
 use oulipoly_runtime::provider_registry::PinnedFamilyEndpoint;
 use serde_json::{Value, json};
@@ -177,7 +177,7 @@ fn setup_request(operation: &str, settings_id: Option<&str>) -> Value {
         request_id: request_id(operation),
         provider_instance_id: None,
         host: default_host_context(),
-        params: SetupObject { fields },
+        params: fields,
     })
     .unwrap_or_else(|_| json!({}))
 }
@@ -195,7 +195,7 @@ fn discovery_request(operation: &str, settings_id: Option<&str>) -> Value {
         request_id: request_id(operation),
         provider_instance_id: None,
         host: default_host_context(),
-        params: DiscoveryObject { fields },
+        params: fields,
     })
     .unwrap_or_else(|_| json!({}))
 }

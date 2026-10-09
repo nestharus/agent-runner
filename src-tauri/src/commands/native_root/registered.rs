@@ -1390,10 +1390,11 @@ else:
             assert_eq!(*operation, "describe");
             assert!(reason.contains(fragment), "{fragment}: {reason}");
         };
-        // A preference the provider did not declare.
+        // A preference the provider did not declare: the client's shared
+        // contract admission refuses it before the result is decoded.
         refused(
             "VERSIONS = ['oulipoly.provider/v1']\nPREFERRED = 'oulipoly.provider/v2'",
-            "preferred_contract must belong to contract_versions",
+            "describe failed: schema_invalid_response",
         );
         // A known capability of the wrong type.
         refused(

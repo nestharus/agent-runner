@@ -2,7 +2,7 @@ use crate::{AppState, load_providers_for_models_dir_with};
 use oulipoly_provider::generated::{
     Diagnostic, SchemaResult, SettingsDeleteResult, SettingsGetResult, SettingsListResult,
     SettingsMigrateResult, SettingsRecord, SettingsRecordSummary, SettingsValidateResult,
-    SettingsValues, SettingsWriteResult,
+    SettingsValues, SettingsWriteResult, diagnostic_severity_str,
 };
 use oulipoly_runtime::provider_settings::{
     ProviderSettingsError, ProviderSettingsHost, ProviderSettingsProcessStatus,
@@ -549,9 +549,18 @@ fn map_validate(result: SettingsValidateResult) -> ProviderSettingsValidateDto {
 fn map_migrate(result: SettingsMigrateResult) -> ProviderSettingsMigrateDto {
     ProviderSettingsMigrateDto {
         actions: result.actions,
-        warnings: result.warnings,
+        warnings: result.warnings.into_iter().map(warning_text).collect(),
         requires_user_input: result.requires_user_input,
         diagnostics: result.diagnostics.into_iter().map(map_diagnostic).collect(),
+    }
+}
+
+/// The contract admits any JSON value as a migration warning; a non-string
+/// warning reaches this string list as its exact JSON text.
+fn warning_text(warning: Value) -> String {
+    match warning {
+        Value::String(text) => text,
+        other => other.to_string(),
     }
 }
 
@@ -577,7 +586,7 @@ fn map_record(record: SettingsRecord) -> ProviderSettingsRecord {
 
 fn map_diagnostic(diagnostic: Diagnostic) -> ProviderDiagnosticDto {
     ProviderDiagnosticDto {
-        severity: diagnostic.severity,
+        severity: diagnostic_severity_str(&diagnostic.severity).to_string(),
         message: diagnostic.message,
         path: diagnostic.path,
         code: diagnostic.code,

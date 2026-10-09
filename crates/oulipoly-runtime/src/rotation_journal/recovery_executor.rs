@@ -25,11 +25,14 @@ pub(super) fn execute_rotation_recovery_plan(
 fn recovery_target_session(
     record: &crate::rotation_journal::RotationJournalRecord,
 ) -> Option<&str> {
-    record
-        .result
-        .host_state_plan
-        .get("target_session_id")
-        .and_then(serde_json::Value::as_str)
+    Some(
+        record
+            .result
+            .host_state_plan
+            .plan()
+            .target_session_id
+            .as_str(),
+    )
 }
 
 fn recover_after_artifact(
@@ -75,7 +78,7 @@ fn recover_during_apply(
     .is_none()
     {
         crate::rotation_host_apply::validate_host_state_plan_with_fence(
-            &record.result.host_state_plan,
+            &crate::rotation_host_apply::host_state_plan_value(&record.result),
             &record.result.artifacts,
             request,
             &record.identity,

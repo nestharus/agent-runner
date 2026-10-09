@@ -42,7 +42,7 @@ pub(super) fn settle_source_ingestion(
     let endpoint = registry
         .preflight_account(&identity.source_provider)
         .map_err(|error| blocked(error.to_string()))?;
-    if !endpoint.capabilities().capabilities.session_turn_pages_v1 {
+    if endpoint.capabilities().capabilities.session_turn_pages_v1 != Some(true) {
         return Err(blocked(
             "tracked source no longer advertises canonical paging",
         ));

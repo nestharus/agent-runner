@@ -74,7 +74,7 @@ fn describe_fixture_binds_prompt_acceptance_to_host_selection() {
 
         assert_eq!(
             dto::host_requested_prompt_acceptance_v1(&request.host),
-            response.result.capabilities.prompt_acceptance_v1
+            response.result.capabilities.prompt_acceptance_v1 == Some(true)
         );
     }
 }

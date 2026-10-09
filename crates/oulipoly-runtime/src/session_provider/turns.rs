@@ -5,8 +5,7 @@ use super::types::{
 };
 use chrono::{DateTime, Utc};
 use oulipoly_provider::generated::{
-    SessionReadTurnsResult as ProviderReadPageResult, SessionTurnBodyState,
-    SessionTurnPageProjection,
+    SessionReadTurnsResult as ProviderReadPageResult, SessionTurnBodyState, SessionTurnProjection,
 };
 use oulipoly_state::{
     SessionTurnIngestStreamKey, SessionTurnPageApply, SessionTurnPageBodyState,
@@ -39,7 +38,7 @@ pub(super) fn map_read_page_result(
         provider_instance_id: result.provider_instance_id,
         settings_id: result.settings_id,
         session_id: result.session_id,
-        projection: map_projection(result.turn_projection),
+        projection: map_projection(result.turn_projection.clone()),
         snapshot_id: result.snapshot_id,
         page_index: result.page_index,
         page_start_sequence: result.page_start_sequence,
@@ -97,7 +96,7 @@ fn validate_page_envelope(
     if result.provider_instance_id != provider_instance_id(&request.identity)?
         || result.settings_id != request.identity.settings_id
         || result.session_id != request.session_id
-        || map_projection(result.turn_projection) != request.projection
+        || map_projection(result.turn_projection.clone()) != request.projection
     {
         return Err(page_error("provider_page_identity_mismatch"));
     }
@@ -227,7 +226,7 @@ fn map_page_turn(
         parent_turn_id: turn.parent_turn_id.clone(),
         is_sidechain: turn.is_sidechain,
         is_compaction_boundary: turn.is_compaction_boundary,
-        body_state: map_body_state(turn.body_state),
+        body_state: map_body_state(turn.body_state.clone()),
         body,
         body_bytes: turn.body_bytes,
         body_sha256: turn.body_sha256.clone(),
@@ -320,14 +319,10 @@ fn validate_optional_token(name: &str, token: Option<&str>) -> Result<(), Sessio
     Ok(())
 }
 
-fn map_projection(projection: SessionTurnPageProjection) -> SessionProviderTurnProjection {
+fn map_projection(projection: SessionTurnProjection) -> SessionProviderTurnProjection {
     match projection {
-        SessionTurnPageProjection::CanonicalIngest => {
-            SessionProviderTurnProjection::CanonicalIngest
-        }
-        SessionTurnPageProjection::UserObservation => {
-            SessionProviderTurnProjection::UserObservation
-        }
+        SessionTurnProjection::CanonicalIngest => SessionProviderTurnProjection::CanonicalIngest,
+        SessionTurnProjection::UserObservation => SessionProviderTurnProjection::UserObservation,
     }
 }
 

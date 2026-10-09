@@ -29,7 +29,8 @@ pub(super) fn compute_validated_chain_segment_mutations(
     identity: &ExternalRotationIdentity,
     result: &RotationMaterializeResult,
 ) -> Result<ChainSegmentMutations, ExternalRotationError> {
-    let plan = result.host_state_plan.as_object().ok_or_else(|| {
+    let plan = super::host_state_plan_value(result);
+    let plan = plan.as_object().ok_or_else(|| {
         semantic_host_plan_rejection("host_state_plan must be an object before host apply")
     })?;
     let inputs = validate_mutation_inputs(plan, request, identity, result)?;

@@ -25,11 +25,12 @@ use crate::provider_registry::DescribeHostOptions;
 use oulipoly_config::PromptMode;
 use oulipoly_core::AutoWakeEnvironmentVariable;
 use oulipoly_provider::generated::{
-    BytePayload, CONTRACT_VERSION, HOST_LAUNCH_OUTPUT_V1_ENV, HOST_LAUNCH_OUTPUT_V1_ENV_VALUE,
-    HOST_TERMINAL_UNAVAILABLE_V1_ENV, HOST_TERMINAL_UNAVAILABLE_V1_ENV_VALUE, HostContext,
-    JsonObject, LAUNCH_OUTPUT_V1, LaunchOutputRequestV1, LaunchParams, LaunchRequest,
-    PROMPT_ACCEPTANCE_V1, PolicyEvaluateParams, PolicyEvaluateRequest, PromptAcceptanceRequestV1,
-    ProviderModelRequest,
+    BytePayload, BytePayloadEncoding, CONTRACT_VERSION, HOST_LAUNCH_OUTPUT_V1_ENV,
+    HOST_LAUNCH_OUTPUT_V1_ENV_VALUE, HOST_TERMINAL_UNAVAILABLE_V1_ENV,
+    HOST_TERMINAL_UNAVAILABLE_V1_ENV_VALUE, HostContext, JsonObject, LAUNCH_OUTPUT_V1,
+    LaunchOutputRequestV1, LaunchParams, LaunchRequest, LaunchSession, LaunchSessionStartMode,
+    ModelInput, PROMPT_ACCEPTANCE_V1, PolicyEvaluateParams, PolicyEvaluateRequest,
+    PromptAcceptanceRequestV1, ProviderModelRequest,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -207,7 +208,7 @@ pub(crate) fn build_launch_request(
         Some(launch_env)
     };
     let stdin = launch_stdin.map(|stdin| BytePayload {
-        encoding: "utf8".to_string(),
+        encoding: BytePayloadEncoding::Utf8,
         data: stdin,
     });
     serde_json::to_value(LaunchRequest {
@@ -392,10 +393,14 @@ fn provider_model_request(
     ProviderModelRequest {
         name: context.model.name.clone(),
         provider_args: provider_args.to_vec(),
-        inputs: json!({
-            "prompt": prompt,
-            "named": context.extra_inputs.clone(),
-        }),
+        inputs: ModelInput {
+            prompt: Some(prompt.to_string()),
+            named: context
+                .extra_inputs
+                .iter()
+                .map(|(name, values)| (name.clone(), values.clone()))
+                .collect(),
+        },
     }
 }
 
@@ -484,24 +489,17 @@ fn provider_args_without_model_suffix(
     effective_args[..effective_args.len() - model_provider_args.len()].to_vec()
 }
 
-fn launch_session(context: &ExternalProviderDispatchContext) -> Option<JsonObject> {
-    let mut session = JsonObject::new();
-    if let Some(session_id) = &context.start_known_provider_session_id {
-        session.insert(
-            "known_provider_session_id".to_string(),
-            Value::String(session_id.clone()),
-        );
-        let start_mode = required_known_provider_session_start_mode(context);
-        session.insert(
-            "start_mode".to_string(),
-            Value::String(start_mode.as_str().to_string()),
-        );
-    }
-    if session.is_empty() {
-        None
-    } else {
-        Some(session)
-    }
+fn launch_session(context: &ExternalProviderDispatchContext) -> Option<LaunchSession> {
+    let session_id = context.start_known_provider_session_id.as_ref()?;
+    let start_mode = match required_known_provider_session_start_mode(context) {
+        crate::services::ProviderSessionStartMode::Create => LaunchSessionStartMode::Create,
+        crate::services::ProviderSessionStartMode::Resume => LaunchSessionStartMode::Resume,
+    };
+    Some(LaunchSession {
+        known_provider_session_id: Some(session_id.clone()),
+        start_mode: Some(start_mode),
+        extension_fields: JsonObject::new(),
+    })
 }
 
 fn required_known_provider_session_start_mode(

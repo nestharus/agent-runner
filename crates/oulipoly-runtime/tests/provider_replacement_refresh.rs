@@ -176,7 +176,7 @@ fn atomic_replacement_refreshes_cached_agreement_without_registry_restart() {
 
     let old = registry.preflight_account("account").unwrap();
     assert_eq!(old.capabilities().provider_id, "gen-one");
-    assert!(!old.capabilities().capabilities.launch_output_v1);
+    assert_ne!(old.capabilities().capabilities.launch_output_v1, Some(true));
     let family = registry.preflight_family("account-family").unwrap();
     assert_eq!(
         registry
@@ -206,7 +206,7 @@ fn atomic_replacement_refreshes_cached_agreement_without_registry_restart() {
     let new = registry.preflight_account("account").unwrap();
     assert!(!Arc::ptr_eq(&old, &new));
     assert_eq!(new.capabilities().provider_id, "gen-two");
-    assert!(new.capabilities().capabilities.launch_output_v1);
+    assert_eq!(new.capabilities().capabilities.launch_output_v1, Some(true));
     assert_eq!(new.account_name(), "account");
     assert_eq!(new.settings_id().unwrap(), "account-settings");
     let new_family = registry.preflight_family("account-family").unwrap();
@@ -254,7 +254,7 @@ fn completed_in_place_write_refreshes_cached_agreement() {
 
     let new = registry.preflight_account("account").unwrap();
     assert_eq!(new.capabilities().provider_id, "gen-two");
-    assert!(new.capabilities().capabilities.launch_output_v1);
+    assert_eq!(new.capabilities().capabilities.launch_output_v1, Some(true));
     assert!(Arc::ptr_eq(
         &new,
         &registry.preflight_account("account").unwrap()
@@ -301,7 +301,10 @@ fn removed_or_unavailable_artifact_fails_without_sticking_then_replacement_recov
     install_atomic(&path, &log, &three);
     let again = registry.preflight_account("account").unwrap();
     assert_eq!(again.capabilities().provider_id, "gen-three");
-    assert!(!again.capabilities().capabilities.launch_output_v1);
+    assert_ne!(
+        again.capabilities().capabilities.launch_output_v1,
+        Some(true)
+    );
     assert_eq!(
         answered(&log),
         [

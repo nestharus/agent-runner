@@ -244,12 +244,13 @@ fn attempt_account_dispatch_with_custody(
     };
     gate_required_capabilities(describe)
         .map_err(|error| terminal_attempt_error(service_error(error)))?;
-    if !describe.capabilities.launch_output_v1 {
+    if describe.capabilities.launch_output_v1 != Some(true) {
         return Err(terminal_attempt_error(protocol_service_error(
             "complete_launch_output_unsupported",
         )));
     }
-    let provider_supports_prompt_acceptance_v1 = describe.capabilities.prompt_acceptance_v1;
+    let provider_supports_prompt_acceptance_v1 =
+        describe.capabilities.prompt_acceptance_v1 == Some(true);
     let candidate = build_launch_candidate(context)
         .map_err(|message| terminal_attempt_error(invalid_provider_input_error(message)))?;
     let policy_request = build_policy_request(
@@ -304,7 +305,7 @@ fn attempt_account_dispatch_with_custody(
         endpoint.family(),
         registry.host_options(),
         launch_prompt_acceptance_v1_enabled,
-        describe.capabilities.launch_output_v1,
+        describe.capabilities.launch_output_v1 == Some(true),
     )
     .map_err(|_| terminal_attempt_error(protocol_service_error("schema_invalid_request")))?;
     if let Some(attempt) = &context.attempt {

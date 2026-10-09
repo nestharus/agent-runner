@@ -5,7 +5,7 @@ use super::provider_error::{ExternalSessionProviderError, map_schema_invalid_req
 use super::replace_input_mapper::PreparedReplaceInput;
 use crate::provider_registry::DescribeHostOptions;
 use oulipoly_provider::generated::{
-    CONTRACT_VERSION, HostContext, JsonObject, RequestEnvelope, SessionBaseParams,
+    CONTRACT_VERSION, HostContext, JsonObject, RequestEnvelope, SessionExportParams,
     SessionReplaceCanonicalTranscript, SessionReplaceParams,
 };
 use serde_json::Value;
@@ -76,7 +76,7 @@ fn session_request_envelope(
     host_options: &DescribeHostOptions,
     mut extra: JsonObject,
     request_id: String,
-) -> Result<RequestEnvelope<SessionBaseParams>, ExternalSessionProviderError> {
+) -> Result<RequestEnvelope<SessionExportParams>, ExternalSessionProviderError> {
     extra.insert(
         "model_name".to_string(),
         Value::String(identity.model_name.clone()),
@@ -90,10 +90,10 @@ fn session_request_envelope(
         request_id,
         provider_instance_id: Some(provider_instance_id(identity)?.to_string()),
         host: host_context(host_options),
-        params: SessionBaseParams {
+        params: SessionExportParams {
             settings_id: identity.settings_id.clone(),
             session_id: session_id.map(str::to_string),
-            extra,
+            extension_fields: extra,
         },
     })
 }
@@ -138,14 +138,14 @@ fn replace_request_envelope(
             replace_protocol: PROVIDER_OWNED_REPLACE_PROTOCOL.to_string(),
             operation_id: input.operation_id.clone(),
             canonical_format: CANONICAL_FORMAT.to_string(),
-            canonical_transcript: Some(SessionReplaceCanonicalTranscript {
+            canonical_transcript: SessionReplaceCanonicalTranscript {
                 kind: "bytes".to_string(),
                 data_base64: input.data_base64.clone(),
                 sha256: input.records_sha256.clone(),
                 turn_count: input.turn_count,
-            }),
+            },
             preimage_sha256_expected: input.preimage_sha256_expected.clone(),
-            host_apply_capability: Some(HOST_APPLY_CAPABILITY.to_string()),
+            host_apply_capability: HOST_APPLY_CAPABILITY.to_string(),
             operation_mode: None,
             recovery_action: None,
             recovery_id: None,
@@ -161,7 +161,7 @@ fn recovery_replace_request_envelope(
     host_options: &DescribeHostOptions,
     request_id: String,
 ) -> Result<RequestEnvelope<SessionReplaceParams>, ExternalSessionProviderError> {
-    let canonical_transcript = Some(recovery_canonical_transcript(recovery.input));
+    let canonical_transcript = recovery_canonical_transcript(recovery.input);
     Ok(RequestEnvelope {
         contract: CONTRACT_VERSION.to_string(),
         request_id,
@@ -177,7 +177,7 @@ fn recovery_replace_request_envelope(
             canonical_format: CANONICAL_FORMAT.to_string(),
             canonical_transcript,
             preimage_sha256_expected: None,
-            host_apply_capability: Some(HOST_APPLY_CAPABILITY.to_string()),
+            host_apply_capability: HOST_APPLY_CAPABILITY.to_string(),
             operation_mode: Some("recover".to_string()),
             recovery_action: Some(recovery.action.to_string()),
             recovery_id: recovery.recovery_id.map(str::to_string),
@@ -206,7 +206,7 @@ fn recovery_canonical_transcript(
 }
 
 fn serialize_request(
-    envelope: RequestEnvelope<SessionBaseParams>,
+    envelope: RequestEnvelope<SessionExportParams>,
 ) -> Result<Value, ExternalSessionProviderError> {
     serde_json::to_value(envelope).map_err(|_| map_schema_invalid_request_error())
 }

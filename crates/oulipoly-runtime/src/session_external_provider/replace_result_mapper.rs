@@ -99,6 +99,9 @@ fn validate_replace_result_with_states(
         .host_state_plan
         .as_ref()
         .ok_or_else(|| map_provider_owned_token_error("invalid_host_state_plan"))?;
+    // The contract closes the plan object, so this is the admitted plan.
+    let plan = &serde_json::to_value(plan)
+        .map_err(|_| map_provider_owned_token_error("invalid_host_state_plan"))?;
     let plan_context = HostStatePlanContext {
         identity,
         session_id,

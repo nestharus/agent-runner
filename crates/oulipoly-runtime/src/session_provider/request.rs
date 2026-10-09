@@ -7,9 +7,9 @@ use super::types::{
 use crate::provider_registry::DescribeHostOptions;
 use crate::session_metadata::TranscriptLookupMode;
 use oulipoly_provider::generated::{
-    CONTRACT_VERSION, JsonObject, RequestEnvelope, SessionBaseParams, SessionEnumerateParams,
-    SessionReadTurnsParams, SessionTurnPageProjection, SessionTurnPageStartMode,
-    SessionTurnPagesV1Protocol,
+    CONTRACT_VERSION, JsonObject, RequestEnvelope, SESSION_TURN_PAGES_V1, SessionEnumerateParams,
+    SessionLocateTranscriptParams, SessionReadTurnsParams, SessionTurnPageStartMode,
+    SessionTurnProjection,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -44,6 +44,10 @@ pub(super) fn base_request(
 fn session_request_id(request_label: &str) -> String {
     format!("session-{request_label}-{}", uuid::Uuid::new_v4())
 }
+
+/// The base session params shared by `session.locate_transcript` and the
+/// session requests built here; the contract gives them one open shape.
+type SessionBaseParams = SessionLocateTranscriptParams;
 
 fn session_request_envelope(
     identity: &SessionProviderIdentity,
@@ -89,7 +93,7 @@ fn session_base_params(
     SessionBaseParams {
         settings_id: identity.settings_id.clone(),
         session_id,
-        extra,
+        extension_fields: extra,
     }
 }
 
@@ -151,7 +155,7 @@ pub(super) fn page_request(
     let mut host = host_context(request.effective_cwd, request.registry.host_options());
     host.deadline_unix_ms = Some(deadline_unix_ms(request.timeout)?);
     let request_token_sha256 = request_token_sha256(
-        start_mode,
+        start_mode.clone(),
         after_token.as_deref(),
         snapshot_id.as_deref(),
         page_token.as_deref(),
@@ -165,7 +169,7 @@ pub(super) fn page_request(
         params: SessionReadTurnsParams {
             settings_id: request.identity.settings_id.clone(),
             session_id: request.session_id.to_string(),
-            read_protocol: SessionTurnPagesV1Protocol,
+            read_protocol: SESSION_TURN_PAGES_V1.to_string(),
             turn_projection: provider_projection(request.projection),
             expected_delivery_nonce: request.expected_delivery_nonce.map(str::to_string),
             start_mode,
@@ -215,14 +219,10 @@ fn page_cursor_fields(
     }
 }
 
-fn provider_projection(projection: SessionProviderTurnProjection) -> SessionTurnPageProjection {
+fn provider_projection(projection: SessionProviderTurnProjection) -> SessionTurnProjection {
     match projection {
-        SessionProviderTurnProjection::CanonicalIngest => {
-            SessionTurnPageProjection::CanonicalIngest
-        }
-        SessionProviderTurnProjection::UserObservation => {
-            SessionTurnPageProjection::UserObservation
-        }
+        SessionProviderTurnProjection::CanonicalIngest => SessionTurnProjection::CanonicalIngest,
+        SessionProviderTurnProjection::UserObservation => SessionTurnProjection::UserObservation,
     }
 }
 
