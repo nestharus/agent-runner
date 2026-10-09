@@ -6,8 +6,8 @@ use super::request_id_format::quota_request_id;
 use crate::provider_registry::DescribeHostOptions;
 use crate::services::QuotaServiceExternalProviderIdentity;
 use oulipoly_provider::generated::{
-    CONTRACT_VERSION, HostContext, JsonObject, QuotaBaseParams, QuotaProbeRequest,
-    QuotaRefreshAuthParams, QuotaRefreshAuthRequest, QuotaSourceRequest,
+    CONTRACT_VERSION, HostContext, JsonObject, QuotaProbeParams, QuotaProbeRequest,
+    QuotaRefreshAuthParams, QuotaRefreshAuthRequest, QuotaSourceParams, QuotaSourceRequest,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -21,7 +21,11 @@ pub(crate) fn build_quota_source_request(
         request_id: quota_request_id("source"),
         provider_instance_id: Some(identity.provider_instance_id.clone()),
         host: host_context(host_options),
-        params: quota_base_params(identity),
+        params: QuotaSourceParams {
+            settings_id: identity.settings_id.clone(),
+            model_name: None,
+            context: Some(quota_context(identity)),
+        },
     })
 }
 
@@ -34,7 +38,11 @@ pub(crate) fn build_quota_probe_request(
         request_id: quota_request_id("probe"),
         provider_instance_id: Some(identity.provider_instance_id.clone()),
         host: host_context(host_options),
-        params: quota_base_params(identity),
+        params: QuotaProbeParams {
+            settings_id: identity.settings_id.clone(),
+            model_name: None,
+            context: Some(quota_context(identity)),
+        },
     })
 }
 
@@ -53,14 +61,6 @@ pub(crate) fn build_quota_refresh_auth_request(
             context: None,
         },
     })
-}
-
-fn quota_base_params(identity: &QuotaServiceExternalProviderIdentity) -> QuotaBaseParams {
-    QuotaBaseParams {
-        settings_id: identity.settings_id.clone(),
-        model_name: None,
-        context: Some(quota_context(identity)),
-    }
 }
 
 fn quota_context(identity: &QuotaServiceExternalProviderIdentity) -> JsonObject {

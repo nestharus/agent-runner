@@ -4,9 +4,7 @@
 use super::{ExternalRotationError, ExternalRotationIdentity, error_formatter};
 use crate::provider_registry::DescribeHostOptions;
 use crate::services::MigrationServiceRequest;
-use oulipoly_provider::generated::{
-    CONTRACT_VERSION, HostContext, JsonObject, MigrationObject, RequestEnvelope, RotationObject,
-};
+use oulipoly_provider::generated::{CONTRACT_VERSION, HostContext, JsonObject, RequestEnvelope};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -40,7 +38,7 @@ pub(super) fn rotation_request(
         request_id: format!("s7c-{operation}"),
         provider_instance_id: identity.provider_instance_id.clone(),
         host: host_context(request, host_options),
-        params: RotationObject { fields },
+        params: fields,
     })
 }
 
@@ -55,9 +53,7 @@ pub(super) fn migration_request(
         request_id: format!("s7c-{operation}"),
         provider_instance_id: identity.provider_instance_id.clone(),
         host: host_context(request, host_options),
-        params: MigrationObject {
-            fields: request_fields(identity, request, operation),
-        },
+        params: request_fields(identity, request, operation),
     })
 }
 

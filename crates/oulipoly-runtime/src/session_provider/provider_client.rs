@@ -138,7 +138,7 @@ fn require_session_enumerate_capability(
 fn require_session_turn_pages_capability(
     describe: &DescribeResult,
 ) -> Result<(), SessionProviderError> {
-    if describe.capabilities.session_turn_pages_v1 {
+    if describe.capabilities.session_turn_pages_v1 == Some(true) {
         Ok(())
     } else {
         Err(SessionProviderError::new(

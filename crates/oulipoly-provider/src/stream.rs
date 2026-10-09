@@ -663,7 +663,14 @@ impl LaunchStreamParser {
         &mut self,
         decoded: DecodedLaunchEvent,
     ) -> Result<(), ProviderClientError> {
-        if let Some(observer) = &self.event_observer {
+        // A stream whose first event skipped seq 1 is always rejected; the
+        // rejection waits only so the next line can report a more specific
+        // ordering error. Its events never reach the host observer.
+        if let Some(observer) = self
+            .event_observer
+            .as_ref()
+            .filter(|_| !self.deferred_initial_skip)
+        {
             observer.observe(&decoded).map_err(|description| {
                 transport_error_with_description(
                     HostErrorKind::Other("launch_event_delivery_failed".to_string()),
@@ -883,35 +890,28 @@ fn decode_launch_event_payloads(
     request_id: &str,
 ) -> Result<LaunchEventWithDecodedPayloads, ProviderClientError> {
     match event {
-        LaunchEvent::Stdout {
-            seq, data_base64, ..
-        } => Ok(LaunchEventWithDecodedPayloads::Stdout {
-            seq,
-            data: decode_base64(&data_base64, request_id)?,
+        LaunchEvent::Stdout(event) => Ok(LaunchEventWithDecodedPayloads::Stdout {
+            seq: event.seq,
+            data: decode_base64(&event.data_base64, request_id)?,
         }),
-        LaunchEvent::Stderr {
-            seq, data_base64, ..
-        } => Ok(LaunchEventWithDecodedPayloads::Stderr {
-            seq,
-            data: decode_base64(&data_base64, request_id)?,
+        LaunchEvent::Stderr(event) => Ok(LaunchEventWithDecodedPayloads::Stderr {
+            seq: event.seq,
+            data: decode_base64(&event.data_base64, request_id)?,
         }),
-        LaunchEvent::Marker {
-            seq, name, value, ..
-        } => Ok(LaunchEventWithDecodedPayloads::Marker { seq, name, value }),
-        LaunchEvent::Heartbeat { seq, detail, .. } => {
-            Ok(LaunchEventWithDecodedPayloads::Heartbeat { seq, detail })
-        }
-        LaunchEvent::Exit {
-            seq,
-            status,
-            terminal_signal,
-            session,
-            ..
-        } => Ok(LaunchEventWithDecodedPayloads::Exit(LaunchExit {
-            seq,
-            status,
-            terminal_signal,
-            session,
+        LaunchEvent::Marker(event) => Ok(LaunchEventWithDecodedPayloads::Marker {
+            seq: event.seq,
+            name: event.name,
+            value: event.value,
+        }),
+        LaunchEvent::Heartbeat(event) => Ok(LaunchEventWithDecodedPayloads::Heartbeat {
+            seq: event.seq,
+            detail: event.detail,
+        }),
+        LaunchEvent::Exit(event) => Ok(LaunchEventWithDecodedPayloads::Exit(LaunchExit {
+            seq: event.seq,
+            status: event.status,
+            terminal_signal: event.terminal_signal,
+            session: event.session,
         })),
     }
 }
@@ -975,4 +975,65 @@ fn protocol_error_with_diagnostics(
     diagnostics: ProviderDiagnostics,
 ) -> ProviderClientError {
     ProviderClientError::protocol(kind, "launch", Some(request_id.to_owned()), diagnostics)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn stdout_line(seq: u64) -> String {
+        format!(
+            "{{\"contract\":\"oulipoly.provider/v1\",\"request_id\":\"req-seq\",\"seq\":{seq},\
+             \"time_unix_ms\":1,\"kind\":\"stdout\",\"data_base64\":\"YQ==\"}}\n"
+        )
+    }
+
+    fn observed_parser() -> (LaunchStreamParser, Arc<Mutex<Vec<u64>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let mut parser = LaunchStreamParser::new(
+            "req-seq".to_owned(),
+            SchemaRegistry::new(),
+            LaunchStreamLimits::default(),
+        );
+        parser.event_observer = Some(LaunchEventObserver::new(move |event| {
+            sink.lock().unwrap().push(event.seq());
+            Ok(())
+        }));
+        (parser, seen)
+    }
+
+    #[test]
+    fn initial_skipped_seq_is_never_observed_and_keeps_its_ordering_error() {
+        for (label, seqs, expected) in [
+            ("skip-at-end", vec![2], "skipped_seq"),
+            ("skip-then-skip", vec![2, 3], "skipped_seq"),
+            ("skip-then-duplicate", vec![2, 2], "duplicate_seq"),
+            ("skip-then-decreasing", vec![2, 1], "decreasing_seq"),
+        ] {
+            let (mut parser, seen) = observed_parser();
+            let mut result = Ok(());
+            for seq in seqs {
+                result = result.and_then(|()| parser.push(stdout_line(seq).as_bytes()));
+            }
+            let error = match result {
+                Ok(()) => parser.finish().expect_err(label),
+                Err(error) => error,
+            };
+            assert_eq!(error.transport_kind(), expected, "{label}");
+            assert!(
+                seen.lock().unwrap().is_empty(),
+                "{label} reached the observer"
+            );
+        }
+    }
+
+    #[test]
+    fn contiguous_events_from_one_reach_the_observer() {
+        let (mut parser, seen) = observed_parser();
+        parser.push(stdout_line(1).as_bytes()).unwrap();
+        parser.push(stdout_line(2).as_bytes()).unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![1, 2]);
+    }
 }

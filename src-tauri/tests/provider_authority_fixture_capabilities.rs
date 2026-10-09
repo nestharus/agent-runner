@@ -50,7 +50,7 @@ fn selected_prompt_acceptance_capability_emits_a_correlated_marker() {
     let describe: DescribeResult = client
         .invoke_typed("describe", request_for(&fixtures, "describe").clone(), [])
         .unwrap();
-    assert!(describe.capabilities.prompt_acceptance_v1);
+    assert_eq!(describe.capabilities.prompt_acceptance_v1, Some(true));
 
     let mut launch_request = fixtures["launch"]["request"].clone();
     launch_request["params"]["argv"] =
@@ -141,9 +141,15 @@ fn generated_profiles_advertise_only_scenario_capabilities() {
             expected,
             "profile for {account}"
         );
-        assert!(!capabilities.prompt_acceptance_v1);
-        assert_eq!(capabilities.launch_output_v1, capabilities.launch);
-        assert_eq!(capabilities.session_turn_pages_v1, capabilities.session);
+        assert_ne!(capabilities.prompt_acceptance_v1, Some(true));
+        assert_eq!(
+            capabilities.launch_output_v1 == Some(true),
+            capabilities.launch
+        );
+        assert_eq!(
+            capabilities.session_turn_pages_v1 == Some(true),
+            capabilities.session
+        );
     }
 }
 
@@ -185,12 +191,12 @@ accepted_output_patterns = ["fixture accepted"]
     let describe: DescribeResult =
         serde_json::from_value(describe_envelope["result"].clone()).unwrap();
     assert!(describe.capabilities.launch);
-    assert!(!describe.capabilities.prompt_acceptance_v1);
-    assert!(describe.capabilities.launch_output_v1);
+    assert_ne!(describe.capabilities.prompt_acceptance_v1, Some(true));
+    assert_eq!(describe.capabilities.launch_output_v1, Some(true));
     assert!(describe.capabilities.policy);
     assert!(describe.capabilities.quota);
     assert!(describe.capabilities.session);
-    assert!(describe.capabilities.session_turn_pages_v1);
+    assert_eq!(describe.capabilities.session_turn_pages_v1, Some(true));
     assert!(describe.capabilities.session_enumerate);
     assert!(describe.capabilities.terminal);
 

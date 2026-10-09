@@ -465,3 +465,82 @@ fn s5_record_env(record: &Path) -> Vec<(String, OsString)> {
         ),
     ]
 }
+
+/// A one-shot provider that answers every request with `response`.
+#[cfg(unix)]
+fn answering_provider(label: &str, response: &serde_json::Value) -> std::path::PathBuf {
+    let dir = temp_fixture_dir(label);
+    fs::create_dir_all(&dir).expect("create provider dir");
+    let path = dir.join("provider");
+    fs::write(
+        &path,
+        format!("#!/bin/sh\ncat >/dev/null\ncat <<'JSON'\n{response}\nJSON\n"),
+    )
+    .expect("write provider script");
+    let mut permissions = fs::metadata(&path)
+        .expect("provider metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).expect("chmod provider script");
+    path
+}
+
+#[cfg(unix)]
+fn shared_fixture(subcommand: &str, name: &str) -> serde_json::Value {
+    agent_provider_contract::fixtures::contract_v1()["non_launch"][subcommand][name].clone()
+}
+
+#[cfg(unix)]
+#[test]
+fn invoke_typed_keeps_schema_open_warning_values() {
+    let warnings = json!(["text", { "code": 7 }, null]);
+    let mut response = shared_fixture("settings.migrate", "success_response");
+    response["result"]["warnings"] = warnings.clone();
+    let client = client_for(answering_provider("open-warnings", &response));
+
+    let result: oulipoly_provider::generated::SettingsMigrateResult = client
+        .invoke_typed(
+            "settings.migrate",
+            shared_fixture("settings.migrate", "request"),
+            [],
+        )
+        .expect("schema-valid warnings are admitted");
+
+    assert_eq!(json!(result.warnings), warnings);
+}
+
+#[cfg(unix)]
+#[test]
+fn invoke_refuses_describe_preferring_an_unadvertised_contract() {
+    let mut response = shared_fixture("describe", "success_response");
+    response["result"]["preferred_contract"] = json!("oulipoly.provider/v2");
+    let client = client_for(answering_provider("incoherent-describe", &response));
+
+    let error = client
+        .invoke_json("describe", shared_fixture("describe", "request"), [])
+        .expect_err("preferred_contract outside contract_versions is refused");
+
+    assert_eq!(error.transport_kind(), "schema_invalid_response");
+}
+
+#[cfg(unix)]
+#[test]
+fn invoke_admits_provider_error_with_open_process_status() {
+    let mut response = shared_fixture("settings.migrate", "error_response");
+    response["process_status"] = json!({ "note": "provider-defined" });
+    let client = client_for(answering_provider("open-process-status", &response));
+
+    let error = client
+        .invoke_json(
+            "settings.migrate",
+            shared_fixture("settings.migrate", "request"),
+            [],
+        )
+        .expect_err("a provider error envelope is an error");
+
+    let ProviderClientError::ProviderCapability(capability) = error else {
+        panic!("schema-valid provider error must stay a provider error: {error:?}");
+    };
+    assert_eq!(capability.error().code, "migration_failed");
+    assert!(capability.provider_reported_process_status().is_none());
+}

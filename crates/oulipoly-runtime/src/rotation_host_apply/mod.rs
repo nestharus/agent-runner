@@ -86,6 +86,13 @@ pub(crate) fn validate_host_state_plan_with_fence(
     )
 }
 
+/// The provider's typed host-state proposal as the JSON object the host
+/// validates before it applies anything. The contract closes every plan
+/// object, so this is the admitted plan unchanged.
+pub(crate) fn host_state_plan_value(result: &RotationMaterializeResult) -> Value {
+    serde_json::to_value(&result.host_state_plan).unwrap_or(Value::Null)
+}
+
 pub fn validate_no_change_host_state_plan(
     host_state_plan: &Value,
     result_artifacts: &[Artifact],

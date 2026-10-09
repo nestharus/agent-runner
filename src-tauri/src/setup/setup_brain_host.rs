@@ -1,8 +1,8 @@
 use oulipoly_config::app::SetupBrainConfig;
 use oulipoly_provider::error::{HostErrorKind, ProviderClientError};
 use oulipoly_provider::generated::{
-    CONTRACT_VERSION, DescribeResult, HostContext, RequestEnvelope, SetupBrainTurnResult,
-    SetupObject,
+    CONTRACT_VERSION, DescribeResult, HostContext, RequestEnvelope, SetupBrainTurnParams,
+    SetupBrainTurnResult,
 };
 use oulipoly_runtime::provider_registry::{
     PinnedFamilyEndpoint, ProviderRegistry, ProviderRegistryOptions, RuntimeProviderArtifact,
@@ -162,7 +162,9 @@ pub fn build_setup_brain_turn_request(
         request_id: "setup-brain-turn".to_string(),
         provider_instance_id: None,
         host: default_host_context(),
-        params: SetupObject { fields },
+        params: SetupBrainTurnParams {
+            extension_fields: fields,
+        },
     })
     .map_err(|error| {
         setup_brain_protocol_error_for_operation("setup_brain.turn", error.to_string())

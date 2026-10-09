@@ -257,3 +257,69 @@ fn missing_final_exit_preserves_retained_marker_evidence() {
         Some(&json!({ "phase": "example" }))
     );
 }
+
+#[test]
+fn launch_reader_and_shared_validator_agree_on_stream_acceptance() {
+    let goldens = agent_provider_contract::fixtures::contract_v1();
+    let golden_stream = goldens["launch"]["sequence"]
+        .as_array()
+        .expect("shared launch sequence")
+        .iter()
+        .map(|kind| json_line(&goldens["launch"]["events"][kind.as_str().unwrap()]))
+        .collect::<String>();
+    let golden_request_id = goldens["launch"]["events"]["exit"]["request_id"]
+        .as_str()
+        .expect("shared launch request id");
+    let ours = |events: &[serde_json::Value]| events.iter().map(json_line).collect::<String>();
+    let cases = [
+        ("shared-golden", golden_request_id, golden_stream),
+        (
+            "shared-request-mismatch",
+            golden_request_id,
+            agent_provider_contract::fixtures::INVALID_LAUNCH_REQUEST_MISMATCH_NDJSON.to_owned(),
+        ),
+        (
+            "contiguous",
+            REQUEST_ID,
+            ours(&[launch_stdout_event(1, "YQ=="), launch_exit_event(2, 0)]),
+        ),
+        ("initial-skip", REQUEST_ID, ours(&[launch_exit_event(2, 0)])),
+        (
+            "initial-skip-then-decreasing",
+            REQUEST_ID,
+            ours(&[launch_stdout_event(2, "YQ=="), launch_exit_event(1, 0)]),
+        ),
+        (
+            "gap",
+            REQUEST_ID,
+            ours(&[launch_stdout_event(1, "YQ=="), launch_exit_event(3, 0)]),
+        ),
+        (
+            "duplicate",
+            REQUEST_ID,
+            ours(&[launch_stdout_event(1, "YQ=="), launch_exit_event(1, 0)]),
+        ),
+        (
+            "missing-exit",
+            REQUEST_ID,
+            ours(&[launch_stdout_event(1, "YQ==")]),
+        ),
+        (
+            "after-exit",
+            REQUEST_ID,
+            ours(&[launch_exit_event(1, 0), launch_stdout_event(2, "YQ==")]),
+        ),
+    ];
+
+    for (label, request_id, stream) in cases {
+        let runner = LaunchJsonlReader::new(request_id).read(stream.as_bytes());
+        let shared = agent_provider_contract::validate_launch_ndjson(stream.as_bytes(), request_id);
+        assert_eq!(
+            runner.is_ok(),
+            shared.is_ok(),
+            "{label}: runner {:?} shared {:?}",
+            runner.as_ref().err(),
+            shared.as_ref().err()
+        );
+    }
+}

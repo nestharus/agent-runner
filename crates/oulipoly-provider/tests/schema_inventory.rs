@@ -35,6 +35,22 @@ fn schema_file_inventory_matches_expected_contract_v1() {
 }
 
 #[test]
+fn contract_v1_snapshot_is_the_admitting_shared_contract() {
+    // Runner admits through the shared contract's embedded schemas; this
+    // checked-in snapshot is the readable copy of exactly those bytes.
+    for filename in EXPECTED_SCHEMA_FILES {
+        let snapshot = fs::read_to_string(contract_v1_dir().join(filename))
+            .unwrap_or_else(|err| panic!("failed reading {filename}: {err}"));
+        let admitting = oulipoly_provider::schemas::schema_by_file(filename)
+            .unwrap_or_else(|| panic!("shared contract lacks {filename}"));
+        assert_eq!(
+            snapshot, admitting,
+            "{filename} differs from the admitting contract"
+        );
+    }
+}
+
+#[test]
 fn contract_v1_schemas_declare_draft_2020_12() {
     for filename in EXPECTED_SCHEMA_FILES {
         let schema = load_json(&contract_v1_dir().join(filename));

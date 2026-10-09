@@ -608,7 +608,7 @@ fn s7c_host_apply_transaction_rechecks_validated_source_segment() {
     let result = fixture.materialize_result();
     let identity = fixture.identity();
     oulipoly_runtime::rotation_host_apply::validate_host_state_plan(
-        &result.host_state_plan,
+        &plan_value(&result),
         &result.artifacts,
         &fixture.request(&mut Vec::new()),
         &identity,
@@ -967,7 +967,7 @@ fn s7c_host_state_plan_runtime_rejects_schema_valid_semantic_mismatches_before_m
         let mut result = fixture.materialize_result();
         apply_host_plan_case(&mut result, case);
         let err = oulipoly_runtime::rotation_host_apply::validate_host_state_plan(
-            &result.host_state_plan,
+            &plan_value(&result),
             &result.artifacts,
             &fixture.request(&mut Vec::new()),
             &fixture.identity(),
@@ -985,7 +985,7 @@ fn s7c_host_state_plan_runtime_rejects_schema_valid_semantic_mismatches_before_m
     let before = conflict.snapshot();
     let result = conflict.materialize_result();
     let err = oulipoly_runtime::rotation_host_apply::validate_host_state_plan(
-        &result.host_state_plan,
+        &plan_value(&result),
         &result.artifacts,
         &conflict.request(&mut Vec::new()),
         &conflict.identity(),
@@ -1677,7 +1677,9 @@ fn apply_host_plan_case(
             result.artifacts[0].path = Some(missing.to_string());
         }
         HostPlanCase::UnsupportedVersion => {
-            result.host_state_plan["schema_version"] = serde_json::json!(999);
+            edit_plan(result, |plan| {
+                plan["schema_version"] = serde_json::json!(999)
+            });
         }
         HostPlanCase::ArtifactResultMismatch => set_plan_artifact_field(
             result,
@@ -1693,7 +1695,7 @@ fn set_plan_field(
     field: &str,
     value: &str,
 ) {
-    result.host_state_plan[field] = serde_json::json!(value);
+    edit_plan(result, |plan| plan[field] = serde_json::json!(value));
 }
 
 fn set_plan_segment_field(
@@ -1702,7 +1704,9 @@ fn set_plan_segment_field(
     field: &str,
     value: &str,
 ) {
-    result.host_state_plan["segments"][index][field] = serde_json::json!(value);
+    edit_plan(result, |plan| {
+        plan["segments"][index][field] = serde_json::json!(value)
+    });
 }
 
 fn set_plan_artifact_field(
@@ -1711,7 +1715,26 @@ fn set_plan_artifact_field(
     field: &str,
     value: &str,
 ) {
-    result.host_state_plan["artifacts"][index][field] = serde_json::json!(value);
+    edit_plan(result, |plan| {
+        plan["artifacts"][index][field] = serde_json::json!(value)
+    });
+}
+
+/// Edits the provider's plan as wire JSON and re-admits it as the typed
+/// proposal, so each case still reaches the host's semantic plan checks.
+fn edit_plan(
+    result: &mut oulipoly_provider::generated::RotationMaterializeResult,
+    edit: impl FnOnce(&mut serde_json::Value),
+) {
+    let mut plan = serde_json::to_value(&result.host_state_plan).expect("plan JSON");
+    edit(&mut plan);
+    result.host_state_plan = serde_json::from_value(plan).expect("edited plan keeps its shape");
+}
+
+fn plan_value(
+    result: &oulipoly_provider::generated::RotationMaterializeResult,
+) -> serde_json::Value {
+    serde_json::to_value(&result.host_state_plan).expect("plan JSON")
 }
 
 fn seed_chain(state: &StateDb, model: &ModelConfig) -> ResolvedResume {

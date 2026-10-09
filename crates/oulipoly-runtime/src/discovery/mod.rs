@@ -1,6 +1,6 @@
 use crate::provider_registry::PinnedFamilyEndpoint;
 use oulipoly_provider::generated::{
-    CONTRACT_VERSION, DiscoveryModelsResult, DiscoveryObject, HostContext, RequestEnvelope,
+    CONTRACT_VERSION, DiscoveryModelsParams, DiscoveryModelsResult, HostContext, RequestEnvelope,
 };
 use oulipoly_state::{CliMapping, DiscoveredModel, ModelParameter, ParamType};
 use serde_json::Value;
@@ -77,7 +77,9 @@ fn discovery_request(endpoint: &PinnedFamilyEndpoint) -> Value {
             env: BTreeMap::new(),
             deadline_unix_ms: None,
         },
-        params: DiscoveryObject { fields },
+        params: DiscoveryModelsParams {
+            extension_fields: fields,
+        },
     })
     .unwrap_or_else(|_| serde_json::json!({}))
 }
