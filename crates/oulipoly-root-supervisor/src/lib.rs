@@ -654,6 +654,7 @@ mod live;
 mod live_output;
 mod retention;
 mod store;
+pub mod store_account;
 #[doc(hidden)]
 pub mod sys;
 mod transport;

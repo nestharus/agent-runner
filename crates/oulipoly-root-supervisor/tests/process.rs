@@ -5624,6 +5624,83 @@ fn ack_without_tagged_end_then_waited_exit_is_not_retirement() {
     assert_eq!(reading.logical, sc::LogicalReading::Owed);
 }
 
+/// After owner loss (the owner killed, no terminal, no successor), the
+/// unclaimed `--account` reader still returns each input's committed
+/// account: an ACK without a tagged end and a durable `rejected-unresolved`
+/// stop, with retirement not described, no replay authority and none of the
+/// task's text. Deterministic peers; not a packaged loss topology.
+#[test]
+fn owner_loss_account_reads_each_input_without_claiming() {
+    let dir = Scratch::new("lossaccount");
+    let prepared = agent_provider_contract::resident_session::ResidentPrepareResult::v1(
+        vec!["resident.serve".to_owned()],
+        "1".repeat(64),
+    );
+    let mut request = spec(
+        &dir,
+        3,
+        json!([
+            { "id": "a", "argv": peer(&dir.state("a"), &["--no-idle"]), "messages": ["PRIVATE-TASK-A"] },
+            { "id": "h", "argv": peer(&dir.state("h"), &["--resident-evidence", "rejected"]),
+              "messages": ["PRIVATE-TASK-H"], "resident": prepared },
+        ]),
+    );
+    request["intent"]["cwd"] = json!(std::env::current_dir().unwrap());
+    let mut first = Run::start(&dir, &request);
+    first.until("insertion ACK", |value| {
+        value["event"] == "ack" && value["harness"] == "a"
+    });
+    first.event("h", "rejected");
+    first.kill();
+    let generations = || count(&db(&dir), "SELECT count(*) FROM owner");
+    assert_eq!(generations(), 1);
+
+    let output = std::process::Command::new(SUPERVISOR)
+        .args([
+            "--account",
+            &dir.store().display().to_string(),
+            "--requester",
+            &requester(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    for private in [
+        "PRIVATE-TASK-A",
+        "PRIVATE-TASK-H",
+        "PRIVATE-RESIDENT-PAYLOAD",
+    ] {
+        assert!(!text.contains(private), "metadata only: {private}");
+    }
+    let account: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(generations(), 1, "the reader claims no generation");
+    assert_eq!(account["kind"], "root_store_account");
+    assert_eq!(account["schema"], "oulipoly.root_store_account/v1");
+    assert_eq!(account["requester"], requester());
+    assert_eq!(account["retry"], "not-authorized");
+    assert_eq!(account["retirement"]["eligible"], false);
+    let input = |harness: &str| {
+        account["inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|input| input["harness"] == harness)
+            .unwrap()
+            .clone()
+    };
+    let a = input("a");
+    assert_eq!(a["state"], "acknowledged-turn-end-unobserved", "{a}");
+    assert_eq!(a["settlement"]["tagged_end"]["state"], "absent");
+    let h = input("h");
+    assert_eq!(h["state"], "stopped-insertion-unresolved", "{h}");
+    assert_eq!(h["stop"], "rejected-unresolved");
+    assert_eq!(h["attempts"]["unresolved"], 1);
+    assert!(h["ack"].is_null());
+    // The killed owner recorded no end for its incarnation or works.
+    assert_eq!(account["recorded_actor_custody"]["state"], "live");
+}
+
 /// An acknowledged close and the prior ACK survive owner death. The
 /// successor attaches the same incarnation through a `recover` request
 /// (admitted and acknowledged `attached` by the new generation, never by

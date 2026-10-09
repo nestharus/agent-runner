@@ -2015,6 +2015,143 @@ pub fn describe(dir: &Path) -> Result<Described, String> {
     read().map_err(|error| format!("store: {error}"))?
 }
 
+/// One logical input as its owners committed it, for a reader that holds
+/// no owner generation. Metadata only: never the message text, the control
+/// line that carried it, argv, cwd or any output.
+#[derive(Debug, Clone)]
+pub(crate) struct InputRecord {
+    pub(crate) harness: String,
+    pub(crate) harness_kind: String,
+    pub(crate) index: i64,
+    pub(crate) key: String,
+    pub(crate) origin: String,
+    pub(crate) producer: Option<String>,
+    pub(crate) admitted_generation: Option<i64>,
+    pub(crate) closures: i64,
+    pub(crate) stop: Option<String>,
+    pub(crate) ack_label: Option<String>,
+    pub(crate) ack_basis: Option<String>,
+    pub(crate) ack_recovered: Option<bool>,
+    pub(crate) ack_generation: Option<i64>,
+    pub(crate) ack_message_id: Option<String>,
+    pub(crate) turn_end_generation: Option<i64>,
+    pub(crate) completion_linked: bool,
+    /// Each attempt's recorded outcome (`None`: no outcome was recorded by
+    /// its generation and no successor classified it).
+    pub(crate) attempts: Vec<Option<String>>,
+}
+
+/// A whole store read in one read transaction without claiming it.
+#[derive(Debug)]
+pub(crate) struct StoreReading {
+    pub(crate) described: Described,
+    pub(crate) owner_generations: i64,
+    pub(crate) last_claimed_unix: i64,
+    pub(crate) facts: SettlementFacts,
+    /// At most the requested bound, in harness/input order.
+    pub(crate) inputs: Vec<InputRecord>,
+    pub(crate) inputs_total: i64,
+    /// Kept control claims by `kind`; their lines are not read.
+    pub(crate) control_kinds: BTreeMap<String, i64>,
+    pub(crate) children: i64,
+    pub(crate) children_unresolved: i64,
+    pub(crate) bash_runs: i64,
+    pub(crate) required_account: Option<String>,
+}
+
+/// Reads `dir`'s per-input and custody records read-only, as
+/// [`describe`] does: nothing written or locked, other versions refused.
+/// A snapshot of the last commits, not proof that no owner is live.
+pub(crate) fn read_unclaimed(dir: &Path, max_inputs: usize) -> Result<StoreReading, String> {
+    let described = describe(dir)?;
+    let conn = Connection::open_with_flags(
+        dir.join(DB_FILE),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("store: {error}"))?;
+    let read = || -> rusqlite::Result<Result<StoreReading, String>> {
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        // One snapshot for every query below.
+        conn.execute_batch("BEGIN DEFERRED")?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version != SCHEMA_VERSION {
+            return Ok(Err(format!("unknown store version {version}")));
+        }
+        let root_id: String = conn.query_row("SELECT root_id FROM root", [], |row| row.get(0))?;
+        if root_id != described.root_id {
+            return Ok(Err("store changed between reads".to_owned()));
+        }
+        let (owner_generations, last_claimed_unix): (i64, i64) = conn.query_row(
+            "SELECT count(*), coalesce(max(claimed_unix), 0) FROM owner",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let facts = settlement_facts(&conn)?;
+        let count = |sql: &str| conn.query_row(sql, [], |row| row.get::<_, i64>(0));
+        let inputs_total = count("SELECT count(*) FROM message")?;
+        let mut attempt_rows = conn
+            .prepare("SELECT outcome FROM attempt WHERE harness = ?1 AND idx = ?2 ORDER BY id")?;
+        let mut inputs = Vec::new();
+        let mut rows = conn.prepare(
+            "SELECT h.id, h.kind, m.harness, m.idx, m.key, m.origin, m.producer,
+                    m.admitted_generation, m.closures, m.stop, m.ack_label, m.ack_basis,
+                    m.ack_recovered, m.ack_generation, m.ack_message_id,
+                    m.turn_end_generation, m.completion_work IS NOT NULL
+             FROM message m JOIN harness h ON h.position = m.harness
+             ORDER BY m.harness, m.idx LIMIT ?1",
+        )?;
+        let limit = i64::try_from(max_inputs).unwrap_or(i64::MAX);
+        let mut query = rows.query(params![limit])?;
+        while let Some(row) = query.next()? {
+            let position: i64 = row.get(2)?;
+            let index: i64 = row.get(3)?;
+            let attempts = attempt_rows
+                .query_map(params![position, index], |r| r.get::<_, Option<String>>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            inputs.push(InputRecord {
+                harness: row.get(0)?,
+                harness_kind: row.get(1)?,
+                index,
+                key: row.get(4)?,
+                origin: row.get(5)?,
+                producer: row.get(6)?,
+                admitted_generation: row.get(7)?,
+                closures: row.get(8)?,
+                stop: row.get(9)?,
+                ack_label: row.get(10)?,
+                ack_basis: row.get(11)?,
+                ack_recovered: row.get(12)?,
+                ack_generation: row.get(13)?,
+                ack_message_id: row.get(14)?,
+                turn_end_generation: row.get(15)?,
+                completion_linked: row.get(16)?,
+                attempts,
+            });
+        }
+        let control_kinds = conn
+            .prepare("SELECT kind, count(*) FROM control GROUP BY kind ORDER BY kind")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<BTreeMap<String, i64>>>()?;
+        let reading = StoreReading {
+            described: described.clone(),
+            owner_generations,
+            last_claimed_unix,
+            facts,
+            inputs,
+            inputs_total,
+            control_kinds,
+            children: count("SELECT count(*) FROM child")?,
+            children_unresolved: count("SELECT count(*) FROM child WHERE outcome IS NULL")?,
+            bash_runs: count("SELECT count(*) FROM bash_run")?,
+            required_account: conn
+                .query_row("SELECT required_account FROM root", [], |row| row.get(0))?,
+        };
+        conn.execute_batch("COMMIT")?;
+        Ok(Ok(reading))
+    };
+    read().map_err(|error| format!("store: {error}"))?
+}
+
 fn earlier_ref(conn: &Connection, caller_ref: &str) -> rusqlite::Result<Option<EarlierRef>> {
     conn.query_row(
         "SELECT harness, idx, admitted_generation, ack_label IS NOT NULL, stop,
