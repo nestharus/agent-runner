@@ -296,6 +296,33 @@ events. Bash counts include children. Child exports may lag the parent's
 local result while Bash drains; zero exports does not prove zero results or
 parent consumption. Output is unredacted and can contain arbitrary secrets.
 
+The owner's `turn-end.native_report` also carries bounded native-outcome
+diagnostics. The caller preserves that record in `events.jsonl` and, for the
+initial turn, in `result.json.answer.turn_end`; rejection projections use the
+same summary in `result.json.rejections`. All are `source: endpoint-report`,
+`meaning: diagnostic-only`, with `physical_custody: not-certified-by-report`.
+These are the endpoint's classifications and counts, not host measurements,
+processing proof, raw native exit attestation or initiating-failure diagnosis.
+
+- `status` contains a common process `kind` and only its integer `code` or
+  `signal` when applicable. Reasons are withheld. The existing `status_code`
+  projection remains available, including for older code-only reports.
+- `terminal_signal_kind` contains only the common terminal classification
+  enum, including quota, rate limit and provider unavailable when reported.
+  Evidence and timestamps are withheld; adapters still own classification.
+- `launch_output` contains only `stdout_bytes`, `stderr_bytes` and
+  `data_event_count` as unsigned 64-bit endpoint reports, when available.
+  Content hashes and output bodies are withheld. Availability depends on
+  upstream launch-output selection and reporting.
+
+Missing, unsupported or malformed optional diagnostics project as null. The
+existing whole-report `state`/`custody` validation remains unchanged: invalid
+reports project no diagnostic fields. Open status/signal objects receive
+separate common-type decoding; unknown kinds never forward arbitrary text.
+Free-form failure codes/messages are withheld. Optional diagnostics do not
+change ACK, tagged end, answer classification, settlement, replay or admission,
+and a reported clean exit cannot turn a failed stop into `answered`.
+
 Caller exits: 0 answered, 1 no-answer, 2 usage, 3 local refusal, 4 frontdoor
 refusal, 5 cancelled, 6 incomplete/stop unknown, 7 cleanup failed, 8 launch
 failed, 9 ended otherwise, 10 async-undelivered. Type-only unexpected failures
