@@ -53,7 +53,9 @@ const EX_IOERR: u8 = 74;
 const EX_TEMPFAIL: u8 = 75;
 
 fn say(value: &Value) {
-    eprintln!("oulipoly-root-bash: {value}");
+    // Diagnostics are best effort: a failed stderr must not replace the
+    // query or command outcome with a panic.
+    let _ = writeln!(io::stderr().lock(), "oulipoly-root-bash: {value}");
 }
 
 fn main() -> ExitCode {
