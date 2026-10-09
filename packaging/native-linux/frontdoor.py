@@ -890,6 +890,14 @@ def make_run(site, user):
     except FileExistsError:
         pass
     check_owned(user_dir)
+    # mkdir's mode is filtered by the caller's umask; both fresh and
+    # previously restrictive uid ancestors must allow workload traversal.
+    # Validate custody first, then change only an actual directory.
+    directory = os.open(user_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.fchmod(directory, 0o711)
+    finally:
+        os.close(directory)
     swept = sweep(user_dir)
     run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(6)
     run = os.path.join(user_dir, run_id)

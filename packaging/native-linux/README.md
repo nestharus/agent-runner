@@ -142,6 +142,14 @@ request, data or parity bridge is provided. The site no longer accepts
 credential_margin_s or credential route fields, even `credential: "none"`.
 Adapter-specific settings/env remain the adapter's own surface.
 
+Workload allocation normalizes `run_base/<uid>` to 0711 after validating
+root custody and non-writability, for fresh and existing restrictive uid
+directories alike. Caller umask must not remove this ancestor's search
+permission; 0711 grants traversal, not group/other listing or writing.
+Ordinary and live allocations use this same normalization. Metadata-only
+discovery and loss-account reads do not repair directories. Private request,
+lock, store and loss-account custody are not broadened by this change.
+
 Admission fixes requester identity from sudo, checks allowed users, package
 and provider custody, cwd access, bounded environment and deadline. The
 optional `live_output` request field is an SDK live-stream advertisement.
