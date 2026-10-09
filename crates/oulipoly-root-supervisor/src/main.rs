@@ -3,6 +3,9 @@
 //! `--describe STORE --requester R --describer D` instead prints one
 //! `session_control/v3` `root_entry` for the root stored at STORE, read
 //! without claiming or locking it (exit 0), or a refusal (exit 65).
+//! `--account STORE --requester R` prints one `root_store_account`
+//! (`store_account` module): the store's per-input account, read the same
+//! way without claiming it (exit 0), or a refusal (exit 65).
 //! `--read-control` reads one bounded JSON caller encounter on stdin and
 //! returns SDK selection, trace steps and retained rejection diagnostics.
 //! It is read-only: no store, process authority, native launch or effect.
@@ -60,10 +63,28 @@ fn main() -> ExitCode {
             }
         };
     }
+    if let [flag, store, requester_flag, requester] = args.as_slice()
+        && flag == "--account"
+        && requester_flag == "--requester"
+    {
+        return match oulipoly_root_supervisor::store_account::account(Path::new(store), requester) {
+            Ok(line) => {
+                println!("{line}");
+                ExitCode::SUCCESS
+            }
+            Err(reason) => {
+                println!(
+                    "{}",
+                    serde_json::json!({ "event": "account-refused", "reason": reason })
+                );
+                ExitCode::from(oulipoly_root_supervisor::EXIT_STORE_REFUSED)
+            }
+        };
+    }
     if !args.is_empty() {
         println!(
             "{}",
-            serde_json::json!({ "event": "terminal", "status": "spec-refused", "reason": "usage: (request on stdin) | --describe STORE --requester R --describer D" })
+            serde_json::json!({ "event": "terminal", "status": "spec-refused", "reason": "usage: (request on stdin) | --describe STORE --requester R --describer D | --account STORE --requester R" })
         );
         return ExitCode::from(oulipoly_root_supervisor::EXIT_SPEC_REFUSED);
     }

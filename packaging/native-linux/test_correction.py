@@ -31,7 +31,7 @@ class Scratch(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp(prefix='correction-'))
         self.addCleanup(shutil.rmtree, self.root, True)
 
-    def run_tree(self, name='run'):
+    def run_tree(self, name='run', retirable=True):
         root = self.root/(name+'-'+str(time.monotonic_ns()))
         for sub in ('private', 'launch/provider', 'store'):
             (root/sub).mkdir(parents=True)
@@ -39,6 +39,11 @@ class Scratch(unittest.TestCase):
             (root/rel).write_text('fake-secret')
         (root/'private/retention').write_text('discard')
         (root/'private/lock').touch()
+        # Removal custody fixtures describe retirement; a loss-account run
+        # (no such account) is kept instead and pruned (below).
+        if retirable:
+            (root/'private'/fd.ROOT_TERMINAL).write_text(json.dumps(
+                {'session_control': {'retirement': {'eligible': True}}}))
         return root
 
     def actor(self, code):
@@ -79,6 +84,21 @@ class OwnedCleanup(Scratch):
             self.assertTrue((outside/'auth.json').exists(),mode)
             self.assertTrue(result['ok'],mode)
             self.assertEqual(run.exists(),mode=='keep')
+
+    def test_kept_loss_run_prune_preserves_outside_through_replaced_ancestor(self):
+        outside = self.root/'outside-kept'
+        outside.mkdir()
+        (outside/'auth.json').write_text('must survive')
+        run = self.run_tree('kept', retirable=False)
+        shutil.rmtree(run/'launch/provider')
+        (run/'launch/provider').symlink_to(outside, target_is_directory=True)
+        # No requester layout here: the store is kept and only scratch pruned.
+        result = fd.retire(str(run), 'discard')
+        self.assertTrue((outside/'auth.json').exists())
+        self.assertTrue(result['ok'])
+        self.assertFalse(result['run_removed'])
+        self.assertTrue((run/'store').is_dir())
+        self.assertFalse((run/'launch').exists())
 
     def test_final_symlink_unlinked_without_target_effect(self):
         run = self.run_tree()

@@ -92,7 +92,7 @@ use agent_provider_contract::session_control as sc;
 use serde_json::{Value, json};
 
 use crate::conversation::InputHold;
-use crate::store::{ControlRow, SettlementFacts, Store};
+use crate::store::{ControlRow, InputFacts, SettlementFacts, Store};
 
 pub(crate) use sc::{Operation, Record, State};
 
@@ -158,7 +158,7 @@ pub(crate) struct Face {
     unreadable: usize,
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| {
@@ -902,58 +902,11 @@ impl Face {
             evidence: Vec::new(),
             observed_at_unix_ms: at,
         };
-        let not_applicable = Some(sc::MissingReason::NotApplicable);
         let mut observations = Vec::new();
         let mut subjects = Vec::new();
         for input in &facts.inputs {
-            let subject = sc::LogicalRef {
-                root: self.root.clone(),
-                child: None,
-                work: Some(input.harness.clone()),
-                input: Some(input.index.to_string()),
-            };
-            let insertion = if input.acknowledged {
-                sc::InsertionState::Acknowledged
-            } else if input.not_inserted {
-                sc::InsertionState::NotInserted
-            } else {
-                sc::InsertionState::Uncertain
-            };
-            let (tagged, tagged_reason) = match (input.acknowledged, input.turn_ended) {
-                (true, true) => (sc::TaggedEndState::Observed, None),
-                (true, false) => (sc::TaggedEndState::Absent, None),
-                (false, _) => (sc::TaggedEndState::Missing, not_applicable),
-            };
-            let (debt, debt_reason) = if input.acknowledged && input.turn_ended {
-                (sc::LogicalSettlementState::Settled, None)
-            } else if input.not_inserted {
-                (sc::LogicalSettlementState::Missing, not_applicable)
-            } else {
-                (sc::LogicalSettlementState::Owed, None)
-            };
-            let mine = [
-                observe(
-                    &subject,
-                    sc::Fact::Insertion {
-                        state: insertion,
-                        missing_reason: None,
-                    },
-                ),
-                observe(
-                    &subject,
-                    sc::Fact::TaggedEnd {
-                        state: tagged,
-                        missing_reason: tagged_reason,
-                    },
-                ),
-                observe(
-                    &subject,
-                    sc::Fact::LogicalSettlement {
-                        state: debt,
-                        missing_reason: debt_reason,
-                    },
-                ),
-            ];
+            let subject = input_subject(&self.root, input);
+            let mine = input_facts(input).map(|fact| observe(&subject, fact));
             let reading = sc::read_settlement(&subject, Some(&lineage), &mine);
             if !matches!(
                 reading.logical,
@@ -982,38 +935,7 @@ impl Face {
         } else {
             sc::LogicalSettlementState::Settled
         };
-        let physical = if facts.required_account_incomplete {
-            blocking.push(
-                "required failure account detail incomplete; physical aggregation is unsettled"
-                    .into(),
-            );
-            sc::PhysicalCustodyState::Unsettled
-        } else if facts.works_open > 0 || facts.incarnations_open > 0 {
-            sc::PhysicalCustodyState::Live
-        } else if facts.works_unknown > 0 || facts.incarnations_unknown > 0 {
-            sc::PhysicalCustodyState::Unsettled
-        } else if facts.incarnations_observed > 0 {
-            sc::PhysicalCustodyState::ExitedWaitPending
-        } else if facts.incarnations == 0 {
-            sc::PhysicalCustodyState::Missing
-        } else {
-            sc::PhysicalCustodyState::ExitedWaited
-        };
-        if facts.works_observed_unpersisted > 0 {
-            blocking.push(format!(
-                "{} Bash physical observation(s) not persisted in work outcomes",
-                facts.works_observed_unpersisted
-            ));
-        }
-        if !matches!(
-            physical,
-            sc::PhysicalCustodyState::ExitedWaited | sc::PhysicalCustodyState::Missing
-        ) {
-            blocking.push(format!(
-                "root physical custody {}",
-                physical_label(physical)
-            ));
-        }
+        let physical = recorded_custody(facts, &mut blocking);
         let root_facts = [observe(
             &root_subject,
             sc::Fact::LogicalSettlement {
@@ -1063,6 +985,95 @@ impl Face {
         });
         (lines, summary)
     }
+}
+
+/// One input's settlement subject within `root`.
+pub(crate) fn input_subject(root: &str, input: &InputFacts) -> sc::LogicalRef {
+    sc::LogicalRef {
+        root: root.to_owned(),
+        child: None,
+        work: Some(input.harness.clone()),
+        input: Some(input.index.to_string()),
+    }
+}
+
+/// The insertion, tagged-end and logical-debt facts the store's records
+/// support for one input. Shared by the owner's settlement and the
+/// unclaimed store account, so both read the same records the same way.
+pub(crate) fn input_facts(input: &InputFacts) -> [sc::Fact; 3] {
+    let not_applicable = Some(sc::MissingReason::NotApplicable);
+    let insertion = if input.acknowledged {
+        sc::InsertionState::Acknowledged
+    } else if input.not_inserted {
+        sc::InsertionState::NotInserted
+    } else {
+        sc::InsertionState::Uncertain
+    };
+    let (tagged, tagged_reason) = match (input.acknowledged, input.turn_ended) {
+        (true, true) => (sc::TaggedEndState::Observed, None),
+        (true, false) => (sc::TaggedEndState::Absent, None),
+        (false, _) => (sc::TaggedEndState::Missing, not_applicable),
+    };
+    let (debt, debt_reason) = if input.acknowledged && input.turn_ended {
+        (sc::LogicalSettlementState::Settled, None)
+    } else if input.not_inserted {
+        (sc::LogicalSettlementState::Missing, not_applicable)
+    } else {
+        (sc::LogicalSettlementState::Owed, None)
+    };
+    [
+        sc::Fact::Insertion {
+            state: insertion,
+            missing_reason: None,
+        },
+        sc::Fact::TaggedEnd {
+            state: tagged,
+            missing_reason: tagged_reason,
+        },
+        sc::Fact::LogicalSettlement {
+            state: debt,
+            missing_reason: debt_reason,
+        },
+    ]
+}
+
+/// Runner aggregation of recorded actor custody, adding its blockers.
+pub(crate) fn recorded_custody(
+    facts: &SettlementFacts,
+    blocking: &mut Vec<String>,
+) -> sc::PhysicalCustodyState {
+    let physical = if facts.required_account_incomplete {
+        blocking.push(
+            "required failure account detail incomplete; physical aggregation is unsettled".into(),
+        );
+        sc::PhysicalCustodyState::Unsettled
+    } else if facts.works_open > 0 || facts.incarnations_open > 0 {
+        sc::PhysicalCustodyState::Live
+    } else if facts.works_unknown > 0 || facts.incarnations_unknown > 0 {
+        sc::PhysicalCustodyState::Unsettled
+    } else if facts.incarnations_observed > 0 {
+        sc::PhysicalCustodyState::ExitedWaitPending
+    } else if facts.incarnations == 0 {
+        sc::PhysicalCustodyState::Missing
+    } else {
+        sc::PhysicalCustodyState::ExitedWaited
+    };
+    if facts.works_observed_unpersisted > 0 {
+        blocking.push(format!(
+            "{} Bash physical observation(s) not persisted in work outcomes",
+            facts.works_observed_unpersisted
+        ));
+    }
+    if !matches!(
+        physical,
+        sc::PhysicalCustodyState::ExitedWaited | sc::PhysicalCustodyState::Missing
+    ) {
+        blocking.push(format!(
+            "root physical custody {}",
+            physical_label(physical)
+        ));
+    }
+    physical
 }
 
 fn recover_account_unavailable(detail: &str) -> Vec<String> {

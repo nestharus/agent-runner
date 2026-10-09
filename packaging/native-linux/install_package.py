@@ -492,7 +492,26 @@ def install_from(args, paths, archive, package_id, journal):
         return 3
 
 
-def live_runs(base):
+LOSS_ACCOUNTS = "loss-accounts"
+LOSS_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.json")
+
+
+def managed_loss_directory(path, unprivileged=False):
+    """Exact managed type/custody. Evidence is not a live run or settlement."""
+    custody(path, unprivileged)
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or stat.S_IMODE(st.st_mode) != 0o700:
+        raise Stop("changed loss-account directory")
+    entries = list(os.scandir(path))
+    for entry in entries:
+        custody(entry.path, unprivileged)
+        st = entry.stat(follow_symlinks=False)
+        if not LOSS_NAME.fullmatch(entry.name) or not stat.S_ISREG(st.st_mode) or stat.S_IMODE(st.st_mode) != 0o600:
+            raise Stop("unknown loss-account object")
+    return [entry.path for entry in entries]
+
+
+def live_runs(base, unprivileged=False):
     """Live/unknown locks prevent removal; no PID markers or proc scans."""
     live = []
     if not os.path.isdir(base):
@@ -503,6 +522,9 @@ def live_runs(base):
             continue
         for run in os.scandir(user.path):
             try:
+                if run.name == LOSS_ACCOUNTS and user.name.isdigit():
+                    managed_loss_directory(run.path, unprivileged)
+                    continue
                 if not run.is_dir(follow_symlinks=False):
                     raise OSError
                 private = os.path.join(run.path, "private")
@@ -513,19 +535,63 @@ def live_runs(base):
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 finally:
                     os.close(fd)
-            except OSError:
+            except (Stop, OSError):
                 live.append(run.path)
     return live
 
 
+def purge_loss_accounts(journal, loss_dirs):
+    """Only after disabling the owned entry, explicitly dispose exact managed
+    evidence. A journal intention is never an observation or authority."""
+    # Explicit write-ahead disposition; only checked managed objects.
+    disposition = journal.data.setdefault("loss_account_disposition", [])
+    current_files = {file for _, files in loss_dirs for file in files}
+    by_path = {item["path"]: item for item in disposition}
+    for file in sorted(current_files):
+        if file not in by_path:
+            item = {"path": file, "state": "purge-intended", "meaning": "evidence deletion, not settlement"}
+            disposition.append(item)
+            by_path[file] = item
+    for item in disposition:
+        if item["state"] == "purge-intended" and item["path"] not in current_files:
+            item["state"] = "absent-after-purge-intent; deletion-unconfirmed"
+    journal.save()
+    # Previous journal paths never grant deletion authority: only the
+    # current exact managed inventory can be removed.
+    for file in sorted(current_files):
+        os.unlink(file)
+        by_path[file]["state"] = "purged-not-settled"
+        journal.save()
+    for path, _ in loss_dirs:
+        os.rmdir(path)
+        user_dir = os.path.dirname(path)
+        if not os.listdir(user_dir):
+            os.rmdir(user_dir)
+    return [{"directory": path, "accounts": len(files), "disposition": "purged-not-settled"}
+                for path, files in loss_dirs]
+
+
 def uninstall_locked(args, paths, record_path, record):
     test = args.unprivileged_test
-    active = live_runs(paths.host(record["run_base"]))
+    active = live_runs(paths.host(record["run_base"]), test)
     if active:
         print(json.dumps({"stopped": "live-or-unknown-runs", "runs": active, "record_retained": record_path}))
         return 3
     removed, left = [], []
     journal = Record(record_path, record)
+    loss_dirs = []
+    base = paths.host(record["run_base"])
+    if os.path.isdir(base):
+        for user in os.scandir(base):
+            path = os.path.join(user.path, LOSS_ACCOUNTS)
+            if user.name.isdigit() and os.path.lexists(path):
+                loss_dirs.append((path, managed_loss_directory(path, test)))
+    evidence = [{"directory": path, "accounts": len(files),
+                 "disposition": "preserved across package removal"} for path, files in loss_dirs]
+    purge_pending = args.purge_site
+    if purge_pending and not any(os.path.lexists(paths.host(path)) for path in (record["sudoers"], record["sudoers"] + ".partial")):
+        evidence = purge_loss_accounts(journal, loss_dirs)
+        purge_pending = False
     # Disabling the owned rule first; package removal cannot leave an entry
     # enabled. Changed rules stop removal and retain the record.
     effects = sorted(record["effects"], key=lambda e: (0 if e.get("alternate") == record["sudoers"] or e["path"] == record["sudoers"] else 1,
@@ -590,6 +656,9 @@ def uninstall_locked(args, paths, record_path, record):
             journal.save()
         elif effect["path"] in (record["sudoers"], record["sudoers"] + ".partial"):
             break
+        if purge_pending and not any(os.path.lexists(paths.host(path)) for path in (record["sudoers"], record["sudoers"] + ".partial")):
+            evidence = purge_loss_accounts(journal, loss_dirs)
+            purge_pending = False
     record["status"] = "removal-incomplete" if left else "removals-finished"
     record["cleanup_left"] = left
     journal.save()
@@ -617,7 +686,8 @@ def uninstall_locked(args, paths, record_path, record):
         # they contain the record's parent: retry only recorded empty dirs.
         os.unlink(record_path)
         removed.append(args.record)
-    print(json.dumps({"removed": removed, "left": left, "record_retained": record_path if left else None}, indent=1))
+    print(json.dumps({"removed": removed, "left": left, "record_retained": record_path if left else None,
+                      "loss_accounts": evidence}, indent=1))
     return 3 if left else 0
 
 

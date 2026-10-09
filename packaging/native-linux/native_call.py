@@ -6,6 +6,8 @@
         [--env NAME=VALUE ...] [--retention discard|keep]
         [--child-route NAME ... [--child-max-starts N] [--child-max-concurrent N]]
         [--live-handle NEWFILE]
+    oulipoly-native-call --loss-op OP --out DIR [--account RUN]
+        OP: loss-accounts | loss-account | capture-loss-accounts | retire-loss-account
     oulipoly-native-call --root HANDLE --out DIR
         (--prompt-file FILE | --close | --stop | --inspect | --hold | --release)
         [--wait SECONDS]
@@ -528,6 +530,71 @@ def write_json(path, value):
         file.write("\n")
 
 
+LOSS_OPS = ("loss-accounts", "loss-account", "capture-loss-accounts", "retire-loss-account")
+
+
+def loss_pointer(terminal):
+    """Route hints, not proof of requester use or semantic settlement."""
+    terminal = terminal if isinstance(terminal, dict) else {}
+    retire = terminal.get("retire")
+    loss = retire.get("loss_account") if isinstance(retire, dict) else None
+    return {"list": {"v": 1, "op": "loss-accounts"},
+            "capture": {"v": 1, "op": "capture-loss-accounts"},
+            "current": loss if isinstance(loss, dict) else None,
+            "meaning": "list/read observational; capture retains/disposes lock-free stale runs without a task; retire explicitly disposes a copy, never settlement; none automatic"}
+
+
+def parse_loss_args(argv):
+    parser = argparse.ArgumentParser(prog="oulipoly-native-call")
+    parser.add_argument("--loss-op", choices=LOSS_OPS, required=True)
+    parser.add_argument("--account")
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--deadline", type=int, default=30)
+    parser.add_argument("--frontdoor")
+    parser.add_argument("--sudo", default="/usr/bin/sudo")
+    parser.add_argument("--direct-requester-uid", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--direct-site-config", help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    import re
+    if args.loss_op in ("loss-account", "retire-loss-account"):
+        if not args.account or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", args.account):
+            parser.error("read/retire need a valid --account")
+    elif args.account is not None:
+        parser.error("list/capture take no --account")
+    if not 1 <= args.deadline <= MAX_DEADLINE_S:
+        parser.error("--deadline out of range")
+    return args
+
+
+def main_loss(argv):
+    args = parse_loss_args(argv)
+    os.mkdir(args.out, 0o700)
+    request = {"v": 1, "op": args.loss_op}
+    if args.account is not None:
+        request["account"] = args.account
+    write_json(os.path.join(args.out, "request.public.json"), request)
+    call = Call(args, args.out)
+    try:
+        code, collection = call.run(request)
+        terminals = [event for event in call.events if event.get("frontdoor") == "terminal"]
+        terminal = terminals[-1] if terminals else None
+        complete = code == 0 and not collection.get("errors") and collection.get("stdout_eof") \
+            and collection.get("stderr_eof") and terminal and terminal.get("stage") == args.loss_op \
+            and terminal.get("exit") == 0
+        cls = "loss-operation-complete" if complete else "loss-operation-incomplete"
+        write_json(os.path.join(args.out, "result.json"), {
+            "class": cls, "operation": args.loss_op, "request": request,
+            "front_door_exit": code, "front_door_terminal": terminal, "collection": collection,
+            "records": [event for event in call.events if event.get("frontdoor") == "loss-account"],
+            "captures": [event for event in call.events if event.get("frontdoor") == "swept"],
+            "loss_accounts": loss_pointer(terminal), "retry": "do-not-replay",
+            "meaning": "transport/export receipt only; not semantic use, receiver truth, processing or settlement"})
+        return 0 if complete else EXITS["incomplete"]
+    finally:
+        call.actions.close()
+        call.capture.close()
+
+
 def main_checked(argv):
     args = parse_args(argv)
     try:
@@ -577,6 +644,7 @@ def main_checked(argv):
         "class": cls,
         "front_door_exit": code,
         "front_door_terminal": terminal,
+        "loss_accounts": loss_pointer(terminal),
         "collection": collection,
         "sends": call.sends,
         "answer": {"present": answer is not None, "linked_messages": linked, "turn_end": turn_end},
@@ -907,6 +975,7 @@ def live_result(out, cls, fields):
         cls = "incomplete"
     write_json(os.path.join(out, "result.json"), {
         "class": cls, **fields,
+        "loss_accounts": loss_pointer(fields.get("front_door_terminal")),
         "processing_completion": "not-observed", "correctness": "not-established", "retry": "do-not-replay",
     })
     return LIVE_EXITS[cls]
@@ -1156,14 +1225,15 @@ def live_control(args, attached, base, until):
 
 def main(argv):
     live = any(arg == "--root" or arg.startswith("--root=") for arg in argv)
+    loss = any(arg == "--loss-op" or arg.startswith("--loss-op=") for arg in argv)
     try:
-        return main_live(argv) if live else main_checked(argv)
+        return main_loss(argv) if loss else main_live(argv) if live else main_checked(argv)
     except (OSError, ValueError, TypeError, OverflowError, KeyError, AttributeError, RecursionError) as error:
         # result.json itself may be unwritable. Always expose a type-only
         # machine-readable failure on stderr, without echoing inputs.
         result = {"class": "incomplete", "reason": type(error).__name__, "stop": "unknown", "retry": "do-not-replay"}
         try:
-            args = parse_live_args(argv) if live else parse_args(argv)
+            args = parse_loss_args(argv) if loss else parse_live_args(argv) if live else parse_args(argv)
             write_json(os.path.join(args.out, "result.json"), result)
         except (OSError, ValueError, TypeError, OverflowError, KeyError, AttributeError, RecursionError):
             pass
