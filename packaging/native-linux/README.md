@@ -229,10 +229,10 @@ bytes each; counts include omitted details and overflow makes completeness
 false. Store/account write failures are reported from owner memory, without
 claiming durability. The frontdoor carries the latest observed required
 account through its retirement report even if its private account file write
-failed. After explicit discard, that report lives only in the opening caller's
-capture under its existing limits; unattended live reports and sweep delivery
-retain their existing gaps. Owner death before delivery can lose unsaved
-observations. No second registry, recovery actor or replay permission is added.
+failed. After explicit discard of a retirable root, that report lives only in
+the opening caller's capture under its existing limits; a root whose account
+does not describe retirement first keeps a loss account (below). Owner death
+before delivery can lose unsaved observations. No second registry, recovery actor or replay permission is added.
 
 The frontdoor does not read, convert, stage, refresh or scrub native credential
 files. Keep retains adapter state. Discard removes the package run tree with
@@ -246,7 +246,8 @@ across relay death is promised,
 or explicit unknown if unavailable, with `retry: do-not-replay`. Physical
 store removal does not claim logical retirement. Keep explicitly preserves
 `private/root-terminal.json`, the store and adapter diagnostics. A free run
-lock permits later sweep with the same reported distinction. Direct recovery
+lock permits later sweep with the same reported distinction; discard of an
+unretirable store, at run end or by sweep, first retains its loss account. Direct recovery
 stores remain useful until their recovery question ends. Cleanup failure is visible.
 None of this is provider credential proof.
 
@@ -394,7 +395,44 @@ terminal. Entries are derived and rebuildable addressing: not ownership,
 admission, scheduling or a capacity reservation; their authority is the
 store's last record. The live-root cap stays 4 per requester at this front
 door, not a global reservation. Discovery reveals no handle token: attaching
-a live root still needs its handle.
+a live root still needs its handle. Its terminal also counts this requester's
+retained `loss_accounts`.
+
+**Loss accounts.** Owner, entry or front-door loss leaves a store whose last
+owner account is unknown or does not describe retirement; so can work left
+owed. Before discard removes such a store, at the run's own end or when a
+later launch of the same requester sweeps its lock-free run, the front door
+retains `loss-accounts/<run>.json` (root-only, 0700, per requester uid; synced
+before the store is removed). It holds the last retained root terminal, how
+it was captured (`by`: `run-end`, `sweep`, ...; entry status where known) and
+`oulipoly-root-supervisor --account`'s `root_store_account/v1`: each input's
+committed state (`acknowledged-turn-ended`,
+`acknowledged-turn-end-unobserved`, `stopped-not-inserted`,
+`stopped-insertion-unresolved` such as a durable `rejected-unresolved` stop
+whose public event was lost, `owed-insertion-unresolved`,
+`owed-not-attempted`), ACK label/basis, tagged-end generation, attempt counts
+by outcome (an attempt with no recorded outcome is `unrecorded`: possibly
+sent), the shared settlement facts read with basis `unwarranted`, recorded
+actor custody, kept control kinds and blockers. The reader claims no owner
+generation, takes no lock and starts nothing; its retirement is never
+eligible. It copies no task text, control lines, argv, cwd, environment,
+tokens, Bash commands or output; at most 256 inputs are listed, the rest
+counted with `complete: false`. A retirable root is discarded as before, with
+no account.
+
+Through the same `run` rule the requester reads them back:
+`{"v":1,"op":"loss-accounts"}` lists summaries, `{"v":1,"op":"loss-account",
+"account":RUN}` returns one record, and `{"v":1,"op":"retire-loss-account",
+"account":RUN}` disposes of one. Reading changes nothing; a failed write
+returns 93 with delivery unknown. Retiring a copy settles nothing. At most 64
+accounts are kept per requester: at capacity, or when the account cannot be
+read or written, discard keeps the store (adapter scratch and the entry
+request pruned) with the reason in the `retire`/`swept` record instead of
+destroying it, and a later sweep tries again. An account is a snapshot of
+transport facts, not native processing, receiver continuity, a new owner,
+settlement or replay authority: redelivery still needs positive
+non-insertion or proven durable same-key continuity excluding a second
+native effect.
 
 Frontdoor classes: native entry status or 90 refusal, 91 setup failure,
 92 kill requested with collection, 93 stop/collection unknown, 94 cleanup

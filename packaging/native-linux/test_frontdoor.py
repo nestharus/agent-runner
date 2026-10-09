@@ -153,9 +153,46 @@ class Custody(Scratch):
                 frontdoor.check_tree(tree)
 
 
+def fixture_package(directory):
+    """A package whose supervisor is a scripted stand-in (never a store
+    reader): `--account` answers a fixed per-input account, and refuses a
+    store under a run named `broken`."""
+    package = os.path.join(directory, "pkg")
+    os.makedirs(os.path.join(package, "bin"), exist_ok=True)
+    supervisor = os.path.join(package, frontdoor.SUPERVISOR)
+    with open(supervisor, "w") as file:
+        file.write(textwrap.dedent("""\
+            #!%s
+            import json, sys
+            assert sys.argv[1] == "--account" and sys.argv[3] == "--requester"
+            if sys.argv[2].endswith("broken/store"):
+                print(json.dumps({"event": "account-refused", "reason": "unknown store version 99"})); sys.exit(65)
+            print(json.dumps({"kind": "root_store_account", "schema": "oulipoly.root_store_account/v1",
+                              "requester": sys.argv[4], "root": "fixture-root", "inputs_total": 1,
+                              "readings": {"owed": 1}, "complete": True,
+                              "inputs": [{"index": 0, "state": "stopped-insertion-unresolved",
+                                          "stop": "rejected-unresolved"}]}))
+        """ % sys.executable))
+    os.chmod(supervisor, 0o755)
+    return package
+
+
+OWED = {"status": "closed", "control": {"lifecycle": "open"},
+        "session_control": {"retirement": {"eligible": False, "blocking": ["input a:0 reads owed", "1 control intent(s) pending"]}}}
+RETIRABLE = {"status": "closed", "session_control": {"retirement": {"eligible": True, "blocking": []}}}
+
+
 class Retention(Scratch):
-    def make_run(self, name, retention, locked):
-        run = os.path.join(self.dir, name)
+    uid = 4242
+
+    def setUp(self):
+        super().setUp()
+        self.user_dir = os.path.join(self.dir, str(self.uid))
+        os.makedirs(self.user_dir)
+        self.package = fixture_package(self.dir)
+
+    def make_run(self, name, retention, locked, terminal=None):
+        run = os.path.join(self.user_dir, name)
         for sub in ("private", "launch/provider", "store"):
             os.makedirs(os.path.join(run, sub))
         for rel in ("launch/provider/adapter-state",):
@@ -163,6 +200,10 @@ class Retention(Scratch):
                 file.write("fixture-secret")
         with open(os.path.join(run, "private", "retention"), "w") as file:
             file.write(retention)
+        frontdoor.write_private(os.path.join(run, "private", "request.json"),
+                                {"messages": ["fixture-private-prompt"], "env": {"K": "fixture-private-env"}})
+        if terminal is not None:
+            frontdoor.write_private(os.path.join(run, "private", frontdoor.ROOT_TERMINAL), terminal)
         fd = os.open(os.path.join(run, "private", "lock"), os.O_RDWR | os.O_CREAT)
         if locked:
             fcntl.flock(fd, fcntl.LOCK_EX)
@@ -171,17 +212,83 @@ class Retention(Scratch):
             os.close(fd)
         return run
 
-    def test_discard_removes_drained_store_without_settling_owed_work(self):
-        run = self.make_run("a", "discard", False)
-        account = {"status": "closed", "control": {"lifecycle": "open"},
-                   "session_control": {"retirement": {"eligible": False, "blocking": ["input a:0 reads owed", "1 control intent(s) pending"]}}}
-        frontdoor.write_private(os.path.join(run, "private", frontdoor.ROOT_TERMINAL), account)
-        record = frontdoor.retire(run, "discard")
+    def accounts(self):
+        directory = os.path.join(self.user_dir, frontdoor.LOSS_ACCOUNTS)
+        return sorted(os.listdir(directory)) if os.path.isdir(directory) else []
+
+    def loss_account(self, name):
+        with open(os.path.join(self.user_dir, frontdoor.LOSS_ACCOUNTS, name + ".json")) as file:
+            return json.load(file)
+
+    def test_discard_retains_owed_account_before_removing_the_store(self):
+        run = self.make_run("a", "discard", False, OWED)
+        with mock.patch.object(frontdoor, "check_owned"):
+            record = frontdoor.retire(run, "discard", package=self.package, capture={"by": "run-end", "entry_status": 70})
         self.assertTrue(record["ok"])
         self.assertTrue(record["run_removed"])
-        self.assertEqual(record["root_terminal"], account)
+        self.assertEqual(record["root_terminal"], OWED)
         self.assertEqual(record["retry"], "do-not-replay")
         self.assertFalse(os.path.exists(run))
+        self.assertTrue(record["loss_account"]["retained"])
+        self.assertEqual(record["loss_account"]["route"], {"v": 1, "op": "loss-account", "account": "a"})
+        account = self.loss_account("a")
+        self.assertEqual(account["schema"], frontdoor.LOSS_ACCOUNT_SCHEMA)
+        self.assertEqual(account["requester"], f"uid:{self.uid}")
+        self.assertEqual(account["captured"]["by"], "run-end")
+        self.assertEqual(account["captured"]["entry_status"], 70)
+        self.assertEqual(account["last_root_terminal"], OWED)
+        self.assertEqual(account["store_account"]["inputs"][0]["stop"], "rejected-unresolved")
+        self.assertEqual(account["retry"], "do-not-replay")
+        text = json.dumps(account)
+        for private in ("fixture-private-prompt", "fixture-private-env", "fixture-secret"):
+            self.assertNotIn(private, text)
+        mode = os.stat(os.path.join(self.user_dir, frontdoor.LOSS_ACCOUNTS)).st_mode
+        self.assertEqual(mode & 0o077, 0, "only root (the front door) reads accounts")
+
+    def test_retirable_discard_keeps_production_cleanup_without_an_account(self):
+        run = self.make_run("done", "discard", False, RETIRABLE)
+        record = frontdoor.retire(run, "discard", package=self.package)
+        self.assertTrue(record["run_removed"])
+        self.assertNotIn("loss_account", record)
+        self.assertEqual(self.accounts(), [])
+
+    def test_unreadable_store_is_kept_pruned_with_a_visible_reason(self):
+        run = self.make_run("broken", "discard", False)
+        with mock.patch.object(frontdoor, "check_owned"):
+            record = frontdoor.retire(run, "discard", package=self.package)
+        self.assertTrue(record["ok"])
+        self.assertFalse(record["run_removed"])
+        self.assertTrue(record["loss_account"]["store_kept"])
+        self.assertIn("version", record["loss_account"]["store_account_error"])
+        self.assertTrue(os.path.isdir(os.path.join(run, "store")))
+        self.assertTrue(os.path.exists(os.path.join(run, "private", "lock")))
+        self.assertFalse(os.path.lexists(os.path.join(run, "launch")), "adapter scratch is not retained")
+        self.assertFalse(os.path.lexists(os.path.join(run, "private", "request.json")), "task/env are not retained")
+        account = self.loss_account("broken")
+        self.assertIsNone(account["store_account"])
+        self.assertEqual(account["last_root_terminal"]["knowledge"], "unknown")
+
+    def test_capacity_keeps_the_store_rather_than_evicting_an_account(self):
+        directory = os.path.join(self.user_dir, frontdoor.LOSS_ACCOUNTS)
+        os.makedirs(directory)
+        for index in range(frontdoor.MAX_LOSS_ACCOUNTS):
+            with open(os.path.join(directory, f"old{index}.json"), "w") as file:
+                file.write("{}")
+        run = self.make_run("late", "discard", False)
+        with mock.patch.object(frontdoor, "check_owned"):
+            record = frontdoor.retire(run, "discard", package=self.package)
+        self.assertFalse(record["loss_account"]["retained"])
+        self.assertIn("capacity", record["loss_account"]["reason"])
+        self.assertTrue(os.path.isdir(os.path.join(run, "store")))
+        self.assertEqual(len(self.accounts()), frontdoor.MAX_LOSS_ACCOUNTS)
+        self.assertNotIn("late.json", self.accounts())
+
+    def test_unknown_requester_layout_keeps_the_store(self):
+        run = os.path.join(self.dir, "loose")
+        os.makedirs(os.path.join(run, "store"))
+        record = frontdoor.retire(run, "discard", package=self.package)
+        self.assertFalse(record["loss_account"]["retained"])
+        self.assertTrue(os.path.isdir(os.path.join(run, "store")))
 
     def test_discard_without_a_root_store_removes_the_run(self):
         run = self.make_run("nostore", "discard", False)
@@ -203,17 +310,71 @@ class Retention(Scratch):
     def test_sweep_takes_only_runs_whose_lock_is_free(self):
         live = self.make_run("live", "discard", True)
         dead = self.make_run("dead", "discard", False)
-        owed = self.make_run("owed", "discard", False)
+        owed = self.make_run("owed", "discard", False, OWED)
+        done = self.make_run("done", "discard", False, RETIRABLE)
         kept = self.make_run("kept", "keep", False)
         with mock.patch.object(frontdoor, "check_owned"):
-            swept = frontdoor.sweep(self.dir)
-        self.assertEqual(sorted(os.path.basename(r["run"]) for r in swept), ["dead", "kept", "owed"])
+            swept = frontdoor.sweep(self.user_dir, self.package)
+        self.assertEqual(sorted(os.path.basename(r["run"]) for r in swept), ["dead", "done", "kept", "owed"])
         self.assertTrue(os.path.exists(os.path.join(live, "launch/provider/adapter-state")))
         self.assertFalse(os.path.exists(dead))
-        # Physical discard does not imply logical retirement.
+        # Physical discard does not imply logical retirement; the lost and
+        # owed accounts are retained for the requester first.
         self.assertFalse(os.path.exists(owed))
+        self.assertFalse(os.path.exists(done))
+        self.assertEqual(self.accounts(), ["dead.json", "owed.json"])
+        self.assertEqual(self.loss_account("dead")["captured"]["by"], "sweep")
         self.assertTrue(os.path.isdir(kept))
         self.assertTrue(os.path.lexists(os.path.join(kept, "launch/provider/adapter-state")))
+
+    def route(self, op, uid=None):
+        out_r, out_w = os.pipe()
+        self.addCleanup(os.close, out_r)
+        user = types.SimpleNamespace(pw_uid=self.uid if uid is None else uid, pw_name="me")
+        with mock.patch.object(frontdoor, "check_owned"), mock.patch.object(frontdoor, "OUT_FD", out_w):
+            try:
+                code = frontdoor.loss_route({"run_base": self.dir}, user, frontdoor.loss_op(op))
+            finally:
+                os.close(out_w)
+        return code, [json.loads(line) for line in os.read(out_r, 1 << 22).splitlines()]
+
+    def test_front_door_loss_is_retrievable_by_the_same_requester_until_retired(self):
+        self.make_run("lost", "discard", False)
+        with mock.patch.object(frontdoor, "check_owned"):
+            swept = frontdoor.sweep(self.user_dir, self.package)
+        self.assertTrue(swept[0]["loss_account"]["retained"])
+        code, lines = self.route({"v": 1, "op": "loss-accounts"})
+        self.assertEqual(code, 0)
+        self.assertEqual([line["account"] for line in lines[:-1]], ["lost"])
+        self.assertEqual(lines[0]["readings"], {"owed": 1})
+        self.assertEqual(lines[-1]["accounts"], 1)
+        self.assertEqual(lines[-1]["retry"], "do-not-replay")
+        code, lines = self.route({"v": 1, "op": "loss-account", "account": "lost"})
+        self.assertEqual(code, 0)
+        self.assertEqual(lines[0]["record"]["store_account"]["inputs"][0]["state"], "stopped-insertion-unresolved")
+        # Reading changes nothing; another requester's directory is separate.
+        self.assertEqual(self.accounts(), ["lost.json"])
+        code, lines = self.route({"v": 1, "op": "loss-accounts"}, uid=self.uid + 1)
+        self.assertEqual((code, lines[-1]["accounts"]), (0, 0))
+        with self.assertRaisesRegex(frontdoor.Refused, "no such account"):
+            self.route({"v": 1, "op": "loss-account", "account": "lost"}, uid=self.uid + 1)
+        code, lines = self.route({"v": 1, "op": "retire-loss-account", "account": "lost"})
+        self.assertEqual(code, 0)
+        self.assertTrue(lines[-1]["retired"])
+        self.assertEqual(self.accounts(), [])
+        with self.assertRaisesRegex(frontdoor.Refused, "no such account"):
+            self.route({"v": 1, "op": "loss-account", "account": "lost"})
+
+    def test_route_requests_are_checked_before_any_effect(self):
+        for bad in ({"v": 1, "op": "loss-account", "account": "../x"},
+                    {"v": 1, "op": "loss-account", "account": ".next-1"},
+                    {"v": 1, "op": "retire-loss-account"},
+                    {"v": 2, "op": "loss-account", "account": "a"},
+                    {"v": 1, "op": "loss-account", "account": "a", "extra": 1}):
+            with self.assertRaises(frontdoor.Refused):
+                frontdoor.loss_op(bad)
+        self.assertIsNone(frontdoor.loss_op({"v": 1, "op": "loss-accounts", "x": 1}))
+        self.assertIsNone(frontdoor.loss_op(request()))
 
 
 class Controls(unittest.TestCase):

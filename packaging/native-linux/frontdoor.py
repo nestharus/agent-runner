@@ -22,6 +22,9 @@ Controls: cancel/close/send/inspect lines and session_control/v3 `request`
 records, whose requester must be this attested requester (`uid:<n>`).
 Stdin `{"v":1,"op":"discover"}` instead lists this requester's roots as v2
 `root_entry` records: derived addressing, not ownership or capacity.
+Discard of a store whose account does not describe retirement first keeps
+its per-input loss account for the requester (`loss-accounts`,
+`loss-account`, `retire-loss-account`); no replay or continuation.
 Task output is unredacted. Full contract and limits: share/README.md.
 """
 
@@ -534,11 +537,20 @@ def root_terminal(run):
         return unknown_root_terminal()
 
 
-def retire(run, retention, account_unavailable=False, required_account=None):
+def retirable(account):
+    """Whether the retained owner account itself describes retirement."""
+    retirement = (account.get("session_control") or {}).get("retirement") or {}
+    return account.get("knowledge") != "unknown" and retirement.get("eligible") is True
+
+
+def retire(run, retention, account_unavailable=False, required_account=None, package=None, capture=None):
     """Remove package scratch after physical entry termination. Logical
     retirement stays in the returned account; removal never settles it.
     Keep preserves the store and adapter diagnostics. This layer knows no
     adapter credential paths or semantics. Caller establishes physical drain.
+    Discard of a root whose account does not describe retirement first
+    retains its loss account for the requester; if it cannot, the store is
+    kept (scratch pruned) with the visible reason instead of destroyed.
     """
     removed = None
     account = unknown_root_terminal() if account_unavailable else root_terminal(run)
@@ -547,7 +559,16 @@ def retire(run, retention, account_unavailable=False, required_account=None):
         # replacement failed. Preserve it without upgrading logical knowledge.
         account["required_account"] = required_account
         account["account_publication"] = "unavailable" if account_unavailable or account.get("knowledge") == "unknown" else "file-published"
-    if retention == "discard":
+    loss = None
+    if retention == "discard" and not retirable(account):
+        loss = retain_loss_account(run, account, package or package_root(), capture or {"by": "run-end"})
+    if retention == "discard" and loss is not None and loss.get("store_kept"):
+        removed = False
+        try:
+            prune_scratch(run)
+        except OSError as error:
+            loss["prune"] = type(error).__name__
+    elif retention == "discard":
         try:
             if not shutil.rmtree.avoids_symlink_attacks:
                 raise OSError("descriptor-safe tree removal unavailable")
@@ -555,12 +576,15 @@ def retire(run, retention, account_unavailable=False, required_account=None):
             removed = True
         except OSError as error:
             removed = type(error).__name__
-    return {"ok": retention != "discard" or removed is True, "run_removed": removed,
-            "root_terminal": account, "retry": "do-not-replay",
-            "meaning": "physical run disposition after drain; logical retirement is separately reported"}
+    result = {"ok": retention != "discard" or removed is True or (removed is False and "prune" not in loss),
+              "run_removed": removed, "root_terminal": account, "retry": "do-not-replay",
+              "meaning": "physical run disposition after drain; logical retirement is separately reported"}
+    if loss is not None:
+        result["loss_account"] = loss
+    return result
 
 
-def sweep(user_dir):
+def sweep(user_dir, package=None):
     results = []
     for run, fd in stale_runs(user_dir):
         try:
@@ -568,10 +592,152 @@ def sweep(user_dir):
                 retention = file.read().strip()
         except OSError:
             retention = "keep"
-        result = retire(run, "discard" if retention == "discard" else "keep")
+        result = retire(run, "discard" if retention == "discard" else "keep", package=package,
+                        capture={"by": "sweep", "front_door": "run lock free: its front door is gone"})
         os.close(fd)
         results.append({"run": run, **result})
     return results
+
+
+# Loss accounts: before discard removes a root store whose owner account does
+# not describe retirement (an owner, entry or front door lost, or work left
+# owed), the store's per-input account is retained for the same requester.
+# Only this front door reads them back (`loss-accounts` / `loss-account`);
+# the requester retires each explicitly. Never replay or continuation.
+
+LOSS_ACCOUNTS = "loss-accounts"
+LOSS_ACCOUNT_SCHEMA = "oulipoly.native_loss_account/v1"
+STORE_ACCOUNT_SCHEMA = "oulipoly.root_store_account/v1"
+MAX_LOSS_ACCOUNTS = 64
+LOSS_ACCOUNT_LIMIT = 1024 * 1024
+ACCOUNT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def run_requester(run):
+    """The requester uid of a run at `run_base/<uid>/<run>`, else None."""
+    uid = os.path.basename(os.path.dirname(os.path.abspath(run)))
+    return int(uid) if uid.isdigit() else None
+
+
+def loss_dir(user_dir, create):
+    path = os.path.join(user_dir, LOSS_ACCOUNTS)
+    if create:
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            pass
+    check_owned(path)
+    if not stat.S_ISDIR(os.lstat(path).st_mode):
+        raise Refused(f"custody: {path} is not a directory")
+    return path
+
+
+def loss_names(directory):
+    return sorted(name[:-5] for name in os.listdir(directory)
+                  if name.endswith(".json") and ACCOUNT_NAME.fullmatch(name[:-5]))
+
+
+def store_account(package, store, uid):
+    """The owner binary's read-only per-input `root_store_account`, or why not."""
+    try:
+        result = subprocess.run(
+            [os.path.join(package, SUPERVISOR), "--account", store, "--requester", control_requester(uid)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            env=ENTRY_ENV, cwd="/", timeout=ADMISSION_S, check=False, close_fds=True)
+    except (OSError, subprocess.SubprocessError) as error:
+        return None, type(error).__name__
+    if len(result.stdout) > LOSS_ACCOUNT_LIMIT:
+        return None, "store account exceeds its bound"
+    try:
+        value = json.loads(result.stdout.decode().strip().splitlines()[-1])
+    except (ValueError, IndexError, UnicodeError):
+        return None, "store account unreadable"
+    if result.returncode == 0 and isinstance(value, dict) and value.get("kind") == "root_store_account" \
+            and value.get("schema") == STORE_ACCOUNT_SCHEMA and value.get("requester") == control_requester(uid):
+        return value, None
+    return None, str(value.get("reason", "store account refused")) if isinstance(value, dict) else "store account refused"
+
+
+def write_durable(directory, name, value):
+    """Replace `directory/name` with `value` and sync both."""
+    pending = os.path.join(directory, ".next-" + secrets.token_hex(8))
+    fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write(json.dumps(value, sort_keys=True))
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(pending, os.path.join(directory, name))
+    finally:
+        try:
+            os.unlink(pending)
+        except FileNotFoundError:
+            pass
+    dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def retain_loss_account(run, terminal, package, capture):
+    """Retain `run`'s loss account for its requester before discard. Returns
+    what happened; `store_kept` means discard must keep the store."""
+    store = os.path.join(run, "store")
+    name = os.path.basename(os.path.abspath(run))
+    if not os.path.lexists(store):
+        return {"retained": False, "store_kept": False,
+                "reason": "no root store existed: no durable per-input record to preserve"}
+    uid = run_requester(run)
+    if uid is None or not ACCOUNT_NAME.fullmatch(name):
+        return {"retained": False, "store_kept": True, "reason": "requester or run name unknown"}
+    try:
+        directory = loss_dir(os.path.dirname(os.path.abspath(run)), create=True)
+        names = loss_names(directory)
+    except (Refused, OSError) as error:
+        return {"retained": False, "store_kept": True,
+                "reason": "loss accounts unavailable: " + (str(error) if isinstance(error, Refused) else type(error).__name__)}
+    if name not in names and len(names) >= MAX_LOSS_ACCOUNTS:
+        return {"retained": False, "store_kept": True,
+                "reason": f"loss-account capacity {MAX_LOSS_ACCOUNTS} reached: retire delivered accounts"}
+    account, error = store_account(package, store, uid)
+    record = {
+        "schema": LOSS_ACCOUNT_SCHEMA,
+        "account": name,
+        "requester": control_requester(uid),
+        "captured": dict(capture, at_unix=int(time.time())),
+        "last_root_terminal": terminal,
+        "store_account": account,
+        "store_account_error": error,
+        "run": "discarded after this capture" if account is not None else "store kept in the run: its account could not be read",
+        "retry": "do-not-replay",
+        "meaning": "a snapshot of what the lost root's owners recorded per input; not native processing, receiver continuity, a new owner generation, settlement or replay authority",
+    }
+    try:
+        write_durable(directory, name + ".json", record)
+    except OSError as failure:
+        return {"retained": False, "store_kept": True, "reason": "loss account unwritten: " + type(failure).__name__}
+    return {"retained": True, "account": name, "store_kept": account is None,
+            "store_account_error": error, "route": {"v": 1, "op": "loss-account", "account": name}}
+
+
+def prune_scratch(run):
+    """Keep only the store and run lock/retention/account of a kept run: the
+    adapter scratch and the entry request (task, env) are not retained."""
+    for entry in os.listdir(run):
+        if entry in ("store", "private"):
+            continue
+        path = os.path.join(run, entry)
+        if os.path.isdir(path) and not os.path.islink(path):
+            if not shutil.rmtree.avoids_symlink_attacks:
+                raise OSError("descriptor-safe tree removal unavailable")
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+    try:
+        os.unlink(os.path.join(run, "private", "request.json"))
+    except FileNotFoundError:
+        pass
 
 
 def make_run(site, user):
@@ -1414,7 +1580,7 @@ def live_daemon(package, site, checked, run_id, run_dir, request_path, user, lis
     except (OSError, subprocess.SubprocessError) as error:
         os.write(ready_w, b"failed " + type(error).__name__.encode() + b"\n")
         listener.close()
-        retire(run_dir, checked["retention"])
+        retire(run_dir, checked["retention"], package=package, capture={"by": "entry-not-started"})
         return EXIT_RUN_FAILED
     relay = LiveRelay(entry, run_dir, checked["deadline"] + site["cancel_grace_s"], site["cancel_grace_s"],
                       listener, user.pw_uid, run_id, token)
@@ -1435,7 +1601,9 @@ def live_daemon(package, site, checked, run_id, run_dir, request_path, user, lis
     relay.stop_listening(socket_path)
     os.close(alive)
     code = entry_exit(status, relay.killed)
-    retired = retire(run_dir, checked["retention"], relay.terminal_account_unavailable, relay.required_account) if status is not None else {"ok": False, "stop": "unknown", "run_removed": False}
+    retired = retire(run_dir, checked["retention"], relay.terminal_account_unavailable, relay.required_account,
+                     package, {"by": "live-run-end", "entry_status": status, "killed": relay.killed}) \
+        if status is not None else {"ok": False, "stop": "unknown", "run_removed": False}
     if relay.collection_errors:
         code = EXIT_UNKNOWN
     if status is not None and not retired["ok"]:
@@ -1554,6 +1722,15 @@ def describe_root(package, store, uid):
     return None, str(value.get("reason", "describe refused")) if isinstance(value, dict) else "describe refused"
 
 
+def loss_count(user_dir):
+    try:
+        return len(loss_names(loss_dir(user_dir, create=False)))
+    except FileNotFoundError:
+        return 0
+    except (Refused, OSError):
+        return None
+
+
 def discover(package, site, user):
     """Lists this requester's roots under this front door's run base: one
     `root_entry` (session_control/v3) per root store, read without claiming
@@ -1599,9 +1776,88 @@ def discover(package, site, user):
         "roots": roots,
         "live_roots": live_roots(user_dir),
         "live_cap": {"per_requester": MAX_LIVE_ROOTS, "scope": "this requester at this front door; not a global reservation"},
+        "loss_accounts": loss_count(user_dir),
         "meaning": "descriptive addresses of this requester's root stores; an entry's authority is the store's last record, not proof it is current; attaching a live root still needs its handle",
         "exit": 0,
     })
+    return 0
+
+
+def loss_op(request):
+    """A checked loss-account route request, or None if it is not one."""
+    op = request.get("op") if isinstance(request, dict) else None
+    if op == "loss-accounts" and request == {"v": 1, "op": op}:
+        return {"op": op}
+    if op in ("loss-account", "retire-loss-account"):
+        name = request.get("account")
+        if set(request) != {"v", "op", "account"} or request.get("v") != 1 \
+                or not isinstance(name, str) or not ACCOUNT_NAME.fullmatch(name):
+            raise Refused(f"{op}: expected v 1 and an account name")
+        return {"op": op, "account": name}
+    return None
+
+
+def read_loss_account(directory, name):
+    fd = os.open(os.path.join(directory, name + ".json"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(fd, "r", encoding="utf-8") as file:
+        if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+            raise ValueError("not regular")
+        text = file.read(4 * LOSS_ACCOUNT_LIMIT + 1)
+    if len(text) > 4 * LOSS_ACCOUNT_LIMIT:
+        raise ValueError("exceeds bound")
+    value = json.loads(text)
+    if not isinstance(value, dict) or value.get("schema") != LOSS_ACCOUNT_SCHEMA:
+        raise ValueError("not a loss account")
+    return value
+
+
+def loss_summary(record):
+    store = record.get("store_account") or {}
+    return {"captured": record.get("captured"), "root": store.get("root"),
+            "readings": store.get("readings"), "inputs_total": store.get("inputs_total"),
+            "complete": store.get("complete"), "store_account_error": record.get("store_account_error")}
+
+
+def loss_route(site, user, op):
+    """This requester's retained loss accounts: list, read one, or retire one.
+    Reading changes nothing; a failed write leaves delivery unknown (93)."""
+    base = site["run_base"]
+    check_owned(base)
+    user_dir = os.path.join(base, str(user.pw_uid))
+    try:
+        check_owned(user_dir)
+        directory = loss_dir(user_dir, create=False)
+        names = loss_names(directory)
+    except FileNotFoundError:
+        directory, names = None, []
+    terminal = {"frontdoor": "terminal", "stage": op["op"], "requester": control_requester(user.pw_uid),
+                "retry": "do-not-replay",
+                "meaning": "retained per-input loss accounts of this requester's lost or unretired roots; not settlement, continuation, a new owner or replay authority"}
+    delivered = True
+    if op["op"] == "loss-accounts":
+        for name in names:
+            try:
+                line = {"frontdoor": "loss-account", "account": name, **loss_summary(read_loss_account(directory, name))}
+            except (OSError, ValueError) as error:
+                line = {"frontdoor": "loss-account", "account": name, "error": type(error).__name__}
+            delivered &= emit(line)
+        terminal.update(accounts=len(names), capacity=MAX_LOSS_ACCOUNTS)
+    elif op["account"] not in names:
+        raise Refused(f"{op['op']}: no such account")
+    elif op["op"] == "loss-account":
+        try:
+            record = read_loss_account(directory, op["account"])
+        except (OSError, ValueError) as error:
+            raise Refused(f"loss-account: unreadable: {type(error).__name__}") from None
+        delivered &= emit({"frontdoor": "loss-account", "account": op["account"], "record": record})
+        terminal["account"] = op["account"]
+    else:
+        os.unlink(os.path.join(directory, op["account"] + ".json"))
+        terminal.update(account=op["account"], retired=True,
+                        meaning="the requester disposed of a retained copy; this settles nothing and authorizes nothing")
+    terminal["exit"] = 0 if delivered else EXIT_UNKNOWN
+    if not emit(terminal) or not delivered:
+        return EXIT_UNKNOWN
     return 0
 
 
@@ -1661,6 +1917,9 @@ def admit(argv, environ, stdin_fd, now):
         raise Refused("request is not JSON") from None
     if request == {"v": 1, "op": "discover"}:
         return package, site, user, None, None, rest
+    op = loss_op(request)
+    if op is not None:
+        return package, site, user, op, None, rest
     checked = check_request(request, site, now)
     check_provider_executable(checked["route"])
     for child in (checked["children"] or {}).get("routes", {}).values():
@@ -1689,9 +1948,9 @@ def run_locked(argv, environ, stdin_fd=0):
     except (OSError, ValueError, TypeError, OverflowError) as error:
         emit({"frontdoor": "terminal", "stage": "refused", "reason": type(error).__name__, "effects": "none"})
         return EXIT_REFUSED
-    if checked is None:
+    if checked is None or "op" in checked:
         try:
-            return discover(package, site, user)
+            return discover(package, site, user) if checked is None else loss_route(site, user, checked)
         except (Refused, OSError) as error:
             emit({"frontdoor": "terminal", "stage": "refused", "reason": str(error) if isinstance(error, Refused) else type(error).__name__, "effects": "none"})
             return EXIT_REFUSED
@@ -1758,7 +2017,9 @@ def run_locked(argv, environ, stdin_fd=0):
         status = relay.run_to_end(stdin_fd)
         os.close(alive)
         code = entry_exit(status, relay.killed)
-        retired = retire(run_dir, checked["retention"], relay.terminal_account_unavailable, relay.required_account) if status is not None else {"ok": False, "stop": "unknown", "run_removed": False}
+        retired = retire(run_dir, checked["retention"], relay.terminal_account_unavailable, relay.required_account,
+                         package, {"by": "run-end", "entry_status": status, "killed": relay.killed}) \
+            if status is not None else {"ok": False, "stop": "unknown", "run_removed": False}
         if relay.collection_errors:
             code = EXIT_UNKNOWN
         if status is not None and (not retired["ok"] or any(not record["ok"] for record in swept)):
@@ -1790,7 +2051,10 @@ def run_locked(argv, environ, stdin_fd=0):
             while entry.poll() is None and time.monotonic() < end:
                 time.sleep(0.01)
             status = entry.poll()
-        retired = retire(run_dir, checked["retention"], relay.terminal_account_unavailable if relay is not None else False, relay.required_account if relay is not None else None) if entry is None or status is not None else {"ok": False, "stop": "unknown"}
+        retired = retire(run_dir, checked["retention"], relay.terminal_account_unavailable if relay is not None else False,
+                         relay.required_account if relay is not None else None, package,
+                         {"by": "front-door-failed", "entry_status": status, "killed": killed}) \
+            if entry is None or status is not None else {"ok": False, "stop": "unknown"}
         stage = "run-failed" if isinstance(failure, RunFailed) else "front-door-failed"
         emit({
             "frontdoor": "terminal",
