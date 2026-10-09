@@ -2063,7 +2063,6 @@ pub(crate) struct StoreReading {
 /// [`describe`] does: nothing written or locked, other versions refused.
 /// A snapshot of the last commits, not proof that no owner is live.
 pub(crate) fn read_unclaimed(dir: &Path, max_inputs: usize) -> Result<StoreReading, String> {
-    let described = describe(dir)?;
     let conn = Connection::open_with_flags(
         dir.join(DB_FILE),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -2078,9 +2077,19 @@ pub(crate) fn read_unclaimed(dir: &Path, max_inputs: usize) -> Result<StoreReadi
             return Ok(Err(format!("unknown store version {version}")));
         }
         let root_id: String = conn.query_row("SELECT root_id FROM root", [], |row| row.get(0))?;
-        if root_id != described.root_id {
-            return Ok(Err("store changed between reads".to_owned()));
-        }
+        let (generation, owner_token): (i64, String) = conn.query_row(
+            "SELECT generation, token FROM owner ORDER BY generation DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let incarnation: Option<i64> =
+            conn.query_row("SELECT max(id) FROM incarnation", [], |row| row.get(0))?;
+        let described = Described {
+            root_id,
+            generation,
+            owner_token,
+            incarnation,
+        };
         let (owner_generations, last_claimed_unix): (i64, i64) = conn.query_row(
             "SELECT count(*), coalesce(max(claimed_unix), 0) FROM owner",
             [],

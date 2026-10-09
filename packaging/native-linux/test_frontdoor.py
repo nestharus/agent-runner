@@ -236,7 +236,7 @@ class Retention(Scratch):
         self.assertEqual(account["requester"], f"uid:{self.uid}")
         self.assertEqual(account["captured"]["by"], "run-end")
         self.assertEqual(account["captured"]["entry_status"], 70)
-        self.assertEqual(account["last_root_terminal"], OWED)
+        self.assertEqual(account["last_root_terminal"], frontdoor.terminal_loss_summary(OWED))
         self.assertEqual(account["store_account"]["inputs"][0]["stop"], "rejected-unresolved")
         self.assertEqual(account["retry"], "do-not-replay")
         text = json.dumps(account)
@@ -270,7 +270,7 @@ class Retention(Scratch):
 
     def test_capacity_keeps_the_store_rather_than_evicting_an_account(self):
         directory = os.path.join(self.user_dir, frontdoor.LOSS_ACCOUNTS)
-        os.makedirs(directory)
+        os.makedirs(directory, mode=0o700)
         for index in range(frontdoor.MAX_LOSS_ACCOUNTS):
             with open(os.path.join(directory, f"old{index}.json"), "w") as file:
                 file.write("{}")

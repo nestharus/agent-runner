@@ -102,8 +102,8 @@ Uninstall acquires an exclusive package directory lock, also excluding
 in-flight admission, and reports live/unknown run locks before changing
 anything. It disables its unchanged rule first. It checks recorded
 package content, including added paths, before removal; changed package,
-site or sudoers files are left and reported. Only recorded empty
-created directories are removed. It keeps the record until removals
+site or sudoers files are left and reported. Except for the explicitly inventoried loss accounts under `--purge-site`,
+only recorded empty created directories are removed. It keeps the record until removals
 finish. If that record blocks removal of its own parent directories, it
 moves to a printed `<ancestor>/.<id>.removal.json` recovery path first.
 Failures return 3 and retain a record. Without `--purge-site`, intentionally
@@ -112,7 +112,7 @@ retained site effects also retain the record and return 3.
 A partially written extraction file that does not match the recorded
 expected content is left for ROOT inspection; the record still names its
 owned partial tree. Neither changed admin content nor unrelated data is
-silently deleted. Nonempty retained run data requires separate explicit
+silently deleted. Other nonempty retained run data requires separate explicit
 ROOT review; uninstall does not stop tasks, purge runs, or remove caller
 output. The root-owned installer copy is a separately owned ROOT effect.
 
@@ -398,41 +398,87 @@ door, not a global reservation. Discovery reveals no handle token: attaching
 a live root still needs its handle. Its terminal also counts this requester's
 retained `loss_accounts`.
 
-**Loss accounts.** Owner, entry or front-door loss leaves a store whose last
-owner account is unknown or does not describe retirement; so can work left
-owed. Before discard removes such a store, at the run's own end or when a
-later launch of the same requester sweeps its lock-free run, the front door
-retains `loss-accounts/<run>.json` (root-only, 0700, per requester uid; synced
-before the store is removed). It holds the last retained root terminal, how
-it was captured (`by`: `run-end`, `sweep`, ...; entry status where known) and
-`oulipoly-root-supervisor --account`'s `root_store_account/v1`: each input's
-committed state (`acknowledged-turn-ended`,
-`acknowledged-turn-end-unobserved`, `stopped-not-inserted`,
-`stopped-insertion-unresolved` such as a durable `rejected-unresolved` stop
-whose public event was lost, `owed-insertion-unresolved`,
-`owed-not-attempted`), ACK label/basis, tagged-end generation, attempt counts
-by outcome (an attempt with no recorded outcome is `unrecorded`: possibly
-sent), the shared settlement facts read with basis `unwarranted`, recorded
-actor custody, kept control kinds and blockers. The reader claims no owner
-generation, takes no lock and starts nothing; its retirement is never
-eligible. It copies no task text, control lines, argv, cwd, environment,
-tokens, Bash commands or output; at most 256 inputs are listed, the rest
-counted with `complete: false`. A retirable root is discarded as before, with
-no account.
+### Loss accounts: capture, retrieval and explicit copy disposition
 
-Through the same `run` rule the requester reads them back:
-`{"v":1,"op":"loss-accounts"}` lists summaries, `{"v":1,"op":"loss-account",
-"account":RUN}` returns one record, and `{"v":1,"op":"retire-loss-account",
-"account":RUN}` disposes of one. Reading changes nothing; a failed write
-returns 93 with delivery unknown. Retiring a copy settles nothing. At most 64
-accounts are kept per requester: at capacity, or when the account cannot be
-read or written, discard keeps the store (adapter scratch and the entry
-request pruned) with the reason in the `retire`/`swept` record instead of
-destroying it, and a later sweep tries again. An account is a snapshot of
-transport facts, not native processing, receiver continuity, a new owner,
-settlement or replay authority: redelivery still needs positive
-non-insertion or proven durable same-key continuity excluding a second
-native effect.
+A non-retirable discard first captures a per-input reading for the same OS
+requester. After starting the entry, the front door restores its original
+PID namespace **for subsequent children** so a reader can fork after entry
+init dies. The entry stays its direct child, PID 1 with private `/proc` and
+the existing parent-death/pipe race fence. Restore failure refuses the launch
+and kills/collects any started entry. This is not survivor/recovery redesign.
+
+After abrupt front-door death, capture only this requester's lock-free stale
+runs without admitting a task or invoking any provider:
+
+```
+oulipoly-native-call --loss-op capture-loss-accounts --out NEWDIR
+oulipoly-native-call --loss-op loss-accounts --out NEWDIR
+oulipoly-native-call --loss-op loss-account --account RUN --out NEWDIR
+oulipoly-native-call --loss-op retire-loss-account --account RUN --out NEWDIR
+```
+
+Equivalent JSON through the same sudoers `run` rule is
+`{"v":1,"op":"capture-loss-accounts"}`, `{"v":1,"op":"loss-accounts"}`,
+or `{"v":1,"op":"loss-account","account":"RUN"}` (or
+`retire-loss-account`). `SUDO_UID` scopes the requester; no path override.
+Task/live caller results carry route hints. Nothing captures/retires
+implicitly in that caller; the next ordinary task launch still sweeps.
+
+**List/read are observational; capture is effectful retention/disposition.**
+Capture writes accounts and may prune/remove stale `discard` runs; `keep`
+runs get an explicit reading without changing their retention policy. Its terminal/caller
+result preserves incomplete capture/delivery as a nonzero outcome. Copies
+stay available on output failure. Retirement explicitly deletes/syncs one
+copy; it settles nothing. Successful exports are transport receipts, not
+semantic use, receiver truth, processing or replay authority.
+
+`run_base/<uid>/loss-accounts/<RUN>.json` is root-private (0700 directory,
+0600 records). First creation syncs the parent; publication syncs file,
+replacement and directory before checking the actual public reader. The
+whole saved record must fit the same served **4 MiB byte bound**. Unreadable,
+malformed, unwritable, oversized or partial readings keep the original
+store. Deferred discard prunes adapter scratch and the private entry request;
+the kept DB still contains private task text under root custody, not a
+scrubbed public store. Capture wording describes discard **intention**;
+only the disposition result observes removal.
+
+The outer terminal is a bounded allowlisted status/retirement/custody
+summary, not its lineage, subjects or required-record bodies. It excludes
+owner tokens, payloads, env/credentials and tool bodies. Known ending
+status/kill evidence survives later sweep/refresh separately. Malformed
+terminal/nested metadata and identity mismatches return unknown/refusal or
+partial results without discarding source evidence.
+
+The inner `root_store_account/v1` reads identity and facts in one SQLite
+read transaction, claiming no generation, locking no owner, starting no
+provider. ACK-without-end, durable `rejected-unresolved`, owed, NULL
+(`unrecorded`) and `unknown-prior-owner` remain distinct. SDK basis is
+`unwarranted`; retirement never eligible, replay never authorized. Open
+custody rows after loss mean end unknown, not live/settled. These snapshots
+establish neither native processing, receiver continuity, complete actor
+custody nor final truth.
+
+At most 256 inputs are listed; omissions/counts and `complete:false` are
+explicit, and the store stays so unlisted evidence is not destroyed. Public
+paging remains missing. This output bound does not bound producer work or
+peak memory. **64 accounts is a soft capture threshold**: concurrent captures
+can overshoot. No scheduler/reservation/automatic eviction is added.
+Capacity/failure-kept stores remain discoverable and owed. Each later
+sweep/capture can repeat a reader (30-second subprocess bound) per stale run;
+aggregate latency/capacity/peak memory are not strictly bounded. Reopen before
+large/live-root ordinary adoption or concrete ordinary pressure/latency.
+
+Normal nonpurging uninstall/replacement preserves accounts. An empty exact
+managed loss directory is not a live run; type/mode/custody and live/unknown
+run fences remain. Nonpurging removal still returns 3 with intentionally
+retained site effects/record, not an assertion that package/rule survived.
+Deliberate `--purge-site` inventories and records exact managed account
+unlink dispositions, reporting `purged-not-settled`; it does not settle them
+or silently purge arbitrary data. Partial deletion accounting stays retained.
+
+Source/owned userns fixtures are not privileged packaged loss/custody G2,
+crash-storage durability, receiver semantics, universal privacy,
+instruction import or efficacy qualification.
 
 Frontdoor classes: native entry status or 90 refusal, 91 setup failure,
 92 kill requested with collection, 93 stop/collection unknown, 94 cleanup

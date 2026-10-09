@@ -23,8 +23,10 @@ records, whose requester must be this attested requester (`uid:<n>`).
 Stdin `{"v":1,"op":"discover"}` instead lists this requester's roots as v2
 `root_entry` records: derived addressing, not ownership or capacity.
 Discard of a store whose account does not describe retirement first keeps
-its per-input loss account for the requester (`loss-accounts`,
-`loss-account`, `retire-loss-account`); no replay or continuation.
+its bounded metadata-only loss account for the requester. `loss-accounts`
+and `loss-account` observe; `capture-loss-accounts` effectfully captures
+lock-free stale runs without a task; `retire-loss-account` explicitly
+removes a copy, settling nothing. No replay or continuation.
 Task output is unredacted. Full contract and limits: share/README.md.
 """
 
@@ -529,18 +531,40 @@ def root_terminal(run):
         with os.fdopen(fd, "r", encoding="utf-8") as file:
             if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
                 raise ValueError("not regular")
-            value = json.loads(file.read(OUTPUT_LIMIT + 1))
+            text = file.read(OUTPUT_LIMIT + 1)
+            if len(text) > OUTPUT_LIMIT:
+                raise ValueError("terminal exceeds bound")
+            value = json.loads(text)
             if not isinstance(value, dict):
                 raise ValueError("not an account")
             return value
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return unknown_root_terminal()
+    except (OSError, ValueError, TypeError, RecursionError) as error:
+        return dict(unknown_root_terminal(), account_error=type(error).__name__)
+
+
+def malformed_terminal(account):
+    if not isinstance(account, dict) or account.get("account_error"):
+        return True
+    if "session_control" not in account:
+        return False
+    session = account["session_control"]
+    retirement = session.get("retirement") if isinstance(session, dict) else None
+    if not isinstance(retirement, dict) or type(retirement.get("eligible")) is not bool:
+        return True
+    blockers = retirement.get("blocking", [])
+    return not isinstance(blockers, list) or not all(isinstance(item, str) for item in blockers) \
+        or "recorded_actor_custody" in session and not isinstance(session["recorded_actor_custody"], dict)
 
 
 def retirable(account):
     """Whether the retained owner account itself describes retirement."""
-    retirement = (account.get("session_control") or {}).get("retirement") or {}
-    return account.get("knowledge") != "unknown" and retirement.get("eligible") is True
+    if malformed_terminal(account) or account.get("knowledge") == "unknown":
+        return False
+    session = account.get("session_control")
+    retirement = session.get("retirement") if isinstance(session, dict) else None
+    return isinstance(retirement, dict) and retirement.get("eligible") is True
 
 
 def retire(run, retention, account_unavailable=False, required_account=None, package=None, capture=None):
@@ -584,7 +608,7 @@ def retire(run, retention, account_unavailable=False, required_account=None, pac
     return result
 
 
-def sweep(user_dir, package=None):
+def sweep(user_dir, package=None, explicit_capture=False):
     results = []
     for run, fd in stale_runs(user_dir):
         try:
@@ -592,9 +616,14 @@ def sweep(user_dir, package=None):
                 retention = file.read().strip()
         except OSError:
             retention = "keep"
-        result = retire(run, "discard" if retention == "discard" else "keep", package=package,
-                        capture={"by": "sweep", "front_door": "run lock free: its front door is gone"})
-        os.close(fd)
+        try:
+            result = retire(run, "discard" if retention == "discard" else "keep", package=package,
+                            capture={"by": "sweep"})
+            if explicit_capture and retention != "discard":
+                result["loss_account"] = retain_loss_account(
+                    run, root_terminal(run), package or package_root(), {"by": "capture"}, keep_store=True)
+        finally:
+            os.close(fd)
         results.append({"run": run, **result})
     return results
 
@@ -610,6 +639,7 @@ LOSS_ACCOUNT_SCHEMA = "oulipoly.native_loss_account/v1"
 STORE_ACCOUNT_SCHEMA = "oulipoly.root_store_account/v1"
 MAX_LOSS_ACCOUNTS = 64
 LOSS_ACCOUNT_LIMIT = 1024 * 1024
+LOSS_RECORD_LIMIT = 4 * LOSS_ACCOUNT_LIMIT
 ACCOUNT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
@@ -627,8 +657,12 @@ def loss_dir(user_dir, create):
         except FileExistsError:
             pass
     check_owned(path)
-    if not stat.S_ISDIR(os.lstat(path).st_mode):
-        raise Refused(f"custody: {path} is not a directory")
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or stat.S_IMODE(st.st_mode) != 0o700:
+        raise Refused(f"custody: {path} is not a private 0700 directory")
+    if create:
+        # Also retry a parent sync that failed after earlier mkdir.
+        sync_directory(user_dir)
     return path
 
 
@@ -658,13 +692,24 @@ def store_account(package, store, uid):
     return None, str(value.get("reason", "store account refused")) if isinstance(value, dict) else "store account refused"
 
 
+def sync_directory(directory):
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def write_durable(directory, name, value):
     """Replace `directory/name` with `value` and sync both."""
+    data = json.dumps(value, sort_keys=True).encode("utf-8")
+    if len(data) > LOSS_RECORD_LIMIT:
+        raise ValueError("loss record exceeds served bound")
     pending = os.path.join(directory, ".next-" + secrets.token_hex(8))
     fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as file:
-            file.write(json.dumps(value, sort_keys=True))
+        with os.fdopen(fd, "wb") as file:
+            file.write(data)
             file.flush()
             os.fsync(file.fileno())
         os.replace(pending, os.path.join(directory, name))
@@ -673,14 +718,55 @@ def write_durable(directory, name, value):
             os.unlink(pending)
         except FileNotFoundError:
             pass
-    dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+    sync_directory(directory)
 
 
-def retain_loss_account(run, terminal, package, capture):
+def terminal_loss_summary(terminal):
+    """Bounded allowlist, not a recursive terminal copy. No lineage tokens,
+    per-subject claims, required record bodies or private payloads."""
+    if not isinstance(terminal, dict):
+        return unknown_root_terminal()
+    summary = {key: terminal[key][:256] for key in ("knowledge", "status", "account_publication", "account_error")
+               if isinstance(terminal.get(key), str)}
+    control = terminal.get("control")
+    if isinstance(control, dict) and isinstance(control.get("lifecycle"), str):
+        summary["control"] = {"lifecycle": control["lifecycle"][:256]}
+    session = terminal.get("session_control")
+    retirement = session.get("retirement") if isinstance(session, dict) else None
+    if not isinstance(retirement, dict) or type(retirement.get("eligible")) is not bool:
+        summary.update(unknown_root_terminal())
+    else:
+        blockers = retirement.get("blocking")
+        summary["session_control"] = {"retirement": {
+            "eligible": retirement["eligible"],
+            "blocking": [item[:256] for item in blockers[:32] if isinstance(item, str)]
+                        if isinstance(blockers, list) else ["blocking metadata unknown"],
+            "blocking_omitted": max(0, len(blockers) - 32) if isinstance(blockers, list) else None}}
+        custody = session.get("recorded_actor_custody")
+        if isinstance(custody, dict):
+            summary["session_control"]["recorded_actor_custody"] = {
+                key: value for key, value in custody.items()
+                if key in ("works_open", "works_unknown", "works_observed_unpersisted",
+                           "incarnations", "incarnations_open", "incarnations_observed",
+                           "incarnations_unknown", "required_account_incomplete")
+                and type(value) in (int, bool)}
+            if isinstance(custody.get("state"), str):
+                summary["session_control"]["recorded_actor_custody"]["state"] = custody["state"][:256]
+    return summary
+
+
+def capture_summary(capture):
+    result = {"at_unix": int(time.time())}
+    if isinstance(capture.get("by"), str):
+        result["by"] = capture["by"][:64]
+    if type(capture.get("entry_status")) is int or "entry_status" in capture and capture["entry_status"] is None:
+        result["entry_status"] = capture["entry_status"]
+    if type(capture.get("killed")) is bool:
+        result["killed"] = capture["killed"]
+    return result
+
+
+def retain_loss_account(run, terminal, package, capture, keep_store=False):
     """Retain `run`'s loss account for its requester before discard. Returns
     what happened; `store_kept` means discard must keep the store."""
     store = os.path.join(run, "store")
@@ -700,25 +786,65 @@ def retain_loss_account(run, terminal, package, capture):
     if name not in names and len(names) >= MAX_LOSS_ACCOUNTS:
         return {"retained": False, "store_kept": True,
                 "reason": f"loss-account capacity {MAX_LOSS_ACCOUNTS} reached: retire delivered accounts"}
+    prior = None
+    if name in names:
+        try:
+            prior = read_loss_account(directory, name)
+        except (OSError, ValueError, TypeError, RecursionError) as failure:
+            return {"retained": False, "store_kept": True,
+                    "reason": "prior loss account unreadable: " + type(failure).__name__}
     account, error = store_account(package, store, uid)
+    # Never destroy omitted-input evidence, even when a partial reading is
+    # useful. Complete here does not mean settlement or native processing.
+    complete = account is not None and account.get("complete") is True \
+        and type(account.get("inputs_total")) is int and isinstance(account.get("inputs"), list) \
+        and account["inputs_total"] == len(account["inputs"]) and account.get("inputs_omitted", 0) == 0 \
+        and not malformed_terminal(terminal)
+    store_kept = keep_store or not complete
     record = {
         "schema": LOSS_ACCOUNT_SCHEMA,
         "account": name,
         "requester": control_requester(uid),
-        "captured": dict(capture, at_unix=int(time.time())),
-        "last_root_terminal": terminal,
+        "captured": capture_summary(capture),
+        "ending_capture": None,
+        "last_root_terminal": terminal_loss_summary(terminal),
         "store_account": account,
         "store_account_error": error,
-        "run": "discarded after this capture" if account is not None else "store kept in the run: its account could not be read",
+        "run": "store kept by retention policy" if keep_store else
+               "store kept: unreadable, malformed or incomplete account" if store_kept else
+               "discard intended after durable capture; removal not observed by this record",
         "retry": "do-not-replay",
-        "meaning": "a snapshot of what the lost root's owners recorded per input; not native processing, receiver continuity, a new owner generation, settlement or replay authority",
+        "meaning": "metadata snapshot, not native processing, receiver continuity, a new owner generation, settlement or replay authority",
     }
+    if prior and isinstance(prior.get("ending_capture"), dict):
+        ending = prior["ending_capture"]
+        record["ending_capture"] = capture_summary(ending)
+        if type(ending.get("at_unix")) is int:
+            record["ending_capture"]["at_unix"] = ending["at_unix"]
+    if capture.get("by") in ("run-end", "live-run-end", "front-door-failed", "entry-not-started"):
+        if record["ending_capture"] is None:
+            record["ending_capture"] = record["captured"]
+        else:
+            # A later missing status or no new kill observation is not
+            # counterevidence to the earlier actual ending.
+            for key in ("entry_status", "killed"):
+                if record["ending_capture"].get(key) is None and key in record["captured"]:
+                    record["ending_capture"][key] = record["captured"][key]
+    if prior and record["last_root_terminal"].get("knowledge") == "unknown":
+        record["last_root_terminal"] = terminal_loss_summary(prior.get("last_root_terminal"))
+    # Failed refresh must not replace a prior usable reading with null.
+    if account is None and prior and prior.get("store_account") is not None:
+        record["store_account"] = prior["store_account"]
+        record["store_account_observed_at"] = prior.get("store_account_observed_at", prior.get("captured"))
     try:
         write_durable(directory, name + ".json", record)
-    except OSError as failure:
-        return {"retained": False, "store_kept": True, "reason": "loss account unwritten: " + type(failure).__name__}
-    return {"retained": True, "account": name, "store_kept": account is None,
-            "store_account_error": error, "route": {"v": 1, "op": "loss-account", "account": name}}
+        # Use the actual public reader before allowing destruction.
+        read_loss_account(directory, name)
+    except (OSError, ValueError, TypeError, RecursionError) as failure:
+        return {"retained": False, "store_kept": True, "reason": "loss account publication unavailable: " + type(failure).__name__}
+    return {"retained": True, "account": name, "store_kept": store_kept,
+            "store_account_error": error, "complete": complete,
+            "route": {"v": 1, "op": "loss-account", "account": name}}
 
 
 def prune_scratch(run):
@@ -858,21 +984,30 @@ def contained(alive_r, alive_w):
 
 
 def start_entry(package, request_path):
-    """Starts the entry as PID 1 of a new PID namespace. Only one process
-    can be started after this (the namespace's init)."""
-    os.unshare(os.CLONE_NEWPID)
+    """Start PID 1 in a new namespace, then restore this front door's
+    children namespace before any later reader fork. The entry remains a
+    direct child: unchanged PDEATHSIG/pipe race check and private /proc."""
+    original = os.open("/proc/self/ns/pid", os.O_RDONLY | os.O_CLOEXEC)
     alive_r, alive_w = os.pipe()
+    entry = None
     try:
-        entry = subprocess.Popen(
-            [os.path.join(package, RUNNER), "native-root", "--request", request_path],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            env=ENTRY_ENV,
-            cwd="/",
-            preexec_fn=contained(alive_r, alive_w),
-            close_fds=True,
-        )
+        os.unshare(os.CLONE_NEWPID)
+        try:
+            entry = subprocess.Popen(
+                [os.path.join(package, RUNNER), "native-root", "--request", request_path],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=ENTRY_ENV,
+                cwd="/", preexec_fn=contained(alive_r, alive_w), close_fds=True)
+        finally:
+            _check(_libc.setns(original, os.CLONE_NEWPID), "restore PID namespace for children")
+    except BaseException:
+        # A failed restore must not orphan a successfully spawned entry.
+        os.close(alive_w)
+        if entry is not None:
+            entry.kill()
+            entry.wait(timeout=COLLECTION_S)
+        raise
     finally:
+        os.close(original)
         os.close(alive_r)
     return entry, alive_w
 
@@ -1786,7 +1921,7 @@ def discover(package, site, user):
 def loss_op(request):
     """A checked loss-account route request, or None if it is not one."""
     op = request.get("op") if isinstance(request, dict) else None
-    if op == "loss-accounts" and request == {"v": 1, "op": op}:
+    if op in ("loss-accounts", "capture-loss-accounts") and request == {"v": 1, "op": op}:
         return {"op": op}
     if op in ("loss-account", "retire-loss-account"):
         name = request.get("account")
@@ -1799,26 +1934,35 @@ def loss_op(request):
 
 def read_loss_account(directory, name):
     fd = os.open(os.path.join(directory, name + ".json"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-    with os.fdopen(fd, "r", encoding="utf-8") as file:
+    with os.fdopen(fd, "rb") as file:
         if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
             raise ValueError("not regular")
-        text = file.read(4 * LOSS_ACCOUNT_LIMIT + 1)
-    if len(text) > 4 * LOSS_ACCOUNT_LIMIT:
+        text = file.read(LOSS_RECORD_LIMIT + 1)
+    if len(text) > LOSS_RECORD_LIMIT:
         raise ValueError("exceeds bound")
     value = json.loads(text)
     if not isinstance(value, dict) or value.get("schema") != LOSS_ACCOUNT_SCHEMA:
         raise ValueError("not a loss account")
+    uid = run_requester(directory)
+    if value.get("account") != name or uid is None or value.get("requester") != control_requester(uid):
+        raise ValueError("loss account identity mismatch")
+    store = value.get("store_account")
+    if store is not None and (not isinstance(store, dict) or store.get("schema") != STORE_ACCOUNT_SCHEMA
+            or store.get("requester") != value["requester"] or not isinstance(store.get("inputs"), list)
+            or not all(isinstance(item, dict) for item in store["inputs"])):
+        raise ValueError("malformed nested store account")
     return value
 
 
 def loss_summary(record):
-    store = record.get("store_account") or {}
+    store = record.get("store_account")
+    store = store if isinstance(store, dict) else {}
     return {"captured": record.get("captured"), "root": store.get("root"),
             "readings": store.get("readings"), "inputs_total": store.get("inputs_total"),
             "complete": store.get("complete"), "store_account_error": record.get("store_account_error")}
 
 
-def loss_route(site, user, op):
+def loss_route(site, user, op, package=None):
     """This requester's retained loss accounts: list, read one, or retire one.
     Reading changes nothing; a failed write leaves delivery unknown (93)."""
     base = site["run_base"]
@@ -1834,31 +1978,40 @@ def loss_route(site, user, op):
                 "retry": "do-not-replay",
                 "meaning": "retained per-input loss accounts of this requester's lost or unretired roots; not settlement, continuation, a new owner or replay authority"}
     delivered = True
-    if op["op"] == "loss-accounts":
+    if op["op"] == "capture-loss-accounts":
+        # Effectful retention/disposition only. No task/provider admission.
+        swept = sweep(user_dir, package, explicit_capture=True) if os.path.isdir(user_dir) else []
+        for result in swept:
+            delivered &= emit({"frontdoor": "swept", **result})
+        terminal.update(runs=len(swept), effects="capture/prune/discard of lock-free stale runs only",
+                        incomplete=any(not result.get("ok") or result.get("loss_account", {}).get("store_kept") and not result.get("loss_account", {}).get("complete") for result in swept))
+    elif op["op"] == "loss-accounts":
         for name in names:
             try:
                 line = {"frontdoor": "loss-account", "account": name, **loss_summary(read_loss_account(directory, name))}
-            except (OSError, ValueError) as error:
+            except (OSError, ValueError, TypeError, RecursionError) as error:
+                terminal["incomplete"] = True
                 line = {"frontdoor": "loss-account", "account": name, "error": type(error).__name__}
             delivered &= emit(line)
-        terminal.update(accounts=len(names), capacity=MAX_LOSS_ACCOUNTS)
+        terminal.update(accounts=len(names), capacity=MAX_LOSS_ACCOUNTS, capacity_kind="soft capture threshold; concurrent captures may overshoot")
     elif op["account"] not in names:
         raise Refused(f"{op['op']}: no such account")
     elif op["op"] == "loss-account":
         try:
             record = read_loss_account(directory, op["account"])
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, TypeError, RecursionError) as error:
             raise Refused(f"loss-account: unreadable: {type(error).__name__}") from None
         delivered &= emit({"frontdoor": "loss-account", "account": op["account"], "record": record})
         terminal["account"] = op["account"]
     else:
         os.unlink(os.path.join(directory, op["account"] + ".json"))
+        sync_directory(directory)
         terminal.update(account=op["account"], retired=True,
                         meaning="the requester disposed of a retained copy; this settles nothing and authorizes nothing")
-    terminal["exit"] = 0 if delivered else EXIT_UNKNOWN
+    terminal["exit"] = EXIT_UNKNOWN if not delivered or terminal.get("incomplete") else 0
     if not emit(terminal) or not delivered:
         return EXIT_UNKNOWN
-    return 0
+    return terminal["exit"]
 
 
 def entry_exit(status, killed):
@@ -1950,9 +2103,9 @@ def run_locked(argv, environ, stdin_fd=0):
         return EXIT_REFUSED
     if checked is None or "op" in checked:
         try:
-            return discover(package, site, user) if checked is None else loss_route(site, user, checked)
-        except (Refused, OSError) as error:
-            emit({"frontdoor": "terminal", "stage": "refused", "reason": str(error) if isinstance(error, Refused) else type(error).__name__, "effects": "none"})
+            return discover(package, site, user) if checked is None else loss_route(site, user, checked, package)
+        except (Refused, OSError, ValueError, TypeError, RecursionError) as error:
+            emit({"frontdoor": "terminal", "stage": "refused", "reason": str(error) if isinstance(error, Refused) else type(error).__name__, "effects": "possible" if checked and checked.get("op") in ("capture-loss-accounts", "retire-loss-account") else "none"})
             return EXIT_REFUSED
 
     children = checked["children"]
