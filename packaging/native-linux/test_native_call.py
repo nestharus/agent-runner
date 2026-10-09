@@ -35,6 +35,12 @@ FAKE_FRONTDOOR = textwrap.dedent("""
         say({"frontdoor": "terminal", "stage": "refused", "reason": "x", "effects": "none"}); sys.exit(90)
     say({"frontdoor": "admitted", "run": "r1"})
     say({"entry": "setup-completed", "launch": {}})
+    if mode.startswith("native-outcome-"):
+        # Only bounded public owner records enter this caller fixture; the
+        # caller is a capture/export boundary, not an endpoint redactor.
+        say({"event": "ack", "index": 0, "message_id": "m1"})
+        event = json.load(open(os.path.join(os.path.dirname(__file__), "native-event.json")))
+        say(event)
     if mode == "rejected":
         say({"event":"rejected", "index":0, "code":-32010, "durable":True,
              "insertion":"unresolved", "retry":"not-authorized", "endpoint_declaration":"not-inserted",
@@ -136,6 +142,55 @@ class Calls(Scratch):
     def seen(self):
         with open(self.path("fd", "seen.json")) as file:
             return json.load(file)
+
+    def test_native_outcome_diagnostics_reach_exports_without_answer_authority(self):
+        for case, report in (
+            ("quota", {"state": "valid", "custody": "complete", "status_code": 1,
+                       "status": {"kind": "exited", "code": 1},
+                       "terminal_signal_kind": "quota_exhausted_inband",
+                       "launch_output": {"stdout_bytes": 0, "stderr_bytes": 321, "data_event_count": 2}}),
+            ("signal", {"state": "valid", "status_code": None,
+                        "status": {"kind": "signal_terminated", "signal": 9}, "terminal_signal_kind": "signal_exit"}),
+            ("missing", {"state": "absent", "status_code": None, "status": None, "terminal_signal_kind": None}),
+            ("unsupported", {"state": "invalid-or-unsupported", "status": None, "terminal_signal_kind": None}),
+            ("contradictory-clean", {"state": "valid", "status_code": 0,
+                                     "status": {"kind": "exited", "code": 0}, "terminal_signal_kind": "clean_exit"}),
+        ):
+            with self.subTest(case=case):
+                event = {"event": "turn-end", "input": 0, "message_id": "m1", "native_report_for": "m1",
+                         "stop_reason": "_oulipoly_native_failed", "own_output": False, "own_turn_end": True,
+                         "native_report": {**report, "source": "endpoint-report", "meaning": "diagnostic-only",
+                                           "physical_custody": "not-certified-by-report"},
+                         "endpoint_durability": "not-established", "canonical_publication": "not-established"}
+                self.write("fd/native-event.json", event)
+                code, out, result = self.call("native-outcome-" + case)
+                self.assertEqual((code, result["class"]), (1, "no-answer"))
+                self.assertEqual(result["front_door_exit"], 87)
+                self.assertEqual(result["answer"]["turn_end"], event)
+                self.assertFalse(result["answer"]["present"])
+                self.assertEqual(result["answer"]["linked_messages"], 0)
+                self.assertEqual(list(result["sends"]), ["close"])
+                self.assertEqual(result["collection"]["errors"], [])
+                with open(os.path.join(out, "events.jsonl")) as file:
+                    captured = [json.loads(line) for line in file]
+                self.assertEqual([e for e in captured if e.get("event") == "turn-end"], [event])
+
+    def test_native_outcome_diagnostics_do_not_veto_existing_answer(self):
+        # Report validity and classification cannot replace the caller's
+        # existing ACK/linked-text/end_turn criteria in either direction.
+        events = [
+            {"event": "ack", "index": 0, "message_id": "m1"},
+            {"event": "agent-message", "input": 0, "parent_message_id": "m1", "text": "fixture answer"},
+            {"event": "turn-end", "input": 0, "stop_reason": "end_turn",
+             "native_report": {"state": "invalid-or-unsupported", "terminal_signal_kind": "quota_exhausted_inband"}},
+            {"entry": "terminal", "relay": "complete"},
+            {"frontdoor": "terminal", "exit": 87},
+        ]
+        collection = {"stdout_eof": True, "errors": []}
+        self.assertEqual(native_call.classify(87, collection, events, {})[:2], ("answered", "fixture answer"))
+        events[2]["stop_reason"] = "_oulipoly_native_failed"
+        events[2]["native_report"] = {"state": "valid", "terminal_signal_kind": "clean_exit", "status_code": 0}
+        self.assertEqual(native_call.classify(87, collection, events, {})[0], "no-answer")
 
     def test_rejection_is_exported_without_close_or_retry_and_deadline_cancels(self):
         code, out, result = self.call("rejected", "--deadline", "1")

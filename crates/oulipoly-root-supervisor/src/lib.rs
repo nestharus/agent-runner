@@ -158,7 +158,13 @@
 //! Tagged idle coverage, an input's own end, native custody reports, endpoint
 //! durability and host canonical publication are separate observations.
 //! Public reports project safe native facts and attribute contrary record
-//! diagnostics without publishing arbitrary private payloads. Diagnostics
+//! diagnostics without publishing arbitrary private payloads. `native_report`
+//! retains common status kinds/code/signal, terminal classification kinds and
+//! optional launch-output byte/event counts as diagnostic-only endpoint reports,
+//! not host measurements or proof. Unsupported/missing optional diagnostics are
+//! null; report validity, ACK/tagged end, answer and settlement stay independent.
+//! Free-form failure codes, reasons, evidence, messages and output hashes are
+//! withheld. Diagnostics
 //! beyond the bounded post-idle window can still arrive during ordinary
 //! reads; silence and owner close do not certify endpoint persistence.
 //!

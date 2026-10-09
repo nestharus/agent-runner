@@ -2645,17 +2645,52 @@ impl HoldWatch {
     }
 }
 
-/// Safe projection: free-form report/status/failure text never becomes public.
+/// Diagnostic-only endpoint reports, never host measurements or authority.
+/// NativeTurnMeta leaves status/signal objects open, so decode their common
+/// vocabulary separately. Never serialize those objects (or free-form failure
+/// codes, reasons, evidence, hashes or messages) into the public record.
 fn native_summary(raw: Option<&Value>) -> Value {
+    use agent_provider_contract::generated::{
+        LaunchOutputCompleteMarkerValueV1, ProcessStatus, TerminalSignalKind,
+    };
+
+    let typed = raw.and_then(agent_provider_contract::acp::NativeTurn::from_report);
     let state = match raw {
         None => "absent",
         Some(Value::Null) => "null",
-        Some(value) if agent_provider_contract::acp::NativeTurn::from_report(value).is_some() => {
-            "valid"
-        }
+        Some(_) if typed.is_some() => "valid",
         Some(_) => "invalid-or-unsupported",
     };
-    let typed = raw.and_then(agent_provider_contract::acp::NativeTurn::from_report);
+    let report = typed.as_ref().map(|turn| &turn.report);
+    let status = report
+        .and_then(|report| report.get("status"))
+        .and_then(|value| serde_json::from_value::<ProcessStatus>(value.clone()).ok())
+        .map(|status| match status {
+            ProcessStatus::Exited { code } => json!({"kind":"exited", "code":code}),
+            ProcessStatus::SignalTerminated { signal } => {
+                json!({"kind":"signal_terminated", "signal":signal})
+            }
+            ProcessStatus::SpawnError { .. } => json!({"kind":"spawn_error"}),
+            ProcessStatus::ProlongedSilence { .. } => json!({"kind":"prolonged_silence"}),
+            ProcessStatus::Cancelled => json!({"kind":"cancelled"}),
+            ProcessStatus::Unknown => json!({"kind":"unknown"}),
+        });
+    let terminal_signal_kind = report
+        .and_then(|report| report.pointer("/terminal_signal/kind"))
+        .and_then(|value| serde_json::from_value::<TerminalSignalKind>(value.clone()).ok())
+        .map(|kind| kind.as_str());
+    let launch_output = report
+        .and_then(|report| report.get("launch_output"))
+        .and_then(|value| {
+            serde_json::from_value::<LaunchOutputCompleteMarkerValueV1>(value.clone()).ok()
+        })
+        .map(|output| {
+            json!({
+                "stdout_bytes":output.stdout.bytes,
+                "stderr_bytes":output.stderr.bytes,
+                "data_event_count":output.data_event_count,
+            })
+        });
     json!({
         "state": state,
         "custody": typed.as_ref().map(|turn| match turn.custody {
@@ -2666,7 +2701,11 @@ fn native_summary(raw: Option<&Value>) -> Value {
             agent_provider_contract::acp::NativeCustody::Incomplete => "incomplete",
         }),
         "status_code": typed.as_ref().and_then(|turn| turn.report.pointer("/status/code")).and_then(Value::as_i64),
+        "status": status,
+        "terminal_signal_kind": terminal_signal_kind,
+        "launch_output": launch_output,
         "source": "endpoint-report",
+        "meaning": "diagnostic-only",
         "physical_custody": "not-certified-by-report",
     })
 }
@@ -2785,6 +2824,377 @@ mod tests {
             rx,
             dir,
         )
+    }
+
+    // Exercise the real ACP decoder, transport, durable ACK/tagged end and
+    // public Worker report. No provider, native CLI or namespace is launched.
+    fn native_outcome_event(
+        case: &str,
+        raw: Option<Value>,
+        last: &str,
+        acknowledged: bool,
+    ) -> Value {
+        use std::io::Write;
+
+        let (mut worker, rx, dir) = worker();
+        worker.session = Some("fixture-session".into());
+        let ack = DurableAck {
+            label: "accepted".into(),
+            basis: Some("single-attempt".into()),
+            recovered: false,
+            generation: worker.store.lock().unwrap().generation(),
+            message_id: Some("m1".into()),
+        };
+        if acknowledged {
+            let mut store = worker.store.lock().unwrap();
+            let attempt = store.begin_attempt(0, 0).unwrap();
+            store.record_ack(0, 0, attempt, &ack).unwrap();
+            worker.tracked[0].ack = Some(ack.clone());
+        }
+        worker.views.lock().unwrap().push(bash::View {
+            id: "test".into(),
+            session: worker.session.clone(),
+            works: vec![],
+            open: vec![OpenInput {
+                index: 0,
+                message_id: acknowledged.then(|| "m1".into()),
+            }],
+            owed_async: vec![],
+            async_accepted: 0,
+            async_recovered: 0,
+            async_turn_ended: 0,
+            async_undelivered: vec![],
+        });
+        let mut update = json!({
+            "sessionUpdate":"state_update", "state":"idle", "stopReason":"_oulipoly_native_failed",
+            "_meta": {agent_provider_contract::acp::TURN_INPUT_META:last},
+        });
+        if let Some(raw) = raw {
+            update["_meta"][agent_provider_contract::acp::NATIVE_TURN_META] = raw;
+        }
+        let (read, write) = crate::sys::pipe().unwrap();
+        let mut sender = File::from(write);
+        writeln!(
+            sender,
+            "{}",
+            json!({
+                "jsonrpc":"2.0", "method":"session/update",
+                "params":{"sessionId":"fixture-session", "update":update},
+            })
+        )
+        .unwrap();
+        drop(sender);
+        let mut client = AcpClient::new(
+            HarnessTransport::new(
+                File::from(read),
+                File::open("/dev/null").unwrap(),
+                Rc::new(Observed::default()),
+                Arc::new(crate::transport::StopSignal::new().unwrap()),
+                None,
+            ),
+            ClientInfo {
+                name: "fixture".into(),
+                version: "1".into(),
+            },
+        );
+        assert!(
+            matches!(
+                client.receive_event().unwrap(),
+                Some(SessionEvent::Idle { .. })
+            ),
+            "{case}"
+        );
+        worker.report_turn(&client, &mut 0);
+        let ends: Vec<_> = rx
+            .try_iter()
+            .filter_map(|event| match event {
+                Event::Report(value) if value["event"] == "turn-end" => Some(value),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            worker.answered.is_empty(),
+            "diagnostics created answer authority: {case}"
+        );
+        let ack_fields = |ack: &DurableAck| {
+            (
+                ack.label.clone(),
+                ack.basis.clone(),
+                ack.recovered,
+                ack.generation,
+                ack.message_id.clone(),
+            )
+        };
+        assert_eq!(
+            worker.tracked[0].ack.as_ref().map(ack_fields),
+            acknowledged.then(|| ack_fields(&ack)),
+            "{case}"
+        );
+        assert_eq!(worker.tracked[0].unknown_attempts, 0, "{case}");
+        if !acknowledged {
+            assert!(
+                ends.is_empty(),
+                "diagnostics manufactured an ACK/end: {case}"
+            );
+            assert!(!worker.tracked[0].turn_ended);
+            assert_eq!(worker.views.lock().unwrap()[0].open.len(), 1);
+            return Value::Null;
+        }
+        assert!(
+            worker.tracked[0].turn_ended,
+            "optional diagnostics blocked tagged end: {case}"
+        );
+        assert!(worker.views.lock().unwrap()[0].open.is_empty());
+        let stored = rusqlite::Connection::open(dir.0.join(crate::store::DB_FILE)).unwrap();
+        let ended: bool = stored
+            .query_row(
+                "SELECT turn_end_generation IS NOT NULL FROM message WHERE harness=0 AND idx=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(ended, "{case}");
+        assert_eq!(ends.len(), 1, "{case}");
+        let end = ends.into_iter().next().unwrap();
+        assert_eq!(end["stop_reason"], "_oulipoly_native_failed", "{case}");
+        assert_eq!(end["own_output"], false, "{case}");
+        assert_eq!(end["native_report_for"], last, "{case}");
+        assert_eq!(end["own_turn_end"], last == "m1", "{case}");
+        assert_eq!(end["endpoint_durability"], "not-established", "{case}");
+        assert_eq!(end["canonical_publication"], "not-established", "{case}");
+        assert_eq!(end["native_report"]["source"], "endpoint-report", "{case}");
+        assert_eq!(
+            end["native_report"]["physical_custody"], "not-certified-by-report",
+            "{case}"
+        );
+        assert_eq!(end["native_report"]["meaning"], "diagnostic-only", "{case}");
+        assert!(!end.to_string().contains("FIXTURE-SECRET"), "{case}: {end}");
+        // Retain actual public boundary specimens for an offline caller-export
+        // encounter, without adding a production journal or test-only API.
+        println!("NATIVE_OUTCOME_EVENT {case} {end}");
+        end
+    }
+
+    fn native_outcome_report() -> Value {
+        json!({"request_id":"FIXTURE-SECRET-request", "custody":"complete", "status":{"kind":"exited", "code":1}})
+    }
+
+    #[test]
+    fn native_outcome_closed_classifications_survive_tagged_end() {
+        for kind in [
+            "clean_exit",
+            "nonzero_exit",
+            "signal_exit",
+            "spawn_error",
+            "quota_exhausted_inband",
+            "maybe_quota_exhausted",
+            "rate_limited",
+            "provider_storage_contention",
+            "provider_unavailable",
+            "prolonged_silence",
+            "cancelled",
+            "unknown",
+        ] {
+            let mut report = native_outcome_report();
+            report["terminal_signal"] = json!({"kind":kind, "evidence":"FIXTURE-SECRET-evidence", "observed_at_unix_ms":23});
+            let end = native_outcome_event(kind, Some(report), "m1", true);
+            assert_eq!(end["native_report"]["state"], "valid");
+            assert_eq!(
+                end["native_report"]["status"],
+                json!({"kind":"exited", "code":1})
+            );
+            assert_eq!(end["native_report"]["status_code"], 1);
+            assert_eq!(end["native_report"]["terminal_signal_kind"], kind);
+            assert!(end["native_report"]["launch_output"].is_null());
+        }
+    }
+
+    #[test]
+    fn native_outcome_signal_and_reason_statuses_are_bounded() {
+        for (case, status, expected) in [
+            (
+                "signal",
+                json!({"kind":"signal_terminated", "signal":9}),
+                json!({"kind":"signal_terminated", "signal":9}),
+            ),
+            (
+                "spawn",
+                json!({"kind":"spawn_error", "reason":"FIXTURE-SECRET-spawn"}),
+                json!({"kind":"spawn_error"}),
+            ),
+            (
+                "silence",
+                json!({"kind":"prolonged_silence", "reason":"FIXTURE-SECRET-silence"}),
+                json!({"kind":"prolonged_silence"}),
+            ),
+            (
+                "cancelled",
+                json!({"kind":"cancelled"}),
+                json!({"kind":"cancelled"}),
+            ),
+            (
+                "unknown",
+                json!({"kind":"unknown"}),
+                json!({"kind":"unknown"}),
+            ),
+        ] {
+            let mut report = native_outcome_report();
+            report["status"] = status;
+            report["failure"] =
+                json!({"code":"FIXTURE-SECRET-code", "message":"FIXTURE-SECRET-message"});
+            let end = native_outcome_event(case, Some(report), "m1", true);
+            assert_eq!(end["native_report"]["status"], expected);
+            assert!(end["native_report"]["status_code"].is_null());
+        }
+    }
+
+    #[test]
+    fn native_outcome_missing_and_legacy_reports_keep_turn_authority() {
+        for (case, raw, state, custody, code) in [
+            ("absent", None, "absent", Value::Null, Value::Null),
+            ("null", Some(Value::Null), "null", Value::Null, Value::Null),
+            (
+                "minimal",
+                Some(json!({"request_id":"fixture", "custody":"incomplete"})),
+                "valid",
+                json!("incomplete"),
+                Value::Null,
+            ),
+            (
+                "legacy",
+                Some(json!({"request_id":"fixture", "custody":"complete", "status":{"code":1}})),
+                "valid",
+                json!("complete"),
+                json!(1),
+            ),
+            (
+                "future-report",
+                Some(json!({"request_id":"fixture", "custody":"future-FIXTURE-SECRET"})),
+                "invalid-or-unsupported",
+                Value::Null,
+                Value::Null,
+            ),
+        ] {
+            let end = native_outcome_event(case, raw, "m1", true);
+            let report = &end["native_report"];
+            assert_eq!(report["state"], state);
+            assert_eq!(report["custody"], custody);
+            assert_eq!(report["status_code"], code);
+            for field in ["status", "terminal_signal_kind", "launch_output"] {
+                assert!(report[field].is_null(), "{case}: {report}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_outcome_hostile_optional_objects_do_not_control_turns() {
+        for (case, status, signal) in [
+            (
+                "future-kinds",
+                json!({"kind":"FIXTURE-SECRET-status"}),
+                json!({"kind":"FIXTURE-SECRET-signal"}),
+            ),
+            (
+                "wrong-types",
+                json!({"kind":{"FIXTURE-SECRET":true}, "code":"FIXTURE-SECRET-code"}),
+                json!({"kind":["FIXTURE-SECRET"]}),
+            ),
+            (
+                "code-overflow",
+                json!({"kind":"exited", "code":2147483648_i64}),
+                json!({}),
+            ),
+            (
+                "signal-overflow",
+                json!({"kind":"signal_terminated", "signal":-2147483649_i64}),
+                json!({}),
+            ),
+            ("missing-code", json!({"kind":"exited"}), json!({})),
+            (
+                "missing-signal",
+                json!({"kind":"signal_terminated"}),
+                json!({}),
+            ),
+            ("missing-reason", json!({"kind":"spawn_error"}), json!({})),
+        ] {
+            let mut report = native_outcome_report();
+            report["status"] = status;
+            report["terminal_signal"] = signal;
+            let end = native_outcome_event(case, Some(report), "m1", true);
+            assert_eq!(end["native_report"]["state"], "valid");
+            assert_eq!(end["native_report"]["custody"], "complete");
+            assert!(end["native_report"]["status"].is_null());
+            assert!(end["native_report"]["terminal_signal_kind"].is_null());
+        }
+        // Ancillary diagnostic garbage is not an admission dependency.
+        let mut report = native_outcome_report();
+        report["status"]["private"] = json!("FIXTURE-SECRET-private");
+        report["terminal_signal"] = json!({"kind":"rate_limited", "evidence":{"FIXTURE-SECRET":true}, "observed_at_unix_ms":"FIXTURE-SECRET"});
+        let end = native_outcome_event("ancillary-garbage", Some(report), "m1", true);
+        assert_eq!(
+            end["native_report"]["status"],
+            json!({"kind":"exited", "code":1})
+        );
+        assert_eq!(end["native_report"]["terminal_signal_kind"], "rate_limited");
+    }
+
+    #[test]
+    fn native_outcome_output_counts_have_numeric_bounds_and_no_hashes() {
+        let mut report = native_outcome_report();
+        report["launch_output"] = json!({
+            "protocol":"oulipoly.launch_output/v1",
+            "stdout":{"bytes":0, "sha256":"a".repeat(64)},
+            "stderr":{"bytes":u64::MAX, "sha256":"b".repeat(64)},
+            "data_event_count":17,
+        });
+        let end = native_outcome_event("counts", Some(report.clone()), "m1", true);
+        assert_eq!(
+            end["native_report"]["launch_output"],
+            json!({"stdout_bytes":0, "stderr_bytes":u64::MAX, "data_event_count":17})
+        );
+        assert!(!end.to_string().contains(&"a".repeat(64)));
+        assert!(!end.to_string().contains(&"b".repeat(64)));
+        for (case, pointer, bad) in [
+            ("negative-bytes", "/launch_output/stderr/bytes", json!(-1)),
+            (
+                "string-count",
+                "/launch_output/data_event_count",
+                json!("FIXTURE-SECRET-count"),
+            ),
+            (
+                "future-output",
+                "/launch_output/protocol",
+                json!("FIXTURE-SECRET-protocol"),
+            ),
+            (
+                "extra-output",
+                "/launch_output/stderr",
+                json!({"bytes":5, "sha256":"b".repeat(64), "payload":"FIXTURE-SECRET"}),
+            ),
+        ] {
+            let mut raw = report.clone();
+            *raw.pointer_mut(pointer).unwrap() = bad;
+            let end = native_outcome_event(case, Some(raw), "m1", true);
+            assert_eq!(end["native_report"]["state"], "invalid-or-unsupported");
+            assert!(end["native_report"]["launch_output"].is_null());
+        }
+    }
+
+    #[test]
+    fn native_outcome_cannot_create_ack_or_change_covering_attribution() {
+        let mut report = native_outcome_report();
+        report["status"] = json!({"kind":"exited", "code":0});
+        report["terminal_signal"] = json!({"kind":"clean_exit"});
+        assert!(native_outcome_event("unacked-clean", Some(report.clone()), "m1", false).is_null());
+        let end = native_outcome_event("covering-clean", Some(report), "m2", true);
+        assert_eq!(end["message_id"], "m1");
+        assert_eq!(end["native_report_for"], "m2");
+        assert_eq!(end["native_report"]["status_code"], 0);
+        assert_eq!(end["native_report"]["terminal_signal_kind"], "clean_exit");
+        // Even a reported clean exit does not override the native failed stop,
+        // create output, or certify custody/publication for the covered input.
+        assert_eq!(end["stop_reason"], "_oulipoly_native_failed");
+        assert_eq!(end["own_turn_end"], false);
     }
 
     #[test]
