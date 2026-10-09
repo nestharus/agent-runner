@@ -404,8 +404,11 @@ A non-retirable discard first captures a per-input reading for the same OS
 requester. After starting the entry, the front door restores its original
 PID namespace **for subsequent children** so a reader can fork after entry
 init dies. The entry stays its direct child, PID 1 with private `/proc` and
-the existing parent-death/pipe race fence. Restore failure refuses the launch
-and kills/collects any started entry. This is not survivor/recovery redesign.
+the existing parent-death/pipe race fence. Restore failure reports any started
+entry and its actual kill/collected-status evidence in ordinary/live startup
+failure and ending capture. Kill/collection is attempted, not guaranteed: an
+unobserved end returns unknown (93), without capture, pruning or removal of
+its source run. This is not survivor/recovery redesign.
 
 After abrupt front-door death, capture only this requester's lock-free stale
 runs without admitting a task or invoking any provider:
@@ -436,8 +439,8 @@ semantic use, receiver truth, processing or replay authority.
 0600 records). First creation syncs the parent; publication syncs file,
 replacement and directory before checking the actual public reader. The
 whole saved record must fit the same served **4 MiB byte bound**. Unreadable,
-malformed, unwritable, oversized or partial readings keep the original
-store. Deferred discard prunes adapter scratch and the private entry request;
+structurally malformed, identity-mismatched, unwritable, oversized or partial
+readings keep the original store. Deferred discard prunes adapter scratch and the private entry request;
 the kept DB still contains private task text under root custody, not a
 scrubbed public store. Capture wording describes discard **intention**;
 only the disposition result observes removal.
@@ -445,9 +448,21 @@ only the disposition result observes removal.
 The outer terminal is a bounded allowlisted status/retirement/custody
 summary, not its lineage, subjects or required-record bodies. It excludes
 owner tokens, payloads, env/credentials and tool bodies. Known ending
-status/kill evidence survives later sweep/refresh separately. Malformed
-terminal/nested metadata and identity mismatches return unknown/refusal or
+status/kill evidence survives later sweep/refresh separately. Checked malformed
+terminal/nested containers and identity mismatches return unknown/refusal or
 partial results without discarding source evidence.
+
+**Trusted-producer boundary:** the custody-checked Rust supervisor from the
+same package owns per-input semantics and non-authority invariants. Python
+checks structure, identity, bounds and listing counts at capture; its public
+reader (also used by observational list/read) checks structure, identity and
+bounds, not per-input facts, readings or nested retry/retirement semantics.
+Reader acceptance and producer `complete:true` are not full semantic
+validation. Well-formed but semantically contradictory producer output can
+therefore be accepted and permit discard; producer correctness is a retained
+dependency, not a malformed-output guarantee. Reopen on producer/schema
+changes, a second producer, actual malformed producer output, or a consumer
+using nested metadata as authority or completeness evidence.
 
 The inner `root_store_account/v1` reads identity and facts in one SQLite
 read transaction, claiming no generation, locking no owner, starting no

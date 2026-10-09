@@ -125,6 +125,18 @@ class RunFailed(Exception):
     """Refused or failed after the run directory was made."""
 
 
+class StartedEntryFailed(RunFailed):
+    """Startup failed after Popen returned: custody and cleanup observations
+    must reach the caller even if the entry's end could not be collected."""
+
+    def __init__(self, entry, cause, status, killed, collection_errors):
+        super().__init__(f"entry started; startup failed: {type(cause).__name__}")
+        self.entry = entry
+        self.status = status
+        self.killed = killed
+        self.collection_errors = collection_errors
+
+
 # Where this process's lines go (stdout; a test may name another fd).
 OUT_FD = 1
 
@@ -795,7 +807,8 @@ def retain_loss_account(run, terminal, package, capture, keep_store=False):
                     "reason": "prior loss account unreadable: " + type(failure).__name__}
     account, error = store_account(package, store, uid)
     # Never destroy omitted-input evidence, even when a partial reading is
-    # useful. Complete here does not mean settlement or native processing.
+    # useful. Counts/complete rely on the same-package trusted producer;
+    # this is not semantic validation, settlement or native processing.
     complete = account is not None and account.get("complete") is True \
         and type(account.get("inputs_total")) is int and isinstance(account.get("inputs"), list) \
         and account["inputs_total"] == len(account["inputs"]) and account.get("inputs_omitted", 0) == 0 \
@@ -838,7 +851,9 @@ def retain_loss_account(run, terminal, package, capture, keep_store=False):
         record["store_account_observed_at"] = prior.get("store_account_observed_at", prior.get("captured"))
     try:
         write_durable(directory, name + ".json", record)
-        # Use the actual public reader before allowing destruction.
+        # Check served bounds/structure/identity with the actual reader.
+        # Per-input semantics and non-authority invariants are owned by the
+        # same-package Rust producer, not revalidated by this Python layer.
         read_loss_account(directory, name)
     except (OSError, ValueError, TypeError, RecursionError) as failure:
         return {"retained": False, "store_kept": True, "reason": "loss account publication unavailable: " + type(failure).__name__}
@@ -999,17 +1014,52 @@ def start_entry(package, request_path):
                 cwd="/", preexec_fn=contained(alive_r, alive_w), close_fds=True)
         finally:
             _check(_libc.setns(original, os.CLONE_NEWPID), "restore PID namespace for children")
-    except BaseException:
-        # A failed restore must not orphan a successfully spawned entry.
+    except BaseException as cause:
         os.close(alive_w)
-        if entry is not None:
+        if entry is None:
+            raise
+        # Keep the successfully started handle and actual cleanup evidence.
+        # A cleanup failure must neither replace the cause nor imply drain.
+        status, killed, errors = None, False, []
+        try:
             entry.kill()
-            entry.wait(timeout=COLLECTION_S)
-        raise
+            killed = True
+        except (OSError, subprocess.SubprocessError) as error:
+            errors.append("entry-kill-failed:" + type(error).__name__)
+        try:
+            status = entry.wait(timeout=COLLECTION_S)
+        except (OSError, subprocess.SubprocessError) as error:
+            errors.append("entry-wait-failed:" + type(error).__name__)
+        raise StartedEntryFailed(entry, cause, status, killed, errors) from cause
     finally:
         os.close(original)
         os.close(alive_r)
     return entry, alive_w
+
+
+def start_failure(run_id, run_dir, retention, package, error):
+    """Truthful startup ending; an unobserved started-entry end forbids
+    capture, prune and removal. No new cleanup/recovery attempt here."""
+    started = isinstance(error, StartedEntryFailed)
+    status = error.status if started else None
+    killed = error.killed if started else False
+    retired = retire(run_dir, retention, package=package,
+                     capture={"by": "front-door-failed" if started else "entry-not-started",
+                              "entry_status": status, "killed": killed}) \
+        if not started or status is not None else {"ok": False, "stop": "unknown", "run_removed": False}
+    if started and status is None:
+        code = EXIT_UNKNOWN
+    elif not retired["ok"]:
+        code = EXIT_CLEANUP_FAILED
+    elif killed:
+        code = EXIT_KILLED
+    else:
+        code = EXIT_UNKNOWN if started else EXIT_RUN_FAILED
+    return {"frontdoor": "terminal", "stage": "run-failed", "run": run_id,
+            "reason": str(error) if started else f"entry not started: {type(error).__name__}",
+            "entry_started": started, "entry_status": status, "killed": killed,
+            "collection_errors": error.collection_errors if started else [],
+            "retire": retired, "effects": "possible", "exit": code, "retry": "do-not-replay"}
 
 
 # Control relay.
@@ -1712,11 +1762,22 @@ def live_daemon(package, site, checked, run_id, run_dir, request_path, user, lis
         signal.signal(number, signal.SIG_IGN)
     try:
         entry, alive = start_entry(package, request_path)
-    except (OSError, subprocess.SubprocessError) as error:
-        os.write(ready_w, b"failed " + type(error).__name__.encode() + b"\n")
+    except (StartedEntryFailed, OSError, subprocess.SubprocessError) as error:
         listener.close()
-        retire(run_dir, checked["retention"], package=package, capture={"by": "entry-not-started"})
-        return EXIT_RUN_FAILED
+        terminal = start_failure(run_id, run_dir, checked["retention"], package, error)
+        # No live client exists yet. Carry bounded ending/disposition evidence
+        # to the opening caller instead of losing it to detached /dev/null.
+        retired = terminal["retire"]
+        terminal["retire"] = {key: retired[key] for key in ("ok", "stop", "run_removed") if key in retired}
+        loss = retired.get("loss_account")
+        if isinstance(loss, dict):
+            terminal["retire"]["loss_account"] = {key: loss[key] for key in
+                ("retained", "account", "store_kept", "complete", "route") if key in loss}
+        try:
+            os.write(ready_w, json.dumps(terminal).encode() + b"\n")
+        finally:
+            os.close(ready_w)
+        return terminal["exit"]
     relay = LiveRelay(entry, run_dir, checked["deadline"] + site["cancel_grace_s"], site["cancel_grace_s"],
                       listener, user.pw_uid, run_id, token)
     signal.signal(signal.SIGTERM, lambda number, frame: relay.signals.append(number))
@@ -1796,7 +1857,7 @@ def open_live(package, site, checked, run_id, run_dir, request_path, user):
     listener.close()
     data = b""
     end = time.monotonic() + ADMISSION_S
-    while b"\n" not in data and time.monotonic() < end:
+    while b"\n" not in data and len(data) <= HELLO_LIMIT and time.monotonic() < end:
         if not select.select([ready_r], [], [], max(0.0, end - time.monotonic()))[0]:
             break
         chunk = os.read(ready_r, 256)
@@ -1805,10 +1866,18 @@ def open_live(package, site, checked, run_id, run_dir, request_path, user):
         data += chunk
     os.close(ready_r)
     if data != b"live\n":
+        try:
+            terminal = json.loads(data) if len(data) <= HELLO_LIMIT else None
+        except ValueError:
+            terminal = None
+        if isinstance(terminal, dict) and terminal.get("frontdoor") == "terminal" \
+                and terminal.get("run") == run_id and terminal.get("stage") == "run-failed" \
+                and terminal.get("exit") in (EXIT_RUN_FAILED, EXIT_KILLED, EXIT_UNKNOWN, EXIT_CLEANUP_FAILED):
+            return terminal["exit"] if emit(terminal) else EXIT_UNKNOWN
         emit({"frontdoor": "terminal", "stage": "run-failed", "run": run_id,
-              "reason": "live root not started: " + (data.decode(errors="replace").strip() or "no readiness"),
+              "reason": "live startup readiness unavailable: " + (data.decode(errors="replace").strip() or "no readiness"),
               "effects": "possible", "retry": "do-not-replay"})
-        return EXIT_UNKNOWN if not data else EXIT_RUN_FAILED
+        return EXIT_UNKNOWN
     emit({
         "frontdoor": "terminal",
         "stage": "live-opened",
@@ -1933,6 +2002,9 @@ def loss_op(request):
 
 
 def read_loss_account(directory, name):
+    """Bounded structural/identity check, not semantic validation of the
+    trusted producer's per-input facts, readings or non-authority fields.
+    Observational read/list use this same limited check."""
     fd = os.open(os.path.join(directory, name + ".json"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     with os.fdopen(fd, "rb") as file:
         if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
@@ -2160,6 +2232,9 @@ def run_locked(argv, environ, stdin_fd=0):
             return open_live(package, site, checked, run_id, run_dir, request_path, user)
         try:
             entry, alive = start_entry(package, request_path)
+        except StartedEntryFailed as error:
+            entry = error.entry
+            raise
         except (OSError, subprocess.SubprocessError) as error:
             raise RunFailed(f"entry not started: {type(error).__name__}") from None
         relay = Relay(entry, run_dir, checked["deadline"] + site["cancel_grace_s"], site["cancel_grace_s"])
@@ -2194,6 +2269,9 @@ def run_locked(argv, environ, stdin_fd=0):
             return EXIT_UNKNOWN
         return code
     except BaseException as failure:
+        if isinstance(failure, StartedEntryFailed):
+            terminal = start_failure(run_id, run_dir, checked["retention"], package, failure)
+            return terminal["exit"] if emit(terminal) else EXIT_UNKNOWN
         killed = False
         status = None
         if entry is not None:
