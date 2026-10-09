@@ -262,6 +262,10 @@ pub(crate) enum Subcommands {
         #[arg(long)]
         output: bool,
     },
+    /// List this requester's native root identities and observed addresses (JSON).
+    /// Uses native.toml; listing grants no ownership or attachment authority.
+    #[cfg(target_os = "linux")]
+    Roots,
     /// Linux, opt-in: start one fresh native OpenCode ACP v2 root from a
     /// JSON request file whose `env` is the root's whole environment, or
     /// recover one for `cancel` or `continue-attached` (never a new root

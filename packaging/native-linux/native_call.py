@@ -8,6 +8,8 @@
         [--live-handle NEWFILE]
     oulipoly-native-call --loss-op OP --out DIR [--account RUN]
         OP: loss-accounts | loss-account | capture-loss-accounts | retire-loss-account
+    oulipoly-native-call --discover
+        Observational JSON on stdout; no task, handle, or output directory.
     oulipoly-native-call --root HANDLE --out DIR
         (--prompt-file FILE | --close | --stop | --inspect | --hold | --release)
         [--wait SECONDS]
@@ -51,6 +53,18 @@ FRONTDOOR = "libexec/oulipoly-native-frontdoor"
 
 class LocalRefusal(Exception):
     """Refused before anything was started."""
+
+
+def frontdoor_argv(args):
+    frontdoor = args.frontdoor or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.realpath(__file__))), FRONTDOOR)
+    frontdoor = os.path.realpath(frontdoor)
+    if args.direct_requester_uid is not None:
+        argv = [sys.executable, frontdoor]
+        if args.direct_site_config:
+            argv += ["--site-config", args.direct_site_config]
+        return argv + ["run"], {"PATH": "/usr/bin:/bin", "SUDO_UID": str(args.direct_requester_uid)}
+    return [args.sudo, "-n", frontdoor, "run"], {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
 
 
 def parse_args(argv):
@@ -323,17 +337,7 @@ class Call:
             self.send(proc, "close", "turn end of the message (readiness, not processing success); owed background completions still get their own turns")
 
     def argv(self):
-        frontdoor = self.args.frontdoor or os.path.join(
-            os.path.dirname(os.path.dirname(os.path.realpath(__file__))), FRONTDOOR
-        )
-        frontdoor = os.path.realpath(frontdoor)
-        if self.args.direct_requester_uid is not None:
-            argv = [sys.executable, frontdoor]
-            if self.args.direct_site_config:
-                argv += ["--site-config", self.args.direct_site_config]
-            env = {"PATH": "/usr/bin:/bin", "SUDO_UID": str(self.args.direct_requester_uid)}
-            return argv + ["run"], env
-        return [self.args.sudo, "-n", frontdoor, "run"], {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+        return frontdoor_argv(self.args)
 
     def run(self, request):
         argv, env = self.argv()
@@ -688,6 +692,92 @@ LIVE_EXITS = {
 }
 
 CONTROL_PROTOCOL = "oulipoly.session_control/v3"
+
+DISCOVERY_MEANING = ("observed addresses only; authority is the store's last record, "
+                     "not a current-owner handshake or ownership; attachment still requires its handle")
+
+
+def discovery_records(raw, requester):
+    """Check the observational envelope and project only public identity/address
+    fields. This is no control admission, authority claim or attach attempt."""
+    if len(raw) > CAPTURE_LIMIT:
+        raise ValueError("discovery output limit")
+    records = [json.loads(line) for line in raw.decode("utf-8").splitlines()]
+    if not records or not all(isinstance(record, dict) for record in records):
+        raise ValueError("discovery records")
+    terminal = records[-1]
+    if terminal.get("frontdoor") != "terminal" or terminal.get("stage") != "discovered" \
+            or terminal.get("requester") != requester or type(terminal.get("exit")) is not int \
+            or terminal["exit"] != 0 or type(terminal.get("roots")) is not int \
+            or terminal["roots"] != len(records) - 1:
+        raise ValueError("discovery terminal")
+    roots, names = [], set()
+    for record in records[:-1]:
+        name, address = record.get("run"), record.get("socket")
+        if record.get("frontdoor") != "root" or not isinstance(name, str) or not name \
+                or name in (".", "..") or "/" in name or name in names \
+                or type(record.get("live")) is not bool \
+                or type(record.get("front_door_holds_run")) is not bool \
+                or (record["live"] and (not isinstance(address, str) or not address.startswith("/"))) \
+                or (not record["live"] and address is not None):
+            raise ValueError("discovery address")
+        names.add(name)
+        entry = record.get("entry")
+        if entry is not None:
+            if not isinstance(entry, dict) or entry.get("kind") != "root_entry" \
+                    or set(entry) != {"kind", "protocol", "requester", "describer", "authority", "observed_at_unix_ms"} \
+                    or entry.get("protocol") != CONTROL_PROTOCOL or entry.get("requester") != requester \
+                    or entry.get("describer") != "frontdoor" \
+                    or type(entry.get("observed_at_unix_ms")) is not int \
+                    or not 0 <= entry["observed_at_unix_ms"] <= 2**64 - 1:
+                raise ValueError("discovery entry")
+            authority = entry.get("authority")
+            if not isinstance(authority, dict) or set(authority) != {"root", "owner", "generation", "incarnation"} or not all(
+                    isinstance(authority.get(key), str) and authority[key]
+                    for key in ("root", "owner", "generation", "incarnation")):
+                raise ValueError("discovery authority")
+            entry = {key: entry[key] for key in
+                     ("kind", "protocol", "requester", "describer", "observed_at_unix_ms")}
+            entry["authority"] = {key: authority[key] for key in ("root", "owner", "generation", "incarnation")}
+        elif not isinstance(record.get("describe_error"), str) or not record["describe_error"]:
+            raise ValueError("discovery missing description")
+        roots.append({"run": name, "live": record["live"], "socket": address,
+                      "front_door_holds_run": record["front_door_holds_run"], "entry": entry,
+                      "description": "observed" if entry is not None else "unavailable"})
+    return roots
+
+
+def main_discovery(argv):
+    parser = argparse.ArgumentParser(prog="oulipoly-native-call")
+    parser.add_argument("--discover", action="store_true", required=True)
+    parser.add_argument("--frontdoor")
+    parser.add_argument("--sudo", default="/usr/bin/sudo")
+    parser.add_argument("--direct-requester-uid", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--direct-site-config", help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    command, env = frontdoor_argv(args)
+    result = {"class": "discovery-incomplete", "requester": f"uid:{os.getuid()}",
+              "roots": None, "meaning": DISCOVERY_MEANING}
+    code = EXITS["incomplete"]
+    try:
+        response = subprocess.run(command, input=b'{"v":1,"op":"discover"}\n',
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  env=env, cwd="/", timeout=30, check=False, close_fds=True)
+        result["front_door_exit"] = response.returncode
+        if response.returncode != 0:
+            result["class"] = "discovery-unavailable"
+            code = EXITS["front-door-refused"]
+        else:
+            result["roots"] = discovery_records(response.stdout, result["requester"])
+            if all(root["description"] == "observed" for root in result["roots"]):
+                result["class"], code = "discovered", 0
+    except OSError:
+        result["class"], code = "discovery-unavailable", EXITS["launch-failed"]
+    except (ValueError, UnicodeError, TypeError, RecursionError, subprocess.TimeoutExpired):
+        # Never echo arbitrary transport, describe errors, settings or tokens.
+        pass
+    print(json.dumps(result, sort_keys=True))
+    return code
 
 
 def read_private(path):
@@ -1224,6 +1314,8 @@ def live_control(args, attached, base, until):
 
 
 def main(argv):
+    if any(arg == "--discover" or arg.startswith("--discover=") for arg in argv):
+        return main_discovery(argv)
     live = any(arg == "--root" or arg.startswith("--root=") for arg in argv)
     loss = any(arg == "--loss-op" or arg.startswith("--loss-op=") for arg in argv)
     try:

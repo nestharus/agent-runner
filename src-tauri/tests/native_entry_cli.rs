@@ -36,6 +36,10 @@ const FAKE_CALLER: &str = r#"#!/bin/sh
 # Stand-in for oulipoly-native-call: record argv/prompt, write result files.
 rec="$FAKE_RECORD"
 printf '%s\n' "$@" > "$rec.argv"
+if [ "$1" = "--discover" ]; then
+  printf '{"class":"discovered","roots":[],"meaning":"observational"}\n'
+  exit 0
+fi
 out=; prompt=; route=
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -181,6 +185,75 @@ fn direct_model_launch_runs_mapped_site_route_on_native_caller() {
     assert_eq!(value_after(&argv, "--cwd"), Some(cwd.to_str().unwrap()));
     assert_eq!(fixture.prompt(), "fix the bug");
     assert!(fixture.legacy_untouched(), "legacy data dir was created");
+}
+
+#[test]
+fn roots_discovery_needs_no_model_prompt_runs_or_legacy_state() {
+    let fixture = Fixture::new("caller = \"@CALLER@\"\nruns_dir = \"@RUNS@\"\n");
+    // Initialization is impossible here: the legacy data root is a file.
+    fs::create_dir_all(fixture.data_dir.parent().unwrap()).unwrap();
+    fs::write(&fixture.data_dir, "legacy blocker").unwrap();
+    let output = fixture.run(&["roots"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stdout(&output).contains("\"class\":\"discovered\""));
+    assert_eq!(fixture.argv().unwrap(), ["--discover"]);
+    assert!(!fixture.root.join("runs").exists());
+    assert!(!fixture.record.with_extension("prompt").exists());
+    assert_eq!(
+        fs::read_to_string(&fixture.data_dir).unwrap(),
+        "legacy blocker"
+    );
+}
+
+#[test]
+fn roots_discovery_refuses_missing_invalid_and_unavailable_selection() {
+    let fixture = Fixture::new("caller = \"@CALLER@\"\nruns_dir = \"@RUNS@\"\n");
+    let output = fixture
+        .command()
+        .args(["roots"])
+        .env("OULIPOLY_CONFIG_HOME", "private-fixture-value")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(!stderr(&output).contains("private-fixture-value"));
+    assert!(fixture.argv().is_none());
+    assert!(fixture.legacy_untouched());
+    for text in [
+        None,
+        Some("caller = \"private-fixture-value\"\n"),
+        Some("caller = ??? private-fixture-value"),
+    ] {
+        let fixture = Fixture::new("caller = \"@CALLER@\"\nruns_dir = \"@RUNS@\"\n");
+        let path = fixture
+            .root
+            .join("config/oulipoly-agent-runner/native.toml");
+        match text {
+            Some(text) => fs::write(path, text).unwrap(),
+            None => fs::remove_file(path).unwrap(),
+        }
+        let output = fixture.run(&["roots"]);
+        assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+        assert!(!stderr(&output).contains("private-fixture-value"));
+        assert!(fixture.argv().is_none());
+        assert!(fixture.legacy_untouched());
+        assert!(!fixture.root.join("runs").exists());
+    }
+    let fixture = Fixture::new("caller = \"@CALLER@\"\nruns_dir = \"@RUNS@\"\n");
+    fs::remove_file(fixture.root.join("fake-native-call")).unwrap();
+    let output = fixture.run(&["roots"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(stderr(&output).contains("discovery caller unavailable"));
+    assert!(fixture.legacy_untouched());
+}
+
+#[test]
+fn roots_discovery_propagates_caller_failure_without_legacy_fallback() {
+    let fixture = Fixture::new("caller = \"@CALLER@\"\nruns_dir = \"@RUNS@\"\n");
+    fs::write(fixture.root.join("fake-native-call"), "#!/bin/sh\nexit 6\n").unwrap();
+    let output = fixture.run(&["roots"]);
+    assert_eq!(output.status.code(), Some(6), "{}", stderr(&output));
+    assert!(fixture.legacy_untouched());
+    assert!(!fixture.root.join("runs").exists());
 }
 
 #[test]
