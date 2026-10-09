@@ -9,6 +9,240 @@ use std::time::{Duration, Instant};
 
 const CLIENT: &str = env!("CARGO_BIN_EXE_oulipoly-root-bash");
 
+#[derive(Clone, Copy, Debug)]
+enum DiagnosticSink {
+    Capture,
+    Full,
+    Disconnected,
+}
+
+impl DiagnosticSink {
+    fn stdio(self) -> Stdio {
+        match self {
+            Self::Capture => Stdio::piped(),
+            Self::Full => Stdio::from(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open("/dev/full")
+                    .unwrap(),
+            ),
+            Self::Disconnected => {
+                let (writer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+                drop(reader);
+                Stdio::from(std::os::fd::OwnedFd::from(writer))
+            }
+        }
+    }
+}
+
+/// Only the requester and an owned synthetic socket peer run. No owner,
+/// namespace wrapper, provider, command launch or production store is used.
+fn diagnostic_control(
+    args: &[&str],
+    reply: Option<&[u8]>,
+    stdout_full: bool,
+    sink: DiagnosticSink,
+) -> std::process::Output {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "u289-query-{}-{}.sock",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    assert!(!path.exists());
+    let server = reply.map(|reply| {
+        let listener = UnixListener::bind(&path).unwrap();
+        let reply = reply.to_vec();
+        std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(12)))
+                .unwrap();
+            let mut request = String::new();
+            BufReader::new(&mut peer).read_line(&mut request).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&request).unwrap(),
+                serde_json::json!({"v":1,"op":"result","root_id":"original","work":7})
+            );
+            peer.write_all(&reply).unwrap();
+            // Leave the partial reply open to exercise the existing socket
+            // deadline; otherwise EOF is a deliberate exchange condition.
+            if reply != b"{\"event\":\"work-result\"" {
+                peer.shutdown(std::net::Shutdown::Write).unwrap();
+            }
+            let mut byte = [0];
+            assert_eq!(
+                peer.read(&mut byte).unwrap(),
+                0,
+                "query connection released"
+            );
+            request
+        })
+    });
+    let mut command = Command::new(CLIENT);
+    command
+        .args(args)
+        .env_remove("OULIPOLY_ROOT_BASH_V1")
+        .stdin(Stdio::null())
+        .stderr(sink.stdio());
+    // A missing path is distinct from an unset ingress environment.
+    if args != ["--result", "rv1w:no-ingress:7"] {
+        command.env("OULIPOLY_ROOT_BASH_V1", &path);
+    }
+    if stdout_full {
+        command.stdout(DiagnosticSink::Full.stdio());
+    }
+    let output = command.output().unwrap();
+    if let Some(server) = server {
+        let request = server.join().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        eprintln!("query request={request:?}; connection released; socket removed");
+    }
+    assert!(!path.exists());
+    eprintln!(
+        "query args={args:?} sink={sink:?} stdout_full={stdout_full} exit={:?} stdout={:?} stderr={:?}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+#[test]
+fn query_outcomes_survive_diagnostic_write_failure() {
+    let witness = b"{\"event\":\"work-result\",\"status\":\"code:7\"}\n";
+    let refusal = b"{\"event\":\"refused\",\"reason\":\"peer-unattributed\"}\n";
+    let mut mismatches = Vec::new();
+    for sink in [
+        DiagnosticSink::Capture,
+        DiagnosticSink::Full,
+        DiagnosticSink::Disconnected,
+    ] {
+        for (args, reply, stdout_full, code, diagnostic) in [
+            (&["--result"][..], None, false, 64, "usage"),
+            (
+                &["--result", "invalid"][..],
+                None,
+                false,
+                64,
+                "bad-reference",
+            ),
+            (
+                &["--result", "rv1w:no-ingress:7"][..],
+                None,
+                false,
+                69,
+                "no-ingress",
+            ),
+            (
+                &["--result", "rv1w:original:7"][..],
+                None,
+                false,
+                69,
+                "connect",
+            ),
+            (
+                &["--result", "rv1w:original:7"][..],
+                Some(&refusal[..]),
+                false,
+                69,
+                "peer-unattributed",
+            ),
+            (
+                &["--result", "rv1w:original:7"][..],
+                Some(&b""[..]),
+                false,
+                75,
+                "UnexpectedEof",
+            ),
+            (
+                &["--result", "rv1w:original:7"][..],
+                Some(&b"invalid\n"[..]),
+                false,
+                75,
+                "InvalidData",
+            ),
+            (
+                &["--result", "rv1w:original:7"][..],
+                Some(&witness[..]),
+                true,
+                74,
+                "local-output",
+            ),
+            (
+                &["--result", "rv1w:original:7"][..],
+                Some(&witness[..]),
+                false,
+                0,
+                "",
+            ),
+        ] {
+            let output = diagnostic_control(args, reply, stdout_full, sink);
+            if output.status.code() != Some(code) {
+                mismatches.push(format!(
+                    "{args:?} {sink:?} stdout_full={stdout_full}: expected {code}, got {:?}",
+                    output.status
+                ));
+            }
+            assert_eq!(
+                output.stdout,
+                if code == 0 { &witness[..] } else { &[][..] }
+            );
+            if matches!(sink, DiagnosticSink::Capture) {
+                let text = String::from_utf8_lossy(&output.stderr);
+                if code == 0 {
+                    assert!(text.is_empty());
+                } else {
+                    assert!(text.contains(diagnostic), "{text}");
+                }
+                if matches!(code, 74 | 75) || diagnostic == "connect" || diagnostic == "no-ingress"
+                {
+                    assert!(text.contains("\"knowledge\":\"unknown\""), "{text}");
+                }
+            } else {
+                assert!(
+                    output.stderr.is_empty(),
+                    "failed sink cannot deliver diagnostics"
+                );
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+#[test]
+fn query_timeout_survives_diagnostic_write_failure() {
+    let mut mismatches = Vec::new();
+    for sink in [
+        DiagnosticSink::Capture,
+        DiagnosticSink::Full,
+        DiagnosticSink::Disconnected,
+    ] {
+        let start = Instant::now();
+        let output = diagnostic_control(
+            &["--result", "rv1w:original:7"],
+            Some(b"{\"event\":\"work-result\""),
+            false,
+            sink,
+        );
+        assert!(start.elapsed() < Duration::from_secs(12));
+        assert!(output.stdout.is_empty());
+        if output.status.code() != Some(75) {
+            mismatches.push(format!("{sink:?}: {:?}", output.status));
+        }
+        if matches!(sink, DiagnosticSink::Capture) {
+            let text = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                text.contains("TimedOut") && text.contains("\"knowledge\":\"unknown\""),
+                "{text}"
+            );
+        } else {
+            assert!(output.stderr.is_empty());
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
 #[test]
 fn stalled_result_peer_is_cancelled_without_a_command_or_invented_result() {
     let dir = std::env::temp_dir().join(format!("u220-query-{}", std::process::id()));
