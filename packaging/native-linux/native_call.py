@@ -729,11 +729,14 @@ def discovery_records(raw, requester):
                     or entry.get("protocol") != CONTROL_PROTOCOL or entry.get("requester") != requester \
                     or entry.get("describer") != "frontdoor" \
                     or type(entry.get("observed_at_unix_ms")) is not int \
-                    or not 0 <= entry["observed_at_unix_ms"] <= 2**64 - 1:
+                    or not 0 <= entry["observed_at_unix_ms"] <= 2**53 - 1:
                 raise ValueError("discovery entry")
             authority = entry.get("authority")
+            # v3 RootEntry HostRef bounds: opaque equality values, not
+            # numeric generations or locally interpreted identifiers.
             if not isinstance(authority, dict) or set(authority) != {"root", "owner", "generation", "incarnation"} or not all(
-                    isinstance(authority.get(key), str) and authority[key]
+                    isinstance(authority.get(key), str) and 1 <= len(authority[key]) <= 256
+                    and all("!" <= char <= "~" for char in authority[key])
                     for key in ("root", "owner", "generation", "incarnation")):
                 raise ValueError("discovery authority")
             entry = {key: entry[key] for key in

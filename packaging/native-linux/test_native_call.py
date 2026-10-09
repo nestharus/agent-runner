@@ -201,6 +201,52 @@ sys.exit({exit_code})
         self.assertEqual((code, result["class"]), (4, "discovery-unavailable"))
         self.assertIsNone(result["roots"])
 
+    # Independent oracle: session-control/v3.schema.json HostRef,
+    # UnixMilliseconds and RootEntry; adjacent README "Bounds and redaction".
+    # RootEntry is descriptive; the frontdoor envelope projects other fields.
+    def test_schema_invalid_authority_values_make_discovery_incomplete(self):
+        invalid = ("", "bad value", "x" * 257, "x\x1f", "x\t", "x\n", "x\x7f",
+                   "café", None, True, 17, ["r"])
+        for field in ("root", "owner", "generation", "incarnation"):
+            for value in invalid:
+                with self.subTest(field=field, value=value):
+                    records = self.records()
+                    records[0]["entry"]["authority"][field] = value
+                    code, result = self.invoke(records)
+                    self.assertEqual((code, result["class"], result["roots"]),
+                                     (6, "discovery-incomplete", None))
+
+    def test_schema_invalid_observation_times_make_discovery_incomplete(self):
+        for value in (-1, 2**53, 2**64 - 1, True, None, "123", 1.5, []):
+            with self.subTest(value=value):
+                records = self.records()
+                records[0]["entry"]["observed_at_unix_ms"] = value
+                code, result = self.invoke(records)
+                self.assertEqual((code, result["class"], result["roots"]),
+                                 (6, "discovery-incomplete", None))
+
+    def test_valid_schema_boundaries_and_producer_values_survive_projection(self):
+        printable = "".join(chr(value) for value in range(0x21, 0x7f))
+        boundaries = {"root": "!", "owner": "~" * 256,
+                      "generation": (printable * 3)[:256], "incarnation": "opaque:/next"}
+        # Current describe_entry emits opaque store ids, decimal generation
+        # and incarnation (or "none"), plus an ordinary Unix millisecond time.
+        producer = {"root": "a" * 32, "owner": "b" * 32,
+                    "generation": "2", "incarnation": "none"}
+        for authority, timestamp in ((boundaries, 0), (boundaries, 2**53 - 1),
+                                     (producer, 1_700_000_000_123)):
+            with self.subTest(authority=authority, timestamp=timestamp):
+                records = self.records()
+                records[0]["entry"].update(authority=authority, observed_at_unix_ms=timestamp)
+                # The SDK's standalone-record framing bound does not apply
+                # to unrelated private fields in this outer envelope.
+                records[0]["last_root_terminal"] = {"settings": "x" * 32769 + SECRET}
+                records[1]["settings"] = SECRET
+                code, result = self.invoke(records)
+                self.assertEqual((code, result["class"]), (0, "discovered"))
+                self.assertEqual(result["roots"][0]["description"], "observed")
+                self.assertEqual(result["roots"][0]["entry"], records[0]["entry"])
+
     def test_missing_transport_and_timeout_remain_unknown(self):
         import contextlib
         import io

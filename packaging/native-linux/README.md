@@ -669,6 +669,9 @@ lock/socket sample, without a current-owner handshake, ownership or attachment
 authority. Tokens and private settings are omitted; attaching still requires
 the separately retained live handle. A root with an unavailable description
 remains visible with `entry: null` and `description: "unavailable"`.
+Observed authority values must each be 1–256 printable non-space ASCII
+characters; observation time must be an integer from 0 through 2^53−1.
+Invalid values make discovery incomplete. Authority values remain opaque.
 
 Discovery exits 0 only for a complete requester-bound listing, including a
 confirmed empty listing. Exit 4 means the front door/transport returned nonzero,
