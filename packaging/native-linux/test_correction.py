@@ -32,7 +32,7 @@ class Scratch(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root, True)
 
     def run_tree(self, name='run', retirable=True):
-        root = self.root/(name+'-'+str(time.monotonic_ns()))
+        root = self.root/'4242'/(name+'-'+str(time.monotonic_ns()))
         for sub in ('private', 'launch/provider', 'store'):
             (root/sub).mkdir(parents=True)
         for rel in ('launch/provider/adapter-state',):
@@ -67,6 +67,12 @@ class Scratch(unittest.TestCase):
         return r,w
 
 class OwnedCleanup(Scratch):
+    def setUp(self):
+        super().setUp()
+        guard = mock.patch.object(fd, 'check_owned')
+        guard.start()
+        self.addCleanup(guard.stop)
+
     def test_replaced_ancestor_preserves_outside_for_keep_discard_sweep(self):
         # nes-owned surrogate for a root-private outside file. The traversal
         # fault reproduces without privileges; no real root test is claimed.
@@ -80,7 +86,7 @@ class OwnedCleanup(Scratch):
             ancestor.symlink_to(outside, target_is_directory=True)
             if mode == 'sweep':
                 with mock.patch.object(fd,'check_owned'):
-                    results = fd.sweep(str(self.root))
+                    results = fd.sweep(str(self.root/'4242'))
                 result = next(r for r in results if r['run']==str(run))
             else:
                 result = fd.retire(str(run),mode)
@@ -95,8 +101,9 @@ class OwnedCleanup(Scratch):
         run = self.run_tree('kept', retirable=False)
         shutil.rmtree(run/'launch/provider')
         (run/'launch/provider').symlink_to(outside, target_is_directory=True)
-        # No requester layout here: the store is kept and only scratch pruned.
-        result = fd.retire(str(run), 'discard')
+        # An unavailable reader keeps the store and only prunes scratch.
+        with mock.patch.object(fd, 'store_account', return_value=(None, 'fixture-unavailable')):
+            result = fd.retire(str(run), 'discard', package='/owned-unused')
         self.assertTrue((outside/'auth.json').exists())
         self.assertTrue(result['ok'])
         self.assertFalse(result['run_removed'])

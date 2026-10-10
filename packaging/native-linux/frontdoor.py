@@ -101,6 +101,7 @@ class RunCustody:
         self.run = self.run_dir = self.lock = None
         self.entry = "not-started"
         self.entry_status = None
+        self.basis = {"kind": "allocation-producer-no-entry"}
         self.supervisor_pid = self.handle = None
         self.capture_errors = []
 
@@ -108,6 +109,7 @@ class RunCustody:
         return {"run": self.run, "run_dir": self.run_dir, "entry": self.entry,
                 "entry_status": self.entry_status, "supervisor_pid": self.supervisor_pid,
                 "handle": self.handle, "capture_errors": list(self.capture_errors),
+                "basis": self.basis,
                 "meaning": "front-door physical custody; address is unverified, not owner authority, acknowledgement or logical settlement"}
 
     def publish(self):
@@ -119,11 +121,13 @@ class RunCustody:
 
     def possible_entry(self):
         self.entry = "possible"
+        self.basis = None
         self.publish()  # Must precede any fork/Popen that can start an entry.
 
     def ended(self, status):
         self.entry_status = status
         self.entry = "ended" if type(status) is int else "possible"
+        self.basis = {"kind": "entry-poll-wait"} if type(status) is int else None
         self.publish()
 
     def close_lock(self):
@@ -140,20 +144,87 @@ def physical_custody(run):
         with os.fdopen(fd, "r", encoding="utf-8") as file:
             if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
                 raise ValueError("not regular")
-            value = json.loads(file.read(HELLO_LIMIT + 1))
+            text = file.read(HELLO_LIMIT + 1)
+            if len(text) > HELLO_LIMIT:
+                raise ValueError("entry custody exceeds bound")
+            value = json.loads(text)
         if not isinstance(value, dict) or value.get("run_dir") != run \
                 or value.get("run") != os.path.basename(run):
             raise ValueError("wrong run")
-        safe = value.get("entry") == "not-started" or \
+        safe = value.get("entry") == "not-started" and value.get("entry_status") is None or \
             value.get("entry") == "ended" and type(value.get("entry_status")) is int
         return safe, value
-    except (OSError, ValueError, TypeError) as error:
+    except (OSError, ValueError, TypeError, RecursionError) as error:
         return False, {"entry": "unknown", "capture_error": type(error).__name__}
 
 
 def protected_disposition(account):
     return {"ok": False, "stop": "unknown", "run_removed": False,
+            "disposition": "retained-physical-uncertainty",
             "physical_custody": account, "retry": "do-not-replay"}
+
+
+def physical_evidence(run):
+    """Export only the positive producer fact, never a handle or PID.
+
+    The older marker's entry state/status already names its producer basis.
+    Missing basis on that marker is not a new administrative attestation.
+    """
+    safe, value = physical_custody(run)
+    if not safe:
+        return None
+    basis = value.get("basis")
+    if isinstance(basis, dict):
+        basis = {key: basis[key] for key in ("kind", "reference") if isinstance(basis.get(key), str)}
+    else:
+        basis = {"kind": "entry-poll-wait" if value["entry"] == "ended"
+                 else "allocation-or-startup-producer-no-entry"}
+    return {"run": value["run"], "run_dir": value["run_dir"],
+            "entry": value["entry"], "entry_status": value.get("entry_status"),
+            "basis": basis}
+
+
+def record_physical_disposition(run, evidence):
+    """ROOT-only deliberate publication; does not signal, retire or sweep.
+
+    ROOT supplies its exact-run collected entry wait or positive no-entry
+    producer witness and its retained reference. No PID lookup or inference
+    from locks, addresses, owner accounts or semantic completeness occurs.
+    The free lock merely excludes an active cooperating marker writer.
+    """
+    if os.geteuid() != 0:
+        raise Refused("physical disposition requires ROOT")
+    check_owned(run)
+    private = os.path.join(run, "private")
+    check_owned(private)
+    if stat.S_IMODE(os.lstat(private).st_mode) != 0o700:
+        raise Refused("physical disposition requires private 0700 custody")
+    if not isinstance(evidence, dict) or set(evidence) != {"run", "run_dir", "entry", "entry_status", "basis"} \
+            or evidence.get("run") != os.path.basename(run) or evidence.get("run_dir") != run:
+        raise Refused("physical disposition evidence has wrong run identity")
+    basis = evidence.get("basis")
+    if not isinstance(basis, dict) or set(basis) != {"kind", "reference"} \
+            or not isinstance(basis.get("reference"), str) or not basis["reference"].strip() \
+            or len(basis["reference"]) > 1024:
+        raise Refused("physical disposition requires a retained witness reference")
+    if not (evidence["entry"] == "ended" and type(evidence["entry_status"]) is int
+            and basis.get("kind") == "root-observed-entry-wait" or
+            evidence["entry"] == "not-started" and evidence["entry_status"] is None
+            and basis.get("kind") == "root-positive-producer-no-entry"):
+        raise Refused("physical disposition requires entry wait or positive producer no-entry")
+    lock = os.open(os.path.join(private, "lock"), os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        safe, prior = physical_custody(run)
+        if safe:
+            raise Refused("positive producer evidence already exists; read it without replacement")
+        value = dict(prior, **evidence)
+        if len(json.dumps(value, sort_keys=True)) > HELLO_LIMIT:
+            raise Refused("physical disposition evidence exceeds marker bound")
+        write_durable(private, ENTRY_CUSTODY, value)
+    finally:
+        os.close(lock)
+    return physical_evidence(run)
 
 
 def control_requester(uid):
@@ -664,6 +735,7 @@ def retire(run, retention, account_unavailable=False, required_account=None, pac
     retains its loss account for the requester; if it cannot, the store is
     kept (scratch pruned) with the visible reason instead of destroyed.
     """
+    physical = None
     if os.path.lexists(os.path.join(run, "private", ENTRY_CUSTODY)):
         safe, physical = physical_custody(run)
         if not safe:
@@ -676,6 +748,14 @@ def retire(run, retention, account_unavailable=False, required_account=None, pac
         account["required_account"] = required_account
         account["account_publication"] = "unavailable" if account_unavailable or account.get("knowledge") == "unknown" else "file-published"
     loss = None
+    if retention == "discard" and physical is not None:
+        try:
+            retain_physical_disposition(run, account)
+        except (Refused, OSError, ValueError, TypeError, RecursionError) as error:
+            # Neither removal nor scratch pruning may consume the only proof.
+            return {"ok": False, "run_removed": False, "root_terminal": account,
+                    "disposition": "retained-evidence-publication-failed",
+                    "physical_evidence_error": type(error).__name__, "retry": "do-not-replay"}
     if retention == "discard" and not retirable(account):
         loss = retain_loss_account(run, account, package or package_root(), capture or {"by": "run-end"})
     if retention == "discard" and loss is not None and loss.get("store_kept"):
@@ -706,7 +786,7 @@ def sweep(user_dir, package=None, explicit_capture=False):
         safe, physical = physical_custody(run)
         if not safe:
             os.close(fd)
-            results.append({"run": run, **protected_disposition(physical)})
+            results.append({"run": run, "scope": "previous-run", **protected_disposition(physical)})
             continue
         try:
             with open(os.path.join(run, "private", "retention"), encoding="utf-8") as file:
@@ -721,7 +801,7 @@ def sweep(user_dir, package=None, explicit_capture=False):
                     run, root_terminal(run), package or package_root(), {"by": "capture"}, keep_store=True)
         finally:
             os.close(fd)
-        results.append({"run": run, **result})
+        results.append({"run": run, "scope": "previous-run", **result})
     return results
 
 
@@ -766,6 +846,38 @@ def loss_dir(user_dir, create):
 def loss_names(directory):
     return sorted(name[:-5] for name in os.listdir(directory)
                   if name.endswith(".json") and ACCOUNT_NAME.fullmatch(name[:-5]))
+
+
+def disposition_names(directory):
+    return sorted(name[:-13] for name in os.listdir(directory)
+                  if name.endswith(".json.retired") and ACCOUNT_NAME.fullmatch(name[:-13]))
+
+
+def retain_physical_disposition(run, terminal):
+    """Same private loss-record interface, durable even after copy retirement.
+
+    Physical-only records do not consume the semantic capture threshold.
+    No automatic expiry: ROOT's custody/audit consumers still need this fact.
+    """
+    evidence = physical_evidence(run)
+    uid = run_requester(run)
+    name = os.path.basename(run)
+    if evidence is None or uid is None or not ACCOUNT_NAME.fullmatch(name):
+        raise ValueError("physical disposition identity/evidence unavailable")
+    directory = loss_dir(os.path.dirname(run), create=True)
+    record = {"schema": LOSS_ACCOUNT_SCHEMA, "account": name,
+              "requester": control_requester(uid), "physical_evidence": evidence,
+              "loss_account_retired": True, "captured": capture_summary({"by": "physical-disposition"}),
+              "last_root_terminal": terminal_loss_summary(terminal), "store_account": None,
+              "retry": "do-not-replay",
+              "meaning": "physical entry fact only; no logical settlement, SDK receipt, continuity or replay authority"}
+    if name in disposition_names(directory):
+        prior = read_loss_account(directory, name, retired=True)
+        if prior.get("physical_evidence") != evidence:
+            raise ValueError("prior physical disposition differs; ROOT must resolve")
+        return prior
+    write_durable(directory, name + ".json.retired", record)
+    return read_loss_account(directory, name, retired=True)
 
 
 def store_account(package, store, uid):
@@ -905,6 +1017,7 @@ def retain_loss_account(run, terminal, package, capture, keep_store=False):
         "requester": control_requester(uid),
         "captured": capture_summary(capture),
         "ending_capture": None,
+        "physical_evidence": physical_evidence(run),
         "last_root_terminal": terminal_loss_summary(terminal),
         "store_account": account,
         "store_account_error": error,
@@ -919,6 +1032,10 @@ def retain_loss_account(run, terminal, package, capture, keep_store=False):
         record["ending_capture"] = capture_summary(ending)
         if type(ending.get("at_unix")) is int:
             record["ending_capture"]["at_unix"] = ending["at_unix"]
+    if prior and record["physical_evidence"] is None:
+        # Preserve a captured physical fact without using it as permission
+        # to dispose of a source whose current marker is unknown.
+        record["physical_evidence"] = prior.get("physical_evidence")
     if capture.get("by") in ("run-end", "live-run-end", "front-door-failed", "entry-not-started"):
         if record["ending_capture"] is None:
             record["ending_capture"] = record["captured"]
@@ -1148,6 +1265,7 @@ def start_failure(run_id, run_dir, retention, package, error, custody=None):
         # exact startup producer's no-handle exception proves no entry start.
         elif isinstance(error, EntryNotStarted):
             custody.entry = "not-started"
+            custody.basis = {"kind": "startup-producer-no-entry"}
             custody.publish()
     retired = retire(run_dir, retention, package=package,
                      capture={"by": "front-door-failed" if started else "entry-not-started",
@@ -2146,11 +2264,17 @@ def loss_op(request):
     return None
 
 
-def read_loss_account(directory, name):
+def read_loss_account(directory, name, retired=False):
     """Bounded structural/identity check, not semantic validation of the
     trusted producer's per-input facts, readings or non-authority fields.
     Observational read/list use this same limited check."""
-    fd = os.open(os.path.join(directory, name + ".json"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    path = os.path.join(directory, name + (".json.retired" if retired else ".json"))
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        if retired:
+            raise
+        return read_loss_account(directory, name, retired=True)
     with os.fdopen(fd, "rb") as file:
         if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
             raise ValueError("not regular")
@@ -2163,6 +2287,13 @@ def read_loss_account(directory, name):
     uid = run_requester(directory)
     if value.get("account") != name or uid is None or value.get("requester") != control_requester(uid):
         raise ValueError("loss account identity mismatch")
+    physical = value.get("physical_evidence")
+    if physical is not None and (not isinstance(physical, dict) or physical.get("run") != name
+            or physical.get("run_dir") != os.path.join(os.path.dirname(directory), name)
+            or not isinstance(physical.get("basis"), dict)
+            or not (physical.get("entry") == "ended" and type(physical.get("entry_status")) is int
+                    or physical.get("entry") == "not-started" and physical.get("entry_status") is None)):
+        raise ValueError("physical evidence identity/fact mismatch")
     store = value.get("store_account")
     if store is not None and (not isinstance(store, dict) or store.get("schema") != STORE_ACCOUNT_SCHEMA
             or store.get("requester") != value["requester"] or not isinstance(store.get("inputs"), list)
@@ -2176,7 +2307,9 @@ def loss_summary(record):
     store = store if isinstance(store, dict) else {}
     return {"captured": record.get("captured"), "root": store.get("root"),
             "readings": store.get("readings"), "inputs_total": store.get("inputs_total"),
-            "complete": store.get("complete"), "store_account_error": record.get("store_account_error")}
+            "complete": store.get("complete"), "store_account_error": record.get("store_account_error"),
+            "physical_evidence": record.get("physical_evidence"),
+            "loss_account_retired": record.get("loss_account_retired", False)}
 
 
 def loss_route(site, user, op, package=None):
@@ -2189,8 +2322,9 @@ def loss_route(site, user, op, package=None):
         check_owned(user_dir)
         directory = loss_dir(user_dir, create=False)
         names = loss_names(directory)
+        dispositions = disposition_names(directory)
     except FileNotFoundError:
-        directory, names = None, []
+        directory, names, dispositions = None, [], []
     terminal = {"frontdoor": "terminal", "stage": op["op"], "requester": control_requester(user.pw_uid),
                 "retry": "do-not-replay",
                 "meaning": "retained per-input loss accounts of this requester's lost or unretired roots; not settlement, continuation, a new owner or replay authority"}
@@ -2203,15 +2337,15 @@ def loss_route(site, user, op, package=None):
         terminal.update(runs=len(swept), effects="capture/prune/discard of lock-free stale runs only",
                         incomplete=any(not result.get("ok") or result.get("loss_account", {}).get("store_kept") and not result.get("loss_account", {}).get("complete") for result in swept))
     elif op["op"] == "loss-accounts":
-        for name in names:
+        for name in sorted(set(names + dispositions)):
             try:
                 line = {"frontdoor": "loss-account", "account": name, **loss_summary(read_loss_account(directory, name))}
             except (OSError, ValueError, TypeError, RecursionError) as error:
                 terminal["incomplete"] = True
                 line = {"frontdoor": "loss-account", "account": name, "error": type(error).__name__}
             delivered &= emit(line)
-        terminal.update(accounts=len(names), capacity=MAX_LOSS_ACCOUNTS, capacity_kind="soft capture threshold; concurrent captures may overshoot")
-    elif op["account"] not in names:
+        terminal.update(accounts=len(names), physical_dispositions=len(dispositions), capacity=MAX_LOSS_ACCOUNTS, capacity_kind="soft semantic capture threshold; physical disposition records persist separately; concurrent captures may overshoot")
+    elif op["account"] not in names + dispositions:
         raise Refused(f"{op['op']}: no such account")
     elif op["op"] == "loss-account":
         try:
@@ -2221,10 +2355,29 @@ def loss_route(site, user, op, package=None):
         delivered &= emit({"frontdoor": "loss-account", "account": op["account"], "record": record})
         terminal["account"] = op["account"]
     else:
-        os.unlink(os.path.join(directory, op["account"] + ".json"))
+        record = read_loss_account(directory, op["account"])
+        evidence = record.get("physical_evidence")
+        if op["account"] in dispositions:
+            archived = read_loss_account(directory, op["account"], retired=True).get("physical_evidence")
+            if evidence is not None and evidence != archived:
+                raise ValueError("physical disposition differs; ROOT must resolve")
+            evidence = archived
+            record["physical_evidence"] = evidence
+        if evidence is not None:
+            # Persist proof before deleting the semantic snapshot. A failure
+            # leaves the old copy, never guessed proof from its existence.
+            archive = {key: record[key] for key in ("schema", "account", "requester", "physical_evidence", "retry")}
+            archive.update(loss_account_retired=True, store_account=None,
+                           captured=capture_summary({"by": "retire-loss-account"}),
+                           meaning="retired semantic copy; retained physical fact settles no logical or SDK obligation")
+            write_durable(directory, op["account"] + ".json.retired", archive)
+            read_loss_account(directory, op["account"], retired=True)
+        if op["account"] in names:
+            os.unlink(os.path.join(directory, op["account"] + ".json"))
         sync_directory(directory)
         terminal.update(account=op["account"], retired=True,
-                        meaning="the requester disposed of a retained copy; this settles nothing and authorizes nothing")
+                        physical_evidence_retained=evidence is not None,
+                        meaning="the requester disposed of the semantic copy; physical evidence remains readable; this settles nothing and authorizes nothing")
     terminal["exit"] = EXIT_UNKNOWN if not delivered or terminal.get("incomplete") else 0
     if not emit(terminal) or not delivered:
         return EXIT_UNKNOWN
@@ -2406,7 +2559,7 @@ def run_locked(argv, environ, stdin_fd=0, custody=None):
             if status is not None else {"ok": False, "stop": "unknown", "run_removed": False}
         if relay.collection_errors:
             code = EXIT_UNKNOWN
-        if status is not None and (not retired["ok"] or any(not record["ok"] for record in swept)):
+        if status is not None and not retired["ok"]:
             code = EXIT_CLEANUP_FAILED
         relay.say({
             "frontdoor": "terminal",

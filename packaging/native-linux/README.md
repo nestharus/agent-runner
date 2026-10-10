@@ -258,7 +258,12 @@ lock permits sweep only with a retained positive no-entry or collected-entry-end
 account in `private/entry-custody.json`; a missing, malformed or possible-entry
 account keeps the entire run, including scratch. Discard of an
 unretirable store, at run end or by sweep, first retains its loss account. Direct recovery
-stores remain useful until their recovery question ends. Cleanup failure is visible.
+stores remain useful until their recovery question ends. Sweep records carry
+`scope: previous-run`; physical uncertainty is reported as
+`disposition: retained-physical-uncertainty`. These retained previous runs do
+not change a healthy current task's exit or caller class. The current run's
+actual cleanup failure still returns 94 / caller `cleanup-failed`. Retained
+requests, scratch and stores continue to cost storage and repeated scan work.
 None of this is provider credential proof.
 
 Allocation/fork failure terminals retain possible effects and the front door's
@@ -271,6 +276,28 @@ these facts is reported separately and cannot authorize later pruning. Existing
 owner/control acknowledgements, current claims, root state and logical custody
 remain in their own records. Unresolved physical questions require ROOT evidence;
 there is no automatic replay, recovery or inference from address or lock absence.
+
+ROOT can deliberately supply independently retained physical evidence through
+the module helper `record_physical_disposition(run, evidence)`. This is an
+administrative Python capability, not a requester/sudoers route, and is not
+automatically called. It checks real root identity, trusted run/private
+ancestry, private 0700 custody and the exact run lock before durably replacing
+an uncertain marker. It does not signal an actor, scan PIDs or remove a run.
+ROOT must first establish the actual evidence for the exact run; the helper
+checks its shape and identity, not the truth of an external witness.
+
+The evidence has exactly `run`, `run_dir`, `entry`, `entry_status` and `basis`.
+`basis` has `kind` and a nonempty `reference` to ROOT's retained witness
+(at most 1024 characters; no token, task or secret payload). Accepted pairs are
+`entry: ended` with the actual integer entry wait status and
+`kind: root-observed-entry-wait`, or `entry: not-started`, null status and
+`kind: root-positive-producer-no-entry`. A supervisor wait, pidfd cessation
+without the entry's collected status, free lock, lost address, owner claim,
+logical retirement or complete loss snapshot cannot supply either basis.
+Missing evidence remains protected; no legacy backfill is inferred. Existing
+positive producer markers need only be read, and cannot be replaced by this
+helper. After ROOT's publication, the existing capture/sweep operation can
+perform disposition under its ordinary guards and retention policy.
 
 ## Programmatic caller
 
@@ -504,9 +531,31 @@ implicitly in that caller; the next ordinary task launch still sweeps.
 Capture writes accounts and may prune/remove physically ended stale `discard` runs; `keep`
 runs get an explicit reading without changing their retention policy. Its terminal/caller
 result preserves incomplete capture/delivery as a nonzero outcome. Copies
-stay available on output failure. Retirement explicitly deletes/syncs one
-copy; it settles nothing. Successful exports are transport receipts, not
+stay available on output failure. Retirement disposes of the semantic copy;
+any captured positive physical fact remains durably readable through the same
+`loss-account` request. It settles nothing. Successful exports are transport receipts, not
 semantic use, receiver truth, processing or replay authority.
+
+Before a marked run is removed, its exact run identity, producer basis and
+entry wait status (or positive producer no-entry fact) are saved in
+`loss-accounts/<RUN>.json.retired`, using the existing loss-record format and
+private durable writer. Unretirable stores' active `<RUN>.json` loss accounts
+also carry this independent `physical_evidence` field. The archive contains no
+handle/token or PID. Evidence-publication failure preserves the entire source
+before pruning/removal. Retirable/no-store runs still retain their physical
+fact; it is independent of semantic snapshots, task/ACK or canonical SDK proof.
+
+List/read expose these records and `loss_account_retired`; list terminals
+report active semantic `accounts` and `physical_dispositions` separately.
+Retirement preserves proof before deleting the active copy and is repeatable
+for a physical-only record. The 64-account soft capture threshold still
+applies to active semantic copies. Physical records have no automatic expiry
+or capacity eviction: ROOT custody-release and campaign audit/readback can
+still need them. Their storage and list/scan cost accumulate. Root-private
+trust, ordinary durable replacement and bounded-reader guarantees remain
+scoped; arbitrary root mutation, filesystem stalls and power loss are not
+qualified. These records are neither a universal process oracle nor an account
+lease, and a loss copy without a positive field proves no physical end.
 
 `run_base/<uid>/loss-accounts/<RUN>.json` is root-private (0700 directory,
 0600 records). First creation syncs the parent; publication syncs file,

@@ -190,6 +190,10 @@ class Retention(Scratch):
         self.user_dir = os.path.join(self.dir, str(self.uid))
         os.makedirs(self.user_dir)
         self.package = fixture_package(self.dir)
+        # All run/loss assets are owned surrogates, never actual root assets.
+        self.custody_guard = mock.patch.object(frontdoor, "check_owned")
+        self.custody_guard.start()
+        self.addCleanup(self.custody_guard.stop)
 
     def make_run(self, name, retention, locked, terminal=None):
         run = os.path.join(self.user_dir, name)
@@ -249,12 +253,15 @@ class Retention(Scratch):
         mode = os.stat(os.path.join(self.user_dir, frontdoor.LOSS_ACCOUNTS)).st_mode
         self.assertEqual(mode & 0o077, 0, "only root (the front door) reads accounts")
 
-    def test_retirable_discard_keeps_production_cleanup_without_an_account(self):
+    def test_retirable_discard_keeps_physical_fact_without_semantic_account(self):
         run = self.make_run("done", "discard", False, RETIRABLE)
         record = frontdoor.retire(run, "discard", package=self.package)
         self.assertTrue(record["run_removed"])
         self.assertNotIn("loss_account", record)
-        self.assertEqual(self.accounts(), [])
+        self.assertEqual(self.accounts(), ["done.json.retired"])
+        record = frontdoor.read_loss_account(os.path.join(self.user_dir, frontdoor.LOSS_ACCOUNTS), "done")
+        self.assertEqual(record["physical_evidence"]["entry_status"], 87)
+        self.assertIsNone(record["store_account"])
 
     def test_unreadable_store_is_kept_pruned_with_a_visible_reason(self):
         run = self.make_run("broken", "discard", False)
@@ -284,8 +291,9 @@ class Retention(Scratch):
         self.assertFalse(record["loss_account"]["retained"])
         self.assertIn("capacity", record["loss_account"]["reason"])
         self.assertTrue(os.path.isdir(os.path.join(run, "store")))
-        self.assertEqual(len(self.accounts()), frontdoor.MAX_LOSS_ACCOUNTS)
+        self.assertEqual(len(self.accounts()), frontdoor.MAX_LOSS_ACCOUNTS + 1)
         self.assertNotIn("late.json", self.accounts())
+        self.assertIn("late.json.retired", self.accounts())
 
     def test_unknown_requester_layout_keeps_the_store(self):
         run = os.path.join(self.dir, "loose")
@@ -326,7 +334,7 @@ class Retention(Scratch):
         # owed accounts are retained for the requester first.
         self.assertFalse(os.path.exists(owed))
         self.assertFalse(os.path.exists(done))
-        self.assertEqual(self.accounts(), ["dead.json", "owed.json"])
+        self.assertEqual(self.accounts(), ["dead.json", "dead.json.retired", "done.json.retired", "owed.json", "owed.json.retired"])
         self.assertEqual(self.loss_account("dead")["captured"]["by"], "sweep")
         self.assertTrue(os.path.isdir(kept))
         self.assertTrue(os.path.lexists(os.path.join(kept, "launch/provider/adapter-state")))
@@ -357,7 +365,7 @@ class Retention(Scratch):
         self.assertEqual(code, 0)
         self.assertEqual(lines[0]["record"]["store_account"]["inputs"][0]["state"], "stopped-insertion-unresolved")
         # Reading changes nothing; another requester's directory is separate.
-        self.assertEqual(self.accounts(), ["lost.json"])
+        self.assertEqual(self.accounts(), ["lost.json", "lost.json.retired"])
         code, lines = self.route({"v": 1, "op": "loss-accounts"}, uid=self.uid + 1)
         self.assertEqual((code, lines[-1]["accounts"]), (0, 0))
         with self.assertRaisesRegex(frontdoor.Refused, "no such account"):
@@ -365,9 +373,11 @@ class Retention(Scratch):
         code, lines = self.route({"v": 1, "op": "retire-loss-account", "account": "lost"})
         self.assertEqual(code, 0)
         self.assertTrue(lines[-1]["retired"])
-        self.assertEqual(self.accounts(), [])
-        with self.assertRaisesRegex(frontdoor.Refused, "no such account"):
-            self.route({"v": 1, "op": "loss-account", "account": "lost"})
+        self.assertEqual(self.accounts(), ["lost.json.retired"])
+        code, lines = self.route({"v": 1, "op": "loss-account", "account": "lost"})
+        self.assertEqual(code, 0)
+        self.assertEqual(lines[0]["record"]["physical_evidence"]["entry_status"], 87)
+        self.assertIsNone(lines[0]["record"]["store_account"])
 
     def test_route_requests_are_checked_before_any_effect(self):
         for bad in ({"v": 1, "op": "loss-account", "account": "../x"},
