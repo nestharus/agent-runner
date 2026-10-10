@@ -72,6 +72,8 @@ for supported forms, exact model-to-site-route mappings and caller/output
 contracts. Building this frontend does not install the native caller package.
 `agents roots` uses that configuration to discover the requester's native root
 identities and observed addresses as JSON; listing grants no attachment authority.
+An explicit `--live-handle FILE` keeps one launched root live with a private
+handle, addressed later by `agents root FILE --inspect|--hold|--release|--cancel|--close|--stop|--prompt-file P`.
 
 Help/usage, non-launch subcommands, GUI and wider legacy-source retirement
 remain separate and unclosed. The older [paired Linux archive](packaging/linux/README.md)

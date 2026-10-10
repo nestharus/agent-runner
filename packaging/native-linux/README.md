@@ -378,21 +378,45 @@ run deadline still bounds an unresponsive owner. What the owner answers:
   aggregation over recorded actors, explicitly separate from SDK one-reference
   physical knowledge; actor completeness/native retirement remains unqualified.
 
-The caller exposes `--root FILE --inspect | --hold | --release`, plus
+The caller exposes `--root FILE --inspect | --hold | --release | --cancel`, plus
 `--control-request JSON` for an exact submission/replay and `--control-prior`
-for its prior caller result. Hold/release use a fresh key. A fresh
+for its prior caller result. Hold/release/cancel use a fresh key, this
+requester (`uid:<n>`) and the authority a fresh inspection reports. After an
+answered `--cancel` the caller does not re-inspect the ending root: it collects
+the front door's terminal to EOF within its wait and reports that physical end
+separately as `physical` (`cancelled`, `incomplete`, `cleanup-failed`, ... or
+`not-observed`). The class remains the control reading; an acknowledged cancel
+is transition knowledge, not proof the tree ended. A fresh
 `inspection_key` selects one owner envelope containing the actual advertisement,
 shared state and settlement. The packaged supervisor's read-only
 `--read-control` mode uses the SDK's schema, capability selection, agreement and
 trace operations. `--control-reader` may name that reader explicitly; no binary,
 banner or source revision participates in negotiation. Missing/incompatible
-control disables this control encounter only; the root's execution continues.
+control before submission disables this control encounter only; the root's
+execution continues. `encounter.submission` distinguishes `not-attempted`,
+`attempted` (send failed with unknown effect), and `sent` (transport write
+completed, not proof of receiver effect). Reader failure after submission
+returns `control-unknown` unless a later validated reading establishes the
+control outcome. The result retains the last validated request, original and
+history, labels its `knowledge_source`, and records later `reader_errors`.
+`encounter.answer` distinguishes an absent answer, a received but unvalidated
+answer, and an SDK-read answer. Unvalidated receiver records are not published
+as accepted claims. A retained prior ACK is transition history, not a new
+execution proof. Follow-up retains the same immutable key/original; this adds
+no replay permission or fresh-key retry.
 
 A changed submission requires the caller's preserved original, including after
 its final outcome. Both exact submission and original-trace conflict joins are
 checked. The owner faithfully replays the original before the separate conflict
 answer. Returned claims, rejected records and diagnostics remain in the caller
-result. Fulfillment is distinct from acknowledgment and non-fulfillment:
+result as accepted claims and generic rejection diagnostics, excluding rejected
+values. The 16 MiB prior-file custody bound is separate from the reader's
+4 MiB whole-encounter bound and the SDK's 32 KiB per-record bound. Legitimate
+multi-record histories can exceed one record's bound; an encounter too large
+for admission refuses before send. If a later encounter exceeds the reader's
+bound, already validated history survives with current-effect uncertainty.
+Malformed later physical accounting degrades that account while preserving
+validated control knowledge. Fulfillment is distinct from acknowledgment and non-fulfillment:
 `inspected`/`acknowledged`/`fulfilled` exit 0, `control-refused`/`unfulfilled`
 exit 18, `control-unknown`/`control-unavailable` exit 19, and a contradictory or
 incomplete account exits 6. Transition knowledge does not establish work
@@ -641,8 +665,8 @@ Later, independent calls by the same requester can then address that root.
   - Cross-supervisor messaging.
   - A global daemon.
   - Generic descendants.
-  - The ordinary `agents` entry and the temporary dispatcher do not open live
-    roots.
+  - The temporary dispatcher does not open live roots; the ordinary `agents`
+    entry opens one only with explicit `--live-handle` (below).
 
 `test_live.py` contains unprivileged stand-in controls for separate callers,
 constructor-initialized record framing/loss, the actual concurrent admission
@@ -653,6 +677,44 @@ proof. Real owner/provider, privileged namespace/sudo/session policy and
 package replacement while a live root holds its lock remain ROOT qualification.
 
 ## Ordinary `agents` entry (`native.toml`)
+
+**Live roots from the ordinary entry.** A launch form with
+`--live-handle NEWFILE` (for example `agents -m MODEL --live-handle h.json
+PROMPT`) passes that absolute path to the caller's `--live-handle`: the root
+outlives the call and its private handle is written to the new file (mode 0600).
+Without the option the launch stays one-shot. `agents root FILE` then takes
+exactly one of `--inspect`, `--hold`, `--release`, `--cancel`, `--close`,
+`--stop`, `--prompt-file P` or `--control-request R [--control-prior C]`, with
+an optional `--wait 1..7200`. It runs one caller `--root` call with a fresh
+record directory under `runs_dir`, no retry or replay. This entry never reads
+the handle or prints it; the caller, front door and owner keep the UID, peer,
+token and exact `{root, owner, generation, incarnation}` checks. Control-face
+operations (`--inspect`, `--hold`, `--release`, `--cancel`, `--control-request`)
+print the caller's private requester `result.json` to stdout; `--prompt-file` prints
+the answer; `--close`/`--stop` print only the stderr status line, which also
+gives the caller's `root` reading. Caller exits are returned as is (see Live
+roots). Missing/invalid configuration and an unavailable caller refuse with
+exit 3 without quoting configuration. `--stop` is the owner-instance stop and
+`--cancel` the durable v3 cancel; `--close` reports physical close separately
+from its acknowledgment. Discovery still grants no attachment: a lost handle
+is not recovered through `agents roots`, and offline recovery is not offered.
+
+Control request and prior files must be caller-owned regular files, without
+final symlinks. Reads are bounded before SDK admission: requests to 64 KiB,
+prior result envelopes to 16 MiB. The SDK independently bounds each protocol
+record to 32 KiB; the prior envelope contains multiple records and accounts.
+Rejected values and unrelated prior-envelope fields are omitted from results.
+Live-opening configuration failures use generic diagnostics. Successful launch
+status lines still contain requester route/caller/path metadata.
+
+`--wait` bounds attachment collection, with 65 seconds more for stop/end
+collection, measured from attachment start. File/connection/SDK operations add
+their own time; this is neither a whole-command deadline nor a cessation
+guarantee. A terminal with no observed entry status or unknown stop reports
+unknown end, including known run retention. Already read control knowledge
+survives local capture/flush failure, reported separately in collection errors.
+Result publication can still fail: a non-success exit and stderr preserve the
+observed reading where that output remains writable.
 
 `agents roots` lists the configured package's native roots for the current
 requester as JSON, through that same caller (`oulipoly-native-call --discover`)

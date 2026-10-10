@@ -11,7 +11,8 @@
     oulipoly-native-call --discover
         Observational JSON on stdout; no task, handle, or output directory.
     oulipoly-native-call --root HANDLE --out DIR
-        (--prompt-file FILE | --close | --stop | --inspect | --hold | --release)
+        (--prompt-file FILE | --close | --stop | --inspect | --hold | --release
+         | --cancel | --control-request FILE [--control-prior FILE])
         [--wait SECONDS]
 
 --live-handle opens a live root: its supervisor outlives this call; --root
@@ -783,30 +784,52 @@ def main_discovery(argv):
     return code
 
 
-def read_private(path):
+CONTROL_REQUEST_LIMIT = 64 * 1024  # SDK records remain independently limited to 32 KiB.
+CONTROL_PRIOR_LIMIT = 16 * 1024 * 1024  # A result envelope contains multiple records/accounts.
+
+
+def read_private(path, limit=1024 * 1024, kind="live handle"):
     """The caller's own regular file (its live handle), read without
     following a final symlink or blocking on a FIFO, bounded."""
     st = os.lstat(path)
     if not stat.S_ISREG(st.st_mode):
-        raise LocalRefusal("live handle is not a regular file")
+        raise LocalRefusal(kind + " is not a regular file")
     if st.st_uid != os.getuid():
-        raise LocalRefusal("live handle is not the caller's own file")
+        raise LocalRefusal(kind + " is not the caller's own file")
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     try:
         opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.getuid():
-            raise LocalRefusal("live handle changed or is not the caller's own regular file")
+        if not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.getuid() \
+                or (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+            raise LocalRefusal(kind + " changed or is not the caller's own regular file")
+        if opened.st_size > limit:
+            raise LocalRefusal(kind + " is too large")
         chunks = []
+        size = 0
         while True:
-            chunk = os.read(fd, 65536)
+            chunk = os.read(fd, min(65536, limit + 1 - size))
             if not chunk:
                 break
             chunks.append(chunk)
-            if sum(map(len, chunks)) > 1024 * 1024:
-                raise LocalRefusal("live handle is too large")
+            size += len(chunk)
+            if size > limit:
+                raise LocalRefusal(kind + " is too large")
         return b"".join(chunks)
     finally:
         os.close(fd)
+
+
+def read_control_input(path, limit, kind):
+    try:
+        value = json.loads(read_private(path, limit, kind))
+        if not isinstance(value, dict):
+            raise LocalRefusal(kind + ": expected object")
+        if kind == "control prior" and any(not isinstance(value.get(k, []), list)
+                                          for k in ("claims", "prior_claims")):
+            raise LocalRefusal(kind + ": expected claim arrays")
+        return value
+    except (OSError, ValueError, RecursionError) as error:
+        raise LocalRefusal(kind + ": " + type(error).__name__) from None
 
 
 def read_handle(path):
@@ -858,10 +881,16 @@ class Attached:
         self.eof = False
         self.signals = []
         self.errors = []
+        self.capture_failed = False
 
     def log(self, **fields):
-        self.actions.write(json.dumps({**fields, "t": round(time.monotonic() - self.start, 3)}, sort_keys=True) + "\n")
-        self.actions.flush()
+        try:
+            self.actions.write(json.dumps({**fields, "t": round(time.monotonic() - self.start, 3)}, sort_keys=True) + "\n")
+            self.actions.flush()
+        except (OSError, ValueError) as error:
+            reason = "action-capture:" + type(error).__name__
+            if reason not in self.errors:
+                self.errors.append(reason)
 
     def connect(self):
         """None when attached, else the refusal class and its reason."""
@@ -921,7 +950,14 @@ class Attached:
                     self.errors.append("interrupted-transport-record")
                 self.eof = True
                 continue
-            self.capture.write(chunk)
+            # Received evidence survives a local capture failure. Continue
+            # parsing this same encounter; capture loss is reported separately.
+            if not self.capture_failed:
+                try:
+                    self.capture.write(chunk)
+                except (OSError, ValueError) as error:
+                    self.errors.append("event-capture:" + type(error).__name__)
+                    self.capture_failed = True
             self.buffer += chunk
             if len(self.buffer) > LINE_LIMIT:
                 self.errors.append("transport-line-limit")
@@ -947,9 +983,17 @@ class Attached:
 
     def close(self):
         if self.sock is not None:
-            self.sock.close()
+            try:
+                self.sock.close()
+            except OSError as error:
+                self.errors.append("transport-close:" + type(error).__name__)
             self.sock = None
-        self.capture.flush()
+        try:
+            self.capture.flush()
+        except (OSError, ValueError) as error:
+            reason = "capture-flush:" + type(error).__name__
+            if reason not in self.errors:
+                self.errors.append(reason)
 
     def turn(self, index, ref, until):
         """Waits for the caller's own input: admitted (by ref), ACK, its
@@ -998,18 +1042,30 @@ def turn_class(account, text):
     if account["refused"] is not None:
         return "follow-up-refused"
     if account["turn_end"] is None:
-        return "root-ended" if account["root_ended"] is not None else "incomplete"
+        return "root-ended" if root_end(account["root_ended"]) == "ended" else "incomplete"
     if text is not None and account["ack"] and account["turn_end"].get("stop_reason") == "end_turn":
         return "answered"
     return "no-answer"
 
 
 def live_close_account(terminal, events):
+    # Physical accounting is fallible evidence, not a reason to discard an
+    # already acquired control reading or turn account.
+    try:
+        return live_close_account_checked(terminal, events)
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as error:
+        return {"async": async_of([]), "owner_terminal": None,
+                "errors": ["live-account-invalid-shape:" + type(error).__name__]}
+
+
+def live_close_account_checked(terminal, events):
     """Use the live supervisor's runtime-only witness across attachments.
     Caller-local records alone may omit earlier turns/reports. Never infer
     whole-root settlement from the closer's own turn or physical retirement."""
     witness = terminal.get("account_events") if terminal else None
-    errors = list(terminal.get("account_errors", [])) if terminal else []
+    errors = terminal.get("account_errors", []) if terminal else []
+    errors = list(errors) if isinstance(errors, list) and all(isinstance(e, str) for e in errors) \
+        else ["live-account-errors-invalid-shape"]
     if not isinstance(witness, list) or not all(isinstance(e, dict) for e in witness):
         witness = [e for e in events if parent_event(e)]
         errors.append("live-account-witness-missing-or-invalid")
@@ -1040,10 +1096,17 @@ def live_close_account(terminal, events):
 
 
 def end_class(terminal, account, collection, cmd):
-    if terminal is None:
+    if not isinstance(terminal, dict):
         return "incomplete"
     code = terminal.get("exit")
     retired = terminal.get("retire", {})
+    if not isinstance(retired, dict) or not isinstance(terminal.get("live", {}), dict) \
+            or not isinstance(terminal.get("cancel", ""), (str, type(None))) \
+            or not isinstance(terminal.get("collection_errors", []), list) \
+            or any("invalid-shape" in e for e in account["errors"]):
+        return "incomplete"
+    if root_end(terminal) != "ended":
+        return "incomplete"
     if code == 94 or (retired.get("ok") is False and retired.get("stop") != "unknown"):
         return "cleanup-failed"
     if code in (90, 91, 93) or code is None or terminal.get("collection_errors") \
@@ -1062,15 +1125,36 @@ def end_class(terminal, account, collection, cmd):
     return "ended-otherwise"
 
 
+def root_end(terminal):
+    if terminal is None:
+        return "unknown (no terminal record; stop not observed)"
+    retired = terminal.get("retire", {})
+    if not isinstance(retired, dict) or not isinstance(retired.get("stop", ""), str):
+        return "unknown (invalid retirement account; stop not observed)"
+    if type(terminal.get("entry_status")) is int and retired.get("stop") != "unknown":
+        return "ended"
+    return "unknown (stop not observed; run retained)" if retired.get("run_removed") is False \
+        else "unknown (stop not observed)"
+
+
 def live_result(out, cls, fields):
+    fields = {key: value for key, value in fields.items() if key != "_control_class"}
     if cls not in LIVE_EXITS:
         fields = {**fields, "classification_error": "undeclared live outcome: " + str(cls)}
         cls = "incomplete"
-    write_json(os.path.join(out, "result.json"), {
+    result = {
         "class": cls, **fields,
         "loss_accounts": loss_pointer(fields.get("front_door_terminal")),
         "processing_completion": "not-observed", "correctness": "not-established", "retry": "do-not-replay",
-    })
+    }
+    try:
+        write_json(os.path.join(out, "result.json"), result)
+    except OSError as error:
+        # A publication failure cannot turn known control evidence into an
+        # unanswered request, nor can it guarantee a successful exit.
+        print(json.dumps({**result, "class": "incomplete", "observed_class": cls,
+                          "publication": type(error).__name__}), file=sys.stderr)
+        return LIVE_EXITS["incomplete"]
     return LIVE_EXITS[cls]
 
 
@@ -1116,7 +1200,7 @@ def opened_live(args, call, terminal, collection):
     return live_result(args.out, cls, {
         **base, "handle": args.live_handle, "run": handle.get("run"), "turn": account,
         "transport": {"errors": attached.errors, "attached": attached.events[0] if attached.events else None},
-        "root": "ended" if account["root_ended"] else "live (detached; this exit is not the root's end)",
+        "root": root_end(account["root_ended"]) if account["root_ended"] else "live (detached; this exit is not the root's end)",
     })
 
 
@@ -1134,11 +1218,14 @@ def parse_live_args(argv):
     action.add_argument("--hold", action="store_true",
                         help="hold new input (admission only; running work continues)")
     action.add_argument("--release", action="store_true", help="release an input hold")
+    action.add_argument("--cancel", action="store_true",
+                        help="the root's durable lifecycle cancel (session_control/v3, this requester); not --stop")
     action.add_argument("--control-request", help="submit an exact shared control request from a JSON file (including replay)")
     parser.add_argument("--control-prior", help="prior caller result preserving the immutable original and its claims")
     parser.add_argument("--control-reader", default=os.path.join(os.path.dirname(os.path.realpath(__file__)), "oulipoly-root-supervisor"),
                         help="read-only SDK consumer executable; defaults to the packaged supervisor")
-    parser.add_argument("--wait", type=int, default=1800, help="this call's own bound; the root is unaffected by it")
+    parser.add_argument("--wait", type=int, default=1800,
+                        help="attachment collection bound; stop collection allows 65s more; not a whole-command deadline or root cessation guarantee")
     args = parser.parse_args(argv)
     if not 1 <= args.wait <= MAX_DEADLINE_S:
         parser.error(f"--wait must be 1..{MAX_DEADLINE_S}")
@@ -1154,6 +1241,8 @@ def main_live(argv):
         return LIVE_EXITS["refused-locally"]
     try:
         handle = read_handle(args.root)
+        args.prior_input = read_control_input(args.control_prior, CONTROL_PRIOR_LIMIT, "control prior") if args.control_prior else {}
+        args.request_input = read_control_input(args.control_request, CONTROL_REQUEST_LIMIT, "control request") if args.control_request else None
         message = None
         if args.prompt_file:
             with open(args.prompt_file, encoding="utf-8") as file:
@@ -1183,8 +1272,8 @@ def main_live(argv):
             return live_result(args.out, "incomplete" if attached.errors else turn_class(account, text), {
                 **base, "turn": account,
                 "transport": {"errors": attached.errors, "attached": attached.events[0] if attached.events else None},
-                "root": "ended" if account["root_ended"] else "live (detached; this exit is not the root's end)"})
-        if args.inspect or args.hold or args.release or args.control_request:
+                "root": root_end(account["root_ended"]) if account["root_ended"] else "live (detached; this exit is not the root's end)"})
+        if args.inspect or args.hold or args.release or args.cancel or args.control_request:
             return live_control(args, attached, base, until)
         cmd = "close" if args.close else "cancel"
         attached.write({"cmd": cmd})
@@ -1206,9 +1295,9 @@ def main_live(argv):
             "account_errors": account["errors"],
             "transport": {"attached": attached.events[0] if attached.events else None,
                           "loss": terminal.get("live") if terminal else None},
-            "physical_close": bool(terminal and terminal.get("entry_status") is not None),
+            "physical_close": root_end(terminal) == "ended",
             "control_meaning": "durable root close" if args.close else "owner-instance stop; durable intent remains for direct recovery",
-            "root": "ended" if terminal else "unknown (no terminal record; stop not observed)"})
+            "root": root_end(terminal)})
     except OSError as error:
         attached.close()
         return live_result(args.out, "incomplete", {**base, "reason": type(error).__name__})
@@ -1258,34 +1347,66 @@ def read_control(args, advertisement, state, request=None, claims=None, prior=No
 
 
 def live_control(args, attached, base, until):
+    # This checkpoint spans acquisition through publication. A later reader,
+    # transport, accounting or local-file failure cannot erase validated facts.
+    known = {**base, "encounter": {"submission": "not-attempted", "answer": "not-observed"}}
+    try:
+        return live_control_checked(args, attached, known, until)
+    except (OSError, ValueError, TypeError, OverflowError, KeyError, AttributeError, RecursionError) as error:
+        attached.close()
+        known["collection"] = {"eof": attached.eof, "errors": attached.errors}
+        known["reporting_error"] = type(error).__name__
+        cls = known.get("_control_class", "control-unknown" if known["encounter"]["submission"] != "not-attempted" else "incomplete")
+        return live_result(args.out, cls, known)
+
+
+def remember_control_reading(known, reading, source):
+    if reading["class"] == "control-unavailable":
+        known.setdefault("reader_errors", []).append({"stage": source, "diagnostics": reading["diagnostics"]})
+        return False
+    known.update(control_records(reading))
+    known["reading"], known["knowledge_source"] = reading, source
+    return True
+
+
+def live_control_checked(args, attached, fields, until):
     """Fresh inspection/agreement, exact submission, and preserved-original trace."""
     state, settlement = inspected(attached, until)
     advertisement = getattr(attached, "control_advertisement", None)
-    fields = {**base, "control_state": state, "settlement": settlement, "advertisement": advertisement}
+    fields.update(control_state=state, settlement=settlement, advertisement=advertisement)
     if state is None or settlement is None:
         attached.detach()
-        return live_result(args.out, "incomplete", {**fields, "reason": "no inspection within the wait bound"})
+        return live_result(args.out, "incomplete", {**fields, "reason": "no inspection within the wait bound",
+            "collection": {"eof": attached.eof, "errors": attached.errors}})
     inspection = read_control(args, advertisement, state)
+    remember_control_reading(fields, inspection, "inspection")
     if inspection["class"] != "inspected" or args.inspect:
         attached.detach()
-        return live_result(args.out, inspection["class"], {**fields, "reading": inspection})
-    prior = {}
-    if args.control_prior:
-        with open(args.control_prior, encoding="utf-8") as file:
-            prior = json.load(file)
+        return live_result(args.out, inspection["class"], {**fields, "reading": inspection,
+            "collection": {"eof": attached.eof, "errors": attached.errors}})
+    prior = args.prior_input
     if args.control_request:
-        with open(args.control_request, encoding="utf-8") as file:
-            request = json.load(file)
+        request = args.request_input
     else:
         request = {"kind": "request", "protocol": CONTROL_PROTOCOL,
                    "request_key": "c" + os.urandom(8).hex(), "requester": f"uid:{os.getuid()}",
-                   "addressed": state["reporter"], "operation": "input_hold" if args.hold else "input_release",
+                   "addressed": state["reporter"],
+                   "operation": "cancel" if args.cancel else "input_hold" if args.hold else "input_release",
                    "scope": {"root": state["reporter"]["root"]}}
     admission = read_control(args, advertisement, state, request, prior=prior)
     if admission["class"] == "control-unavailable":
         attached.detach()
-        return live_result(args.out, "control-unavailable", {**fields, "request": request, "reading": admission})
+        return live_result(args.out, "control-unavailable", {**fields, "reading": admission,
+            "collection": {"eof": attached.eof, "errors": attached.errors}})
+    # The SDK reader returns only validated protocol records. Do not publish
+    # rejected input or arbitrary fields from the enclosing prior result.
+    remember_control_reading(fields, admission, "admission")
+    request = admission["request"]
+    fields["submission_inspection"] = state
+    fields["encounter"]["submission"] = "attempted"
+    fields["_control_class"] = "control-unknown"
     attached.write(request)
+    fields["encounter"]["submission"] = "sent"
     attached.log(action="send", control=request["operation"], request_key=request["request_key"])
     claims, refusal, answered = [], None, False
     while True:
@@ -1297,23 +1418,72 @@ def live_control(args, attached, base, until):
             break
         if event.get("event") == "control-answer" and event.get("request") == request:
             claims = event.get("claims", [])
+            fields["encounter"]["answer"] = "received-unvalidated"
             answered = True
             break
-    reading = read_control(args, advertisement, state, request, claims, prior)
-    current_state, current_settlement = inspected(attached, until) if answered else (None, None)
-    fields["submission_inspection"] = state
+    reading = read_control(args, advertisement, state, request, claims, prior) if answered else fields["reading"]
+    answer_read = remember_control_reading(fields, reading, "answer") if answered else False
+    if answer_read and answered:
+        fields["encounter"]["answer"] = "sdk-read"
+        fields["_control_class"] = reading["class"]
+    if answered and answer_read and request.get("operation") == "cancel" \
+            and reading["class"] in ("acknowledged", "fulfilled") \
+            and any(c.get("kind") in ("acknowledgment", "fulfillment") for c in reading.get("claims", [])):
+        return cancel_result(args, attached, fields, reading, until)
+    try:
+        current_state, current_settlement = inspected(attached, until) if answered else (None, None)
+    except OSError as error:
+        attached.errors.append("reinspection:" + type(error).__name__)
+        current_state, current_settlement = None, None
     fields["control_state"], fields["settlement"] = current_state, current_settlement
     if current_state is not None:
-        reading = read_control(args, getattr(attached, "control_advertisement", None), current_state, request, claims, prior)
+        current_reading = read_control(args, getattr(attached, "control_advertisement", None), current_state, request, claims, prior)
+        if remember_control_reading(fields, current_reading, "reinspection") and answered:
+            fields["encounter"]["answer"] = "sdk-read"
+            fields["_control_class"] = current_reading["class"]
     else:
-        reading["inspection_unavailable"] = True
+        fields["inspection_unavailable"] = True
     attached.detach()
-    cls = "control-refused" if refusal is not None else reading["class"] if answered and current_state is not None else "incomplete"
-    return live_result(args.out, cls, {**fields, "request": request, "claims": claims,
-        "original": reading.get("original", prior.get("original", request)),
-        "prior_claims": prior.get("prior_claims", []) + prior.get("claims", []),
-        "reading": reading, "refusal": refusal,
-        "meaning": "shared transition knowledge; running-work settlement is separately reported"})
+    # A retained prior ACK is history, not a new execution/answer proof. When
+    # no post-send SDK reading exists, the current encounter remains unknown.
+    cls = "control-refused" if refusal is not None else fields.get("_control_class", "control-unknown")
+    return live_result(args.out, cls, {**fields, "refusal": refusal,
+        "collection": {"eof": attached.eof, "errors": attached.errors},
+        "meaning": "shared transition knowledge includes retained history; neither history nor an answer proves a new execution; running-work settlement is separately reported"})
+
+
+def control_records(reading):
+    return {key: reading[key] for key in ("request", "original", "claims", "prior_claims") if key in reading}
+
+
+def cancel_result(args, attached, fields, reading, until):
+    """A durable cancel's answer is the transition knowledge; the root then
+    ends. Its physical end is collected separately within this call's bound
+    and never derived from the acknowledgment."""
+    terminal = None
+    try:
+        while True:
+            event = attached.next_event(until + STOP_GRACE_S)
+            if event is None:
+                break
+            if event.get("frontdoor") == "terminal":
+                terminal = event
+    except OSError as error:
+        attached.errors.append("end-collection:" + type(error).__name__)
+    attached.close()
+    collection = {"eof": attached.eof, "errors": attached.errors}
+    if terminal is None:
+        physical = {"class": "not-observed", "root": "end not observed within this call's wait"}
+    else:
+        account = live_close_account(terminal, attached.events)
+        physical = {"class": end_class(terminal, account, collection, "cancel"), "root": root_end(terminal),
+                    **{k: terminal.get(k) for k in ("exit", "entry_status", "killed", "cancel", "retire")},
+                    "account_errors": account["errors"]}
+    fields = {**fields, "submission_inspection": fields["control_state"], "control_state": None, "settlement": None}
+    return live_result(args.out, reading["class"], {**fields, **control_records(reading),
+        "reading": reading, "refusal": None, "collection": collection, "physical": physical,
+        "front_door_terminal": terminal,
+        "meaning": "durable cancel transition knowledge; physical end is the separate `physical` account"})
 
 
 def main(argv):
