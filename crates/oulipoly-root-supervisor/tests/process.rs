@@ -6453,3 +6453,211 @@ fn sdk_resident_child_rejection_reaches_its_requester() {
     let text = serde_json::to_string(&seen).unwrap();
     assert!(!text.contains("PRIVATE-RESIDENT-PAYLOAD"));
 }
+
+/// Missing attach records are possible-effect uncertainty, across every
+/// owner. Inject durable open rows, not a production fault or a forced
+/// post-clone read error. Real PID 1/parent/ingress exercise recovery and
+/// admission; exact namespace death then establishes physical release.
+#[test]
+fn attached_missing_work_stays_owed_and_charged_until_namespace_end() {
+    let dir = Scratch::new("missing-custody");
+    let mut first = Run::start(
+        &dir,
+        &child_spec(
+            &dir,
+            json!([
+                { "id": "p", "argv": peer(&dir.state("p"), &["--live-reattach"]), "messages": ["echo:first"] },
+                { "id": "m", "argv": peer(&dir.state("m"), &["--mode", "silent"]), "messages": ["possible-effect"] }
+            ]),
+            json!({ "quiet": peer_route(&dir, "q", &["--mode", "silent"]) }),
+            4,
+            2,
+        ),
+    );
+    let root_pid = first.until("root", |v| v["event"] == "root-pid1-started")["pid"]
+        .as_i64()
+        .unwrap();
+    first.event("p", "turn-end");
+    wait_state(&dir.state("m"), |v| {
+        v["prompts"].as_array().is_some_and(|p| p.len() == 1)
+    });
+    first.kill();
+    // Two admitted children: one unknown harness, and one positively ended
+    // harness with an unknown Bash namespace. No actual child is launched.
+    let conn = rusqlite::Connection::open(dir.store().join("intent.sqlite3")).unwrap();
+    conn.execute_batch("
+        INSERT INTO work(id,harness,incarnation,generation) VALUES(100,1,1,1);
+        INSERT INTO harness(position,id,argv,endpoint,kind) VALUES(2,'missing-child','[]','stdio','child'),(3,'bash-child','[]','stdio','child');
+        INSERT INTO child(harness,parent,parent_work,route,requester_pid,inputs_open,admitted_generation)
+            SELECT h,0,(SELECT min(id) FROM work WHERE harness=0),'quiet',1,'[]',1 FROM (SELECT 2 AS h UNION ALL SELECT 3);
+        INSERT INTO work(id,harness,incarnation,generation) VALUES(101,2,1,1);
+        INSERT INTO work(id,harness,incarnation,generation,outcome,observer) VALUES(102,3,1,1,'code:0','work-pid1-wait');
+        INSERT INTO work(id,harness,incarnation,generation,kind) VALUES(103,3,1,1,'bash');
+        INSERT INTO bash_run(work,requester_work,requester_pid,inputs_open,argv,cwd,delivery_mode) VALUES(103,102,1,'[]','[]','/','stream');
+    ").unwrap();
+    drop(conn);
+    for generation in [2, 3] {
+        let mut owner = Run::start(&dir, &recover_for(&dir, "continue-attached"));
+        let missing = owner.event("m", "prior-end-unknown");
+        assert_eq!(
+            missing["meaning"],
+            "absent-from-attached-root-liveness-unknown"
+        );
+        assert_eq!(missing["relaunch"], "not-authorized");
+        let reopened = owner.event("p", "recovered-conversation");
+        assert_eq!(reopened["state"], "live-usable", "{reopened}");
+        owner.control(&json!({ "cmd":"send", "harness":"p", "text":format!("spawn:{CHILD_CLIENT} quiet must-not-start") }).to_string());
+        let refusal = owner.until("charged concurrency refusal", |v| {
+            v["event"] == "child-refused"
+        });
+        assert!(
+            refusal["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("budget-concurrent: 2 of 2"),
+            "{refusal}"
+        );
+        owner.until("new parent turn ended", |v| {
+            v["harness"] == "p" && v["event"] == "turn-end" && v["input"] == generation - 1
+        });
+        let conn = db(&dir);
+        assert_eq!(count(&conn, "SELECT count(*) FROM owner"), generation);
+        assert_eq!(count(&conn, "SELECT count(*) FROM child"), 2);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM work WHERE id IN (100,101,103) AND outcome IS NULL"
+            ),
+            3
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM work WHERE outcome='never-launched'"
+            ),
+            0
+        );
+        assert_eq!(count(&conn, "SELECT count(*) FROM incarnation"), 1);
+        drop(conn);
+        assert_eq!(
+            read_state(&dir.state("m"))["prompts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(events(&owner.seen, "m", "launched").is_empty());
+        owner.kill();
+    }
+    let mut final_owner = Run::start(&dir, &recover_for(&dir, "continue-attached"));
+    final_owner.event("p", "recovered-conversation");
+    final_owner.event("m", "prior-end-unknown");
+    // Cancel is a request, not proof of root end. Force and wait the exact
+    // owned namespace init; release can then observe that positive end.
+    kill_and_reap_root(&dir, i32::try_from(root_pid).unwrap());
+    final_owner.cancel();
+    let (closed, _, _) = final_owner.terminal();
+    assert_eq!(closed["root_pid1"]["end_observed"], true);
+    assert_eq!(closed["children"]["charged_before_root_end"], 2);
+    assert_eq!(closed["children"]["end_unknown"], 0);
+    assert_eq!(closed["session_control"]["retirement"]["eligible"], false);
+    assert_eq!(
+        closed["session_control"]["recorded_actor_custody"]["state"],
+        "unsettled"
+    );
+    assert_eq!(
+        count(
+            &db(&dir),
+            "SELECT count(*) FROM work WHERE id IN (100,101,103) AND outcome='ended-with-root-namespace-status-unknown' AND observer IS NULL"
+        ),
+        3
+    );
+    // End was observed through the root pidfd; reap only this owned root.
+    reap_if_ours(i32::try_from(root_pid).unwrap());
+    let (terminal, status, seen) =
+        Run::start(&dir, &recover_for(&dir, "continue-attached")).terminal();
+    assert_eq!(status.code(), Some(6), "{terminal}");
+    assert_eq!(terminal["status"], "root-absent");
+    assert_eq!(terminal["children"]["end_unknown"], 0, "{terminal}");
+    assert_eq!(terminal["session_control"]["retirement"]["eligible"], false);
+    assert!(roots_started(&seen).is_empty());
+    let conn = db(&dir);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM work WHERE id IN (100,101,103) AND outcome='ended-with-root-namespace-status-unknown' AND observer IS NULL"
+        ),
+        3
+    );
+    assert_eq!(count(&conn, "SELECT count(*) FROM incarnation"), 1);
+}
+
+/// A real current-owner child work namespace ends without its harness wait
+/// report. Capacity is released while the durable status remains unknown.
+#[test]
+fn child_namespace_end_without_wait_releases_capacity_without_settling_custody() {
+    let dir = Scratch::new("child-physical-end");
+    let mut owner = Run::start(
+        &dir,
+        &child_spec(
+            &dir,
+            json!([{ "id":"p", "argv":peer(&dir.state("p"), &[]), "messages":[
+            format!("spawn:{CHILD_CLIENT} quiet first > /dev/null 2>&1")
+        ] }]),
+            json!({"quiet":peer_route(&dir,"q", &["--mode","silent"])}),
+            4,
+            2,
+        ),
+    );
+    let root = owner.until("root", |v| v["event"] == "root-pid1-started")["pid"]
+        .as_u64()
+        .unwrap();
+    let child = owner.event("child-1", "launched")["pid"].as_u64().unwrap();
+    let work = *children(root)
+        .iter()
+        .find(|pid| children(**pid) == vec![child])
+        .unwrap();
+    let fd = pidfd(i32::try_from(work).unwrap()).unwrap();
+    assert_eq!(ppid(work), root);
+    assert_eq!(children(work), vec![child]);
+    // SAFETY: the exact verified work PID 1 of this fixture's own child.
+    assert_eq!(
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        },
+        0
+    );
+    let result = owner.until("child result", |v| v["event"] == "child-result");
+    assert_eq!(result["end"]["event"], "end-unknown");
+    assert_eq!(result["lifecycle"]["liveness"], "not-running");
+    assert_eq!(result["lifecycle"]["end"], "status-unknown");
+    owner.event("p", "turn-end");
+    // Allow result publication's pending release to complete, then exercise
+    // both places concurrently through the real attributed ingress.
+    owner.control(&json!({"cmd":"send", "text":format!("spawn:sleep 0.1; {CHILD_CLIENT} quiet second > /dev/null 2>&1 & {CHILD_CLIENT} quiet third > /dev/null 2>&1 & wait")}).to_string());
+    owner.event("child-2", "launched");
+    owner.event("child-3", "launched");
+    assert_eq!(count(&db(&dir), "SELECT count(*) FROM child"), 3);
+    assert_eq!(
+        count(
+            &db(&dir),
+            "SELECT count(*) FROM work WHERE outcome='ended-with-work-namespace-status-unknown' AND observer IS NULL"
+        ),
+        1
+    );
+    owner.cancel();
+    let (terminal, _, _) = owner.terminal();
+    assert_eq!(terminal["children"]["end_unknown"], 0);
+    assert_eq!(terminal["children"]["children"][0]["end_unknown"], true);
+    assert_eq!(
+        terminal["children"]["children"][0]["liveness_unknown"],
+        false
+    );
+    assert_eq!(terminal["session_control"]["retirement"]["eligible"], false);
+}

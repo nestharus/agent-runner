@@ -29,11 +29,10 @@
 //!   it refuses (`route-slots-used`), recording and starting nothing. This
 //!   owner runs only the slot's prepared argv; it prepares nothing.
 //! * **Budget.** `max_concurrent` charges every admitted child until its
-//!   end and its attributed Bash runs' ends are positively observed. A
-//!   child whose launch or end is unknown (possible start, failed waiter,
-//!   left to a successor), or one of whose Bash runs ended unknown, stays
-//!   charged for the rest of this owner's life: it may still be running,
-//!   so it can exhaust the root's capacity rather than let more start.
+//!   namespace and its attributed Bash namespaces are positively ended.
+//!   Genuinely uncertain liveness stays charged and is re-observed from
+//!   unresolved durable work on every owner claim. A namespace end releases
+//!   physical capacity even when exit status and logical custody are unknown.
 //! * **Life.** The child is driven like any harness, with one attempt and
 //!   one closure (no relaunch or replay), its prompt prefixed with
 //!   [`CHILD_BRIEF`]. After its tagged turn end its harness is stopped
@@ -54,7 +53,7 @@
 //!   consumed anything. The child's slot is held after `result` until its
 //!   Bash runs end. None of it is delivered to any harness as a new input.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufReader, Read};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::Sender;
@@ -237,13 +236,29 @@ struct State {
     closed: Option<&'static str>,
     /// Live Bash runs requested from a child's namespace, by work.
     runs: BTreeMap<i64, (usize, Arc<Root>)>,
-    /// Children whose Bash run ended unknown (position), counted once.
+    /// Children with genuinely uncertain Bash liveness, counted once.
     runs_unknown: Vec<usize>,
     finished: Vec<Value>,
     refused: u64,
-    /// Children whose end (or a Bash run's end) is unknown: still charged
+    /// Children whose physical end (or a Bash namespace's end) is unknown: charged
     /// against `max_concurrent` (they may still be running).
-    unknown: u64,
+    unknown: BTreeSet<usize>,
+    /// Earlier owners' child Bash namespaces, published before recovery
+    /// starts workers. Charged even if the child's harness already ended.
+    recovered_runs: BTreeMap<i64, usize>,
+}
+
+impl State {
+    fn unknown_charged(&self) -> u64 {
+        let positions: BTreeSet<_> = self
+            .unknown
+            .iter()
+            .copied()
+            .chain(self.recovered_runs.values().copied())
+            .filter(|position| !self.live.iter().any(|child| child.position == *position))
+            .collect();
+        positions.len() as u64
+    }
 }
 
 /// This owner's children: policy, budget, lineage and stops.
@@ -304,8 +319,8 @@ impl Registry {
         }
     }
 
-    /// A child's Bash run ended (`ended`: its waiter reported the end) or
-    /// its end became unknown (not `ended`).
+    /// A child's Bash namespace positively ended (`ended`), possibly with
+    /// unknown harness status, or its physical end remains unknown.
     pub(crate) fn remove_run(&self, work: i64, ended: bool) {
         let mut state = self.state.lock().expect("children");
         if let Some((position, _)) = state.runs.remove(&work)
@@ -449,7 +464,7 @@ impl Registry {
         summary["bash_run_end_unknown"] = json!(run_unknown);
         state.live.retain(|child| child.position != position);
         if unknown || run_unknown {
-            state.unknown += 1;
+            state.unknown.insert(position);
         }
         state.finished.push(summary);
     }
@@ -458,18 +473,58 @@ impl Registry {
         self.state.lock().expect("children").refused += 1;
     }
 
-    /// A child recovered from an earlier owner whose end is unknown.
-    pub(crate) fn note_recovered(&self, summary: Value, unknown: bool) {
+    /// Record a recovered child, charging only genuinely uncertain liveness.
+    pub(crate) fn note_recovered(&self, position: usize, summary: Value, unknown: bool) {
         let mut state = self.state.lock().expect("children");
         if unknown {
-            state.unknown += 1;
+            state.unknown.insert(position);
         }
         state.finished.push(summary);
     }
 
+    pub(crate) fn add_recovered_run(&self, position: usize, work: i64) {
+        if self.is_child(position) {
+            self.state
+                .lock()
+                .expect("children")
+                .recovered_runs
+                .insert(work, position);
+        }
+    }
+
+    pub(crate) fn finish_recovered_run(&self, work: i64, physically_ended: bool) {
+        if physically_ended {
+            self.state
+                .lock()
+                .expect("children")
+                .recovered_runs
+                .remove(&work);
+        }
+    }
+
     pub(crate) fn ends_unproven(&self) -> bool {
         let state = self.state.lock().expect("children");
-        state.unknown > 0 || !state.live.is_empty()
+        state.unknown_charged() > 0 || !state.live.is_empty()
+    }
+
+    /// A positive end of the root namespace ends every child namespace.
+    /// Keep historical status/custody facts; only current liveness changes.
+    pub(crate) fn summary_after_namespace_end(&self) -> Value {
+        let mut summary = self.summary();
+        summary["charged_before_root_end"] = json!(
+            summary["live"].as_u64().unwrap_or(0) + summary["end_unknown"].as_u64().unwrap_or(0)
+        );
+        summary["end_unknown"] = json!(0);
+        summary["live"] = json!(0);
+        summary["end_unknown_meaning"] = json!(
+            "no physical charge: root namespace positively ended; unknown outcomes and custody remain recorded"
+        );
+        for child in summary["children"].as_array_mut().expect("children") {
+            child["liveness_at_child_report"] = child["liveness"].clone();
+            child["liveness"] = json!("not-running");
+            child["liveness_unknown"] = json!(false);
+        }
+        summary
     }
 
     /// For the terminal report.
@@ -482,8 +537,8 @@ impl Registry {
             "max_concurrent": self.policy.as_ref().map(|policy| policy.max_concurrent),
             "starts": state.starts,
             "refused": state.refused,
-            "end_unknown": state.unknown,
-            "end_unknown_meaning": "charged against max_concurrent for the rest of this owner: possibly still running",
+            "end_unknown": state.unknown_charged(),
+            "end_unknown_meaning": "charged against max_concurrent while liveness is unproven; rebuilt from open work on each claim",
             "live": state.live.len(),
             "children": state.finished,
             "children_scope": "this owner generation's finished admissions and recovered open children only; `starts` counts every start over the root's life; an empty list is not 'no children'",
@@ -634,8 +689,17 @@ impl ChildLink {
                 seen.end = Some(end.clone());
                 Some(end)
             }
+            "work-namespace-ended" => {
+                let end = json!({ "event": "end-unknown", "physical": "namespace-ended", "receipt": report["receipt"] });
+                seen.end = Some(end.clone());
+                Some(end)
+            }
             "wait-failed" => {
-                let end = json!({ "event": "end-unknown", "reason": report["reason"] });
+                let mut end = json!({ "event": "end-unknown", "reason": report["reason"] });
+                if let Some(previous) = &seen.end {
+                    end["physical"] = previous["physical"].clone();
+                    end["receipt"] = previous["receipt"].clone();
+                }
                 seen.end = Some(end.clone());
                 Some(end)
             }
@@ -671,7 +735,7 @@ impl ChildLink {
         }
     }
 
-    /// The outcome for the parent, and whether its end is unknown.
+    /// The outcome for the parent, and whether it may still be running.
     fn result(&self, record: &HarnessRecord) -> (Value, &'static str, bool) {
         let seen = self.seen.lock().expect("child seen");
         let stopped = self.stopped();
@@ -701,9 +765,10 @@ impl ChildLink {
             "stopped": stopped,
             "end": seen.end,
             "launch": seen.launch,
-            "meaning": "answer is the child's last linked text before its tagged turn end; end is its waiter's report; neither is task correctness",
+            "meaning": "answer is the child's last linked text before its tagged turn end; end separates harness wait status from namespace end; neither is task correctness",
         });
-        (result, outcome, end_unknown)
+        let possibly_running = end_unknown && result["end"]["physical"] != "namespace-ended";
+        (result, outcome, possibly_running)
     }
 }
 
@@ -846,7 +911,7 @@ pub(crate) fn serve(
             HarnessRecord::empty(&id)
         }
     };
-    let (mut result, outcome, end_unknown) = link.result(&record);
+    let (mut result, outcome, liveness_unknown) = link.result(&record);
     let recorded = ctx.store.lock().expect("store lock").resolve_child(
         position,
         &match link.stopped() {
@@ -858,11 +923,12 @@ pub(crate) fn serve(
     let bash_signalled = ctx.registry.kill_runs_of(position);
     let (open_runs, run_unknown) = ctx.registry.runs_of(position);
     result["lifecycle"] = json!({
-        "end": if end_unknown { "unknown" } else if result["end"].is_null() { "no-process" } else { "observed" },
+        "end": if result["end"]["event"] == "end-unknown" { "status-unknown" } else if liveness_unknown { "unknown" } else if result["end"].is_null() { "no-process" } else { "observed" },
+        "liveness": if liveness_unknown { "unknown" } else { "not-running" },
         "bash_runs_open": open_runs,
         "bash_kill_requests": bash_signalled,
         "bash_run_end_unknown": run_unknown,
-        "budget": if end_unknown || run_unknown {
+        "budget": if liveness_unknown || run_unknown {
             "still charged (an end is unknown: it may be running)"
         } else if open_runs > 0 {
             "still charged until its Bash runs end"
@@ -898,7 +964,8 @@ pub(crate) fn serve(
         "stopped": link.stopped(),
         "answered": result["answer"].is_string(),
         "end": result["end"],
-        "end_unknown": end_unknown,
+        "end_unknown": liveness_unknown || result["end"]["event"] == "end-unknown",
+        "liveness_unknown": liveness_unknown,
         "bash_runs_open_at_result": open_runs,
         "bash_run_end_unknown": run_unknown,
         "outcome_recorded": recorded.is_ok(),
@@ -916,7 +983,7 @@ pub(crate) fn serve(
         "gone"
     });
     ctx.registry
-        .finish(position, summary, end_unknown || run_unknown);
+        .finish(position, summary, liveness_unknown || run_unknown);
     crate::bash::leave_child(ctx.gate, ctx.tx);
 }
 
@@ -961,11 +1028,13 @@ fn admit(
         ));
     }
     // Unknown ends stay charged: they may still be running.
-    let charged = u32::try_from(state.live.len() as u64 + state.unknown).unwrap_or(u32::MAX);
+    let charged =
+        u32::try_from(state.live.len() as u64 + state.unknown_charged()).unwrap_or(u32::MAX);
     if charged >= policy.max_concurrent {
         return Err(format!(
             "budget-concurrent: {charged} of {} ({} unknown-end charged)",
-            policy.max_concurrent, state.unknown
+            policy.max_concurrent,
+            state.unknown_charged()
         ));
     }
     // A prepared route's slot: the next unused one, or a refusal.
@@ -1062,7 +1131,7 @@ fn admit(
             _ => "ambiguous-open-inputs",
         },
         "starts": { "used": state.starts, "max": policy.max_starts },
-        "concurrent": { "live": state.live.len(), "unknown_charged": state.unknown, "max": policy.max_concurrent },
+        "concurrent": { "live": state.live.len(), "unknown_charged": state.unknown_charged(), "max": policy.max_concurrent },
         "meaning": "durably admitted; not a start",
     });
     let mut accepted = accepted;
@@ -1482,6 +1551,86 @@ mod tests {
             slots[0].data_root = "slots/0".to_owned();
         }
         assert!(relative.validate().unwrap_err().contains("absolute"));
+    }
+
+    #[test]
+    fn namespace_end_releases_capacity_with_status_and_custody_unknown() {
+        let mut f = fixture("physical-release", 4);
+        eprintln!("owned-fixture: {}", f._dir.0.display());
+        let child = admit(&ctx(&f), &who(0, f.parent), 7, &request()).unwrap();
+        let work = f
+            .store
+            .lock()
+            .unwrap()
+            .begin_work(child.position, 1)
+            .unwrap();
+        // Rebuild the registry as a successor does, retaining total starts.
+        f.registry = Registry::new(
+            Some(policy(&f._dir.0, 4)),
+            1,
+            1,
+            BTreeMap::from([("echo".into(), 1)]),
+            Arc::clone(&f.custody),
+        );
+        crate::recover_child(
+            crate::ChildPrior {
+                child: crate::store::OpenChild {
+                    work,
+                    incarnation: 1,
+                    position: child.position,
+                    id: "child-1".into(),
+                },
+                found: crate::ChildFound::Exited(json!({ "work_pid1":"signal:9", "harness":null })),
+            },
+            &f.slot,
+            &f.custody,
+            &f.store,
+            &f.registry,
+            &mut Vec::new(),
+        );
+        assert_eq!(f.registry.summary()["end_unknown"], 0);
+        assert_eq!(
+            f.registry.summary()["children"][0]["liveness"],
+            "not-running"
+        );
+        assert!(
+            f.store
+                .lock()
+                .unwrap()
+                .settlement_facts()
+                .unwrap()
+                .works_unknown
+                > 0
+        );
+        admit(&ctx(&f), &who(0, f.parent), 7, &request()).unwrap();
+        admit(&ctx(&f), &who(0, f.parent), 7, &request()).unwrap();
+    }
+
+    #[test]
+    fn recovered_bash_charge_is_per_child_and_released_only_by_physical_end() {
+        let f = fixture("recovered-bash-charge", 4);
+        eprintln!("owned-fixture: {}", f._dir.0.display());
+        let prior = admit(&ctx(&f), &who(0, f.parent), 7, &request()).unwrap();
+        f.registry.finish(prior.position, json!({}), false);
+        f.registry.add_recovered_run(1, 101);
+        f.registry.add_recovered_run(1, 102);
+        f.registry.note_recovered(1, json!({}), true);
+        assert_eq!(f.registry.summary()["end_unknown"], 1);
+        let child = admit(&ctx(&f), &who(0, f.parent), 7, &request()).unwrap();
+        assert!(admit(&ctx(&f), &who(0, f.parent), 7, &request()).is_err());
+        f.registry.finish(child.position, json!({}), false);
+        f.registry.finish_recovered_run(101, false);
+        assert_eq!(f.registry.summary()["end_unknown"], 1);
+        // Another ended child whose only possible effect is Bash. Once both
+        // namespaces end, no semantic uncertainty permanently charges it.
+        f.registry.add_recovered_run(3, 201);
+        f.registry.add_recovered_run(3, 202);
+        assert_eq!(f.registry.summary()["end_unknown"], 2);
+        f.registry.finish_recovered_run(201, true);
+        assert_eq!(f.registry.summary()["end_unknown"], 2);
+        f.registry.finish_recovered_run(202, true);
+        assert_eq!(f.registry.summary()["end_unknown"], 1);
+        admit(&ctx(&f), &who(0, f.parent), 7, &request()).unwrap();
     }
 
     /// D2/D3: a child whose end is unknown (or one of whose Bash runs

@@ -1181,7 +1181,7 @@ impl Store {
     }
 
     /// Records how an incarnation was found ended; `label` says what was
-    /// actually observed, never more.
+    /// actually observed, never more. Recovery still consumes any receipts.
     pub(crate) fn end_incarnation(&mut self, id: i64, label: &str) -> Result<(), StoreError> {
         let generation = self.generation;
         self.write(|tx| {
@@ -1189,6 +1189,23 @@ impl Store {
                 "UPDATE incarnation SET ended = ?2, ended_generation = ?3
                  WHERE id = ?1 AND ended IS NULL",
                 params![id, label, generation],
+            )
+            .map(drop)
+        })
+    }
+
+    /// After this owner's workers consumed their receipts and the root
+    /// namespace positively ended, all remaining open work physically ended
+    /// too. No harness wait status or logical settlement is invented.
+    pub(crate) fn end_unresolved_work_namespaces(&mut self, id: i64) -> Result<(), StoreError> {
+        let generation = self.generation;
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE work SET outcome = 'ended-with-root-namespace-status-unknown',
+                                 observer = NULL, resolved_generation = ?2
+                 WHERE incarnation = ?1 AND outcome IS NULL
+                   AND EXISTS (SELECT 1 FROM incarnation WHERE id = ?1 AND ended IS NOT NULL)",
+                params![id, generation],
             )
             .map(drop)
         })
@@ -2546,6 +2563,8 @@ mod tests {
         let mut stale = Store::claim(&dir.0, Some(&intent())).unwrap().store;
         assert_eq!(stale.generation(), 1);
         stale.begin_attempt(0, 0).unwrap();
+        let incarnation = stale.begin_incarnation("fixture", "fixture").unwrap();
+        stale.begin_work(0, incarnation).unwrap();
         fs::remove_file(dir.0.join(LOCK_FILE)).unwrap();
         let successor = Store::claim(&dir.0, None).unwrap();
         assert_eq!(successor.store.generation(), 2);
@@ -2559,6 +2578,10 @@ mod tests {
             stale.record_closure(0, 0, 2, 3),
             Err(StoreError::FenceLost { current: 2 })
         );
+        assert_eq!(
+            stale.end_unresolved_work_namespaces(incarnation),
+            Err(StoreError::FenceLost { current: 2 })
+        );
         let rows = attempts(&dir.0);
         assert_eq!(rows, vec![(1, Some(UNKNOWN_PRIOR_OWNER.to_owned()))]);
         let reloaded = Store::claim(&dir.0, None);
@@ -2569,6 +2592,14 @@ mod tests {
             .query_row("SELECT closures FROM message", [], |row| row.get(0))
             .unwrap();
         assert_eq!(closures, 0, "stale closure must not be recorded");
+        let open: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM work WHERE outcome IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(open, 1, "stale namespace-end write must not resolve work");
     }
 
     /// A live owner refuses a duplicate claim before any write, and a

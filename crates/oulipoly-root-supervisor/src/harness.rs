@@ -218,6 +218,8 @@ pub(crate) enum Prior {
     Exited { work: i64, receipt: Value },
     /// Its root PID 1 is gone and left no report for it.
     Unknown { work: i64 },
+    /// Attached root has no record; effects and liveness remain possible.
+    Missing { work: i64 },
 }
 
 /// One launched or adopted harness this worker is driving.
@@ -827,6 +829,10 @@ impl Worker {
                     self.observe_prior_unknown(work);
                     return;
                 }
+                Some(Prior::Missing { work }) => {
+                    self.observe_prior_missing(work);
+                    return;
+                }
                 None => return,
             }
         }
@@ -861,6 +867,10 @@ impl Worker {
                     // observed exit, so not a closure. Launch again.
                     self.observe_prior_unknown(work);
                     continue;
+                }
+                Some(Prior::Missing { work }) => {
+                    self.observe_prior_missing(work);
+                    return;
                 }
                 None => match self.launch() {
                     Some(live) => live,
@@ -1270,6 +1280,18 @@ impl Worker {
         true
     }
 
+    fn observe_prior_missing(&mut self, work: i64) {
+        self.report(json!({
+            "event": "prior-end-unknown", "work": work,
+            "meaning": "absent-from-attached-root-liveness-unknown",
+            "relaunch": "not-authorized",
+        }));
+        // Leave the durable work open for every later owner. Do not settle
+        // orphaned completions: the requester may still physically exist.
+        self.prior_unknown_ends += 1;
+        self.label_remaining("launch-unknown");
+    }
+
     fn observe_prior_unknown(&mut self, work: i64) {
         self.report(json!({
             "event": "prior-end-unknown",
@@ -1612,10 +1634,21 @@ impl Worker {
                     .release(live.token);
                 match receipt["harness"].as_str() {
                     Some(status) => Ok((status.to_owned(), receipt)),
-                    None => Err(format!(
-                        "harness-end-not-reported; work-pid1 {}",
-                        receipt["work_pid1"]
-                    )),
+                    None => {
+                        self.report(json!({ "event": "work-namespace-ended", "work": live.work, "receipt": receipt }));
+                        self.durable(|store| {
+                            store.resolve_work(
+                                live.work,
+                                "ended-with-work-namespace-status-unknown",
+                                None,
+                            )
+                        });
+                        self.orphaned_completions(live.work);
+                        Err(format!(
+                            "harness-end-not-reported; work-pid1 {}",
+                            receipt["work_pid1"]
+                        ))
+                    }
                 }
             }
             ReceiptWait::Lost => Err("root-pid1-connection-lost".to_owned()),
