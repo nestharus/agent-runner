@@ -34,9 +34,9 @@
 //!   caller's further input to the live conversation (`follow-up`),
 //!   committed with its minted key, the control line that carried it and
 //!   the caller's reference before it is reported admitted. Once admitted
-//!   it is owed like any intent message, and a recovery resubmits it the
-//!   same way. Version 5 added this; a version 4 store is refused like any
-//!   other version (no migration).
+//!   it is owed like any intent message. Recovery preserves its key and
+//!   refuses retry after any possibly inserted attempt. Version 5 added this;
+//!   a version 4 store is refused like any other version (no migration).
 //! * A `harness` of kind `child` is a registered child an intent harness
 //!   asked for through the ingress; `child` keeps the durable lineage: the
 //!   requesting (parent) harness and the exact parent **work** it was
@@ -123,7 +123,6 @@ pub(crate) const ATTEMPTS_EXHAUSTED: &str = "attempts-exhausted";
 /// only to that attempt; it cannot erase an earlier unresolved submission.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AttemptOutcome {
-    Refused,
     NotSent,
     Acknowledged,
     Unresolved,
@@ -132,7 +131,6 @@ pub(crate) enum AttemptOutcome {
 impl AttemptOutcome {
     pub(crate) fn classify(outcome: Option<&str>) -> Self {
         match outcome {
-            Some("rejected") => Self::Refused,
             Some("not-sent") => Self::NotSent,
             Some("ack:accepted" | "ack:duplicate-unknown") => Self::Acknowledged,
             // NULL, unknown-prior-owner, invalid/closed responses, and any
@@ -146,7 +144,7 @@ impl AttemptOutcome {
     }
 
     fn not_inserted(self) -> bool {
-        matches!(self, Self::Refused | Self::NotSent)
+        self == Self::NotSent
     }
 }
 
@@ -958,16 +956,25 @@ impl Store {
         })
     }
 
-    /// Records that an attempt is about to be sent. Must commit before the
-    /// send, so a successor can never miss an attempt that was sent.
-    pub(crate) fn begin_attempt(&mut self, harness: usize, idx: usize) -> Result<i64, StoreError> {
+    /// Reserves before send, only if every previous reservation positively
+    /// excluded submission. Keys, ACKs, peer dedup declarations, owner changes
+    /// and spare budget are not exact receiver-continuity evidence. None is a
+    /// refusal to reserve, not a store failure and not another attempt.
+    pub(crate) fn begin_attempt(
+        &mut self,
+        harness: usize,
+        idx: usize,
+    ) -> Result<Option<i64>, StoreError> {
         let generation = self.generation;
         self.write(|tx| {
+            if !attempt_account(tx, int(harness), int(idx))?.all_not_inserted {
+                return Ok(None);
+            }
             tx.execute(
                 "INSERT INTO attempt (harness, idx, generation) VALUES (?1, ?2, ?3)",
                 params![int(harness), int(idx), generation],
             )?;
-            Ok(tx.last_insert_rowid())
+            Ok(Some(tx.last_insert_rowid()))
         })
     }
 
@@ -982,9 +989,7 @@ impl Store {
                 "UPDATE attempt SET outcome = ?2, resolved_generation = ?3 WHERE id = ?1",
                 params![attempt, outcome, generation],
             )?;
-            if AttemptOutcome::classify(Some(outcome)) == AttemptOutcome::Refused
-                || outcome == "rejected-unresolved"
-            {
+            if matches!(outcome, "rejected" | "rejected-unresolved") {
                 // RPC rejection is not retry authority. Commit
                 // this stop together with resolution, without creating an ACK.
                 tx.execute(
@@ -2555,6 +2560,76 @@ mod tests {
             .unwrap()
     }
 
+    /// Exercise the neutral client's actual pre-call branches, not an endpoint
+    /// non-insertion string. No native provider or process is involved.
+    #[test]
+    fn pre_submit_exclusion_allows_retry_but_not_after_an_uncertain_call() {
+        use agent_provider_contract::acp::{
+            AcpClient, ClientInfo, DeliveryOutcome, Incoming, PeerClosed, Transport,
+        };
+        use serde_json::{Value, json};
+        struct Wire {
+            sent: Vec<Value>,
+            replies: std::collections::VecDeque<Incoming>,
+        }
+        impl Transport for Wire {
+            fn send(&mut self, v: &Value) -> Result<(), PeerClosed> {
+                self.sent.push(v.clone());
+                Ok(())
+            }
+            fn recv(&mut self) -> Incoming {
+                self.replies.pop_front().unwrap_or(Incoming::Closed)
+            }
+        }
+        let dir = Dir::new("pre-submit");
+        let mut claimed = Store::claim(&dir.0, Some(&intent())).unwrap();
+        let mut message = claimed.harnesses.remove(0).messages.remove(0).message;
+        let mut store = claimed.store;
+        let mut client = AcpClient::new(
+            Wire {
+                sent: vec![],
+                replies: std::collections::VecDeque::from([Incoming::Message(
+                    json!({"jsonrpc":"2.0", "id":1, "result":{"protocolVersion":2, "info":{"name":"fixture", "version":"1"}, "capabilities":{"session":{}}}}),
+                )]),
+            },
+            ClientInfo {
+                name: "fixture".into(),
+                version: "1".into(),
+            },
+        );
+        let attempt = store.begin_attempt(0, 0).unwrap().unwrap();
+        assert!(matches!(
+            client.submit("s", &mut message),
+            DeliveryOutcome::NotNegotiated
+        ));
+        store.resolve_attempt(attempt, "not-sent").unwrap();
+        client.initialize().unwrap();
+        let next = store.begin_attempt(0, 0).unwrap().unwrap();
+        assert!(matches!(
+            client.submit("s", &mut message),
+            DeliveryOutcome::NotAcknowledged(_)
+        ));
+        store
+            .resolve_attempt(next, "no-ack:transport-closed")
+            .unwrap();
+        // A mismatch is also local pre-call exclusion, but cannot repair that
+        // earlier uncertain call. The durable gate refuses another reservation.
+        assert!(matches!(
+            client.submit("other", &mut message),
+            DeliveryOutcome::SessionMismatch
+        ));
+        assert_eq!(store.begin_attempt(0, 0).unwrap(), None);
+        let wire = client.into_transport();
+        assert_eq!(
+            wire.sent
+                .iter()
+                .filter(|v| v["method"] == "session/prompt")
+                .count(),
+            1
+        );
+        assert_eq!(attempts(&dir.0).len(), 2);
+    }
+
     /// A stale instance whose lock was lost (here: lock file replaced) is
     /// refused before it writes anything, and its write is absent.
     #[test]
@@ -2801,7 +2876,7 @@ mod tests {
         else {
             panic!("completion admission")
         };
-        let attempt = store.begin_attempt(0, idx).unwrap();
+        let attempt = store.begin_attempt(0, idx).unwrap().unwrap();
         store
             .record_ack(
                 0,
@@ -2876,7 +2951,7 @@ mod tests {
         else {
             panic!("first admission");
         };
-        let attempt = store.begin_attempt(0, idx).unwrap();
+        let attempt = store.begin_attempt(0, idx).unwrap().unwrap();
         let ack = DurableAck {
             label: "accepted".into(),
             basis: None,
@@ -2932,7 +3007,7 @@ mod tests {
     /// dispositions. Fresh and recovered admissions remain the same logical
     /// input, and only its durable ACK plus tagged end settles transport.
     #[test]
-    fn admitted_completion_uncertainty_stays_owed_until_exact_link_end() {
+    fn admitted_completion_uncertainty_stays_owed_without_retry_or_readmission() {
         for recovered in [false, true] {
             for failure in [
                 "no-ack:invalid-response",
@@ -2964,7 +3039,7 @@ mod tests {
                         .resolve_completion(run, "undelivered", Some("conversation-ended"))
                         .unwrap()
                 );
-                let attempt = store.begin_attempt(0, idx).unwrap();
+                let attempt = store.begin_attempt(0, idx).unwrap().unwrap();
                 store.resolve_attempt(attempt, failure).unwrap();
                 assert!(
                     !store
@@ -2980,31 +3055,11 @@ mod tests {
                     store.admit_follow_up(0, 0, None, "again", false, Some((run, Some(parent)))),
                     Ok(Admission::NotReoffered(_))
                 ));
-                let later = store.begin_attempt(0, idx).unwrap();
-                let ack = DurableAck {
-                    label: "duplicate-unknown".into(),
-                    basis: None,
-                    recovered: false,
-                    generation: store.generation(),
-                    message_id: Some("m".into()),
-                };
-                store.record_ack(0, idx, later, &ack).unwrap();
-                assert!(!store.resolve_completion(run, "turn-ended", None).unwrap());
-                assert!(
-                    !store
-                        .resolve_completion(run, "undelivered", Some("connection-ended"))
-                        .unwrap()
-                );
-                store.record_turn_end(0, idx).unwrap();
-                assert!(store.reconcile_completion(run).unwrap());
+                assert_eq!(store.begin_attempt(0, idx).unwrap(), None);
                 assert!(!store.reconcile_completion(run).unwrap());
-                drop(store);
-                let claimed = Store::claim(&dir.0, None).unwrap();
-                assert!(claimed.completions_reconciled.is_empty());
-                let store = claimed.store;
                 assert_eq!(
                     store.inherited_completions(None).unwrap()[0]["completion"],
-                    "turn-ended"
+                    "delivery-unknown"
                 );
                 let history: String = store
                     .conn
@@ -3047,7 +3102,7 @@ mod tests {
         else {
             panic!("admission")
         };
-        let attempt = store.begin_attempt(0, idx).unwrap();
+        let attempt = store.begin_attempt(0, idx).unwrap().unwrap();
         store
             .resolve_attempt(attempt, "rejected-unresolved")
             .unwrap();
@@ -3068,67 +3123,50 @@ mod tests {
         assert!(message.ack.is_none());
     }
 
-    /// A rejection settles only conclusive non-insertion, never an earlier
-    /// uncertain attempt on that logical completion input.
+    /// A later pre-submit exclusion cannot clear an earlier possible send.
+    /// RPC rejection strings (including the old internal label) are not proof.
     #[test]
-    fn completion_rejection_does_not_erase_prior_uncertainty() {
-        for prior_outcome in [
-            Some("not-sent"),
+    fn reservation_requires_all_prior_attempts_to_exclude_submission() {
+        for outcome in [
+            None,
+            Some("unknown-prior-owner"),
             Some("no-ack:invalid-response"),
             Some("no-ack:transport-closed"),
+            Some("rejected"),
+            Some("rejected-unresolved"),
             Some("unfamiliar-response"),
-            None,
+            Some("not-sent"),
         ] {
-            let uncertain = prior_outcome != Some("not-sent");
-            let dir = Dir::new("completion-rejection");
+            let dir = Dir::new("reservation-gate");
             let mut store = Store::claim(&dir.0, Some(&intent())).unwrap().store;
-            let incarnation = store
-                .begin_incarnation("token", "unprivileged-userns")
-                .unwrap();
-            let parent = store.begin_work(0, incarnation).unwrap();
-            let run = store
-                .begin_bash(0, parent, incarnation, 1, "[]", &["x".into()], "/", true)
-                .unwrap();
-            let Admission::Admitted(idx, _) = store
-                .admit_follow_up(0, 0, None, "completion", false, Some((run, None)))
-                .unwrap()
-            else {
-                panic!("first admission")
-            };
-            let prior = store.begin_attempt(0, idx).unwrap();
-            if let Some(outcome) = prior_outcome {
-                store.resolve_attempt(prior, outcome).unwrap();
+            let attempt = store.begin_attempt(0, 0).unwrap().unwrap();
+            if let Some(outcome) = outcome {
+                store.resolve_attempt(attempt, outcome).unwrap();
             }
-            let rejected = store.begin_attempt(0, idx).unwrap();
-            store.resolve_attempt(rejected, "rejected").unwrap();
-            assert_eq!(
-                store
-                    .resolve_completion(run, "undelivered", Some("rejected"))
-                    .unwrap(),
-                !uncertain
-            );
+            let safe = outcome == Some("not-sent");
+            let next = store.begin_attempt(0, 0).unwrap();
+            assert_eq!(next.is_some(), safe);
+            if let Some(next) = next {
+                store.resolve_attempt(next, "not-sent").unwrap();
+            }
+            // An artificial later label tests complete historical accounting,
+            // not authorization to create this extra reservation.
+            if !safe {
+                store.conn.execute("INSERT INTO attempt(harness,idx,generation,outcome,resolved_generation) VALUES(0,0,1,'not-sent',1)", []).unwrap();
+                assert_eq!(store.begin_attempt(0, 0).unwrap(), None);
+            }
             drop(store);
-            let claimed = Store::claim(&dir.0, None).unwrap();
-            let message = &claimed.harnesses[0].messages[idx];
-            assert_eq!(message.unknown_attempts, u32::from(uncertain));
-            assert_eq!(message.attempts, 2);
-            assert_eq!(message.stop.as_deref(), Some("rejected"));
-            let store = claimed.store;
+            let mut claimed = Store::claim(&dir.0, None).unwrap();
+            assert_eq!(claimed.harnesses[0].messages[0].attempts, 2);
             assert_eq!(
-                store.inherited_completions(None).unwrap()[0]["completion"],
-                if uncertain {
-                    "delivery-unknown"
-                } else {
-                    "undelivered"
-                }
+                claimed.harnesses[0].messages[0].unknown_attempts,
+                u32::from(!safe)
             );
-            drop(store);
-            let claimed = Store::claim(&dir.0, None).unwrap();
             assert_eq!(
-                claimed.harnesses[0].messages[idx].unknown_attempts,
-                u32::from(uncertain)
+                claimed.store.begin_attempt(0, 0).unwrap().is_some(),
+                safe,
+                "a generation change does not change exclusion evidence"
             );
-            assert_eq!(claimed.harnesses[0].messages[idx].attempts, 2);
         }
     }
 

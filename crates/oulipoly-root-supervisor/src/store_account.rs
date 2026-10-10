@@ -161,7 +161,7 @@ fn input_account(
     for outcome in &record.attempts {
         match AttemptOutcome::classify(outcome.as_deref()) {
             AttemptOutcome::Acknowledged => acknowledged += 1,
-            AttemptOutcome::Refused | AttemptOutcome::NotSent => not_inserted += 1,
+            AttemptOutcome::NotSent => not_inserted += 1,
             AttemptOutcome::Unresolved => unresolved += 1,
         }
         match outcome.as_deref() {
@@ -316,7 +316,7 @@ mod tests {
             .begin_incarnation("token", "unprivileged-userns")
             .unwrap();
         store.begin_work(0, incarnation).unwrap();
-        let acked = store.begin_attempt(0, 0).unwrap();
+        let acked = store.begin_attempt(0, 0).unwrap().unwrap();
         let ack = DurableAck {
             label: "accepted".into(),
             basis: Some("single-attempt".into()),
@@ -326,7 +326,7 @@ mod tests {
         };
         store.record_ack(0, 0, acked, &ack).unwrap();
         store.record_turn_end(0, 0).unwrap();
-        let rejected = store.begin_attempt(0, 1).unwrap();
+        let rejected = store.begin_attempt(0, 1).unwrap().unwrap();
         store
             .resolve_attempt(rejected, "rejected-unresolved")
             .unwrap();
