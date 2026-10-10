@@ -109,6 +109,25 @@ moves to a printed `<ancestor>/.<id>.removal.json` recovery path first.
 Failures return 3 and retain a record. Without `--purge-site`, intentionally
 retained site effects also retain the record and return 3.
 
+The trusted installer recognizes both frontdoor-produced loss-directory kinds:
+active semantic `<RUN>.json` accounts and physical-only `<RUN>.json.retired`
+dispositions, including earlier packages' evidence in the same `run_base`.
+Normal nonpurging removal preserves both kinds byte-intact while disabling and
+removing only the recorded owned rule/package. Its `loss_accounts` report
+counts semantic `accounts` and `physical_dispositions` separately. Recognition
+is only an evidence-object classification, not physical drain, logical
+settlement or permission to remove retained run directories; package/run lock
+fencing is unchanged. Unknown names (including crash-left `.next-*` writes),
+wrong types, modes or custody still stop removal before disabling the rule.
+
+Existing explicit `--purge-site` deliberately deletes both recognized evidence
+kinds after disabling the owned entry. The write-ahead disposition journal
+labels each current file's `kind` as `semantic-account` or
+`physical-only-disposition`; the result reports both counts and
+`purged-not-settled`. Evidence deletion is not settlement. Unknown/untrusted
+objects are not a purge inventory, and previous journal paths never supply
+deletion authority. No automatic expiry or purge is added.
+
 A partially written extraction file that does not match the recorded
 expected content is left for ROOT inspection; the record still names its
 owned partial tree. Neither changed admin content nor unrelated data is
