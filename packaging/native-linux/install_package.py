@@ -493,7 +493,23 @@ def install_from(args, paths, archive, package_id, journal):
 
 
 LOSS_ACCOUNTS = "loss-accounts"
-LOSS_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.json")
+# Both durable kinds produced by this package's frontdoor. Pending writes
+# (.next-*) and future/unknown kinds deliberately remain outside the inventory.
+LOSS_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.json(?P<physical>\.retired)?")
+
+
+def loss_record_kind(name):
+    match = LOSS_NAME.fullmatch(name)
+    if match is None:
+        raise Stop("unknown loss-account object")
+    return "physical-only-disposition" if match["physical"] else "semantic-account"
+
+
+def loss_evidence_report(path, files, disposition):
+    kinds = [loss_record_kind(os.path.basename(file)) for file in files]
+    return {"directory": path, "accounts": kinds.count("semantic-account"),
+            "physical_dispositions": kinds.count("physical-only-disposition"),
+            "disposition": disposition}
 
 
 def managed_loss_directory(path, unprivileged=False):
@@ -506,7 +522,8 @@ def managed_loss_directory(path, unprivileged=False):
     for entry in entries:
         custody(entry.path, unprivileged)
         st = entry.stat(follow_symlinks=False)
-        if not LOSS_NAME.fullmatch(entry.name) or not stat.S_ISREG(st.st_mode) or stat.S_IMODE(st.st_mode) != 0o600:
+        loss_record_kind(entry.name)
+        if not stat.S_ISREG(st.st_mode) or stat.S_IMODE(st.st_mode) != 0o600:
             raise Stop("unknown loss-account object")
     return [entry.path for entry in entries]
 
@@ -552,6 +569,9 @@ def purge_loss_accounts(journal, loss_dirs):
             item = {"path": file, "state": "purge-intended", "meaning": "evidence deletion, not settlement"}
             disposition.append(item)
             by_path[file] = item
+        # Kind comes from the current checked inventory, not old journal
+        # claims or record bodies. It grants no settlement/drain authority.
+        by_path[file]["kind"] = loss_record_kind(os.path.basename(file))
     for item in disposition:
         if item["state"] == "purge-intended" and item["path"] not in current_files:
             item["state"] = "absent-after-purge-intent; deletion-unconfirmed"
@@ -567,8 +587,8 @@ def purge_loss_accounts(journal, loss_dirs):
         user_dir = os.path.dirname(path)
         if not os.listdir(user_dir):
             os.rmdir(user_dir)
-    return [{"directory": path, "accounts": len(files), "disposition": "purged-not-settled"}
-                for path, files in loss_dirs]
+    return [loss_evidence_report(path, files, "purged-not-settled")
+            for path, files in loss_dirs]
 
 
 def uninstall_locked(args, paths, record_path, record):
@@ -586,8 +606,8 @@ def uninstall_locked(args, paths, record_path, record):
             path = os.path.join(user.path, LOSS_ACCOUNTS)
             if user.name.isdigit() and os.path.lexists(path):
                 loss_dirs.append((path, managed_loss_directory(path, test)))
-    evidence = [{"directory": path, "accounts": len(files),
-                 "disposition": "preserved across package removal"} for path, files in loss_dirs]
+    evidence = [loss_evidence_report(path, files, "preserved across package removal")
+                for path, files in loss_dirs]
     purge_pending = args.purge_site
     if purge_pending and not any(os.path.lexists(paths.host(path)) for path in (record["sudoers"], record["sudoers"] + ".partial")):
         evidence = purge_loss_accounts(journal, loss_dirs)
