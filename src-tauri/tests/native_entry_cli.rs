@@ -125,7 +125,6 @@ impl Fixture {
             .env_remove("OULIPOLY_CONFIG_HOME")
             .env("OULIPOLY_DATA_DIR", &self.data_dir)
             .env("XDG_DATA_HOME", self.root.join("data"))
-            .env("HOME", &self.root)
             .env("FAKE_RECORD", &self.record)
             .env_remove("OULIPOLY_PARENT_INVOCATION")
             .stdin(std::process::Stdio::null());
@@ -901,4 +900,21 @@ fn root_controls_refuse_without_quoting_private_configuration() {
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
     assert!(stderr(&output).contains("root caller unavailable"));
     assert!(fixture.legacy_untouched());
+}
+
+#[test]
+fn live_opening_configuration_errors_keep_private_settings_out_of_output() {
+    for text in [
+        "caller = \"private-opening-value\"\n",
+        "private-opening-value = [",
+    ] {
+        let fixture = Fixture::new(text);
+        let output = fixture.run(&["-m", "sol~high", "--live-handle", "new-handle", "prompt"]);
+        assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+        assert!(stderr(&output).contains("configuration unavailable or invalid"));
+        assert!(!stderr(&output).contains("private-opening-value"));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("private-opening-value"));
+        assert!(fixture.argv().is_none());
+        assert!(fixture.legacy_untouched());
+    }
 }

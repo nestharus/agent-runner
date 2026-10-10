@@ -317,7 +317,8 @@ pub(crate) enum Subcommands {
         /// the original of that exact request.
         #[arg(long, value_name = "FILE")]
         control_prior: Option<PathBuf>,
-        /// This call's own wait bound in seconds; the root is unaffected by it.
+        /// Attachment collection bound in seconds; stop collection allows 65s
+        /// more. Not a whole-command deadline or proof that the root stopped.
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=7200))]
         wait: Option<u32>,
     },

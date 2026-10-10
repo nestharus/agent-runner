@@ -415,6 +415,246 @@ class LiveControl(unittest.TestCase):
         self.assertIn(code, (0, 6))
 
 
+class OrdinaryControlBoundary(unittest.TestCase):
+    """Ordinary Rust entry -> real caller/relay -> real SDK reader. Scripted
+    owner and local capture failures only; no namespace or owner durability."""
+
+    tearDown, open, handle_file = LiveRoot.tearDown, LiveRoot.open, LiveRoot.handle_file
+
+    def setUp(self):
+        self.entry = os.environ.get("ROOT_ENTRY")
+        self.reader = os.environ.get("ROOT_CONTROL_READER")
+        if not self.entry or not self.reader:
+            self.skipTest("ROOT_ENTRY and ROOT_CONTROL_READER must name current built consumers")
+        LiveRoot.setUp(self)
+        self.runs = os.path.join(self.dir, "runs")
+        self.config = os.path.join(self.dir, "config", "oulipoly-agent-runner")
+        os.makedirs(self.config)
+        self.wrapper = os.path.join(self.dir, "caller")
+        with open(self.wrapper, "w") as file:
+            file.write("#!" + sys.executable + "\nimport os, sys\n")
+            file.write("sys.path.insert(0, " + repr(HERE) + ")\nimport native_call\n")
+            file.write(textwrap.dedent("""
+                original = native_call.Attached.next_event
+                class FailedCapture:
+                    def write(self, data): raise OSError('fixture capture unavailable')
+                    def flush(self): raise OSError('fixture flush unavailable')
+                def next_event(self, until):
+                    event = original(self, until)
+                    if event and event.get('event') == 'control-answer' and os.environ.get('BOUNDARY_CAPTURE'):
+                        self.capture.close()
+                        self.capture = FailedCapture()
+                    return event
+                native_call.Attached.next_event = next_event
+                write_json = native_call.write_json
+                def publish(path, value):
+                    if path.endswith('/result.json') and os.environ.get('BOUNDARY_PUBLICATION'):
+                        raise OSError('fixture publication unavailable')
+                    write_json(path, value)
+                native_call.write_json = publish
+            """))
+            file.write("sys.exit(native_call.main(sys.argv[1:] + ['--control-reader', " + repr(self.reader) + "]))\n")
+        os.chmod(self.wrapper, 0o700)
+        with open(os.path.join(self.config, "native.toml"), "w") as file:
+            file.write("caller = " + json.dumps(self.wrapper) + "\nruns_dir = " + json.dumps(self.runs) + "\n")
+
+    def invoke(self, handle, *args, capture=False, publication=False):
+        before = set(os.listdir(self.runs)) if os.path.exists(self.runs) else set()
+        env = {**os.environ, "XDG_CONFIG_HOME": os.path.dirname(self.config),
+               "BOUNDARY_CAPTURE": "1" if capture else "", "BOUNDARY_PUBLICATION": "1" if publication else ""}
+        env.pop("OULIPOLY_CONFIG_HOME", None)
+        env.pop("OULIPOLY_PARENT_INVOCATION", None)
+        proc = subprocess.run([self.entry, "root", handle, *args], env=env, cwd=self.dir,
+                              stdin=subprocess.DEVNULL, capture_output=True, timeout=20)
+        created = set(os.listdir(self.runs)) - before
+        self.assertEqual(len(created), 1)
+        path = os.path.join(self.runs, created.pop(), "result.json")
+        stored = b""
+        if os.path.isfile(path):
+            with open(path, "rb") as file:
+                stored = file.read()
+        result = json.loads(stored) if stored else None
+        self.assertNotIn(b"Traceback", proc.stderr)
+        if proc.stdout:
+            self.assertEqual(json.loads(proc.stdout), result, "ordinary stdout must reflect stored result")
+        print(json.dumps({"boundary": args[0], "exit": proc.returncode,
+                          "class": result["class"] if result else "publication-unavailable"}))
+        return proc, result, stored
+
+    def input_file(self, value):
+        path = os.path.join(self.dir, "input-" + str(time.monotonic_ns()))
+        native_call.write_json(path, value)
+        return path
+
+    def test_private_request_and_prior_values_never_reach_stdout_errors_or_result(self):
+        run, terminal = self.open(script=CONTROL_ENTRY)
+        handle = self.handle_file(terminal)
+        secret = "PRIVATE-BOUNDARY-SENTINEL"
+        request = {"kind": "request", "protocol": native_call.CONTROL_PROTOCOL,
+                   "request_key": "boundary-request", "requester": "uid:%d" % os.getuid(),
+                   "addressed": {"root": "r1", "owner": "o1", "generation": "1", "incarnation": "1"},
+                   "operation": "input_hold", "scope": {"root": "r1"}}
+        valid = self.input_file(request)
+        bad_json = os.path.join(self.dir, "malformed")
+        with open(bad_json, "w") as file:
+            file.write('{"token":"' + secret + '",')
+        for path, expected in ((handle, 19), (self.input_file({"token": secret}), 19), (bad_json, 3)):
+            proc, result, stored = self.invoke(handle, "--control-request", path)
+            self.assertEqual(proc.returncode, expected)
+            boundary = proc.stdout + proc.stderr + stored
+            self.assertNotIn(secret.encode(), boundary)
+            self.assertNotIn(terminal["handle"]["token"].encode(), boundary)
+            self.assertNotIn("request", result)
+        for prior, expected in (({"original": terminal["handle"]}, 19),
+                                ({"original": request, "claims": [{"token": secret}]}, 6),
+                                ({"original": request, "claims": [{"token": secret * 3000}]}, 6),
+                                ({"original": request, "unrelated": secret * 3000}, 0)):
+            proc, result, stored = self.invoke(handle, "--control-request", valid,
+                                               "--control-prior", self.input_file(prior))
+            self.assertEqual(proc.returncode, expected, result)
+            self.assertNotIn(secret.encode(), proc.stdout + proc.stderr + stored)
+            self.assertNotIn(terminal["handle"]["token"].encode(), proc.stdout + proc.stderr + stored)
+            if expected != 19:
+                self.assertEqual(result["original"], request)
+        proc, result, stored = self.invoke(handle, "--control-request", valid, "--control-prior", bad_json)
+        self.assertEqual(proc.returncode, 3)
+        self.assertNotIn(secret.encode(), proc.stdout + proc.stderr + stored)
+        self.invoke(handle, "--close")
+
+    def test_special_and_oversized_control_files_are_refused_before_attachment(self):
+        run, terminal = self.open(script=CONTROL_ENTRY)
+        handle = self.handle_file(terminal)
+        fifo = os.path.join(self.dir, "fifo")
+        os.mkfifo(fifo)
+        link = os.path.join(self.dir, "link")
+        os.symlink(handle, link)
+        for flag, limit in (("--control-request", native_call.CONTROL_REQUEST_LIMIT),
+                            ("--control-prior", native_call.CONTROL_PRIOR_LIMIT)):
+            huge = os.path.join(self.dir, flag[2:])
+            with open(huge, "wb") as file:
+                file.write(b"PRIVATE-OVERSIZED-SENTINEL")
+                file.truncate(limit + 1)
+            for path in (fifo, link, huge):
+                args = ["--control-request", handle, flag, path] if flag == "--control-prior" else [flag, path]
+                start = time.monotonic()
+                proc, result, stored = self.invoke(handle, *args, "--wait", "1")
+                self.assertLess(time.monotonic() - start, 5)
+                self.assertEqual((proc.returncode, result["class"], result["started"]), (3, "refused-locally", False))
+                self.assertNotIn(b"PRIVATE-OVERSIZED-SENTINEL", proc.stdout + proc.stderr + stored)
+        _, closed, _ = self.invoke(handle, "--close")
+        self.assertEqual(closed["front_door_terminal"]["live"]["attaches"], 1)
+
+    def test_ack_and_refusal_survive_later_capture_and_flush_failure(self):
+        for operation in ("--hold", "--cancel"):
+            run, terminal = self.open(name=operation[2:], script=CONTROL_ENTRY)
+            handle = self.handle_file(terminal)
+            proc, result, _ = self.invoke(handle, operation, capture=True)
+            self.assertEqual((proc.returncode, result["class"], result["reading"]["class"]), (0, "acknowledged", "acknowledged"))
+            self.assertEqual(result["claims"][2]["kind"], "acknowledgment")
+            self.assertTrue(result["collection"]["errors"])
+            if operation == "--hold":
+                self.invoke(handle, "--close")
+            else:
+                self.assertEqual(result["physical"]["class"], "incomplete")
+        refusing = CONTROL_ENTRY.replace('cancel = cmd["operation"] == "cancel"', 'cancel = False').replace(
+            'for claim in claims: say(claim)',
+            'claims = [claims[0], claims[1], dict(common, kind="refusal", operation=cmd["operation"], responder=me, stage="transition", reason="already_terminal", observed_at_unix_ms=4), dict(common, kind="outcome", result="refused", observed_at_unix_ms=5)]\n        for claim in claims: say(claim)')
+        run, terminal = self.open(name="refused", script=refusing)
+        handle = self.handle_file(terminal)
+        proc, result, _ = self.invoke(handle, "--cancel", capture=True)
+        self.assertEqual((proc.returncode, result["reading"]["class"]), (18, "control-refused"))
+        self.assertTrue(result["collection"]["errors"])
+        self.invoke(handle, "--close")
+
+    def test_publication_failure_is_not_success_and_keeps_observed_control_reply(self):
+        run, terminal = self.open(script=CONTROL_ENTRY)
+        handle = self.handle_file(terminal)
+        proc, result, _ = self.invoke(handle, "--hold", publication=True)
+        self.assertEqual(proc.returncode, 6)
+        self.assertIsNone(result)
+        stderr_records = [json.loads(line) for line in proc.stderr.splitlines() if line.startswith(b"{")]
+        self.assertEqual(stderr_records[0]["observed_class"], "acknowledged")
+        self.assertEqual(stderr_records[0]["reading"]["class"], "acknowledged")
+        self.assertEqual(stderr_records[0]["publication"], "OSError")
+        self.invoke(handle, "--close")
+
+    def test_terminal_without_observed_stop_stays_unknown_on_reported_paths(self):
+        # This peer has no entry wait evidence. A terminal and EOF must not
+        # become evidence of a physical stop. Scratch retention is known.
+        authority = {"root": "r1", "owner": "o1", "generation": "1", "incarnation": "1"}
+        unknown = {"frontdoor": "terminal", "exit": 93, "entry_status": None,
+                   "retire": {"ok": False, "stop": "unknown", "run_removed": False},
+                   "collection_errors": ["stop-or-eof-not-observed"]}
+        for operation in ("--cancel", "--close", "--prompt-file", "opening"):
+            address = os.path.join(self.dir, operation.lstrip("-") + ".sock")
+            listener = socket.socket(socket.AF_UNIX)
+            listener.bind(address)
+            listener.listen(1)
+            handle_value = {"v": 1, "uid": os.getuid(), "run": "retained", "token": "private-token", "socket": address}
+            failures = []
+            def serve():
+                try:
+                    conn, _ = listener.accept()
+                    with conn, conn.makefile("rb") as stream:
+                        json.loads(stream.readline())
+                        conn.sendall(frontdoor.encoded({"frontdoor": "attached"}))
+                        if operation == "opening":
+                            conn.sendall(frontdoor.encoded(unknown))
+                            return
+                        for line in stream:
+                            cmd = json.loads(line)
+                            if cmd.get("cmd") == "inspect":
+                                state = {"kind": "control_state", "protocol": native_call.CONTROL_PROTOCOL,
+                                         "reporter": authority, "scope": {"root": "r1"},
+                                         "input": {"state": "input_open"}, "lifecycle": {"state": "open"}, "observed_at_unix_ms": 1}
+                                conn.sendall(frontdoor.encoded({"event": "inspection", "inspection_key": cmd["inspection_key"],
+                                    "control_state": state, "settlement": {"event": "settlement"},
+                                    "advertisement": {native_call.CONTROL_PROTOCOL: {"operations": ["cancel"], "reports": ["inspection"], "facts": []}}}))
+                                continue
+                            if cmd.get("kind") == "request":
+                                common = {k: cmd[k] for k in ("protocol", "request_key", "requester", "addressed")}
+                                claims = [dict(common, kind="receipt", durable=True, observed_at_unix_ms=2),
+                                          dict(common, kind="admission", operation="cancel", responder=authority, observed_at_unix_ms=3),
+                                          dict(common, kind="acknowledgment", operation="cancel", responder=authority,
+                                               observed_at_unix_ms=4, **{"from": "open", "to": "cancelling"}),
+                                          dict(common, kind="outcome", result="acknowledged", observed_at_unix_ms=5)]
+                                conn.sendall(frontdoor.encoded({"event": "control-answer", "request": cmd, "claims": claims}))
+                            conn.sendall(frontdoor.encoded(unknown))
+                            return
+                except BaseException as error:
+                    failures.append(error)
+            worker = threading.Thread(target=serve, daemon=True)
+            worker.start()
+            try:
+                if operation == "opening":
+                    # Inherited opening path uses the same actual attachment.
+                    out = os.path.join(self.dir, "opening-out")
+                    os.mkdir(out)
+                    args = types.SimpleNamespace(live_handle=os.path.join(self.dir, "opening-handle"), out=out, deadline=1)
+                    with open(os.path.join(out, "caller.jsonl"), "w") as actions, \
+                            open(os.path.join(out, "events.jsonl"), "wb") as capture:
+                        call = types.SimpleNamespace(actions=actions, capture=capture, start=time.monotonic())
+                        code = native_call.opened_live(args, call, {"handle": handle_value}, {"errors": []})
+                    with open(os.path.join(out, "result.json")) as file:
+                        result = json.load(file)
+                    self.assertEqual(code, 6)
+                else:
+                    args = [operation, self.input_file("prompt")] if operation == "--prompt-file" else [operation]
+                    proc, result, _ = self.invoke(self.input_file(handle_value), *args)
+                    self.assertEqual(proc.returncode, 0 if operation == "--cancel" else 6)
+                physical = result["physical"] if operation == "--cancel" else result
+                self.assertIn("unknown", physical["root"])
+                self.assertIn("run retained", physical["root"])
+                self.assertEqual(physical["class"], "incomplete")
+                if operation == "--close":
+                    self.assertFalse(result["physical_close"])
+            finally:
+                listener.close()
+                worker.join(timeout=5)
+            self.assertFalse(worker.is_alive())
+            self.assertFalse(failures, failures)
+
+
 class ForeignPeer(unittest.TestCase):
     def test_peer_of_another_uid_is_refused_before_hello(self):
         directory = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
@@ -695,7 +935,7 @@ class ClosePrecedence(unittest.TestCase):
     def test_cleanup_collection_cancel_and_loss_precedence_is_explicit(self):
         account = {"errors": ["missing-account"], "async": {"undelivered": [{"work": 2}]}}
         collection = {"eof": True, "errors": []}
-        base = {"exit": 87, "retire": {"ok": True}}
+        base = {"exit": 87, "entry_status": 87, "retire": {"ok": True}}
         classify = lambda t, c=collection, cmd="close": native_call.end_class(t, account, c, cmd)
         self.assertEqual(classify({**base, "exit": 94}, cmd="cancel"), "cleanup-failed")
         self.assertEqual(classify(base, {"eof": False, "errors": []}, "cancel"), "incomplete")

@@ -672,7 +672,7 @@ record directory under `runs_dir`, no retry or replay. This entry never reads
 the handle or prints it; the caller, front door and owner keep the UID, peer,
 token and exact `{root, owner, generation, incarnation}` checks. Control-face
 operations (`--inspect`, `--hold`, `--release`, `--cancel`, `--control-request`)
-print the caller's token-free `result.json` to stdout; `--prompt-file` prints
+print the caller's private requester `result.json` to stdout; `--prompt-file` prints
 the answer; `--close`/`--stop` print only the stderr status line, which also
 gives the caller's `root` reading. Caller exits are returned as is (see Live
 roots). Missing/invalid configuration and an unavailable caller refuse with
@@ -680,6 +680,23 @@ exit 3 without quoting configuration. `--stop` is the owner-instance stop and
 `--cancel` the durable v3 cancel; `--close` reports physical close separately
 from its acknowledgment. Discovery still grants no attachment: a lost handle
 is not recovered through `agents roots`, and offline recovery is not offered.
+
+Control request and prior files must be caller-owned regular files, without
+final symlinks. Reads are bounded before SDK admission: requests to 64 KiB,
+prior result envelopes to 16 MiB. The SDK independently bounds each protocol
+record to 32 KiB; the prior envelope contains multiple records and accounts.
+Rejected values and unrelated prior-envelope fields are omitted from results.
+Live-opening configuration failures use generic diagnostics. Successful launch
+status lines still contain requester route/caller/path metadata.
+
+`--wait` bounds attachment collection, with 65 seconds more for stop/end
+collection, measured from attachment start. File/connection/SDK operations add
+their own time; this is neither a whole-command deadline nor a cessation
+guarantee. A terminal with no observed entry status or unknown stop reports
+unknown end, including known run retention. Already read control knowledge
+survives local capture/flush failure, reported separately in collection errors.
+Result publication can still fail: a non-success exit and stderr preserve the
+observed reading where that output remains writable.
 
 `agents roots` lists the configured package's native roots for the current
 requester as JSON, through that same caller (`oulipoly-native-call --discover`)

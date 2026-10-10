@@ -7,7 +7,8 @@ fn decode(value: &Value) -> Result<sc::Record, sc::ControlUnavailable> {
 }
 
 /// Select actual advertised capabilities, then check both submission and
-/// immutable original trace joins. Rejected records and diagnostics are returned.
+/// immutable original trace joins. Only accepted records and generic rejection
+/// diagnostics are returned; rejected input can be a private handle by mistake.
 pub fn read(value: &Value) -> Value {
     match read_selected(value) {
         Ok(reading) => reading,
@@ -54,13 +55,24 @@ fn read_selected(value: &Value) -> Result<Value, sc::ControlUnavailable> {
     let mut trace = sc::RequestTrace::new(original.clone())?;
     let mut steps = Vec::new();
     let mut rejected = Vec::new();
+    let mut prior_claims = Vec::new();
+    let mut claims = Vec::new();
     let mut conflict = false;
     for record in value["prior_claims"]
         .as_array()
         .into_iter()
         .flatten()
-        .chain(value["claims"].as_array().into_iter().flatten())
+        .map(|record| (record, true))
+        .chain(
+            value["claims"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|record| (record, false)),
+        )
     {
+        let (record, is_prior) = record;
+        let mut accepted = None;
         let result = decode(record).and_then(|claim| {
             if let sc::Record::Conflict(answer) = &claim {
                 answer.answer_to(&submitted)?;
@@ -72,14 +84,21 @@ fn read_selected(value: &Value) -> Result<Value, sc::ControlUnavailable> {
                     "submission is unrelated to original",
                 ));
             }
-            trace.accept(&claim)
+            let step = trace.accept(&claim)?;
+            accepted = Some(claim);
+            Ok(step)
         });
         match result {
             Ok(step) => {
                 conflict |= matches!(step, sc::Step::SubmissionConflict { .. });
                 steps.push(step);
+                if is_prior {
+                    prior_claims.push(accepted.unwrap());
+                } else {
+                    claims.push(accepted.unwrap());
+                }
             }
-            Err(diagnostic) => rejected.push(json!({"record": record, "diagnostic": diagnostic})),
+            Err(diagnostic) => rejected.push(json!({"diagnostic": diagnostic})),
         }
     }
     let class = if !rejected.is_empty() {
@@ -99,7 +118,8 @@ fn read_selected(value: &Value) -> Result<Value, sc::ControlUnavailable> {
         }
     };
     Ok(
-        json!({"class": class, "selected": selected, "original": sc::Record::Request(original),
+        json!({"class": class, "selected": selected, "request": sc::Record::Request(submitted),
+        "original": sc::Record::Request(original), "claims": claims, "prior_claims": prior_claims,
         "steps": steps, "rejected": rejected, "outcome": trace.outcome(),
         "admission": trace.admission(), "acknowledgment": trace.acknowledgment(),
         "fulfillment": trace.fulfillment(), "non_fulfillment": trace.non_fulfillment(),

@@ -123,8 +123,8 @@ fn run_if_selected_with_root(
         }
         return Ok(None);
     }
-    // Discovery and handle-addressed controls never quote private settings.
-    let private = discovery || control;
+    // Private live opening, discovery and controls never quote settings.
+    let private = discovery || control || cli.live_handle.is_some();
     let root = match config_root() {
         Ok(root) => root,
         Err(_) if private => {
@@ -250,7 +250,7 @@ fn root_control(
         status.map_err(|error| format!("native root caller unavailable: {}", error.kind()))?;
     let mut stdout = std::io::stdout().lock();
     if face {
-        // The control-face record is the caller's token-free result.
+        // The control-face record is private requester metadata.
         return report_to(&out, status, Answer::Record, &mut stdout);
     }
     let answer = if control.prompt_file.is_some() {
