@@ -439,9 +439,11 @@ class OrdinaryControlBoundary(unittest.TestCase):
                 class FailedCapture:
                     def write(self, data): raise OSError('fixture capture unavailable')
                     def flush(self): raise OSError('fixture flush unavailable')
+                    def close(self): pass
                 def next_event(self, until):
                     event = original(self, until)
-                    if event and event.get('event') == 'control-answer' and os.environ.get('BOUNDARY_CAPTURE'):
+                    target = 'inspection' if os.environ.get('BOUNDARY_CAPTURE') == 'inspection' else 'control-answer'
+                    if event and event.get('event') == target and os.environ.get('BOUNDARY_CAPTURE'):
                         self.capture.close()
                         self.capture = FailedCapture()
                     return event
@@ -461,7 +463,7 @@ class OrdinaryControlBoundary(unittest.TestCase):
     def invoke(self, handle, *args, capture=False, publication=False):
         before = set(os.listdir(self.runs)) if os.path.exists(self.runs) else set()
         env = {**os.environ, "XDG_CONFIG_HOME": os.path.dirname(self.config),
-               "BOUNDARY_CAPTURE": "1" if capture else "", "BOUNDARY_PUBLICATION": "1" if publication else ""}
+               "BOUNDARY_CAPTURE": str(capture) if capture else "", "BOUNDARY_PUBLICATION": "1" if publication else ""}
         env.pop("OULIPOLY_CONFIG_HOME", None)
         env.pop("OULIPOLY_PARENT_INVOCATION", None)
         proc = subprocess.run([self.entry, "root", handle, *args], env=env, cwd=self.dir,
@@ -545,14 +547,16 @@ class OrdinaryControlBoundary(unittest.TestCase):
         self.assertEqual(closed["front_door_terminal"]["live"]["attaches"], 1)
 
     def test_ack_and_refusal_survive_later_capture_and_flush_failure(self):
-        for operation in ("--hold", "--cancel"):
+        for operation in ("--inspect", "--hold", "--cancel"):
             run, terminal = self.open(name=operation[2:], script=CONTROL_ENTRY)
             handle = self.handle_file(terminal)
-            proc, result, _ = self.invoke(handle, operation, capture=True)
-            self.assertEqual((proc.returncode, result["class"], result["reading"]["class"]), (0, "acknowledged", "acknowledged"))
-            self.assertEqual(result["claims"][2]["kind"], "acknowledgment")
+            proc, result, _ = self.invoke(handle, operation, capture="inspection" if operation == "--inspect" else True)
+            expected = "inspected" if operation == "--inspect" else "acknowledged"
+            self.assertEqual((proc.returncode, result["class"], result["reading"]["class"]), (0, expected, expected))
+            if operation != "--inspect":
+                self.assertEqual(result["claims"][2]["kind"], "acknowledgment")
             self.assertTrue(result["collection"]["errors"])
-            if operation == "--hold":
+            if operation != "--cancel":
                 self.invoke(handle, "--close")
             else:
                 self.assertEqual(result["physical"]["class"], "incomplete")

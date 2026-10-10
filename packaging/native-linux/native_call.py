@@ -1330,11 +1330,13 @@ def live_control(args, attached, base, until):
     fields = {**base, "control_state": state, "settlement": settlement, "advertisement": advertisement}
     if state is None or settlement is None:
         attached.detach()
-        return live_result(args.out, "incomplete", {**fields, "reason": "no inspection within the wait bound"})
+        return live_result(args.out, "incomplete", {**fields, "reason": "no inspection within the wait bound",
+            "collection": {"eof": attached.eof, "errors": attached.errors}})
     inspection = read_control(args, advertisement, state)
     if inspection["class"] != "inspected" or args.inspect:
         attached.detach()
-        return live_result(args.out, inspection["class"], {**fields, "reading": inspection})
+        return live_result(args.out, inspection["class"], {**fields, "reading": inspection,
+            "collection": {"eof": attached.eof, "errors": attached.errors}})
     prior = args.prior_input
     if args.control_request:
         request = args.request_input
