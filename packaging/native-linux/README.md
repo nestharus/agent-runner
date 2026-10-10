@@ -254,10 +254,23 @@ across relay death is promised,
 or explicit unknown if unavailable, with `retry: do-not-replay`. Physical
 store removal does not claim logical retirement. Keep explicitly preserves
 `private/root-terminal.json`, the store and adapter diagnostics. A free run
-lock permits later sweep with the same reported distinction; discard of an
+lock permits sweep only with a retained positive no-entry or collected-entry-end
+account in `private/entry-custody.json`; a missing, malformed or possible-entry
+account keeps the entire run, including scratch. Discard of an
 unretirable store, at run end or by sweep, first retains its loss account. Direct recovery
 stores remain useful until their recovery question ends. Cleanup failure is visible.
 None of this is provider credential proof.
+
+Allocation/fork failure terminals retain possible effects and the front door's
+owned run, unverified handle/address, host supervisor identity and entry-end
+knowledge, even when a second cleanup/capture failure reaches the outer handler.
+The supervisor identity is diagnostic, never a namespace entry PID or owner
+claim. Only the detached supervisor publishes physical facts after fork; the
+opening parent's readiness failure cannot replace them. Failure to publish
+these facts is reported separately and cannot authorize later pruning. Existing
+owner/control acknowledgements, current claims, root state and logical custody
+remain in their own records. Unresolved physical questions require ROOT evidence;
+there is no automatic replay, recovery or inference from address or lock absence.
 
 ## Programmatic caller
 
@@ -469,8 +482,9 @@ failure and ending capture. Kill/collection is attempted, not guaranteed: an
 unobserved end returns unknown (93), without capture, pruning or removal of
 its source run. This is not survivor/recovery redesign.
 
-After abrupt front-door death, capture only this requester's lock-free stale
-runs without admitting a task or invoking any provider:
+After abrupt front-door death, capture this requester's lock-free stale runs
+only when their entry-custody account positively records no entry start or a
+collected entry end, without admitting a task or invoking any provider:
 
 ```
 oulipoly-native-call --loss-op capture-loss-accounts --out NEWDIR
@@ -487,7 +501,7 @@ Task/live caller results carry route hints. Nothing captures/retires
 implicitly in that caller; the next ordinary task launch still sweeps.
 
 **List/read are observational; capture is effectful retention/disposition.**
-Capture writes accounts and may prune/remove stale `discard` runs; `keep`
+Capture writes accounts and may prune/remove physically ended stale `discard` runs; `keep`
 runs get an explicit reading without changing their retention policy. Its terminal/caller
 result preserves incomplete capture/delivery as a nonzero outcome. Copies
 stay available on output failure. Retirement explicitly deletes/syncs one
@@ -636,16 +650,16 @@ Later, independent calls by the same requester can then address that root.
     admission guard covers count/allocation; the allocated run's locked
     reservation holds its slot until retirement. A competing guard holder
     is refused explicitly (`requester admission busy`); the cap refusal is
-    `4 already held`. Dead ones (lock free) are not counted and are swept by
-    the next run.
+    `4 already held`. Lock-free reservations are not counted. The next run
+    sweeps them only with positive no-entry or collected-entry-end evidence.
   - The supervisor holds the package's shared lock and the run lock for the
     root's life.
 - **Outcomes (caller exits).**
 
   | Exit | Class | Meaning |
   |---|---|---|
-  | 11 | `root-absent` | No address: the root ended and was retired, or never existed. |
-  | 12 | `root-dead` | The address is present but nothing is listening; the supervisor died, and the lock is free for the sweep. |
+  | 11 | `root-absent` | No address; this does not establish physical entry end or logical retirement. |
+  | 12 | `root-dead` | The address is present but nothing is listening; this does not establish physical entry end or permit sweep. |
   | 13 | `root-foreign` | The address is not accessible, or the peer is another uid. |
   | 14 | `root-refused` | The token or run is wrong (`handle-token`, `not-this-root`), or the reason is `busy` or `hello-timeout`. |
   | 15 | `follow-up-refused` | The owner refused the input (for example `input-closed`). |
