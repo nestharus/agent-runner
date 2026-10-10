@@ -409,7 +409,8 @@ class LiveControl(unittest.TestCase):
         run, terminal = self.open(script=CONTROL_ENTRY.replace(
             'elif cmd.get("kind") == "request":', 'elif cmd.get("kind") == "request" and cmd["operation"] != "cancel":'))
         code, result = self.call("--root", self.handle_file(terminal), "--cancel", "--wait", "2")
-        self.assertEqual((code, result["class"]), (6, "incomplete"), result)
+        self.assertEqual((code, result["class"]), (19, "control-unknown"), result)
+        self.assertEqual(result["encounter"], {"submission": "sent", "answer": "not-observed"})
         self.assertNotIn("physical", result)
         code, closed = self.call("--root", self.handle_file(terminal), "--close")
         self.assertIn(code, (0, 6))
@@ -430,9 +431,34 @@ class OrdinaryControlBoundary(unittest.TestCase):
         self.runs = os.path.join(self.dir, "runs")
         self.config = os.path.join(self.dir, "config", "oulipoly-agent-runner")
         os.makedirs(self.config)
+        self.reader_proxy = os.path.join(self.dir, "reader")
+        with open(self.reader_proxy, "w") as file:
+            file.write("#!" + sys.executable + "\nimport json, os, subprocess, sys\n")
+            file.write("reader = " + repr(self.reader) + "\n")
+            file.write(textwrap.dedent("""
+                payload = sys.stdin.read()
+                path = os.environ['BOUNDARY_READER_LOG']
+                try:
+                    with open(path) as log: count = len(log.readlines()) + 1
+                except FileNotFoundError:
+                    count = 1
+                encounter = json.loads(payload)
+                fail = int(os.environ.get('BOUNDARY_READER_FAIL_FROM') or 0)
+                if fail and count >= fail:
+                    code, output = 65, ''
+                else:
+                    process = subprocess.run([reader, *sys.argv[1:]], input=payload, text=True, capture_output=True)
+                    code, output = process.returncode, process.stdout
+                with open(path, 'a') as log:
+                    log.write(json.dumps({'call': count, 'bytes': len(payload.encode()),
+                        'prior_records': len(encounter['prior_claims']), 'exit': code}) + '\\n')
+                sys.stdout.write(output)
+                sys.exit(code)
+            """))
+        os.chmod(self.reader_proxy, 0o700)
         self.wrapper = os.path.join(self.dir, "caller")
         with open(self.wrapper, "w") as file:
-            file.write("#!" + sys.executable + "\nimport os, sys\n")
+            file.write("#!" + sys.executable + "\nimport json, os, sys\n")
             file.write("sys.path.insert(0, " + repr(HERE) + ")\nimport native_call\n")
             file.write(textwrap.dedent("""
                 original = native_call.Attached.next_event
@@ -442,10 +468,17 @@ class OrdinaryControlBoundary(unittest.TestCase):
                     def close(self): pass
                 def next_event(self, until):
                     event = original(self, until)
+                    shape = os.environ.get('BOUNDARY_PHYSICAL_SHAPE')
+                    if event and event.get('frontdoor') == 'terminal' and shape:
+                        key, value = json.loads(shape)
+                        event[key] = value
                     target = 'inspection' if os.environ.get('BOUNDARY_CAPTURE') == 'inspection' else 'control-answer'
                     if event and event.get('event') == target and os.environ.get('BOUNDARY_CAPTURE'):
                         self.capture.close()
-                        self.capture = FailedCapture()
+                        if os.environ.get('BOUNDARY_CAPTURE') == 'closed':
+                            self.actions.close()
+                        else:
+                            self.capture = FailedCapture()
                     return event
                 native_call.Attached.next_event = next_event
                 write_json = native_call.write_json
@@ -454,16 +487,27 @@ class OrdinaryControlBoundary(unittest.TestCase):
                         raise OSError('fixture publication unavailable')
                     write_json(path, value)
                 native_call.write_json = publish
+                write = native_call.Attached.write
+                def send(self, value):
+                    if value.get('kind') == 'request' and os.environ.get('BOUNDARY_SEND_FAILURE'):
+                        raise OSError('fixture send failed; effect unknown')
+                    return write(self, value)
+                native_call.Attached.write = send
             """))
-            file.write("sys.exit(native_call.main(sys.argv[1:] + ['--control-reader', " + repr(self.reader) + "]))\n")
+            file.write("sys.exit(native_call.main(sys.argv[1:] + ['--control-reader', " + repr(self.reader_proxy) + "]))\n")
         os.chmod(self.wrapper, 0o700)
         with open(os.path.join(self.config, "native.toml"), "w") as file:
             file.write("caller = " + json.dumps(self.wrapper) + "\nruns_dir = " + json.dumps(self.runs) + "\n")
 
-    def invoke(self, handle, *args, capture=False, publication=False):
+    def invoke(self, handle, *args, capture=False, publication=False, reader_fail_from=0,
+               physical_shape=None, send_failure=False):
         before = set(os.listdir(self.runs)) if os.path.exists(self.runs) else set()
+        reader_log = os.path.join(self.dir, "reader-log-" + str(time.monotonic_ns()))
         env = {**os.environ, "XDG_CONFIG_HOME": os.path.dirname(self.config),
-               "BOUNDARY_CAPTURE": str(capture) if capture else "", "BOUNDARY_PUBLICATION": "1" if publication else ""}
+               "BOUNDARY_CAPTURE": str(capture) if capture else "", "BOUNDARY_PUBLICATION": "1" if publication else "",
+               "BOUNDARY_READER_LOG": reader_log, "BOUNDARY_READER_FAIL_FROM": str(reader_fail_from),
+               "BOUNDARY_PHYSICAL_SHAPE": json.dumps(physical_shape) if physical_shape else "",
+               "BOUNDARY_SEND_FAILURE": "1" if send_failure else ""}
         env.pop("OULIPOLY_CONFIG_HOME", None)
         env.pop("OULIPOLY_PARENT_INVOCATION", None)
         proc = subprocess.run([self.entry, "root", handle, *args], env=env, cwd=self.dir,
@@ -481,6 +525,10 @@ class OrdinaryControlBoundary(unittest.TestCase):
             self.assertEqual(json.loads(proc.stdout), result, "ordinary stdout must reflect stored result")
         print(json.dumps({"boundary": args[0], "exit": proc.returncode,
                           "class": result["class"] if result else "publication-unavailable"}))
+        self.reader_calls = []
+        if os.path.isfile(reader_log):
+            with open(reader_log) as file:
+                self.reader_calls = [json.loads(line) for line in file]
         return proc, result, stored
 
     def input_file(self, value):
@@ -569,6 +617,13 @@ class OrdinaryControlBoundary(unittest.TestCase):
         self.assertEqual((proc.returncode, result["reading"]["class"]), (18, "control-refused"))
         self.assertTrue(result["collection"]["errors"])
         self.invoke(handle, "--close")
+        run, terminal = self.open(name="closed-capture", script=CONTROL_ENTRY)
+        handle = self.handle_file(terminal)
+        proc, result, _ = self.invoke(handle, "--hold", capture="closed")
+        self.assertEqual((proc.returncode, result["class"], result["reading"]["class"]), (0, "acknowledged", "acknowledged"))
+        self.assertIn("action-capture:ValueError", result["collection"]["errors"])
+        self.assertIn("capture-flush:ValueError", result["collection"]["errors"])
+        self.invoke(handle, "--close")
 
     def test_publication_failure_is_not_success_and_keeps_observed_control_reply(self):
         run, terminal = self.open(script=CONTROL_ENTRY)
@@ -580,6 +635,83 @@ class OrdinaryControlBoundary(unittest.TestCase):
         self.assertEqual(stderr_records[0]["observed_class"], "acknowledged")
         self.assertEqual(stderr_records[0]["reading"]["class"], "acknowledged")
         self.assertEqual(stderr_records[0]["publication"], "OSError")
+        self.invoke(handle, "--close")
+
+    def test_cancel_ack_survives_malformed_physical_accounts(self):
+        cases = [(key, value, "incomplete") for key, value in (
+            ("retire", []), ("account_errors", 7), ("cancel", 7), ("live", []),
+            ("account_events", [{"event": "ack", "index": [], "message_id": "m"}]))]
+        cases.append(("retire", {"ok": False, "stop": "observed", "run_removed": False}, "cleanup-failed"))
+        for key, value, physical_class in cases:
+            with self.subTest(field=key):
+                run, terminal = self.open(name=key, script=CONTROL_ENTRY)
+                proc, result, _ = self.invoke(self.handle_file(terminal), "--cancel", physical_shape=(key, value))
+                self.assertEqual((proc.returncode, result["class"], result["reading"]["class"]), (0, "acknowledged", "acknowledged"))
+                self.assertEqual(result["request"], result["original"])
+                self.assertEqual(result["request"]["request_key"], result["claims"][2]["request_key"])
+                self.assertEqual(result["claims"][2]["kind"], "acknowledgment")
+                self.assertEqual(result["physical"]["class"], physical_class)
+                if key == "retire" and isinstance(value, list):
+                    self.assertIn("unknown", result["physical"]["root"])
+                self.assertEqual(waited(terminal["supervisor_pid"]), 82)
+                self.assertFalse(os.path.exists(run), "real relay cleanup remains separate from malformed reporting")
+
+    def test_reader_failure_preserves_valid_history_and_distinguishes_submission_stages(self):
+        run, terminal = self.open(script=CONTROL_ENTRY)
+        handle = self.handle_file(terminal)
+        _, prior, _ = self.invoke(handle, "--hold")
+        request_file, prior_file = self.input_file(prior["request"]), self.input_file(prior)
+        for stage, failure, expected in (("not-attempted", {"reader_fail_from": 2}, "control-unavailable"),
+                                         ("attempted", {"send_failure": True}, "control-unknown"),
+                                         ("sent", {"reader_fail_from": 3}, "control-unknown")):
+            with self.subTest(stage=stage):
+                proc, result, stored = self.invoke(handle, "--control-request", request_file,
+                                                   "--control-prior", prior_file, **failure)
+                self.assertEqual((proc.returncode, result["class"]), (19, expected))
+                self.assertEqual(result["encounter"]["submission"], stage)
+                if stage == "not-attempted":
+                    self.assertNotIn("request", result, "unvalidated input cannot become published knowledge")
+                else:
+                    self.assertEqual(result["request"], prior["request"])
+                    self.assertEqual(result["original"], prior["original"])
+                    self.assertEqual(result["prior_claims"], prior["claims"])
+                    self.assertEqual(result["claims"], [], "new receiver claims have not passed the reader")
+                    self.assertEqual((result["reading"]["class"], result["knowledge_source"]), ("acknowledged", "admission"))
+                    self.assertNotIn("physical", result, "a prior ACK proves no new execution or physical end")
+                if stage == "sent":
+                    self.assertEqual(result["encounter"]["answer"], "received-unvalidated")
+                    self.assertEqual([c["exit"] for c in self.reader_calls], [0, 0, 65, 65])
+                    self.assertEqual([e["stage"] for e in result["reader_errors"]], ["answer", "reinspection"])
+                self.assertNotIn(terminal["handle"]["token"].encode(), proc.stdout + proc.stderr + stored)
+        proc, result, _ = self.invoke(handle, "--release", reader_fail_from=4)
+        self.assertEqual((proc.returncode, result["class"], result["knowledge_source"]), (0, "acknowledged", "answer"))
+        self.assertEqual(result["encounter"]["answer"], "sdk-read")
+        self.assertEqual(result["claims"][2]["to"], "input_open")
+        self.assertEqual([c["exit"] for c in self.reader_calls], [0, 0, 0, 65])
+        self.assertEqual(result["reader_errors"][0]["stage"], "reinspection")
+        self.invoke(handle, "--close")
+
+    def test_aggregated_valid_prior_exceeds_one_record_through_actual_sdk_reader(self):
+        replaying = CONTROL_ENTRY.replace('held = "input_open"', 'held = "input_open"\nanswers = {}').replace(
+            'for claim in claims: say(claim)',
+            'claims = answers.setdefault(cmd["request_key"], claims)\n        for claim in claims: say(claim)')
+        run, terminal = self.open(script=replaying)
+        handle = self.handle_file(terminal)
+        _, prior, _ = self.invoke(handle, "--hold")
+        # Identical replay records are legitimate trace history. No unrelated
+        # envelope padding is used; every record goes to the actual SDK reader.
+        claims = prior["claims"] * 40
+        self.assertGreater(len(json.dumps(claims).encode()), 32 * 1024)
+        self.assertTrue(all(len(json.dumps(c).encode()) < 32 * 1024 for c in claims))
+        proc, result, _ = self.invoke(handle, "--control-request", self.input_file(prior["request"]),
+                                     "--control-prior", self.input_file({"original": prior["original"], "claims": claims}))
+        self.assertEqual((proc.returncode, result["class"]), (0, "acknowledged"))
+        self.assertEqual(result["prior_claims"], claims)
+        self.assertEqual(result["original"], prior["original"])
+        admission_call = self.reader_calls[1]
+        self.assertEqual((admission_call["prior_records"], admission_call["exit"]), (len(claims), 0))
+        self.assertGreater(admission_call["bytes"], 32 * 1024)
+        print(json.dumps({"aggregated_prior_bytes": admission_call["bytes"], "validated_prior_records": len(claims)}))
         self.invoke(handle, "--close")
 
     def test_terminal_without_observed_stop_stays_unknown_on_reported_paths(self):

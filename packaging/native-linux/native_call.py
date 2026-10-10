@@ -887,7 +887,7 @@ class Attached:
         try:
             self.actions.write(json.dumps({**fields, "t": round(time.monotonic() - self.start, 3)}, sort_keys=True) + "\n")
             self.actions.flush()
-        except OSError as error:
+        except (OSError, ValueError) as error:
             reason = "action-capture:" + type(error).__name__
             if reason not in self.errors:
                 self.errors.append(reason)
@@ -955,7 +955,7 @@ class Attached:
             if not self.capture_failed:
                 try:
                     self.capture.write(chunk)
-                except OSError as error:
+                except (OSError, ValueError) as error:
                     self.errors.append("event-capture:" + type(error).__name__)
                     self.capture_failed = True
             self.buffer += chunk
@@ -983,11 +983,14 @@ class Attached:
 
     def close(self):
         if self.sock is not None:
-            self.sock.close()
+            try:
+                self.sock.close()
+            except OSError as error:
+                self.errors.append("transport-close:" + type(error).__name__)
             self.sock = None
         try:
             self.capture.flush()
-        except OSError as error:
+        except (OSError, ValueError) as error:
             reason = "capture-flush:" + type(error).__name__
             if reason not in self.errors:
                 self.errors.append(reason)
@@ -1046,11 +1049,23 @@ def turn_class(account, text):
 
 
 def live_close_account(terminal, events):
+    # Physical accounting is fallible evidence, not a reason to discard an
+    # already acquired control reading or turn account.
+    try:
+        return live_close_account_checked(terminal, events)
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as error:
+        return {"async": async_of([]), "owner_terminal": None,
+                "errors": ["live-account-invalid-shape:" + type(error).__name__]}
+
+
+def live_close_account_checked(terminal, events):
     """Use the live supervisor's runtime-only witness across attachments.
     Caller-local records alone may omit earlier turns/reports. Never infer
     whole-root settlement from the closer's own turn or physical retirement."""
     witness = terminal.get("account_events") if terminal else None
-    errors = list(terminal.get("account_errors", [])) if terminal else []
+    errors = terminal.get("account_errors", []) if terminal else []
+    errors = list(errors) if isinstance(errors, list) and all(isinstance(e, str) for e in errors) \
+        else ["live-account-errors-invalid-shape"]
     if not isinstance(witness, list) or not all(isinstance(e, dict) for e in witness):
         witness = [e for e in events if parent_event(e)]
         errors.append("live-account-witness-missing-or-invalid")
@@ -1081,11 +1096,16 @@ def live_close_account(terminal, events):
 
 
 def end_class(terminal, account, collection, cmd):
-    if terminal is None:
+    if not isinstance(terminal, dict):
         return "incomplete"
     code = terminal.get("exit")
     retired = terminal.get("retire", {})
-    if retired.get("stop") == "unknown" or type(terminal.get("entry_status")) is not int:
+    if not isinstance(retired, dict) or not isinstance(terminal.get("live", {}), dict) \
+            or not isinstance(terminal.get("cancel", ""), (str, type(None))) \
+            or not isinstance(terminal.get("collection_errors", []), list) \
+            or any("invalid-shape" in e for e in account["errors"]):
+        return "incomplete"
+    if root_end(terminal) != "ended":
         return "incomplete"
     if code == 94 or (retired.get("ok") is False and retired.get("stop") != "unknown"):
         return "cleanup-failed"
@@ -1109,6 +1129,8 @@ def root_end(terminal):
     if terminal is None:
         return "unknown (no terminal record; stop not observed)"
     retired = terminal.get("retire", {})
+    if not isinstance(retired, dict) or not isinstance(retired.get("stop", ""), str):
+        return "unknown (invalid retirement account; stop not observed)"
     if type(terminal.get("entry_status")) is int and retired.get("stop") != "unknown":
         return "ended"
     return "unknown (stop not observed; run retained)" if retired.get("run_removed") is False \
@@ -1116,6 +1138,7 @@ def root_end(terminal):
 
 
 def live_result(out, cls, fields):
+    fields = {key: value for key, value in fields.items() if key != "_control_class"}
     if cls not in LIVE_EXITS:
         fields = {**fields, "classification_error": "undeclared live outcome: " + str(cls)}
         cls = "incomplete"
@@ -1324,15 +1347,39 @@ def read_control(args, advertisement, state, request=None, claims=None, prior=No
 
 
 def live_control(args, attached, base, until):
+    # This checkpoint spans acquisition through publication. A later reader,
+    # transport, accounting or local-file failure cannot erase validated facts.
+    known = {**base, "encounter": {"submission": "not-attempted", "answer": "not-observed"}}
+    try:
+        return live_control_checked(args, attached, known, until)
+    except (OSError, ValueError, TypeError, OverflowError, KeyError, AttributeError, RecursionError) as error:
+        attached.close()
+        known["collection"] = {"eof": attached.eof, "errors": attached.errors}
+        known["reporting_error"] = type(error).__name__
+        cls = known.get("_control_class", "control-unknown" if known["encounter"]["submission"] != "not-attempted" else "incomplete")
+        return live_result(args.out, cls, known)
+
+
+def remember_control_reading(known, reading, source):
+    if reading["class"] == "control-unavailable":
+        known.setdefault("reader_errors", []).append({"stage": source, "diagnostics": reading["diagnostics"]})
+        return False
+    known.update(control_records(reading))
+    known["reading"], known["knowledge_source"] = reading, source
+    return True
+
+
+def live_control_checked(args, attached, fields, until):
     """Fresh inspection/agreement, exact submission, and preserved-original trace."""
     state, settlement = inspected(attached, until)
     advertisement = getattr(attached, "control_advertisement", None)
-    fields = {**base, "control_state": state, "settlement": settlement, "advertisement": advertisement}
+    fields.update(control_state=state, settlement=settlement, advertisement=advertisement)
     if state is None or settlement is None:
         attached.detach()
         return live_result(args.out, "incomplete", {**fields, "reason": "no inspection within the wait bound",
             "collection": {"eof": attached.eof, "errors": attached.errors}})
     inspection = read_control(args, advertisement, state)
+    remember_control_reading(fields, inspection, "inspection")
     if inspection["class"] != "inspected" or args.inspect:
         attached.detach()
         return live_result(args.out, inspection["class"], {**fields, "reading": inspection,
@@ -1353,8 +1400,13 @@ def live_control(args, attached, base, until):
             "collection": {"eof": attached.eof, "errors": attached.errors}})
     # The SDK reader returns only validated protocol records. Do not publish
     # rejected input or arbitrary fields from the enclosing prior result.
+    remember_control_reading(fields, admission, "admission")
     request = admission["request"]
+    fields["submission_inspection"] = state
+    fields["encounter"]["submission"] = "attempted"
+    fields["_control_class"] = "control-unknown"
     attached.write(request)
+    fields["encounter"]["submission"] = "sent"
     attached.log(action="send", control=request["operation"], request_key=request["request_key"])
     claims, refusal, answered = [], None, False
     while True:
@@ -1366,39 +1418,45 @@ def live_control(args, attached, base, until):
             break
         if event.get("event") == "control-answer" and event.get("request") == request:
             claims = event.get("claims", [])
+            fields["encounter"]["answer"] = "received-unvalidated"
             answered = True
             break
-    reading = read_control(args, advertisement, state, request, claims, prior)
-    if answered and request.get("operation") == "cancel" and reading["class"] in ("acknowledged", "fulfilled"):
-        return cancel_result(args, attached, fields, request, claims, prior, reading, until)
+    reading = read_control(args, advertisement, state, request, claims, prior) if answered else fields["reading"]
+    answer_read = remember_control_reading(fields, reading, "answer") if answered else False
+    if answer_read and answered:
+        fields["encounter"]["answer"] = "sdk-read"
+        fields["_control_class"] = reading["class"]
+    if answered and answer_read and request.get("operation") == "cancel" \
+            and reading["class"] in ("acknowledged", "fulfilled") \
+            and any(c.get("kind") in ("acknowledgment", "fulfillment") for c in reading.get("claims", [])):
+        return cancel_result(args, attached, fields, reading, until)
     try:
         current_state, current_settlement = inspected(attached, until) if answered else (None, None)
     except OSError as error:
         attached.errors.append("reinspection:" + type(error).__name__)
         current_state, current_settlement = None, None
-    fields["submission_inspection"] = state
     fields["control_state"], fields["settlement"] = current_state, current_settlement
     if current_state is not None:
         current_reading = read_control(args, getattr(attached, "control_advertisement", None), current_state, request, claims, prior)
-        if current_reading["class"] == "control-unavailable":
-            reading["reinspection_unavailable"] = current_reading["diagnostics"]
-        else:
-            reading = current_reading
+        if remember_control_reading(fields, current_reading, "reinspection") and answered:
+            fields["encounter"]["answer"] = "sdk-read"
+            fields["_control_class"] = current_reading["class"]
     else:
-        reading["inspection_unavailable"] = True
+        fields["inspection_unavailable"] = True
     attached.detach()
-    cls = "control-refused" if refusal is not None else reading["class"] if answered and current_state is not None else "incomplete"
-    return live_result(args.out, cls, {**fields, **control_records(reading),
-        "reading": reading, "refusal": refusal,
+    # A retained prior ACK is history, not a new execution/answer proof. When
+    # no post-send SDK reading exists, the current encounter remains unknown.
+    cls = "control-refused" if refusal is not None else fields.get("_control_class", "control-unknown")
+    return live_result(args.out, cls, {**fields, "refusal": refusal,
         "collection": {"eof": attached.eof, "errors": attached.errors},
-        "meaning": "shared transition knowledge; running-work settlement is separately reported"})
+        "meaning": "shared transition knowledge includes retained history; neither history nor an answer proves a new execution; running-work settlement is separately reported"})
 
 
 def control_records(reading):
     return {key: reading[key] for key in ("request", "original", "claims", "prior_claims") if key in reading}
 
 
-def cancel_result(args, attached, fields, request, claims, prior, reading, until):
+def cancel_result(args, attached, fields, reading, until):
     """A durable cancel's answer is the transition knowledge; the root then
     ends. Its physical end is collected separately within this call's bound
     and never derived from the acknowledgment."""

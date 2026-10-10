@@ -392,13 +392,31 @@ shared state and settlement. The packaged supervisor's read-only
 `--read-control` mode uses the SDK's schema, capability selection, agreement and
 trace operations. `--control-reader` may name that reader explicitly; no binary,
 banner or source revision participates in negotiation. Missing/incompatible
-control disables this control encounter only; the root's execution continues.
+control before submission disables this control encounter only; the root's
+execution continues. `encounter.submission` distinguishes `not-attempted`,
+`attempted` (send failed with unknown effect), and `sent` (transport write
+completed, not proof of receiver effect). Reader failure after submission
+returns `control-unknown` unless a later validated reading establishes the
+control outcome. The result retains the last validated request, original and
+history, labels its `knowledge_source`, and records later `reader_errors`.
+`encounter.answer` distinguishes an absent answer, a received but unvalidated
+answer, and an SDK-read answer. Unvalidated receiver records are not published
+as accepted claims. A retained prior ACK is transition history, not a new
+execution proof. Follow-up retains the same immutable key/original; this adds
+no replay permission or fresh-key retry.
 
 A changed submission requires the caller's preserved original, including after
 its final outcome. Both exact submission and original-trace conflict joins are
 checked. The owner faithfully replays the original before the separate conflict
 answer. Returned claims, rejected records and diagnostics remain in the caller
-result. Fulfillment is distinct from acknowledgment and non-fulfillment:
+result as accepted claims and generic rejection diagnostics, excluding rejected
+values. The 16 MiB prior-file custody bound is separate from the reader's
+4 MiB whole-encounter bound and the SDK's 32 KiB per-record bound. Legitimate
+multi-record histories can exceed one record's bound; an encounter too large
+for admission refuses before send. If a later encounter exceeds the reader's
+bound, already validated history survives with current-effect uncertainty.
+Malformed later physical accounting degrades that account while preserving
+validated control knowledge. Fulfillment is distinct from acknowledgment and non-fulfillment:
 `inspected`/`acknowledged`/`fulfilled` exit 0, `control-refused`/`unfulfilled`
 exit 18, `control-unknown`/`control-unavailable` exit 19, and a contradictory or
 incomplete account exits 6. Transition knowledge does not establish work
