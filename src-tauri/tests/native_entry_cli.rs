@@ -14,6 +14,7 @@
 //!     Owns:
 //!       - ordinary -m / agent launches selected onto a stand-in native caller
 //!       - unmapped, malformed and unsupported-form refusals without caller or legacy State
+//!       - opt-in live opening and `agents root` handle controls on the stand-in caller
 //! ```
 //!
 //! The caller is a stand-in shell script that records its argv and prompt
@@ -39,6 +40,23 @@ printf '%s\n' "$@" > "$rec.argv"
 if [ "$1" = "--discover" ]; then
   printf '{"class":"discovered","roots":[],"meaning":"observational"}\n'
   exit 0
+fi
+if [ "$1" = "--root" ]; then
+  mkdir -m 700 "$4"
+  case "$5" in
+    --prompt-file)
+      printf 'live answer' > "$4/final.md"
+      printf '{"class":"answered","root":"live (detached; this exit is not the root'"'"'s end)"}\n' > "$4/result.json"
+      exit 0 ;;
+    --close)
+      printf '{"class":"closed","root":"ended"}\n' > "$4/result.json"
+      exit 0 ;;
+    --cancel)
+      printf '{"class":"acknowledged","physical":{"class":"not-observed"}}\n' > "$4/result.json"
+      exit 0 ;;
+  esac
+  printf '{"class":"root-dead"}\n' > "$4/result.json"
+  exit 12
 fi
 out=; prompt=; route=
 while [ $# -gt 0 ]; do
@@ -730,4 +748,157 @@ fn old_credential_config_refuses_without_invoking_caller() {
     assert!(stderr(&output).contains("unknown field"));
     assert!(fixture.argv().is_none());
     assert!(!fixture.data_dir.exists());
+}
+
+#[test]
+fn one_shot_launch_requests_no_live_root() {
+    let fixture = Fixture::new(CONFIG);
+    let output = fixture.run(&["-m", "codex~high", "hi"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        !fixture
+            .argv()
+            .unwrap()
+            .contains(&"--live-handle".to_owned())
+    );
+    assert!(!stderr(&output).contains("live root requested"));
+}
+
+#[test]
+fn live_handle_opts_one_launch_into_an_ongoing_root() {
+    let fixture = Fixture::new(CONFIG);
+    let output = fixture.run(&["-m", "codex~high", "--live-handle", "h.json", "hi"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let argv = fixture.argv().unwrap();
+    let handle = fs::canonicalize(fixture.root.join("work"))
+        .unwrap()
+        .join("h.json");
+    assert_eq!(
+        value_after(&argv, "--live-handle"),
+        Some(handle.to_str().unwrap())
+    );
+    assert_eq!(value_after(&argv, "--route"), Some("sol-high"));
+    assert_eq!(fixture.prompt(), "hi");
+    assert!(stderr(&output).contains("live root requested"));
+    assert!(fixture.legacy_untouched());
+    // The opt-in belongs to launch forms only.
+    let output = fixture.run(&["--usage", "--live-handle", "h.json"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+}
+
+fn root_out(fixture: &Fixture) -> PathBuf {
+    let argv = fixture.argv().unwrap();
+    let out = PathBuf::from(value_after(&argv, "--out").unwrap());
+    assert_eq!(out.parent(), Some(fixture.root.join("runs").as_path()));
+    out
+}
+
+#[test]
+fn root_controls_hand_the_handle_path_to_the_caller_without_reading_it() {
+    let fixture = Fixture::new(CONFIG);
+    // The entry never opens the handle: a missing file reaches the caller.
+    let handle = fixture.root.join("absent-handle.json");
+    let handle = handle.to_str().unwrap();
+    for (control, code, printed) in [
+        (vec!["--inspect"], 12, Some("{\"class\":\"root-dead\"}\n")),
+        (vec!["--hold"], 12, Some("{\"class\":\"root-dead\"}\n")),
+        (vec!["--release"], 12, Some("{\"class\":\"root-dead\"}\n")),
+        (
+            vec!["--cancel"],
+            0,
+            Some("{\"class\":\"acknowledged\",\"physical\":{\"class\":\"not-observed\"}}\n"),
+        ),
+        (vec!["--close"], 0, None),
+        (vec!["--stop"], 12, None),
+        (vec!["--prompt-file", "p.md"], 0, None),
+        (
+            vec![
+                "--control-request",
+                "r.json",
+                "--control-prior",
+                "prior.json",
+            ],
+            12,
+            Some("{\"class\":\"root-dead\"}\n"),
+        ),
+    ] {
+        let mut args = vec!["root", handle];
+        args.extend(&control);
+        args.extend(["--wait", "9"]);
+        let output = fixture.run(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{control:?}: {}",
+            stderr(&output)
+        );
+        let argv = fixture.argv().unwrap();
+        let out = root_out(&fixture);
+        let mut expected = vec![
+            "--root".to_owned(),
+            handle.to_owned(),
+            "--out".to_owned(),
+            out.to_str().unwrap().to_owned(),
+        ];
+        expected.extend(control.iter().map(|arg| (*arg).to_owned()));
+        expected.extend(["--wait".to_owned(), "9".to_owned()]);
+        assert_eq!(argv, expected);
+        match (printed, control[0]) {
+            (Some(record), _) => assert_eq!(stdout(&output), record),
+            (None, "--prompt-file") => assert_eq!(stdout(&output), "live answer\n"),
+            (None, _) => assert_eq!(stdout(&output), ""),
+        }
+        assert!(!fixture.record.with_extension("prompt").exists());
+        assert!(fixture.legacy_untouched());
+    }
+}
+
+#[test]
+fn root_control_shapes_are_exactly_one_control() {
+    let fixture = Fixture::new(CONFIG);
+    for args in [
+        &["root", "h.json"][..],
+        &["root", "h.json", "--close", "--cancel"],
+        &["root", "h.json", "--inspect", "--wait", "0"],
+        &["root", "--inspect"],
+    ] {
+        let output = fixture.run(args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert!(fixture.argv().is_none());
+    }
+    let output = fixture.run(&["root", "h.json", "--inspect", "--control-prior", "p.json"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(fixture.argv().is_none());
+    assert!(fixture.legacy_untouched());
+}
+
+#[test]
+fn root_controls_refuse_without_quoting_private_configuration() {
+    for text in [None, Some("caller = \"private-fixture-value\"\n")] {
+        let fixture = Fixture::new(CONFIG);
+        let path = fixture
+            .root
+            .join("config/oulipoly-agent-runner/native.toml");
+        match text {
+            Some(text) => fs::write(path, text).unwrap(),
+            None => fs::remove_file(path).unwrap(),
+        }
+        let output = fixture.run(&["root", "h.json", "--inspect"]);
+        assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+        assert!(!stderr(&output).contains("private-fixture-value"));
+        assert!(fixture.argv().is_none());
+        assert!(!fixture.root.join("runs").exists());
+        assert!(fixture.legacy_untouched());
+    }
+    let fixture = Fixture::new(CONFIG);
+    fs::remove_file(fixture.root.join("fake-native-call")).unwrap();
+    let output = fixture.run(&["root", "h.json", "--close"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(stderr(&output).contains("root caller unavailable"));
+    assert!(fixture.legacy_untouched());
 }

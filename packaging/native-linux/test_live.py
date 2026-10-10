@@ -308,15 +308,20 @@ CONTROL_ENTRY = textwrap.dedent("""
                  "advertisement": {"oulipoly.session_control/v3": {"operations": ["input_hold", "input_release", "recover", "close", "cancel"], "reports": ["inspection"], "facts": []}}})
         elif cmd.get("kind") == "request":
             ref = {k: cmd[k] for k in ("request_key", "requester", "addressed")}
-            to = "input_held" if cmd["operation"] == "input_hold" else "input_open"
+            cancel = cmd["operation"] == "cancel"
+            to = "cancelling" if cancel else "input_held" if cmd["operation"] == "input_hold" else "input_open"
             common = dict(ref, protocol=cmd["protocol"])
             claims = [dict(common, kind="receipt", durable=True, observed_at_unix_ms=2),
                       dict(common, kind="admission", operation=cmd["operation"], responder=me, observed_at_unix_ms=3),
                       dict(common, kind="acknowledgment", operation=cmd["operation"], responder=me,
-                           observed_at_unix_ms=4, **{"from": held, "to": to}),
+                           observed_at_unix_ms=4, **{"from": "open" if cancel else held, "to": to}),
                       dict(common, kind="outcome", result="acknowledged", observed_at_unix_ms=5)]
             for claim in claims: say(claim)
             say({"event": "control-answer", "request": cmd, "claims": claims})
+            if cancel:
+                say({"event": "cancel-requested", "by": "session-control"})
+                say({"event": "terminal", "status": "cancelled", "async": {"accepted": 0, "turn_ended": 0, "undelivered": [], "owed": 0}})
+                say({"entry": "terminal", "relay": "complete"}); sys.exit(82)
             held = to
         elif cmd.get("cmd") == "close":
             say({"event": "terminal", "status": "closed", "async": {"accepted": 0, "turn_ended": 0, "undelivered": [], "owed": 0}})
@@ -363,6 +368,50 @@ class LiveControl(unittest.TestCase):
         self.assertEqual(result["submission_inspection"]["input"]["state"], "input_held")
         self.assertEqual(result["claims"][2]["to"], "input_open")
         code, result = self.call("--root", handle, "--close")
+        self.assertIn(code, (0, 6))
+
+    def test_durable_cancel_is_requester_bound_and_its_physical_end_is_separate(self):
+        run, terminal = self.open(script=CONTROL_ENTRY)
+        code, result = self.call("--root", self.handle_file(terminal), "--cancel")
+        self.assertEqual((code, result["class"]), (0, "acknowledged"), result)
+        request = result["request"]
+        self.assertEqual((request["operation"], request["requester"]), ("cancel", "uid:%d" % os.getuid()))
+        self.assertEqual(request["addressed"], result["submission_inspection"]["reporter"])
+        self.assertEqual([c["kind"] for c in result["claims"]], ["receipt", "admission", "acknowledgment", "outcome"])
+        self.assertEqual(result["claims"][2]["to"], "cancelling")
+        self.assertIsNone(result["control_state"], "no post-cancel state is claimed")
+        physical = result["physical"]
+        self.assertEqual((physical["root"], physical["class"]), ("ended", "cancelled"), physical)
+        self.assertEqual(physical["cancel"], "requester durable cancel")
+        self.assertEqual(waited(terminal["supervisor_pid"]), 82)
+        self.assertFalse(os.path.exists(run))
+        code, stale = self.call("--root", self.handle_file(terminal), "--inspect")
+        self.assertEqual((code, stale["class"]), (11, "root-absent"))
+
+    def test_refused_cancel_waits_for_no_physical_end(self):
+        refusing = CONTROL_ENTRY.replace('cancel = cmd["operation"] == "cancel"', 'cancel = False').replace(
+            'dict(common, kind="outcome", result="acknowledged", observed_at_unix_ms=5)]',
+            'dict(common, kind="outcome", result="acknowledged", observed_at_unix_ms=5)]\n'
+            '        if cmd["operation"] == "cancel":\n'
+            '            claims = [claims[0], claims[1], dict(common, kind="refusal", operation="cancel", responder=me,'
+            ' stage="transition", reason="already_terminal", observed_at_unix_ms=4), dict(common, kind="outcome", result="refused", observed_at_unix_ms=5)]')
+        run, terminal = self.open(script=refusing)
+        started = time.monotonic()
+        code, result = self.call("--root", self.handle_file(terminal), "--cancel", "--wait", "20")
+        self.assertLess(time.monotonic() - started, 15, "no wait for an end a refusal does not cause")
+        self.assertEqual((code, result["class"]), (18, "control-refused"), result)
+        self.assertEqual(result["claims"][2]["kind"], "refusal")
+        self.assertNotIn("physical", result)
+        code, closed = self.call("--root", self.handle_file(terminal), "--close")
+        self.assertIn(code, (0, 6))
+
+    def test_unanswered_cancel_is_not_acknowledged(self):
+        run, terminal = self.open(script=CONTROL_ENTRY.replace(
+            'elif cmd.get("kind") == "request":', 'elif cmd.get("kind") == "request" and cmd["operation"] != "cancel":'))
+        code, result = self.call("--root", self.handle_file(terminal), "--cancel", "--wait", "2")
+        self.assertEqual((code, result["class"]), (6, "incomplete"), result)
+        self.assertNotIn("physical", result)
+        code, closed = self.call("--root", self.handle_file(terminal), "--close")
         self.assertIn(code, (0, 6))
 
 

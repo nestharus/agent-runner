@@ -123,6 +123,44 @@ pub struct Cli {
     /// Pass model inputs as key=value pairs (repeatable)
     #[arg(id = "input", short = 'i', long = "input", value_name = "KEY=VALUE")]
     pub(crate) inputs: Vec<String>,
+
+    /// Linux native launch only: keep the root live after this call and write
+    /// its private handle to this new file (mode 0600). Address it later with
+    /// `agents root FILE ...`. Without it, the launch is one-shot.
+    #[cfg(target_os = "linux")]
+    #[arg(long = "live-handle", value_name = "NEWFILE")]
+    pub(crate) live_handle: Option<PathBuf>,
+}
+
+/// One control of a live native root, through its private handle.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, clap::Args)]
+#[group(required = true, multiple = false)]
+pub(crate) struct RootControl {
+    /// Report the root's control state and settlement reading (JSON).
+    #[arg(long)]
+    pub(crate) inspect: bool,
+    /// Hold new input (admission only; running work continues).
+    #[arg(long)]
+    pub(crate) hold: bool,
+    /// Release an input hold.
+    #[arg(long)]
+    pub(crate) release: bool,
+    /// The root's durable lifecycle cancel, as this requester.
+    #[arg(long)]
+    pub(crate) cancel: bool,
+    /// Close the root: drain and end its tree.
+    #[arg(long)]
+    pub(crate) close: bool,
+    /// Stop this owner instance only; not the durable cancel.
+    #[arg(long)]
+    pub(crate) stop: bool,
+    /// Deliver one more input from this file and wait for its own turn.
+    #[arg(long, value_name = "FILE")]
+    pub(crate) prompt_file: Option<PathBuf>,
+    /// Submit (or replay) an exact session_control/v3 request from this JSON file.
+    #[arg(long, value_name = "FILE")]
+    pub(crate) control_request: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -266,6 +304,23 @@ pub(crate) enum Subcommands {
     /// Uses native.toml; listing grants no ownership or attachment authority.
     #[cfg(target_os = "linux")]
     Roots,
+    /// Address a live native root opened with `--live-handle`: inspect, hold,
+    /// release, cancel, close, stop, one more input, or an exact control
+    /// request. Uses native.toml's caller; the handle stays private.
+    #[cfg(target_os = "linux")]
+    Root {
+        /// The private live handle file written when the root was opened.
+        handle: PathBuf,
+        #[command(flatten)]
+        control: RootControl,
+        /// With `--control-request` only: the prior caller result preserving
+        /// the original of that exact request.
+        #[arg(long, value_name = "FILE")]
+        control_prior: Option<PathBuf>,
+        /// This call's own wait bound in seconds; the root is unaffected by it.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=7200))]
+        wait: Option<u32>,
+    },
     /// Linux, opt-in: start one fresh native OpenCode ACP v2 root from a
     /// JSON request file whose `env` is the root's whole environment, or
     /// recover one for `cancel` or `continue-attached` (never a new root

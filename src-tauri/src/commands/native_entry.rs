@@ -17,6 +17,7 @@
 //!       - refusal of launch forms the native entry does not support
 //!       - one installed native caller invocation and its result rendering
 //!       - observational requester root discovery through the configured caller
+//!       - opt-in live opening and handle-addressed live root controls
 //! ```
 //!
 //! The ordinary Linux CLI launch forms require `<config root>/native.toml`.
@@ -38,8 +39,16 @@
 //! `answered` (0) is not task correctness.
 //! `agents roots` uses the same configured caller's observational discovery
 //! before legacy initialization, with no model, prompt or run allocation.
+//!
+//! `--live-handle NEWFILE` on a launch form is the explicit opt-in to an
+//! ongoing root: the caller writes the private handle (mode 0600) and the
+//! root outlives this call. `agents root FILE <control>` hands that file to
+//! the same caller's `--root` operations. This entry never reads the handle
+//! or prints its contents; the caller and front door keep the UID, peer,
+//! token and exact v3 authority checks. Without the opt-in a launch stays
+//! one-shot. One caller attempt per control, no replay.
 
-use crate::usage::cli::{Cli, Subcommands};
+use crate::usage::cli::{Cli, RootControl, Subcommands};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -98,12 +107,29 @@ fn run_if_selected_with_root(
     config_root: impl FnOnce() -> Result<PathBuf, String>,
 ) -> Result<Option<i32>, String> {
     let discovery = matches!(cli.command, Some(Subcommands::Roots));
-    if !discovery && !is_launch_form(cli) {
+    let control = matches!(cli.command, Some(Subcommands::Root { .. }));
+    if let Some(Subcommands::Root {
+        control,
+        control_prior: Some(_),
+        ..
+    }) = &cli.command
+        && control.control_request.is_none()
+    {
+        return refuse("--control-prior needs --control-request");
+    }
+    if !discovery && !control && !is_launch_form(cli) {
+        if cli.live_handle.is_some() {
+            return refuse("--live-handle needs a native launch form");
+        }
         return Ok(None);
     }
+    // Discovery and handle-addressed controls never quote private settings.
+    let private = discovery || control;
     let root = match config_root() {
         Ok(root) => root,
-        Err(_) if discovery => return refuse("cannot determine native discovery configuration"),
+        Err(_) if private => {
+            return refuse("cannot determine native discovery/control configuration");
+        }
         Err(reason) => {
             return refuse(&format!(
                 "cannot determine native configuration selection: {reason}"
@@ -113,13 +139,21 @@ fn run_if_selected_with_root(
     let config = match selected_config(&root) {
         Ok(config) => config,
         // Resolver and TOML diagnostics may quote private configuration.
-        Err(_) if discovery => {
-            return refuse("native discovery configuration unavailable or invalid");
+        Err(_) if private => {
+            return refuse("native discovery/control configuration unavailable or invalid");
         }
         Err(reason) => return refuse(&reason),
     };
     let result = if discovery {
         discover(&config)
+    } else if let Some(Subcommands::Root {
+        handle,
+        control,
+        control_prior,
+        wait,
+    }) = &cli.command
+    {
+        root_control(&config, handle, control, control_prior.as_deref(), *wait)
     } else {
         run_selected(cli, &config)
     };
@@ -152,6 +186,79 @@ fn discover(config: &NativeEntryConfig) -> Result<i32, String> {
         .status()
         .map_err(|error| format!("native discovery caller unavailable: {}", error.kind()))?;
     Ok(status.code().unwrap_or(6))
+}
+
+/// Caller `--root` argv for one control, and whether its result is printed.
+fn root_argv(
+    handle: &Path,
+    control: &RootControl,
+    prior: Option<&Path>,
+    wait: Option<u32>,
+    out: &Path,
+) -> (Vec<std::ffi::OsString>, bool) {
+    let mut argv: Vec<std::ffi::OsString> =
+        vec!["--root".into(), handle.into(), "--out".into(), out.into()];
+    let flag = [
+        (control.inspect, "--inspect"),
+        (control.hold, "--hold"),
+        (control.release, "--release"),
+        (control.cancel, "--cancel"),
+        (control.close, "--close"),
+        (control.stop, "--stop"),
+    ]
+    .into_iter()
+    .find_map(|(set, flag)| set.then_some(flag));
+    let mut face = flag.is_some_and(|flag| flag != "--close" && flag != "--stop");
+    if let Some(flag) = flag {
+        argv.push(flag.into());
+    } else if let Some(file) = &control.prompt_file {
+        argv.extend(["--prompt-file".into(), file.into()]);
+    } else if let Some(file) = &control.control_request {
+        argv.extend(["--control-request".into(), file.into()]);
+        face = true;
+    }
+    if let Some(prior) = prior {
+        argv.extend(["--control-prior".into(), prior.into()]);
+    }
+    if let Some(wait) = wait {
+        argv.extend(["--wait".into(), wait.to_string().into()]);
+    }
+    (argv, face)
+}
+
+fn root_control(
+    config: &NativeEntryConfig,
+    handle: &Path,
+    control: &RootControl,
+    prior: Option<&Path>,
+    wait: Option<u32>,
+) -> Result<i32, String> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&config.runs_dir)
+        .map_err(|error| format!("runs_dir: {}", error.kind()))?;
+    let out = config.runs_dir.join(run_id());
+    let (argv, face) = root_argv(handle, control, prior, wait, &out);
+    let previous = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+    let status = Command::new(&config.caller)
+        .args(&argv)
+        .stdin(std::process::Stdio::null())
+        .status();
+    unsafe { libc::signal(libc::SIGINT, previous) };
+    let status =
+        status.map_err(|error| format!("native root caller unavailable: {}", error.kind()))?;
+    let mut stdout = std::io::stdout().lock();
+    if face {
+        // The control-face record is the caller's token-free result.
+        return report_to(&out, status, Answer::Record, &mut stdout);
+    }
+    let answer = if control.prompt_file.is_some() {
+        Answer::Final
+    } else {
+        Answer::None
+    };
+    report_to(&out, status, answer, &mut stdout)
 }
 
 fn refuse(reason: &str) -> Result<Option<i32>, String> {
@@ -284,7 +391,11 @@ fn run_selected(cli: &Cli, config: &NativeEntryConfig) -> Result<i32, String> {
         Some(project) => std::path::absolute(project).map_err(|error| error.to_string())?,
         None => std::env::current_dir().map_err(|error| format!("cwd: {error}"))?,
     };
-    launch(config, &model_name, model, &prompt, &cwd)
+    let live = match &cli.live_handle {
+        Some(path) => Some(std::path::absolute(path).map_err(|error| error.to_string())?),
+        None => None,
+    };
+    launch(config, &model_name, model, &prompt, &cwd, live.as_deref())
 }
 
 fn lookup<'a>(config: &'a NativeEntryConfig, name: &str) -> Result<&'a NativeModel, String> {
@@ -334,6 +445,7 @@ fn caller_argv(
     allow_file: Option<&Path>,
     cwd: &Path,
     out: &Path,
+    live: Option<&Path>,
 ) -> Vec<std::ffi::OsString> {
     let mut argv: Vec<std::ffi::OsString> = Vec::new();
     let mut push = |flag: &str, value: &dyn AsRef<std::ffi::OsStr>| {
@@ -359,6 +471,9 @@ fn caller_argv(
     if let Some(limit) = model.child_max_concurrent {
         push("--child-max-concurrent", &limit.to_string());
     }
+    if let Some(handle) = live {
+        push("--live-handle", &handle);
+    }
     match allow_file {
         Some(file) => push("--allow-file", &file),
         None => argv.push("--trusted-task".into()),
@@ -372,6 +487,7 @@ fn launch(
     model: &NativeModel,
     prompt: &str,
     cwd: &Path,
+    live: Option<&Path>,
 ) -> Result<i32, String> {
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -398,11 +514,17 @@ fn launch(
         allow_file.as_deref(),
         cwd,
         &out,
+        live,
     );
     eprintln!(
-        "native entry: model '{model_name}' -> site route '{}' via {} (one attempt, no replay); out {}",
+        "native entry: model '{model_name}' -> site route '{}' via {} (one attempt, no replay{}); out {}",
         model.route,
         config.caller.display(),
+        if live.is_some() {
+            "; live root requested"
+        } else {
+            ""
+        },
         out.display()
     );
     // A terminal Ctrl-C reaches the caller in the same foreground group; it
@@ -417,12 +539,24 @@ fn launch(
 }
 
 fn report(out: &Path, status: std::process::ExitStatus) -> Result<i32, String> {
-    report_to(out, status, &mut std::io::stdout().lock())
+    report_to(out, status, Answer::Final, &mut std::io::stdout().lock())
+}
+
+/// What a caller call presents on stdout.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// `final.md`, required after success.
+    Final,
+    /// The caller's `result.json` control record, required.
+    Record,
+    /// Nothing; the status line and record directory only.
+    None,
 }
 
 fn report_to(
     out: &Path,
     status: std::process::ExitStatus,
+    answer: Answer,
     stdout: &mut impl Write,
 ) -> Result<i32, String> {
     use std::os::unix::process::ExitStatusExt;
@@ -444,11 +578,23 @@ fn report_to(
         (None, Some(signal)) => 128 + signal,
         (None, None) => 1,
     };
+    // The caller's own reading of whether the root lives on after this call.
+    let root = result
+        .as_ref()
+        .and_then(|value| value.get("root"))
+        .and_then(|value| value.as_str())
+        .map(|root| format!("; root {root}"))
+        .unwrap_or_default();
     eprintln!(
-        "native entry: class {class}; caller exit {code}; front door exit {front_door}; records {} (answered is not correctness)",
+        "native entry: class {class}; caller exit {code}; front door exit {front_door}{root}; records {} (answered is not correctness)",
         out.display()
     );
-    if let Err(reason) = present_answer(out, stdout, code == 0 || class == "answered") {
+    let presented = match answer {
+        Answer::Final => present_answer(out, "final.md", stdout, code == 0 || class == "answered"),
+        Answer::Record => present_answer(out, "result.json", stdout, true),
+        Answer::None => Ok(()),
+    };
+    if let Err(reason) = presented {
         // Presentation is this entry's boundary, separate from caller custody.
         // Keep every non-successful caller code; never upgrade its outcome.
         let entry_code = if code == 0 { 6 } else { code };
@@ -458,8 +604,13 @@ fn report_to(
     Ok(code)
 }
 
-fn present_answer(out: &Path, stdout: &mut impl Write, required: bool) -> Result<(), String> {
-    let path = out.join("final.md");
+fn present_answer(
+    out: &Path,
+    name: &str,
+    stdout: &mut impl Write,
+    required: bool,
+) -> Result<(), String> {
+    let path = out.join(name);
     let answer = match std::fs::read_to_string(&path) {
         Ok(answer) => answer,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => return Ok(()),
@@ -632,7 +783,10 @@ mod tests {
             .open("/dev/full")
             .unwrap();
         let mut stdout = std::io::BufWriter::with_capacity(4096, file);
-        assert_eq!(report_to(dir.path(), status, &mut stdout).unwrap(), 6);
+        assert_eq!(
+            report_to(dir.path(), status, Answer::Final, &mut stdout).unwrap(),
+            6
+        );
         assert_eq!(stdout.buffer(), b"retained answer\n");
         assert_eq!(
             std::fs::read(dir.path().join("result.json")).unwrap(),

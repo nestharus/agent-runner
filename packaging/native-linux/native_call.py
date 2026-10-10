@@ -11,7 +11,8 @@
     oulipoly-native-call --discover
         Observational JSON on stdout; no task, handle, or output directory.
     oulipoly-native-call --root HANDLE --out DIR
-        (--prompt-file FILE | --close | --stop | --inspect | --hold | --release)
+        (--prompt-file FILE | --close | --stop | --inspect | --hold | --release
+         | --cancel | --control-request FILE [--control-prior FILE])
         [--wait SECONDS]
 
 --live-handle opens a live root: its supervisor outlives this call; --root
@@ -1134,6 +1135,8 @@ def parse_live_args(argv):
     action.add_argument("--hold", action="store_true",
                         help="hold new input (admission only; running work continues)")
     action.add_argument("--release", action="store_true", help="release an input hold")
+    action.add_argument("--cancel", action="store_true",
+                        help="the root's durable lifecycle cancel (session_control/v3, this requester); not --stop")
     action.add_argument("--control-request", help="submit an exact shared control request from a JSON file (including replay)")
     parser.add_argument("--control-prior", help="prior caller result preserving the immutable original and its claims")
     parser.add_argument("--control-reader", default=os.path.join(os.path.dirname(os.path.realpath(__file__)), "oulipoly-root-supervisor"),
@@ -1184,7 +1187,7 @@ def main_live(argv):
                 **base, "turn": account,
                 "transport": {"errors": attached.errors, "attached": attached.events[0] if attached.events else None},
                 "root": "ended" if account["root_ended"] else "live (detached; this exit is not the root's end)"})
-        if args.inspect or args.hold or args.release or args.control_request:
+        if args.inspect or args.hold or args.release or args.cancel or args.control_request:
             return live_control(args, attached, base, until)
         cmd = "close" if args.close else "cancel"
         attached.write({"cmd": cmd})
@@ -1279,7 +1282,8 @@ def live_control(args, attached, base, until):
     else:
         request = {"kind": "request", "protocol": CONTROL_PROTOCOL,
                    "request_key": "c" + os.urandom(8).hex(), "requester": f"uid:{os.getuid()}",
-                   "addressed": state["reporter"], "operation": "input_hold" if args.hold else "input_release",
+                   "addressed": state["reporter"],
+                   "operation": "cancel" if args.cancel else "input_hold" if args.hold else "input_release",
                    "scope": {"root": state["reporter"]["root"]}}
     admission = read_control(args, advertisement, state, request, prior=prior)
     if admission["class"] == "control-unavailable":
@@ -1300,6 +1304,8 @@ def live_control(args, attached, base, until):
             answered = True
             break
     reading = read_control(args, advertisement, state, request, claims, prior)
+    if answered and request.get("operation") == "cancel" and reading["class"] in ("acknowledged", "fulfilled"):
+        return cancel_result(args, attached, fields, request, claims, prior, reading, until)
     current_state, current_settlement = inspected(attached, until) if answered else (None, None)
     fields["submission_inspection"] = state
     fields["control_state"], fields["settlement"] = current_state, current_settlement
@@ -1314,6 +1320,35 @@ def live_control(args, attached, base, until):
         "prior_claims": prior.get("prior_claims", []) + prior.get("claims", []),
         "reading": reading, "refusal": refusal,
         "meaning": "shared transition knowledge; running-work settlement is separately reported"})
+
+
+def cancel_result(args, attached, fields, request, claims, prior, reading, until):
+    """A durable cancel's answer is the transition knowledge; the root then
+    ends. Its physical end is collected separately within this call's bound
+    and never derived from the acknowledgment."""
+    terminal = None
+    while True:
+        event = attached.next_event(until + STOP_GRACE_S)
+        if event is None:
+            break
+        if event.get("frontdoor") == "terminal":
+            terminal = event
+    attached.close()
+    collection = {"eof": attached.eof, "errors": attached.errors}
+    if terminal is None:
+        physical = {"class": "not-observed", "root": "end not observed within this call's wait"}
+    else:
+        account = live_close_account(terminal, attached.events)
+        physical = {"class": end_class(terminal, account, collection, "cancel"), "root": "ended",
+                    **{k: terminal.get(k) for k in ("exit", "entry_status", "killed", "cancel", "retire")},
+                    "account_errors": account["errors"]}
+    fields = {**fields, "submission_inspection": fields["control_state"], "control_state": None, "settlement": None}
+    return live_result(args.out, reading["class"], {**fields, "request": request, "claims": claims,
+        "original": reading.get("original", prior.get("original", request)),
+        "prior_claims": prior.get("prior_claims", []) + prior.get("claims", []),
+        "reading": reading, "refusal": None, "collection": collection, "physical": physical,
+        "front_door_terminal": terminal,
+        "meaning": "durable cancel transition knowledge; physical end is the separate `physical` account"})
 
 
 def main(argv):

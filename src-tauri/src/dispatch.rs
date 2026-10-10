@@ -455,6 +455,10 @@ fn dispatch_subcommand(
         #[cfg(target_os = "linux")]
         Subcommands::Roots => unreachable!("native discovery must execute through native_entry"),
         #[cfg(target_os = "linux")]
+        Subcommands::Root { .. } => {
+            unreachable!("native root controls must execute through native_entry")
+        }
+        #[cfg(target_os = "linux")]
         Subcommands::NativeRoot { .. } => {
             unreachable!("offline commands must execute through run_offline_entry")
         }

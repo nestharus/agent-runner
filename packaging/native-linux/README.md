@@ -378,9 +378,15 @@ run deadline still bounds an unresponsive owner. What the owner answers:
   aggregation over recorded actors, explicitly separate from SDK one-reference
   physical knowledge; actor completeness/native retirement remains unqualified.
 
-The caller exposes `--root FILE --inspect | --hold | --release`, plus
+The caller exposes `--root FILE --inspect | --hold | --release | --cancel`, plus
 `--control-request JSON` for an exact submission/replay and `--control-prior`
-for its prior caller result. Hold/release use a fresh key. A fresh
+for its prior caller result. Hold/release/cancel use a fresh key, this
+requester (`uid:<n>`) and the authority a fresh inspection reports. After an
+answered `--cancel` the caller does not re-inspect the ending root: it collects
+the front door's terminal to EOF within its wait and reports that physical end
+separately as `physical` (`cancelled`, `incomplete`, `cleanup-failed`, ... or
+`not-observed`). The class remains the control reading; an acknowledged cancel
+is transition knowledge, not proof the tree ended. A fresh
 `inspection_key` selects one owner envelope containing the actual advertisement,
 shared state and settlement. The packaged supervisor's read-only
 `--read-control` mode uses the SDK's schema, capability selection, agreement and
@@ -641,8 +647,8 @@ Later, independent calls by the same requester can then address that root.
   - Cross-supervisor messaging.
   - A global daemon.
   - Generic descendants.
-  - The ordinary `agents` entry and the temporary dispatcher do not open live
-    roots.
+  - The temporary dispatcher does not open live roots; the ordinary `agents`
+    entry opens one only with explicit `--live-handle` (below).
 
 `test_live.py` contains unprivileged stand-in controls for separate callers,
 constructor-initialized record framing/loss, the actual concurrent admission
@@ -653,6 +659,27 @@ proof. Real owner/provider, privileged namespace/sudo/session policy and
 package replacement while a live root holds its lock remain ROOT qualification.
 
 ## Ordinary `agents` entry (`native.toml`)
+
+**Live roots from the ordinary entry.** A launch form with
+`--live-handle NEWFILE` (for example `agents -m MODEL --live-handle h.json
+PROMPT`) passes that absolute path to the caller's `--live-handle`: the root
+outlives the call and its private handle is written to the new file (mode 0600).
+Without the option the launch stays one-shot. `agents root FILE` then takes
+exactly one of `--inspect`, `--hold`, `--release`, `--cancel`, `--close`,
+`--stop`, `--prompt-file P` or `--control-request R [--control-prior C]`, with
+an optional `--wait 1..7200`. It runs one caller `--root` call with a fresh
+record directory under `runs_dir`, no retry or replay. This entry never reads
+the handle or prints it; the caller, front door and owner keep the UID, peer,
+token and exact `{root, owner, generation, incarnation}` checks. Control-face
+operations (`--inspect`, `--hold`, `--release`, `--cancel`, `--control-request`)
+print the caller's token-free `result.json` to stdout; `--prompt-file` prints
+the answer; `--close`/`--stop` print only the stderr status line, which also
+gives the caller's `root` reading. Caller exits are returned as is (see Live
+roots). Missing/invalid configuration and an unavailable caller refuse with
+exit 3 without quoting configuration. `--stop` is the owner-instance stop and
+`--cancel` the durable v3 cancel; `--close` reports physical close separately
+from its acknowledgment. Discovery still grants no attachment: a lost handle
+is not recovered through `agents roots`, and offline recovery is not offered.
 
 `agents roots` lists the configured package's native roots for the current
 requester as JSON, through that same caller (`oulipoly-native-call --discover`)
