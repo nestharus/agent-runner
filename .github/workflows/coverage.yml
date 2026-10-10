@@ -24,8 +24,17 @@ concurrency:
   group: coverage-${{ github.ref }}
   cancel-in-progress: true
 
+# Mirrors ci.yml's test environment: the workspace tests expect these
+# isolated data/config dirs, a TERM value, and bounded build parallelism.
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
+  TERM: xterm-256color
+  OULIPOLY_DATA_DIR: ${{ github.workspace }}/target/ci-data
+  OULIPOLY_DATA_HOME: ${{ github.workspace }}/target/ci-data-home
+  XDG_CONFIG_HOME: ${{ github.workspace }}/target/ci-config-home
+  XDG_DATA_HOME: ${{ github.workspace }}/target/ci-xdg-data
+  XDG_CACHE_HOME: ${{ github.workspace }}/target/ci-cache
 
 jobs:
   rust-coverage:
@@ -46,7 +55,7 @@ jobs:
       - name: Install system deps (Linux)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev ripgrep util-linux ncurses-bin
 
       - uses: taiki-e/install-action@v2
         with:
@@ -55,10 +64,67 @@ jobs:
       - name: Install pinned agent-bash
         uses: ./.github/actions/install-agent-bash
 
+      - run: rg --version && script --version && command -v tput
+
       - name: Generate coverage (lcov, cobertura, JSON summary)
+        timeout-minutes: 90
+        env:
+          # Same test runner as ci.yml: the runtime unit harness needs a TTY.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: bash ${{ github.workspace }}/.github/scripts/ci-test-runner.sh
+        shell: bash
+        # Coverage measures which code the suite exercises; the pass/fail
+        # gate for tests is ci.yml. --ignore-run-fail runs every target and
+        # still produces the report when some tests fail. The failing tests
+        # are counted, listed in the job summary and flagged as a warning,
+        # not hidden. A run in which no test result is reported (for example
+        # a build failure) still fails this step.
         run: |
           mkdir -p coverage
-          cargo llvm-cov --workspace --no-report
+          cargo llvm-cov --workspace --no-report --ignore-run-fail 2>&1 | tee coverage/test-output.log
+          sed 's/\x1b\[[0-9;]*m//g' coverage/test-output.log > coverage/test-output.txt
+          rm coverage/test-output.log
+          results=$(grep -ac '^test result:' coverage/test-output.txt || true)
+          passed=$(awk '/^test result:/ {n += $4} END {print n + 0}' coverage/test-output.txt)
+          failed=$(awk '/^test result:/ {n += $6} END {print n + 0}' coverage/test-output.txt)
+          if [ "$results" -eq 0 ]; then
+            echo "::error title=Coverage::no test results were reported; see the log for build errors"
+            exit 1
+          fi
+          {
+            echo "### Rust coverage test run"
+            echo
+            echo "Test targets: $results. Passed: $passed. Failed: $failed."
+            if [ "$failed" -gt 0 ]; then
+              echo
+              echo "Failing tests (first 200):"
+              echo
+              echo '```'
+              grep -aE '^test .+ \.\.\. FAILED$' coverage/test-output.txt | sort -u | head -200
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$failed" -gt 0 ]; then
+            echo "::warning title=Failing tests::$failed of $((passed + failed)) tests failed during the coverage run; the coverage report is still produced. See the job summary."
+          fi
+          # A process killed while writing its profile (some tests kill
+          # agent-runner children on purpose) leaves a corrupt .profraw,
+          # and one corrupt file makes llvm-profdata refuse the whole merge.
+          # Drop unreadable profiles and say how many were dropped.
+          profdata="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-profdata"
+          total=0
+          dropped=0
+          while IFS= read -r -d '' f; do
+            total=$((total + 1))
+            if ! "$profdata" show "$f" > /dev/null 2>&1; then
+              echo "dropping unreadable profile: $f"
+              rm -f "$f"
+              dropped=$((dropped + 1))
+            fi
+          done < <(find . -path ./node_modules -prune -o -name '*.profraw' -print0)
+          echo "Profiles: $total found, $dropped unreadable and dropped." >> "$GITHUB_STEP_SUMMARY"
+          if [ "$dropped" -gt 0 ]; then
+            echo "::warning title=Coverage profiles::$dropped of $total .profraw files were unreadable and were left out of the report."
+          fi
           cargo llvm-cov report --lcov --output-path coverage/lcov.info
           cargo llvm-cov report --cobertura --output-path coverage/coverage.xml
           cargo llvm-cov report --json --summary-only --output-path coverage/coverage-summary.json
