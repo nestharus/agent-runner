@@ -16,6 +16,7 @@
 //!       - model-name to site-route mapping for -m and agent frontmatter selection
 //!       - refusal of launch forms the native entry does not support
 //!       - one installed native caller invocation and its result rendering
+//!       - observational requester root discovery through the configured caller
 //! ```
 //!
 //! The ordinary Linux CLI launch forms require `<config root>/native.toml`.
@@ -35,6 +36,8 @@
 //! The caller is one attempt, with no replay. Its exit code is returned as
 //! is unless answer presentation fails after caller success (entry exit 6);
 //! `answered` (0) is not task correctness.
+//! `agents roots` uses the same configured caller's observational discovery
+//! before legacy initialization, with no model, prompt or run allocation.
 
 use crate::usage::cli::{Cli, Subcommands};
 use serde::Deserialize;
@@ -94,11 +97,13 @@ fn run_if_selected_with_root(
     cli: &Cli,
     config_root: impl FnOnce() -> Result<PathBuf, String>,
 ) -> Result<Option<i32>, String> {
-    if !is_launch_form(cli) {
+    let discovery = matches!(cli.command, Some(Subcommands::Roots));
+    if !discovery && !is_launch_form(cli) {
         return Ok(None);
     }
     let root = match config_root() {
         Ok(root) => root,
+        Err(_) if discovery => return refuse("cannot determine native discovery configuration"),
         Err(reason) => {
             return refuse(&format!(
                 "cannot determine native configuration selection: {reason}"
@@ -107,9 +112,18 @@ fn run_if_selected_with_root(
     };
     let config = match selected_config(&root) {
         Ok(config) => config,
+        // Resolver and TOML diagnostics may quote private configuration.
+        Err(_) if discovery => {
+            return refuse("native discovery configuration unavailable or invalid");
+        }
         Err(reason) => return refuse(&reason),
     };
-    match run_selected(cli, &config) {
+    let result = if discovery {
+        discover(&config)
+    } else {
+        run_selected(cli, &config)
+    };
+    match result {
         Ok(code) => Ok(Some(code)),
         Err(reason) => refuse(&reason),
     }
@@ -129,6 +143,15 @@ fn selected_config(root: &Path) -> Result<NativeEntryConfig, String> {
         Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
     };
     parse_config(&text).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn discover(config: &NativeEntryConfig) -> Result<i32, String> {
+    let status = Command::new(&config.caller)
+        .arg("--discover")
+        .stdin(std::process::Stdio::null())
+        .status()
+        .map_err(|error| format!("native discovery caller unavailable: {}", error.kind()))?;
+    Ok(status.code().unwrap_or(6))
 }
 
 fn refuse(reason: &str) -> Result<Option<i32>, String> {

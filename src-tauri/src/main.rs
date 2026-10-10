@@ -549,8 +549,9 @@ fn run_cli_entrypoint() -> ExitCode {
         }
     };
     // native.toml selects the per-root ACP v2 native root for ordinary
-    // launches. It precedes legacy maintenance scheduling, owner bootstrap,
-    // State and provider registries; its refusals never fall through.
+    // launches and requester discovery. It precedes legacy maintenance
+    // scheduling, owner bootstrap, State and provider registries; its
+    // refusals never fall through.
     #[cfg(target_os = "linux")]
     match commands::native_entry::run_if_selected(&cli) {
         Ok(None) => {}

@@ -70,6 +70,8 @@ configuration and unsupported launch forms refuse with exit 3, with no legacy
 fallback or substitute model. See the [native Linux entry configuration](packaging/native-linux/README.md#ordinary-agents-entry-nativetoml)
 for supported forms, exact model-to-site-route mappings and caller/output
 contracts. Building this frontend does not install the native caller package.
+`agents roots` uses that configuration to discover the requester's native root
+identities and observed addresses as JSON; listing grants no attachment authority.
 
 Help/usage, non-launch subcommands, GUI and wider legacy-source retirement
 remain separate and unclosed. The older [paired Linux archive](packaging/linux/README.md)

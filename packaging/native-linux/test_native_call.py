@@ -115,6 +115,153 @@ class Scratch(unittest.TestCase):
 
 
 
+class Discovery(Scratch):
+    """Requester discovery through a fake sudo, never a privileged entry."""
+
+    def records(self):
+        requester = f"uid:{os.getuid()}"
+        return [{"frontdoor": "root", "run": "kept-root", "live": False, "socket": None,
+                 "front_door_holds_run": False,
+                 "entry": {"kind": "root_entry", "protocol": "oulipoly.session_control/v3",
+                           "requester": requester, "describer": "frontdoor",
+                           "authority": {"root": "r", "owner": "o", "generation": "2", "incarnation": "1"},
+                           "observed_at_unix_ms": 123}, "describe_error": None},
+                {"frontdoor": "terminal", "stage": "discovered", "requester": requester,
+                 "roots": 1, "exit": 0}]
+
+    def invoke(self, records, exit_code=0):
+        import subprocess
+        raw = records if isinstance(records, bytes) else b"".join(json.dumps(r).encode() + b"\n" for r in records)
+        self.write("response", raw.decode("utf-8", errors="surrogateescape"))
+        sudo = self.write("fake-sudo", f"""#!/usr/bin/python3
+import json, os, sys
+directory = os.path.dirname(__file__)
+request = json.loads(sys.stdin.buffer.read())
+json.dump({{"argv": sys.argv[1:], "request": request}}, open(directory + "/seen", "w"))
+sys.stdout.buffer.write(open(directory + "/response", "rb").read())
+print("fixture-access-marker", file=sys.stderr)
+sys.exit({exit_code})
+""", 0o755)
+        output = subprocess.run([sys.executable, native_call.__file__, "--discover", "--sudo", sudo,
+                                 "--frontdoor", self.path("frontdoor")],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        self.assertNotIn(SECRET.encode(), output.stdout + output.stderr)
+        with open(self.path("seen")) as file:
+            seen = json.load(file)
+        self.assertEqual(seen["request"], {"v": 1, "op": "discover"})
+        self.assertEqual(seen["argv"], ["-n", self.path("frontdoor"), "run"])
+        return output.returncode, json.loads(output.stdout)
+
+    def test_discovery_preserves_identity_and_observed_address_without_attach_authority(self):
+        records = self.records()
+        records[0].update(live=True, socket="/requester/run/live.sock", front_door_holds_run=True,
+                          token=SECRET, last_root_terminal={"settings": SECRET})
+        records[1]["settings"] = SECRET
+        code, result = self.invoke(records)
+        self.assertEqual(code, 0)
+        self.assertEqual(result["class"], "discovered")
+        root = result["roots"][0]
+        self.assertEqual(root["entry"]["authority"], {"root": "r", "owner": "o", "generation": "2", "incarnation": "1"})
+        self.assertEqual(root["socket"], "/requester/run/live.sock")
+        self.assertIn("not a current-owner handshake", result["meaning"])
+        self.assertIn("requires its handle", result["meaning"])
+
+    def test_empty_discovery_requires_a_complete_requester_terminal(self):
+        terminal = dict(self.records()[-1], roots=0)
+        code, result = self.invoke([terminal])
+        self.assertEqual((code, result["class"], result["roots"]), (0, "discovered", []))
+        for records in ([], [dict(terminal, requester="uid:foreign")], [dict(terminal, roots=1)],
+                        [terminal, terminal], [dict(terminal, exit=True)]):
+            with self.subTest(records=records):
+                code, result = self.invoke(records)
+                self.assertEqual(code, 6)
+                self.assertIsNone(result["roots"])
+
+    def test_foreign_malformed_and_unsupported_entries_are_incomplete(self):
+        for change in ({"requester": "uid:foreign"}, {"protocol": "oulipoly.session_control/v2"},
+                       {"authority": {"root": SECRET}}, {"observed_at_unix_ms": True}, {"token": SECRET}):
+            with self.subTest(change=change):
+                records = self.records()
+                records[0]["entry"].update(change)
+                code, result = self.invoke(records)
+                self.assertEqual(code, 6)
+                self.assertIsNone(result["roots"])
+        code, result = self.invoke(b"not-json fixture-access-marker\n")
+        self.assertEqual(code, 6)
+        self.assertIsNone(result["roots"])
+
+    def test_unavailable_description_is_visible_and_refusal_is_not_empty_success(self):
+        records = self.records()
+        records[0].update(entry=None, describe_error=SECRET)
+        code, result = self.invoke(records)
+        self.assertEqual(code, 6)
+        self.assertEqual(result["roots"][0]["description"], "unavailable")
+        self.assertIsNone(result["roots"][0]["entry"])
+        code, result = self.invoke([], exit_code=90)
+        self.assertEqual((code, result["class"]), (4, "discovery-unavailable"))
+        self.assertIsNone(result["roots"])
+
+    # Independent oracle: session-control/v3.schema.json HostRef,
+    # UnixMilliseconds and RootEntry; adjacent README "Bounds and redaction".
+    # RootEntry is descriptive; the frontdoor envelope projects other fields.
+    def test_schema_invalid_authority_values_make_discovery_incomplete(self):
+        invalid = ("", "bad value", "x" * 257, "x\x1f", "x\t", "x\n", "x\x7f",
+                   "café", None, True, 17, ["r"])
+        for field in ("root", "owner", "generation", "incarnation"):
+            for value in invalid:
+                with self.subTest(field=field, value=value):
+                    records = self.records()
+                    records[0]["entry"]["authority"][field] = value
+                    code, result = self.invoke(records)
+                    self.assertEqual((code, result["class"], result["roots"]),
+                                     (6, "discovery-incomplete", None))
+
+    def test_schema_invalid_observation_times_make_discovery_incomplete(self):
+        for value in (-1, 2**53, 2**64 - 1, True, None, "123", 1.5, []):
+            with self.subTest(value=value):
+                records = self.records()
+                records[0]["entry"]["observed_at_unix_ms"] = value
+                code, result = self.invoke(records)
+                self.assertEqual((code, result["class"], result["roots"]),
+                                 (6, "discovery-incomplete", None))
+
+    def test_valid_schema_boundaries_and_producer_values_survive_projection(self):
+        printable = "".join(chr(value) for value in range(0x21, 0x7f))
+        boundaries = {"root": "!", "owner": "~" * 256,
+                      "generation": (printable * 3)[:256], "incarnation": "opaque:/next"}
+        # Current describe_entry emits opaque store ids, decimal generation
+        # and incarnation (or "none"), plus an ordinary Unix millisecond time.
+        producer = {"root": "a" * 32, "owner": "b" * 32,
+                    "generation": "2", "incarnation": "none"}
+        for authority, timestamp in ((boundaries, 0), (boundaries, 2**53 - 1),
+                                     (producer, 1_700_000_000_123)):
+            with self.subTest(authority=authority, timestamp=timestamp):
+                records = self.records()
+                records[0]["entry"].update(authority=authority, observed_at_unix_ms=timestamp)
+                # The SDK's standalone-record framing bound does not apply
+                # to unrelated private fields in this outer envelope.
+                records[0]["last_root_terminal"] = {"settings": "x" * 32769 + SECRET}
+                records[1]["settings"] = SECRET
+                code, result = self.invoke(records)
+                self.assertEqual((code, result["class"]), (0, "discovered"))
+                self.assertEqual(result["roots"][0]["description"], "observed")
+                self.assertEqual(result["roots"][0]["entry"], records[0]["entry"])
+
+    def test_missing_transport_and_timeout_remain_unknown(self):
+        import contextlib
+        import io
+        import subprocess
+        from unittest import mock
+        for error, expected in ((FileNotFoundError(), 8), (subprocess.TimeoutExpired("fixture", 30), 6)):
+            with self.subTest(error=error), mock.patch.object(native_call.subprocess, "run", side_effect=error):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    code = native_call.main(["--discover"])
+                result = json.loads(out.getvalue())
+                self.assertEqual(code, expected)
+                self.assertIsNone(result["roots"])
+
+
 class Calls(Scratch):
     def setUp(self):
         super().setUp()

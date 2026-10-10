@@ -654,6 +654,33 @@ package replacement while a live root holds its lock remain ROOT qualification.
 
 ## Ordinary `agents` entry (`native.toml`)
 
+`agents roots` lists the configured package's native roots for the current
+requester as JSON, through that same caller (`oulipoly-native-call --discover`)
+and its UID-bound front door. No model, prompt, output directory or legacy
+State/owner/service initialization is needed. Valid `native.toml` is required;
+discovery does not create `runs_dir`. The caller needs the `--discover` capability;
+an unavailable or older caller refuses, with no fallback. Source delivery
+does not update an installed caller.
+
+The result preserves each observed run, socket, front-door lock observation
+and v3 RootEntry (root, owner, generation, incarnation and observation time).
+These are descriptive observations: the store's last authority record and a
+lock/socket sample, without a current-owner handshake, ownership or attachment
+authority. Tokens and private settings are omitted; attaching still requires
+the separately retained live handle. A root with an unavailable description
+remains visible with `entry: null` and `description: "unavailable"`.
+Observed authority values must each be 1–256 printable non-space ASCII
+characters; observation time must be an integer from 0 through 2^53−1.
+Invalid values make discovery incomplete. Authority values remain opaque.
+
+Discovery exits 0 only for a complete requester-bound listing, including a
+confirmed empty listing. Exit 4 means the front door/transport returned nonzero,
+6 means malformed, partial or timed-out discovery, and 8 means transport launch
+was unavailable. The CLI refuses missing/invalid configuration or an unavailable
+caller with exit 3 and propagates caller exits. Collection has a 30-second bound;
+timeout establishes no root state. `roots: null` means no usable listing was
+obtained. No task, attach, control, stale sweep, replay or recovery is performed.
+
 Ordinary Linux CLI launch requires `<runner config root>/native.toml`
 (normally `~/.config/oulipoly-agent-runner/native.toml`). With valid
 configuration, the launch forms

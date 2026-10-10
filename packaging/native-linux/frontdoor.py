@@ -20,7 +20,7 @@ with do-not-replay. Keep preserves diagnostics. Neither removal nor closed/7
 (native87) establishes logical retirement.
 Controls: cancel/close/send/inspect lines and session_control/v3 `request`
 records, whose requester must be this attested requester (`uid:<n>`).
-Stdin `{"v":1,"op":"discover"}` instead lists this requester's roots as v2
+Stdin `{"v":1,"op":"discover"}` instead lists this requester's roots as v3
 `root_entry` records: derived addressing, not ownership or capacity.
 Discard of a store whose account does not describe retirement first keeps
 its bounded metadata-only loss account for the requester. `loss-accounts`
