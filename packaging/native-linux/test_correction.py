@@ -39,6 +39,9 @@ class Scratch(unittest.TestCase):
             (root/rel).write_text('fake-secret')
         (root/'private/retention').write_text('discard')
         (root/'private/lock').touch()
+        # Explicit physical precondition for the sweep custody fixture.
+        (root/'private'/fd.ENTRY_CUSTODY).write_text(json.dumps(
+            {'run': root.name, 'run_dir': str(root), 'entry': 'ended', 'entry_status': 87}))
         # Removal custody fixtures describe retirement; a loss-account run
         # (no such account) is kept instead and pruned (below).
         if retirable:

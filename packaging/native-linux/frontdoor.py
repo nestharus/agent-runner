@@ -85,6 +85,75 @@ CONTROL_PROTOCOL = "oulipoly.session_control/v3"
 CONTROL_RECORD_LIMIT = 32768
 # Final logical account survives in the package terminal even under discard.
 ROOT_TERMINAL = "root-terminal.json"
+ENTRY_CUSTODY = "entry-custody.json"
+
+
+class RunCustody:
+    """Front-door facts, independent of owner claims and logical retirement.
+
+    The parent and detached child share the pre-fork account. After fork only
+    the child publishes physical facts; readiness loss cannot overwrite them.
+    A missing/failed publication is never permission for a later sweep.
+    """
+
+    def __init__(self):
+        self.effects = "none"
+        self.run = self.run_dir = self.lock = None
+        self.entry = "not-started"
+        self.entry_status = None
+        self.supervisor_pid = self.handle = None
+        self.capture_errors = []
+
+    def facts(self):
+        return {"run": self.run, "run_dir": self.run_dir, "entry": self.entry,
+                "entry_status": self.entry_status, "supervisor_pid": self.supervisor_pid,
+                "handle": self.handle, "capture_errors": list(self.capture_errors),
+                "meaning": "front-door physical custody; address is unverified, not owner authority, acknowledgement or logical settlement"}
+
+    def publish(self):
+        try:
+            write_durable(os.path.join(self.run_dir, "private"), ENTRY_CUSTODY, self.facts())
+        except (OSError, ValueError, TypeError) as error:
+            self.capture_errors.append("entry-custody:" + type(error).__name__)
+            raise
+
+    def possible_entry(self):
+        self.entry = "possible"
+        self.publish()  # Must precede any fork/Popen that can start an entry.
+
+    def ended(self, status):
+        self.entry_status = status
+        self.entry = "ended" if type(status) is int else "possible"
+        self.publish()
+
+    def close_lock(self):
+        lock, self.lock = self.lock, None
+        if lock is not None:
+            os.close(lock)
+
+
+def physical_custody(run):
+    """Positive no-entry or collected entry end only. No PID inference."""
+    try:
+        fd = os.open(os.path.join(run, "private", ENTRY_CUSTODY),
+                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd, "r", encoding="utf-8") as file:
+            if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+                raise ValueError("not regular")
+            value = json.loads(file.read(HELLO_LIMIT + 1))
+        if not isinstance(value, dict) or value.get("run_dir") != run \
+                or value.get("run") != os.path.basename(run):
+            raise ValueError("wrong run")
+        safe = value.get("entry") == "not-started" or \
+            value.get("entry") == "ended" and type(value.get("entry_status")) is int
+        return safe, value
+    except (OSError, ValueError, TypeError) as error:
+        return False, {"entry": "unknown", "capture_error": type(error).__name__}
+
+
+def protected_disposition(account):
+    return {"ok": False, "stop": "unknown", "run_removed": False,
+            "physical_custody": account, "retry": "do-not-replay"}
 
 
 def control_requester(uid):
@@ -118,11 +187,18 @@ TRUSTED_OWNERS = frozenset({0})
 
 
 class Refused(Exception):
-    """Refused before any effect."""
+    """Admission refusal; the caller separately tracks allocation effects."""
 
 
 class RunFailed(Exception):
     """Refused or failed after the run directory was made."""
+
+
+class EntryNotStarted(RunFailed):
+    """The startup producer had no Popen handle when startup failed."""
+
+    def __init__(self, cause):
+        super().__init__(f"entry not started: {type(cause).__name__}")
 
 
 class StartedEntryFailed(RunFailed):
@@ -588,6 +664,10 @@ def retire(run, retention, account_unavailable=False, required_account=None, pac
     retains its loss account for the requester; if it cannot, the store is
     kept (scratch pruned) with the visible reason instead of destroyed.
     """
+    if os.path.lexists(os.path.join(run, "private", ENTRY_CUSTODY)):
+        safe, physical = physical_custody(run)
+        if not safe:
+            return protected_disposition(physical)
     removed = None
     account = unknown_root_terminal() if account_unavailable else root_terminal(run)
     if required_account is not None:
@@ -623,6 +703,11 @@ def retire(run, retention, account_unavailable=False, required_account=None, pac
 def sweep(user_dir, package=None, explicit_capture=False):
     results = []
     for run, fd in stale_runs(user_dir):
+        safe, physical = physical_custody(run)
+        if not safe:
+            os.close(fd)
+            results.append({"run": run, **protected_disposition(physical)})
+            continue
         try:
             with open(os.path.join(run, "private", "retention"), encoding="utf-8") as file:
                 retention = file.read().strip()
@@ -881,7 +966,9 @@ def prune_scratch(run):
         pass
 
 
-def make_run(site, user):
+def make_run(site, user, custody=None):
+    custody = custody if custody is not None else RunCustody()
+    custody.effects = "possible"  # Includes partial allocation and sweep.
     base = site["run_base"]
     check_owned(base)
     user_dir = os.path.join(base, str(user.pw_uid))
@@ -901,11 +988,14 @@ def make_run(site, user):
     swept = sweep(user_dir)
     run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(6)
     run = os.path.join(user_dir, run_id)
+    custody.run, custody.run_dir = run_id, run
     os.mkdir(run, 0o711)
     os.chmod(run, 0o711)
     os.mkdir(os.path.join(run, "private"), 0o700)
     lock = os.open(os.path.join(run, "private", "lock"), os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    custody.lock = lock
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    custody.publish()
     return run_id, run, lock, swept
 
 
@@ -1025,7 +1115,7 @@ def start_entry(package, request_path):
     except BaseException as cause:
         os.close(alive_w)
         if entry is None:
-            raise
+            raise EntryNotStarted(cause) from cause
         # Keep the successfully started handle and actual cleanup evidence.
         # A cleanup failure must neither replace the cause nor imply drain.
         status, killed, errors = None, False, []
@@ -1045,17 +1135,27 @@ def start_entry(package, request_path):
     return entry, alive_w
 
 
-def start_failure(run_id, run_dir, retention, package, error):
+def start_failure(run_id, run_dir, retention, package, error, custody=None):
     """Truthful startup ending; an unobserved started-entry end forbids
     capture, prune and removal. No new cleanup/recovery attempt here."""
     started = isinstance(error, StartedEntryFailed)
     status = error.status if started else None
     killed = error.killed if started else False
+    if custody is not None:
+        if started:
+            custody.ended(status)
+        # A raw error may have replaced startup cleanup evidence. Only the
+        # exact startup producer's no-handle exception proves no entry start.
+        elif isinstance(error, EntryNotStarted):
+            custody.entry = "not-started"
+            custody.publish()
     retired = retire(run_dir, retention, package=package,
                      capture={"by": "front-door-failed" if started else "entry-not-started",
                               "entry_status": status, "killed": killed}) \
-        if not started or status is not None else {"ok": False, "stop": "unknown", "run_removed": False}
-    if started and status is None:
+        if (custody is None and not started) or status is not None \
+            or custody is not None and custody.entry == "not-started" \
+        else protected_disposition(custody.facts() if custody is not None else {"entry": "possible"})
+    if status is None and (started or custody is not None and custody.entry == "possible"):
         code = EXIT_UNKNOWN
     elif not retired["ok"]:
         code = EXIT_CLEANUP_FAILED
@@ -1064,10 +1164,12 @@ def start_failure(run_id, run_dir, retention, package, error):
     else:
         code = EXIT_UNKNOWN if started else EXIT_RUN_FAILED
     return {"frontdoor": "terminal", "stage": "run-failed", "run": run_id,
-            "reason": str(error) if started else f"entry not started: {type(error).__name__}",
-            "entry_started": started, "entry_status": status, "killed": killed,
+            "reason": str(error) if isinstance(error, RunFailed) else f"entry startup failed: {type(error).__name__}",
+            "entry_started": True if started else (None if custody is not None and custody.entry == "possible" else False),
+            "entry_status": status, "killed": killed,
             "collection_errors": error.collection_errors if started else [],
-            "retire": retired, "effects": "possible", "exit": code, "retry": "do-not-replay"}
+            "retire": retired, "effects": "possible", "exit": code, "retry": "do-not-replay",
+            "custody": custody.facts() if custody is not None else None}
 
 
 # Control relay.
@@ -1443,10 +1545,10 @@ def live_roots(user_dir):
     return count
 
 
-def make_live_run(site, user):
+def make_live_run(site, user, custody=None):
     """Serialize check/allocation per requester, and reserve the slot before
     releasing the guard. A locked reservation counts even before listen/fork.
-    Dead reservations are lock-free and swept like dead live sockets."""
+    Lock-free reservations require positive physical evidence before sweep."""
     base = site["run_base"]
     check_owned(base)
     user_dir = os.path.join(base, str(user.pw_uid))
@@ -1463,13 +1565,16 @@ def make_live_run(site, user):
             raise Refused("live roots: requester admission busy") from None
         if live_roots(user_dir) >= MAX_LIVE_ROOTS:
             raise Refused(f"live roots: {MAX_LIVE_ROOTS} already held by this requester")
-        allocated = make_run(site, user)
+        allocated = make_run(site, user, custody)
         _, run, lock, _ = allocated
         try:
             write_private(os.path.join(run, "private", LIVE_RESERVATION), "reserved")
         except OSError:
-            retire(run, "discard")
-            os.close(lock)
+            try:
+                retire(run, "discard")  # Allocation only; no fork was attempted.
+            finally:
+                if custody is None:
+                    os.close(lock)
             raise
         return allocated
     finally:
@@ -1764,15 +1869,18 @@ class LiveRelay(Relay):
         return delivered
 
 
-def live_daemon(package, site, checked, run_id, run_dir, request_path, user, listener, socket_path, token, ready_w):
+def live_daemon(package, site, checked, run_id, run_dir, request_path, user, listener, socket_path, token, ready_w, custody=None):
     """The detached owning supervisor of one live root. Returns its exit."""
     for number in (signal.SIGHUP, signal.SIGINT):
         signal.signal(number, signal.SIG_IGN)
+    if custody is not None:
+        custody.supervisor_pid = os.getpid()
+        custody.publish()
     try:
         entry, alive = start_entry(package, request_path)
-    except (StartedEntryFailed, OSError, subprocess.SubprocessError) as error:
+    except (EntryNotStarted, StartedEntryFailed, OSError, subprocess.SubprocessError) as error:
         listener.close()
-        terminal = start_failure(run_id, run_dir, checked["retention"], package, error)
+        terminal = start_failure(run_id, run_dir, checked["retention"], package, error, custody)
         # No live client exists yet. Carry bounded ending/disposition evidence
         # to the opening caller instead of losing it to detached /dev/null.
         retired = terminal["retire"]
@@ -1786,22 +1894,36 @@ def live_daemon(package, site, checked, run_id, run_dir, request_path, user, lis
         finally:
             os.close(ready_w)
         return terminal["exit"]
-    relay = LiveRelay(entry, run_dir, checked["deadline"] + site["cancel_grace_s"], site["cancel_grace_s"],
-                      listener, user.pw_uid, run_id, token)
-    signal.signal(signal.SIGTERM, lambda number, frame: relay.signals.append(number))
-    os.write(ready_w, b"live\n")
-    os.close(ready_w)
+    relay = None
     try:
+        relay = LiveRelay(entry, run_dir, checked["deadline"] + site["cancel_grace_s"], site["cancel_grace_s"],
+                          listener, user.pw_uid, run_id, token)
+        signal.signal(signal.SIGTERM, lambda number, frame: relay.signals.append(number))
+        try:
+            os.write(ready_w, b"live\n")
+        finally:
+            os.close(ready_w)
         status = relay.run_to_end(None)
     except BaseException as failure:
-        relay.collection_errors.append("live-relay-failed:" + type(failure).__name__)
+        if relay is not None:
+            relay.collection_errors.append("live-relay-failed:" + type(failure).__name__)
         if entry.poll() is None:
             os.kill(entry.pid, signal.SIGKILL)
-            relay.killed = True
+            if relay is not None:
+                relay.killed = True
         end = time.monotonic() + COLLECTION_S
         while entry.poll() is None and time.monotonic() < end:
             time.sleep(0.01)
         status = entry.poll()
+        if relay is None:
+            if custody is not None:
+                custody.ended(status)
+            listener.close()
+            os.close(alive)
+            # Physical end may be known; owner/control/capture are still owed.
+            return EXIT_UNKNOWN
+    if custody is not None:
+        custody.ended(status)
     relay.stop_listening(socket_path)
     os.close(alive)
     code = entry_exit(status, relay.killed)
@@ -1835,14 +1957,24 @@ def live_daemon(package, site, checked, run_id, run_dir, request_path, user, lis
     return code
 
 
-def open_live(package, site, checked, run_id, run_dir, request_path, user):
+def open_live(package, site, checked, run_id, run_dir, request_path, user, custody=None):
     """Forks the detached owning supervisor (its own session, no caller
     stdio), waits for its readiness and answers the opening caller with
     the root's handle. This process then ends; the root does not."""
     token = secrets.token_hex(16)
     listener, socket_path = listen_live(run_dir, user.pw_uid)
     ready_r, ready_w = os.pipe()
-    pid = os.fork()
+    if custody is not None:
+        custody.handle = {"v": 1, "run": run_id, "socket": socket_path, "token": token, "uid": user.pw_uid}
+    try:
+        if custody is not None:
+            custody.possible_entry()
+        pid = os.fork()
+    except BaseException:
+        os.close(ready_r)
+        os.close(ready_w)
+        listener.close()
+        raise
     if pid == 0:
         code = EXIT_UNKNOWN
         try:
@@ -1856,23 +1988,27 @@ def open_live(package, site, checked, run_id, run_dir, request_path, user):
                 # The opening caller's channel must end with this call.
                 os.close(OUT_FD)
             code = live_daemon(package, site, checked, run_id, run_dir, request_path, user, listener,
-                               socket_path, token, ready_w)
+                               socket_path, token, ready_w, custody)
         except BaseException:
             pass
         finally:
             os._exit(code & 0xFF)
-    os.close(ready_w)
-    listener.close()
-    data = b""
-    end = time.monotonic() + ADMISSION_S
-    while b"\n" not in data and len(data) <= HELLO_LIMIT and time.monotonic() < end:
-        if not select.select([ready_r], [], [], max(0.0, end - time.monotonic()))[0]:
-            break
-        chunk = os.read(ready_r, 256)
-        if not chunk:
-            break
-        data += chunk
-    os.close(ready_r)
+    if custody is not None:
+        custody.supervisor_pid = pid
+    try:
+        os.close(ready_w)
+        listener.close()
+        data = b""
+        end = time.monotonic() + ADMISSION_S
+        while b"\n" not in data and len(data) <= HELLO_LIMIT and time.monotonic() < end:
+            if not select.select([ready_r], [], [], max(0.0, end - time.monotonic()))[0]:
+                break
+            chunk = os.read(ready_r, 256)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(ready_r)
     if data != b"live\n":
         try:
             terminal = json.loads(data) if len(data) <= HELLO_LIMIT else None
@@ -1884,7 +2020,8 @@ def open_live(package, site, checked, run_id, run_dir, request_path, user):
             return terminal["exit"] if emit(terminal) else EXIT_UNKNOWN
         emit({"frontdoor": "terminal", "stage": "run-failed", "run": run_id,
               "reason": "live startup readiness unavailable: " + (data.decode(errors="replace").strip() or "no readiness"),
-              "effects": "possible", "retry": "do-not-replay"})
+              "effects": "possible", "custody": custody.facts() if custody is not None else None,
+              "retry": "do-not-replay"})
         return EXIT_UNKNOWN
     emit({
         "frontdoor": "terminal",
@@ -1901,7 +2038,7 @@ def open_live(package, site, checked, run_id, run_dir, request_path, user):
 
 
 def run_lock_held(run):
-    """Whether a front door holds this run's lock now (its owner is live)."""
+    """Whether a front door holds this run's lock; no owner-claim/end inference."""
     try:
         fd = os.open(os.path.join(run, "private", "lock"), os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError:
@@ -2172,7 +2309,8 @@ def harness_report(route):
     }}
 
 
-def run_locked(argv, environ, stdin_fd=0):
+def run_locked(argv, environ, stdin_fd=0, custody=None):
+    custody = custody if custody is not None else RunCustody()
     try:
         package, site, user, checked, env, rest = admit(argv, environ, stdin_fd, time.time())
     except Refused as refusal:
@@ -2182,6 +2320,8 @@ def run_locked(argv, environ, stdin_fd=0):
         emit({"frontdoor": "terminal", "stage": "refused", "reason": type(error).__name__, "effects": "none"})
         return EXIT_REFUSED
     if checked is None or "op" in checked:
+        if checked and checked.get("op") in ("capture-loss-accounts", "retire-loss-account"):
+            custody.effects = "possible"
         try:
             return discover(package, site, user) if checked is None else loss_route(site, user, checked, package)
         except (Refused, OSError, ValueError, TypeError, RecursionError) as error:
@@ -2191,21 +2331,27 @@ def run_locked(argv, environ, stdin_fd=0):
     children = checked["children"]
     try:
         allocate = make_live_run if checked["live"] else make_run
-        run_id, run_dir, lock, swept = allocate(site, user)
+        run_id, run_dir, lock, swept = allocate(site, user, custody)
     except Refused as refusal:
-        if checked["live"]:
+        if checked["live"] and custody.effects == "none":
             emit({"frontdoor": "terminal", "stage": "refused", "reason": str(refusal), "effects": "none"})
             return EXIT_REFUSED
-        emit({"frontdoor": "terminal", "stage": "run-failed", "reason": type(refusal).__name__, "effects": "possible"})
+        emit({"frontdoor": "terminal", "stage": "run-failed", "reason": type(refusal).__name__,
+              "effects": "possible", "custody": custody.facts(), "retry": "do-not-replay"})
+        custody.close_lock()
         return EXIT_RUN_FAILED
-    except OSError as error:
-        emit({"frontdoor": "terminal", "stage": "run-failed", "reason": type(error).__name__, "effects": "possible"})
+    except (OSError, ValueError, TypeError) as error:
+        emit({"frontdoor": "terminal", "stage": "run-failed", "reason": type(error).__name__,
+              "effects": "possible", "custody": custody.facts(), "retry": "do-not-replay"})
+        custody.close_lock()
         return EXIT_RUN_FAILED
-    for record in swept:
-        emit({"frontdoor": "swept", **record})
+    custody.effects = "possible"
+    custody.run, custody.run_dir, custody.lock = run_id, run_dir, lock
     entry = None
     relay = None
     try:
+        for record in swept:
+            emit({"frontdoor": "swept", **record})
         try:
             write_private(os.path.join(run_dir, "private", "retention"), checked["retention"])
             request_path = os.path.join(run_dir, "private", "request.json")
@@ -2237,20 +2383,22 @@ def run_locked(argv, environ, stdin_fd=0):
             "live": checked["live"],
         })
         if checked["live"]:
-            return open_live(package, site, checked, run_id, run_dir, request_path, user)
+            return open_live(package, site, checked, run_id, run_dir, request_path, user, custody)
         try:
+            custody.possible_entry()
             entry, alive = start_entry(package, request_path)
         except StartedEntryFailed as error:
             entry = error.entry
             raise
         except (OSError, subprocess.SubprocessError) as error:
-            raise RunFailed(f"entry not started: {type(error).__name__}") from None
+            raise RunFailed(f"entry startup failed; start unknown: {type(error).__name__}") from None
         relay = Relay(entry, run_dir, checked["deadline"] + site["cancel_grace_s"], site["cancel_grace_s"])
         relay.requester_uid = user.pw_uid
         relay.stdin_buffer = rest
         for number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
             signal.signal(number, lambda number, frame: relay.signals.append(number))
         status = relay.run_to_end(stdin_fd)
+        custody.ended(status)
         os.close(alive)
         code = entry_exit(status, relay.killed)
         retired = retire(run_dir, checked["retention"], relay.terminal_account_unavailable, relay.required_account,
@@ -2277,8 +2425,8 @@ def run_locked(argv, environ, stdin_fd=0):
             return EXIT_UNKNOWN
         return code
     except BaseException as failure:
-        if isinstance(failure, StartedEntryFailed):
-            terminal = start_failure(run_id, run_dir, checked["retention"], package, failure)
+        if isinstance(failure, (StartedEntryFailed, EntryNotStarted)):
+            terminal = start_failure(run_id, run_dir, checked["retention"], package, failure, custody)
             return terminal["exit"] if emit(terminal) else EXIT_UNKNOWN
         killed = False
         status = None
@@ -2290,10 +2438,11 @@ def run_locked(argv, environ, stdin_fd=0):
             while entry.poll() is None and time.monotonic() < end:
                 time.sleep(0.01)
             status = entry.poll()
+            custody.ended(status)
         retired = retire(run_dir, checked["retention"], relay.terminal_account_unavailable if relay is not None else False,
                          relay.required_account if relay is not None else None, package,
                          {"by": "front-door-failed", "entry_status": status, "killed": killed}) \
-            if entry is None or status is not None else {"ok": False, "stop": "unknown"}
+            if custody.entry == "not-started" or type(status) is int else protected_disposition(custody.facts())
         stage = "run-failed" if isinstance(failure, RunFailed) else "front-door-failed"
         emit({
             "frontdoor": "terminal",
@@ -2304,9 +2453,10 @@ def run_locked(argv, environ, stdin_fd=0):
             "killed": killed,
             "retire": retired,
             "effects": "possible",
+            "custody": custody.facts(),
             "retry": "do-not-replay",
         })
-        if status is None and entry is not None:
+        if custody.entry == "possible":
             return EXIT_UNKNOWN
         if not retired["ok"]:
             return EXIT_CLEANUP_FAILED
@@ -2314,21 +2464,25 @@ def run_locked(argv, environ, stdin_fd=0):
             return EXIT_RUN_FAILED
         return EXIT_KILLED if killed else EXIT_UNKNOWN
     finally:
-        os.close(lock)
+        custody.close_lock()
 
 
 def run(argv, environ, stdin_fd=0):
     package_lock = None
+    custody = RunCustody()
     try:
         package = package_root()
         check_owned(package)
         package_lock = os.open(package, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         fcntl.flock(package_lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        return run_locked(argv, environ, stdin_fd)
+        return run_locked(argv, environ, stdin_fd, custody)
     except (Refused, OSError, ValueError, TypeError) as error:
-        emit({"frontdoor": "terminal", "stage": "refused", "reason": type(error).__name__, "effects": "none"})
-        return EXIT_REFUSED
+        emit({"frontdoor": "terminal", "stage": "refused" if custody.effects == "none" else "front-door-failed",
+              "reason": type(error).__name__, "effects": custody.effects,
+              "custody": custody.facts(), "retry": "do-not-replay"})
+        return EXIT_REFUSED if custody.effects == "none" else EXIT_UNKNOWN
     finally:
+        custody.close_lock()
         if package_lock is not None:
             os.close(package_lock)
 

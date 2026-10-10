@@ -195,6 +195,10 @@ class Retention(Scratch):
         run = os.path.join(self.user_dir, name)
         for sub in ("private", "launch/provider", "store"):
             os.makedirs(os.path.join(run, sub))
+        # Sweep needs positive physical evidence independently of the owner
+        # terminal. These synthetic retention fixtures have already ended.
+        frontdoor.write_private(os.path.join(run, "private", frontdoor.ENTRY_CUSTODY),
+                                {"run": name, "run_dir": run, "entry": "ended", "entry_status": 87})
         for rel in ("launch/provider/adapter-state",):
             with open(os.path.join(run, rel), "w") as file:
                 file.write("fixture-secret")
