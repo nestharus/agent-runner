@@ -95,7 +95,7 @@ File: `/home/nes/projects/agent-runner/.npmrc`
 
 ```
 @fortawesome:registry=https://npm.fontawesome.com/
-//npm.fontawesome.com/:_authToken=1619E852-300E-409B-B563-DF4BC372D935
+//npm.fontawesome.com/:_authToken=<REDACTED: revoked and rotated 2026-10-09>
 ```
 
 This is a Font Awesome Pro registry auth token. It is NOT currently tracked by git,
