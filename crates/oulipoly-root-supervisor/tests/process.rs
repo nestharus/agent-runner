@@ -480,78 +480,31 @@ fn separate_process_owns_two_harnesses_and_ends_after_exact_reaping() {
     assert!(messages.iter().all(|m| m["basis"] == "single-attempt"));
 }
 
-/// (b) Exit before acknowledgement, observed by the exact child's exit,
-/// relaunches and resubmits the same key. The dedup peer inserts once; the
-/// non-dedup peer yields duplicate-unknown, never at-most-once.
+/// A work exit and a peer's dedup declaration do not exclude insertion.
+/// Spare budget must not authorize another prompt, even within one owner.
 #[test]
-fn exit_before_ack_relaunches_with_same_key() {
-    let dir = Scratch::new("retry");
-    let run = Run::start(
-        &dir,
-        &spec(
-            &dir,
-            3,
-            json!([
-                { "id": "dedup", "argv": peer(&dir.state("dedup"), &["--mode", "exit-before-ack-once", "--exit-after-acks", "1"]), "messages": ["hello"] },
-                { "id": "plain", "argv": peer(&dir.state("plain"), &["--mode", "exit-before-ack-once", "--no-dedup", "--exit-after-acks", "1"]), "messages": ["hello"] },
-            ]),
-        ),
-    );
-    let (terminal, status, seen) = run.terminal();
-    assert_eq!(terminal["status"], "ended", "{terminal}");
-    assert_eq!(status.code(), Some(0));
+fn exit_before_ack_stays_owed_without_same_input_resubmission() {
+    let dir = Scratch::new("uncertain-exit");
+    let (terminal, status, seen) = Run::start(&dir, &spec(&dir, 3, json!([
+        {"id":"dedup", "argv":peer(&dir.state("dedup"), &["--mode","exit-before-ack-once","--exit-after-acks","1"]), "messages":["hello", "later"]},
+        {"id":"plain", "argv":peer(&dir.state("plain"), &["--mode","exit-before-ack-once","--no-dedup","--exit-after-acks","1"]), "messages":["hello", "later"]}
+    ]))).terminal();
+    assert_eq!(status.code(), Some(3), "{terminal}");
     for id in ["dedup", "plain"] {
-        // Exit observed before the closure is counted and before relaunch.
-        let order: Vec<&str> = seen
-            .iter()
-            .filter(|value| value["harness"] == id)
-            .filter_map(|value| value["event"].as_str())
-            .filter(|event| ["exited", "closure-observed", "relaunch", "launched"].contains(event))
-            .collect();
-        assert_eq!(
-            order,
-            [
-                "launched",
-                "exited",
-                "closure-observed",
-                "relaunch",
-                "launched",
-                "exited"
-            ],
-            "{id}"
-        );
-        assert_eq!(events(&seen, id, "relaunch")[0]["same_key"], true);
-        assert_eq!(events(&seen, id, "session-resumed").len(), 1);
+        assert!(events(&seen, id, "relaunch").is_empty());
+        assert_eq!(events(&seen, id, "closure-observed").len(), 1);
         let state = read_state(&dir.state(id));
-        let prompts = state["prompts"].as_array().unwrap();
-        assert_eq!(prompts.len(), 2, "{id}");
-        assert_eq!(prompts[0]["key"], prompts[1]["key"], "{id}: same key");
-        assert_eq!(prompts[0]["session"], prompts[1]["session"], "{id}");
-        assert_eq!(harness(&terminal, id)["launches"], 2);
-        assert_eq!(harness(&terminal, id)["messages"][0]["closures"], 1);
+        assert_eq!(state["prompts"].as_array().unwrap().len(), 1);
+        assert_eq!(state["insertions"].as_array().unwrap().len(), 1);
+        assert_eq!(harness(&terminal, id)["launches"], 1);
+        let message = &harness(&terminal, id)["messages"][0];
+        assert_eq!(message["state"], "owed");
+        assert_eq!(message["label"], "delivery-unresolved");
+        assert_eq!(message["attempts"], 1);
+        assert_eq!(message["unresolved_attempts"], 1);
+        assert_eq!(message["closures"], 1);
+        assert_eq!(harness(&terminal, id)["messages"][1]["attempts"], 0);
     }
-    let dedup = &harness(&terminal, "dedup")["messages"][0];
-    assert_eq!(
-        read_state(&dir.state("dedup"))["insertions"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    assert_eq!(dedup["label"], "accepted");
-    assert_eq!(dedup["basis"], "session-contract");
-    assert_eq!(dedup["recovered"], true);
-
-    let plain = &harness(&terminal, "plain")["messages"][0];
-    assert_eq!(
-        read_state(&dir.state("plain"))["insertions"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
-    assert_eq!(plain["label"], "duplicate-unknown");
-    assert_eq!(plain["at_most_once"], false);
 }
 
 /// (c) A silent harness does not block another harness's delivery, is not
@@ -614,7 +567,7 @@ fn closure_cap_declares_outage_on_observed_closures() {
             &dir,
             3,
             json!([
-                { "id": "flaky", "argv": peer(&dir.state("flaky"), &["--mode", "exit-before-ack-always"]), "messages": ["x", "y"] },
+                { "id": "flaky", "argv": peer(&dir.state("flaky"), &["--mode", "exit-at-start"]), "messages": ["x", "y"] },
                 { "id": "fine", "argv": peer(&dir.state("fine"), &["--exit-after-acks", "1"]), "messages": ["z"] },
             ]),
         ),
@@ -911,100 +864,39 @@ fn owner_killed_with_quiet_work_leaves_root_and_peers_alive_and_restart_reattach
             "{id}: survivor kept, not dropped: {first}"
         );
     }
-    let (terminal, status, seen) = second.terminal();
-    assert_eq!(terminal["status"], "ended", "{terminal}");
-    assert_eq!(status.code(), Some(0));
-    assert!(roots_started(&seen).is_empty(), "no new incarnation");
-    let recovered = seen
-        .iter()
-        .find(|value| value["event"] == "intent-recovered")
-        .unwrap();
-    assert_eq!(recovered["generation"], 2);
-    assert_eq!(recovered["prior_attempts_unknown"], 2);
     for id in ["dedup", "plain"] {
+        second.event(id, "holding-survivor");
+    }
+    second.cancel();
+    let (terminal, status, seen) = second.terminal();
+    assert_eq!(status.code(), Some(2), "{terminal}");
+    assert!(roots_started(&seen).is_empty());
+    for id in ["dedup", "plain"] {
+        assert!(events(&seen, id, "session-resumed").is_empty());
+        assert!(events(&seen, id, "launched").is_empty());
         let state = read_state(&dir.state(id));
-        let prompts = state["prompts"].as_array().unwrap();
-        assert_eq!(prompts.len(), 2, "{id}");
-        assert_eq!(prompts[0]["key"], prompts[1]["key"], "{id}: same key");
-        assert_eq!(prompts[0]["session"], prompts[1]["session"], "{id}");
-        assert_eq!(
-            state["launches"].as_array().unwrap().len(),
-            1,
-            "{id}: same process"
-        );
-        let reattached = events(&seen, id, "reattached");
-        assert_eq!(reattached.len(), 1, "{id}");
-        assert!(peers.contains(&reattached[0]["pid"].as_u64().unwrap()));
-        assert_eq!(events(&seen, id, "session-resumed").len(), 1, "{id}");
-        assert!(
-            events(&seen, id, "launched").is_empty(),
-            "{id}: no relaunch"
-        );
+        assert_eq!(state["prompts"].as_array().unwrap().len(), 1);
+        assert_eq!(state["insertions"].as_array().unwrap().len(), 1);
+        assert_eq!(state["launches"].as_array().unwrap().len(), 1);
         let record = harness(&terminal, id);
-        assert_eq!(record["launches"], 0);
         assert_eq!(record["reattached"], 1);
-        assert_eq!(record["exits"], json!(["code:0"]));
-        let message = &record["messages"][0];
-        assert_eq!(message["state"], "acknowledged");
-        assert_eq!(message["label"], "duplicate-unknown", "{id}");
-        assert_eq!(message["at_most_once"], false);
-        assert_eq!(message["ack_generation"], 2);
-        assert_eq!(message["attempts"], 2);
-        assert_eq!(message["prior_unknown"], 1);
-        assert_eq!(message["closures"], 0, "owner death is not a closure");
-        assert_eq!(message["completion"], "not-observed");
+        assert_eq!(record["messages"][0]["state"], "owed");
+        assert_eq!(record["messages"][0]["attempts"], 1);
+        assert_eq!(record["messages"][0]["prior_unknown"], 1);
+        assert_eq!(record["messages"][0]["closures"], 0);
     }
     assert_eq!(
-        read_state(&dir.state("dedup"))["insertions"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    assert_eq!(
-        harness(&terminal, "dedup")["messages"][0]["recovered"],
-        true
-    );
-    assert_eq!(
-        read_state(&dir.state("plain"))["insertions"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
-    assert_eq!(
-        harness(&terminal, "plain")["messages"][0]["recovered"],
-        false
-    );
-    // Not its parent: only the exit is observed, never its status.
-    assert_eq!(
-        terminal["root_pid1"]["outcome"],
-        "released-exit-observed-by-pidfd"
-    );
-    assert_eq!(terminal["root_pid1"]["parent"], false);
-    assert!(terminal["root_pid1"]["status"].is_null());
-    let conn = db(&dir);
-    assert_eq!(
         count(
-            &conn,
-            "SELECT count(*) FROM attempt WHERE generation = 1 AND outcome = 'unknown-prior-owner'"
-        ),
-        2
-    );
-    assert_eq!(count(&conn, "SELECT count(*) FROM incarnation"), 1);
-    assert_eq!(
-        count(
-            &conn,
-            "SELECT count(*) FROM work WHERE outcome = 'code:0' AND observer = 'work-pid1-wait'"
+            &db(&dir),
+            "SELECT count(*) FROM attempt WHERE outcome='unknown-prior-owner'"
         ),
         2
     );
 }
 
-/// A socket-endpoint harness: the owner chooses its socket under the
-/// store, connects to it rather than to stdio, and a restarted owner takes
-/// the surviving harness back by connecting to the same socket again. The
-/// owner's death closed only its connection, not the harness's endpoint.
+/// A socket listener survives its owner, but retained endpoint identity is
+/// not retry authority. Recovery holds the work without reconnect/resubmission;
+/// explicit cancel supplies physical end and then listener path cleanup.
 #[test]
 fn socket_endpoint_survives_owner_and_restart_reconnects_to_it() {
     let dir = Scratch::new("socket");
@@ -1025,7 +917,7 @@ fn socket_endpoint_survives_owner_and_restart_reconnects_to_it() {
     let peer_pid = launched["pid"].as_u64().unwrap();
     let work = launched["work"].as_i64().unwrap();
     first.event("sock", "endpoint-connected");
-    let opened = first.event("sock", "session-opened");
+    first.event("sock", "session-opened");
     wait_state(&dir.state("sock"), |state| {
         state["insertions"].as_array().unwrap().len() == 1
     });
@@ -1041,91 +933,59 @@ fn socket_endpoint_survives_owner_and_restart_reconnects_to_it() {
     let found = second.until("custody", |value| value["event"] == "custody");
     assert_eq!(found["outcome"], "attached", "{found}");
     assert_eq!(second.event("sock", "reattached")["pid"], peer_pid);
-    second.event("sock", "endpoint-connected");
-    let resumed = second.event("sock", "session-resumed");
-    assert_eq!(resumed["session"], opened["session"]);
+    second.event("sock", "holding-survivor");
+    assert!(socket.exists(), "held listener is not physical end");
+    second.cancel();
     let (terminal, status, seen) = second.terminal();
-    assert_eq!(terminal["status"], "ended", "{terminal}");
-    assert_eq!(status.code(), Some(0));
-    assert!(events(&seen, "sock", "launched").is_empty(), "no relaunch");
-    let record = harness(&terminal, "sock");
-    assert_eq!(record["exits"], json!(["code:0"]));
-    let message = &record["messages"][0];
-    assert_eq!(message["label"], "duplicate-unknown");
-    assert_eq!(message["recovered"], true);
-    let state = read_state(&dir.state("sock"));
+    assert_eq!(status.code(), Some(2), "{terminal}");
+    assert!(events(&seen, "sock", "endpoint-connected").is_empty());
+    assert!(events(&seen, "sock", "session-resumed").is_empty());
+    assert!(events(&seen, "sock", "launched").is_empty());
+    assert_eq!(harness(&terminal, "sock")["messages"][0]["state"], "owed");
     assert_eq!(
-        state["launches"].as_array().unwrap().len(),
-        1,
-        "same process"
-    );
-    assert_eq!(state["insertions"].as_array().unwrap().len(), 1);
-    assert!(!socket.exists(), "removed after the harness's observed end");
-}
-
-/// (i) Observed closures persist across an owner kill, so the cap is
-/// reached across restarts and a further restart does not reset it. The
-/// second closure is the surviving harness's exit when the restarted owner
-/// attaches to it, as reported by its work PID 1.
-#[test]
-fn closures_and_outage_cap_persist_across_restart() {
-    let dir = Scratch::new("cap");
-    let modes = "exit-before-ack-always,insert-then-silent";
-    let mut first = Run::start(
-        &dir,
-        &spec(
-            &dir,
-            2,
-            json!([{ "id": "flaky", "argv": peer(&dir.state("flaky"), &["--launch-modes", modes, "--on-reinit", "exit"]), "messages": ["x"] }]),
-        ),
-    );
-    first.event("flaky", "closure-observed");
-    let survivor = first.until("second launch", |value| {
-        value["event"] == "launched" && value["launch"] == 2
-    })["pid"]
-        .as_u64()
-        .unwrap();
-    wait_state(&dir.state("flaky"), |state| {
-        state["prompts"].as_array().unwrap().len() == 2
-    });
-    first.kill();
-    assert!(alive(survivor));
-
-    let (terminal, status, seen) = Run::start(&dir, &recover(&dir)).terminal();
-    assert_eq!(terminal["status"], "ended-owed", "{terminal}");
-    assert_eq!(status.code(), Some(3));
-    let record = harness(&terminal, "flaky");
-    assert_eq!(record["launches"], 0);
-    assert_eq!(record["reattached"], 1);
-    assert_eq!(record["exits"], json!(["code:1"]));
-    let message = &record["messages"][0];
-    assert_eq!(message["label"], "outage");
-    assert_eq!(message["closures"], 2);
-    assert_eq!(message["attempts"], 2);
-    assert_eq!(message["prior_unknown"], 1);
-    assert_eq!(events(&seen, "flaky", "outage")[0]["closures"], 2);
-    assert!(!alive(survivor));
-
-    let (terminal, status, seen) = Run::start(&dir, &recover(&dir)).terminal();
-    assert_eq!(terminal["status"], "ended-owed", "{terminal}");
-    assert_eq!(status.code(), Some(3));
-    assert_eq!(custody(&seen)["outcome"], "fresh");
-    assert_eq!(harness(&terminal, "flaky")["launches"], 0);
-    assert_eq!(harness(&terminal, "flaky")["reattached"], 0);
-    let message = &harness(&terminal, "flaky")["messages"][0];
-    assert_eq!(message["label"], "outage");
-    assert_eq!(
-        message["closures"], 2,
-        "recovered closures are the persisted ones"
-    );
-    assert_eq!(message["attempts"], 2);
-    assert!(events(&seen, "flaky", "launched").is_empty());
-    assert_eq!(
-        read_state(&dir.state("flaky"))["launches"]
+        read_state(&dir.state("sock"))["prompts"]
             .as_array()
             .unwrap()
             .len(),
-        2
+        1
+    );
+    assert!(
+        !socket.exists(),
+        "removed only after observed namespace end"
+    );
+}
+
+/// (i) No prompt can reach peers that exit during session start. Those real
+/// pre-submit closures may spend the configured cap; later owners cannot
+/// reset it. This is distinct from a possibly inserted prompt's uncertainty.
+#[test]
+fn closures_and_outage_cap_persist_across_restart() {
+    let dir = Scratch::new("cap");
+    let request = spec(
+        &dir,
+        2,
+        json!([{"id":"flaky", "argv":peer(&dir.state("flaky"), &["--mode","exit-at-start"]), "messages":["x"]}]),
+    );
+    let (terminal, status, _) = Run::start(&dir, &request).terminal();
+    assert_eq!(status.code(), Some(3), "{terminal}");
+    assert_eq!(harness(&terminal, "flaky")["messages"][0]["closures"], 2);
+    assert_eq!(harness(&terminal, "flaky")["messages"][0]["attempts"], 0);
+    for _ in 0..2 {
+        let (terminal, status, seen) = Run::start(&dir, &recover(&dir)).terminal();
+        assert_eq!(status.code(), Some(3), "{terminal}");
+        assert_eq!(
+            harness(&terminal, "flaky")["messages"][0]["label"],
+            "outage"
+        );
+        assert_eq!(harness(&terminal, "flaky")["messages"][0]["closures"], 2);
+        assert_eq!(harness(&terminal, "flaky")["launches"], 0);
+        assert!(roots_started(&seen).is_empty());
+    }
+    assert!(
+        read_state(&dir.state("flaky"))["prompts"]
+            .as_array()
+            .unwrap()
+            .is_empty()
     );
 }
 
@@ -1257,13 +1117,12 @@ fn interface_acceptance_before_commit_is_not_durable() {
 /// (l) An owner-restart loop with unresolved outcomes cannot buy unlimited
 /// attempts: attempts persist across owner kills and count toward the
 /// intent's delivery-attempt budget, separately from observed closures.
-/// The quiet peer survives both owner kills and is resubmitted to by
-/// reattachment. Once the budget is used up, a recovery stops the message
-/// as `attempts-exhausted` with the unknown attempts still unknown and no
+/// The quiet peer survives both owner kills without another submission.
+/// Spare budget remains unused while insertion is unknown, with no
 /// closure, outage or acknowledgement invented, and still holds the
 /// surviving peer (never dropped as gone) until explicit cancel.
 #[test]
-fn owner_restart_loop_exhausts_persisted_attempt_budget() {
+fn owner_restart_loop_does_not_spend_spare_budget_on_uncertain_input() {
     let dir = Scratch::new("budget");
     let state = dir.state("quiet");
     let request = json!({
@@ -1286,9 +1145,14 @@ fn owner_restart_loop_exhausts_persisted_attempt_budget() {
             pid,
             "the same surviving process"
         );
-        wait_state(&state, |state| {
-            state["prompts"].as_array().unwrap().len() == round + 1
-        });
+        if round == 0 {
+            wait_state(&state, |state| {
+                state["prompts"].as_array().unwrap().len() == 1
+            });
+        } else {
+            owner.event("quiet", "holding-survivor");
+            assert_eq!(read_state(&state)["prompts"].as_array().unwrap().len(), 1);
+        }
         owner.kill();
         assert!(alive(pid));
     }
@@ -1313,8 +1177,8 @@ fn owner_restart_loop_exhausts_persisted_attempt_budget() {
     assert_eq!(record["exits"], json!(["signal:9"]));
     let message = &record["messages"][0];
     assert_eq!(message["state"], "owed");
-    assert_eq!(message["label"], "attempts-exhausted");
-    assert_eq!(message["attempts"], 2);
+    assert_eq!(message["label"], "delivery-unresolved");
+    assert_eq!(message["attempts"], 1);
     assert_eq!(message["closures"], 0, "owner death is not a closure");
     assert!(!alive(survivor));
 
@@ -1333,7 +1197,7 @@ fn owner_restart_loop_exhausts_persisted_attempt_budget() {
             &conn,
             "SELECT count(*) FROM attempt WHERE outcome = 'unknown-prior-owner'"
         ),
-        2
+        1
     );
     assert_eq!(
         count(
@@ -1346,57 +1210,49 @@ fn owner_restart_loop_exhausts_persisted_attempt_budget() {
 }
 
 /// (m) Within one owner, the budget counts attempts made by earlier
-/// generations too: one unknown attempt from a killed owner plus two
-/// observed-closure attempts use a budget of three. The survivor's exit at
-/// reattachment is an observed closure but no new attempt.
+/// generations too. An exhausted budget remains exhausted, independently
+/// of the uncertainty gate; owner loss is not an observed closure.
 #[test]
 fn attempt_budget_counts_earlier_generations_before_sending() {
-    let dir = Scratch::new("budget-run");
-    let state = dir.state("flaky");
-    let mut first = Run::start(
+    let dir = Scratch::new("budget-one");
+    let mut request = spec(
         &dir,
-        &json!({
-            "store": dir.store(),
-            "intent": {
-                "outage_closure_cap": 5,
-                "delivery_attempt_cap": 3,
-                "cwd": "/",
-                "workload": { "isolation": "unprivileged-userns" },
-                "harnesses": [{ "id": "flaky", "argv": peer(&state, &["--launch-modes", "insert-then-silent,exit-before-ack-always", "--on-reinit", "exit"]), "messages": ["x"] }],
-            },
-        }),
+        5,
+        json!([{"id":"h", "argv":peer(&dir.state("h"), &["--mode","insert-then-silent"]), "messages":["x"]}]),
     );
-    let survivor = first.event("flaky", "launched")["pid"].as_u64().unwrap();
-    wait_state(&state, |state| {
-        !state["prompts"].as_array().unwrap().is_empty()
+    request["intent"]["delivery_attempt_cap"] = json!(1);
+    let mut first = Run::start(&dir, &request);
+    first.event("h", "launched");
+    wait_state(&dir.state("h"), |v| {
+        v["prompts"].as_array().unwrap().len() == 1
     });
     first.kill();
-    assert!(alive(survivor));
-
-    let (terminal, status, seen) = Run::start(&dir, &recover(&dir)).terminal();
-    assert_eq!(terminal["status"], "ended-owed", "{terminal}");
-    assert_eq!(status.code(), Some(3));
-    let record = harness(&terminal, "flaky");
-    assert_eq!(record["reattached"], 1);
-    assert_eq!(record["launches"], 2);
-    assert_eq!(record["exits"], json!(["code:1", "code:1", "code:1"]));
-    let message = &record["messages"][0];
+    let mut second = Run::start(&dir, &recover(&dir));
+    second.event("h", "holding-survivor");
+    second.cancel();
+    let (terminal, status, seen) = second.terminal();
+    assert_eq!(status.code(), Some(2), "{terminal}");
+    let message = &harness(&terminal, "h")["messages"][0];
     assert_eq!(message["label"], "attempts-exhausted");
-    assert_eq!(message["attempts"], 3);
+    assert_eq!(message["attempts"], 1);
     assert_eq!(message["prior_unknown"], 1);
-    assert_eq!(message["closures"], 3);
-    assert!(events(&seen, "flaky", "outage").is_empty());
-    assert_eq!(events(&seen, "flaky", "attempts-exhausted").len(), 1);
-    assert_eq!(read_state(&state)["prompts"].as_array().unwrap().len(), 3);
-    assert_eq!(read_state(&state)["launches"].as_array().unwrap().len(), 3);
+    assert_eq!(message["closures"], 0);
+    assert!(events(&seen, "h", "session-resumed").is_empty());
+    assert_eq!(
+        read_state(&dir.state("h"))["prompts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 /// (n) While the owner is dead, one surviving peer exits on its own (status
 /// 7) and another stays quiet. Its work PID 1, its actual parent, waited it;
 /// root PID 1 kept that report. The restarted owner reports that exit as
 /// exactly what was observed (`code:7`, by the work PID 1's wait), counts it
-/// as a closure, relaunches with the same key, and reattaches to the quiet
-/// survivor.
+/// as a closure without retrying the uncertain input, and holds the quiet
+/// survivor until explicit cancel.
 #[test]
 fn peer_exit_while_owner_dead_is_reported_by_its_actual_waiter() {
     let dir = Scratch::new("waiter");
@@ -1430,9 +1286,11 @@ fn peer_exit_while_owner_dead_is_reported_by_its_actual_waiter() {
     assert!(alive(stays));
     assert!(alive(root_pid));
 
-    let (terminal, status, seen) = Run::start(&dir, &recover(&dir)).terminal();
-    assert_eq!(terminal["status"], "ended", "{terminal}");
-    assert_eq!(status.code(), Some(0));
+    let mut second = Run::start(&dir, &recover(&dir));
+    second.event("stays", "holding-survivor");
+    second.cancel();
+    let (terminal, status, seen) = second.terminal();
+    assert_eq!(status.code(), Some(2), "{terminal}");
     let found = custody(&seen);
     assert_eq!(found["outcome"], "attached");
     assert_eq!(found["survivors"], 1);
@@ -1446,19 +1304,19 @@ fn peer_exit_while_owner_dead_is_reported_by_its_actual_waiter() {
     let record = harness(&terminal, "ends");
     assert_eq!(record["prior_exits"], json!(["code:7"]));
     assert_eq!(record["reattached"], 0);
-    assert_eq!(record["launches"], 1);
-    assert_eq!(record["exits"], json!(["code:0"]));
+    assert_eq!(record["launches"], 0);
+    assert_eq!(record["exits"], json!([]));
     let message = &record["messages"][0];
-    assert_eq!(message["state"], "acknowledged");
+    assert_eq!(message["state"], "owed");
     assert_eq!(message["closures"], 1);
-    assert_eq!(message["recovered"], true);
+    assert_eq!(message["recovered"], false);
     let state = read_state(&dir.state("ends"));
     let prompts = state["prompts"].as_array().unwrap();
-    assert_eq!(prompts[0]["key"], prompts[1]["key"]);
+    assert_eq!(prompts.len(), 1);
     let record = harness(&terminal, "stays");
     assert_eq!(record["reattached"], 1);
     assert_eq!(record["launches"], 0);
-    assert_eq!(record["messages"][0]["state"], "acknowledged");
+    assert_eq!(record["messages"][0]["state"], "owed");
 }
 
 /// Kills this test's watched root PID 1 and waits it as its parent (it was
@@ -1488,7 +1346,7 @@ fn kill_and_reap_root(dir: &Scratch, pid: i32) -> i32 {
 /// finds the recorded incarnation absent and reports exactly that: no exit
 /// observed, no status, and the peer ended with the root namespace, status
 /// unknown. No closure is counted; nothing is fabricated. A new recorded
-/// incarnation under the same root identity relaunches with the same key.
+/// incarnation is not created merely to retry the uncertain input.
 #[test]
 fn root_pid1_death_while_owner_dead_is_unknown_not_fabricated() {
     let dir = Scratch::new("absent");
@@ -1514,8 +1372,8 @@ fn root_pid1_death_while_owner_dead_is_unknown_not_fabricated() {
     assert!(!alive(peer_pid), "the peer ends with its root namespace");
 
     let (terminal, status, seen) = Run::start(&dir, &recover(&dir)).terminal();
-    assert_eq!(terminal["status"], "ended", "{terminal}");
-    assert_eq!(status.code(), Some(0));
+    assert_eq!(terminal["status"], "ended-owed", "{terminal}");
+    assert_eq!(status.code(), Some(3));
     let found = custody(&seen);
     assert_eq!(found["outcome"], "absent");
     assert_eq!(found["observed"], "absent-exit-not-observed");
@@ -1531,18 +1389,20 @@ fn root_pid1_death_while_owner_dead_is_unknown_not_fabricated() {
         "no fabricated exit"
     );
     let started = roots_started(&seen);
-    assert_eq!(started.len(), 1);
-    assert_eq!(started[0]["incarnation"], 2);
+    assert!(
+        started.is_empty(),
+        "physical root end is not input retry authority"
+    );
     let record = harness(&terminal, "h");
     assert_eq!(record["prior_unknown_ends"], 1);
     assert_eq!(record["prior_exits"], json!([]));
-    assert_eq!(record["launches"], 1);
-    assert_eq!(record["exits"], json!(["code:0"]));
+    assert_eq!(record["launches"], 0);
+    assert_eq!(record["exits"], json!([]));
     assert_eq!(
         record["messages"][0]["closures"], 0,
         "unknown end is not a closure"
     );
-    assert_eq!(record["messages"][0]["state"], "acknowledged");
+    assert_eq!(record["messages"][0]["state"], "owed");
     let conn = db(&dir);
     let ended: String = conn
         .query_row("SELECT ended FROM incarnation WHERE id = 1", [], |row| {
@@ -1682,9 +1542,11 @@ fn unattributed_peers_are_refused_and_roots_are_independent() {
         "root a is untouched by root b's owner death"
     );
     assert!(alive(root_b) && alive(peer_b));
-    let (terminal, status, seen) = Run::start(&b, &recover(&b)).terminal();
-    assert_eq!(terminal["status"], "ended", "{terminal}");
-    assert_eq!(status.code(), Some(0));
+    let mut recovered_b = Run::start(&b, &recover(&b));
+    recovered_b.event("quiet", "holding-survivor");
+    recovered_b.cancel();
+    let (terminal, status, seen) = recovered_b.terminal();
+    assert_eq!(status.code(), Some(2), "{terminal}");
     assert_eq!(custody(&seen)["outcome"], "attached");
     assert_eq!(events(&seen, "quiet", "reattached")[0]["pid"], peer_b);
     assert!(alive(root_a) && alive(peer_a));
@@ -1700,8 +1562,8 @@ fn unattributed_peers_are_refused_and_roots_are_independent() {
 /// still exactly it (start time and boot id). Here the store's recorded
 /// start time no longer matches the running root PID 1 (as after pid
 /// reuse). The restarted owner neither adopts nor signals that process:
-/// it treats the recorded incarnation as not running, starts a new
-/// incarnation, and relaunches. The unadopted process and its peer are
+/// it treats the recorded incarnation as not running, but cannot retry
+/// the uncertain input or launch a replacement for it. The unadopted process and its peer are
 /// left alive (this test's cleanup ends them).
 #[test]
 fn mismatched_incarnation_is_neither_adopted_nor_signalled() {
@@ -1735,15 +1597,14 @@ fn mismatched_incarnation_is_neither_adopted_nor_signalled() {
     assert_eq!(found["outcome"], "absent", "{found}");
     assert_eq!(found["observed"], "recorded-process-not-running");
     let (terminal, status, seen) = second.terminal();
-    assert_eq!(terminal["status"], "ended", "{terminal}");
-    assert_eq!(status.code(), Some(0));
+    assert_eq!(terminal["status"], "ended-owed", "{terminal}");
+    assert_eq!(status.code(), Some(3));
     let record = harness(&terminal, "h");
     assert_eq!(record["reattached"], 0, "never adopted");
     assert_eq!(record["prior_unknown_ends"], 1);
-    assert_eq!(record["launches"], 1);
+    assert_eq!(record["launches"], 0);
     let started = roots_started(&seen);
-    assert_eq!(started.len(), 1);
-    assert_ne!(started[0]["pid"], old_root);
+    assert!(started.is_empty());
     assert!(alive(old_root), "unadopted process is not signalled");
     assert!(alive(old_peer));
 }
@@ -1921,8 +1782,8 @@ fn superseded_recovered_owner_keeps_its_incarnation_discoverable() {
 /// harness ends with its namespace). Root PID 1 reports the work PID 1's
 /// own status, without a harness status. The restarted owner records that
 /// as an unknown end, not a closure: with a closure cap of 1 the message is
-/// not declared an outage; it is relaunched with the same key and
-/// acknowledged.
+/// not declared an outage. Physical end does not exclude earlier insertion,
+/// so that message remains owed without relaunch.
 #[test]
 fn work_pid1_end_without_harness_wait_is_unknown_not_a_closure() {
     let dir = Scratch::new("nowait");
@@ -1976,9 +1837,11 @@ fn work_pid1_end_without_harness_wait_is_unknown_not_a_closure() {
     assert!(!alive(ends), "the harness ended with its work namespace");
     assert!(alive(stays) && alive(root_pid));
 
-    let (terminal, status, seen) = Run::start(&dir, &recover(&dir)).terminal();
-    assert_eq!(terminal["status"], "ended", "{terminal}");
-    assert_eq!(status.code(), Some(0));
+    let mut second = Run::start(&dir, &recover(&dir));
+    second.event("stays", "holding-survivor");
+    second.cancel();
+    let (terminal, status, seen) = second.terminal();
+    assert_eq!(status.code(), Some(2), "{terminal}");
     let found = custody(&seen);
     assert_eq!(found["outcome"], "attached");
     assert_eq!(found["receipts"], 1);
@@ -1998,14 +1861,14 @@ fn work_pid1_end_without_harness_wait_is_unknown_not_a_closure() {
         "no harness status invented"
     );
     assert_eq!(record["prior_unknown_ends"], 1);
-    assert_eq!(record["launches"], 1);
-    assert_eq!(record["exits"], json!(["code:0"]));
+    assert_eq!(record["launches"], 0);
+    assert_eq!(record["exits"], json!([]));
     let message = &record["messages"][0];
     assert_eq!(message["closures"], 0, "no harness wait, no closure");
-    assert_eq!(message["state"], "acknowledged");
+    assert_eq!(message["state"], "owed");
     let state = read_state(&dir.state("ends"));
     let prompts = state["prompts"].as_array().unwrap();
-    assert_eq!(prompts[0]["key"], prompts[1]["key"]);
+    assert_eq!(prompts.len(), 1);
     let (outcome, observer): (String, Option<String>) = db(&dir)
         .query_row(
             "SELECT outcome, observer FROM work
@@ -2872,12 +2735,10 @@ fn sdk_resident_rejected_turn_preserves_uncertainty_and_blocks_replay() {
     }
 }
 
-/// SDK resume consumes the stored native session after an observed peer
-/// exit. Same-key dedup is transport evidence, not native at-most-once proof.
+/// Resident session identity and endpoint dedup are not receiver continuity.
 #[test]
-fn sdk_resident_resume_keeps_session_and_transport_history() {
-    let dir = Scratch::new("sdk-resume");
-    let state = dir.state("h");
+fn sdk_resident_uncertain_exit_does_not_resume_or_resubmit_same_input() {
+    let dir = Scratch::new("sdk-uncertain");
     let prepared = agent_provider_contract::resident_session::ResidentPrepareResult::v1(
         vec!["resident.serve".to_owned()],
         "3".repeat(64),
@@ -2886,28 +2747,28 @@ fn sdk_resident_resume_keeps_session_and_transport_history() {
         &dir,
         3,
         json!([{
-            "id":"h", "argv":peer(&state, &["--resident-evidence","absent", "--mode","exit-before-ack-once", "--exit-after-acks","1"]),
-            "messages":["synthetic prompt"], "resident":prepared,
+            "id":"h", "argv":peer(&dir.state("h"), &["--resident-evidence","absent", "--mode","exit-before-ack-once"]),
+            "messages":["synthetic prompt"], "resident":prepared
         }]),
     );
     request["intent"]["cwd"] = json!(std::env::current_dir().unwrap());
     let (terminal, status, seen) = Run::start(&dir, &request).terminal();
-    assert_eq!(status.code(), Some(0), "{terminal}");
+    assert_eq!(status.code(), Some(3), "{terminal}");
     let starts = events(&seen, "h", "resident-session-started");
-    assert_eq!(starts.len(), 2);
+    assert_eq!(starts.len(), 1);
     assert_eq!(starts[0]["resumed"], false);
-    assert_eq!(starts[1]["resumed"], true);
-    assert_eq!(starts[0]["session"], starts[1]["session"]);
-    assert!(starts.iter().all(|s| s["canonical_binding"] == "unbound"));
-    assert_eq!(read_state(&state)["prompts"].as_array().unwrap().len(), 2);
     assert_eq!(
-        read_state(&state)["insertions"].as_array().unwrap().len(),
+        read_state(&dir.state("h"))["prompts"]
+            .as_array()
+            .unwrap()
+            .len(),
         1
     );
     let message = &harness(&terminal, "h")["messages"][0];
-    assert_eq!(message["state"], "acknowledged");
-    assert_eq!(message["attempts"], 2);
+    assert_eq!(message["state"], "owed");
+    assert_eq!(message["attempts"], 1);
     assert_eq!(message["closures"], 1);
+    assert_eq!(message["unresolved_attempts"], 1);
 }
 
 /// Real host transport and owner: safe evidence projections, own versus
@@ -4579,9 +4440,9 @@ fn continue_attached_with_an_unended_turn_is_unknown_and_close_is_not_applied() 
     assert_eq!(prompts(&dir), 1);
 }
 
-/// ROOT's gate-only recovery goal: a retry refusal cannot settle an earlier
-/// unknown insertion for admission or ordinary close, under either capability
-/// declaration. This exercises the owner that actually receives the refusal.
+/// Spare budget and either live-reattach declaration cannot authorize a retry.
+/// The peer would refuse a retry, but must not receive one; later caller input
+/// and ordinary close remain held while the earlier input is uncertain.
 #[test]
 fn retry_refusal_with_declared_reattach_keeps_prior_turn_unresolved() {
     retry_refusal_keeps_prior_turn_unresolved(false);
@@ -4623,7 +4484,9 @@ fn retry_refusal_keeps_prior_turn_unresolved(absent: bool) {
     assert!(alive(pid));
 
     let mut second = Run::start(&dir, &recover_for(&dir, "continue-attached"));
-    assert_eq!(second.event("h", "rejected")["code"], -32011);
+    let held = second.event("h", "recovered-conversation");
+    assert_eq!(held["state"], "unknown");
+    assert_eq!(held["reason"], "delivery-unresolved");
     second.control(r#"{"cmd":"send","ref":"distinct","text":"new caller"}"#);
     let decision = second.until("admission decision", |v| {
         v["event"] == "follow-up-refused" || v["event"] == "follow-up-admitted"
@@ -4632,7 +4495,7 @@ fn retry_refusal_keeps_prior_turn_unresolved(absent: bool) {
     second.control(r#"{"cmd":"close"}"#);
     assert_eq!(
         second.event("h", "close-not-applied")["reason"],
-        "delivery-unresolved"
+        "turn-state-unknown"
     );
     assert!(alive(pid), "ordinary close must preserve the unknown turn");
     assert!(alive(u64::from(second.supervisor_pid())));
@@ -4656,7 +4519,7 @@ fn retry_refusal_keeps_prior_turn_unresolved(absent: bool) {
             &conn,
             "SELECT count(*) FROM attempt WHERE outcome = 'rejected-unresolved'"
         ),
-        1
+        0
     );
     assert_eq!(
         count(
@@ -4671,11 +4534,13 @@ fn retry_refusal_keeps_prior_turn_unresolved(absent: bool) {
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .filter(|v| v["direction"] == "recv" && v["value"]["method"] == "session/prompt")
         .collect();
-    assert_eq!(requests.len(), 2, "no new caller reached the peer");
     assert_eq!(
-        requests[0]["value"]["params"]["_meta"],
-        requests[1]["value"]["params"]["_meta"]
+        requests.len(),
+        1,
+        "neither retry nor new caller reached the peer"
     );
+    assert!(events(&seen, "h", "reopen-attempt").is_empty());
+    assert!(events(&seen, "h", "rejected").is_empty());
 }
 
 /// The declaration recorded at the first negotiation is necessary, not
@@ -4783,12 +4648,10 @@ fn reopened_parent_requests_a_child_from_new_input() {
 
 /// A reopened survivor that ends after inserting a new input without
 /// acknowledging it leaves that input owed: its observed exit is a
-/// closure, and the input is relaunched with the same key like any owed
-/// input, in the recorded session (the peer's dedup returns the earlier
-/// insertion). It is never dropped because the conversation was a reopened
-/// one.
+/// closure, but no spare budget or restored key authorizes resubmission.
+/// The settled first input and genuinely distinct resumed input stay separate.
 #[test]
-fn reopened_conversation_closed_with_new_input_owed_relaunches_it_with_the_same_key() {
+fn reopened_conversation_uncertain_new_input_stays_owed_without_relaunch() {
     let dir = Scratch::new("reopen-closure");
     let pid = settled_then_owner_killed(
         &dir,
@@ -4803,25 +4666,19 @@ fn reopened_conversation_closed_with_new_input_owed_relaunches_it_with_the_same_
     assert_eq!(second.event("h", "follow-up-admitted")["input"], 1);
     let closure = second.event("h", "closure-observed");
     assert_eq!(closure["index"], 1, "{closure}");
-    let relaunch = second.event("h", "relaunch");
-    assert_eq!(relaunch["same_key"], true);
-    let launched = second.event("h", "launched");
-    assert_ne!(launched["pid"].as_u64(), Some(pid));
-    let ack = second.until("ack of input 1", |value| {
-        value["event"] == "ack" && value["index"] == 1
-    });
-    assert_eq!(ack["recovered"], true, "{ack}");
-    second.until("turn-end of input 1", |value| {
-        value["event"] == "turn-end" && value["input"] == 1
-    });
-    second.control(r#"{"cmd":"close"}"#);
-    let (terminal, status, _) = second.terminal();
-    assert_eq!(terminal["status"], "closed", "{terminal}");
-    assert_eq!(status.code(), Some(7));
+    let (terminal, status, seen) = second.terminal();
+    assert_eq!(status.code(), Some(3), "{terminal}");
+    assert!(!alive(pid));
+    assert!(events(&seen, "h", "relaunch").is_empty());
+    assert!(events(&seen, "h", "launched").is_empty());
     let record = harness(&terminal, "h");
-    assert_eq!(record["messages"][1]["closures"], 1, "{record}");
+    assert_eq!(record["messages"][0]["state"], "acknowledged");
+    assert_eq!(record["messages"][1]["state"], "owed");
+    assert_eq!(record["messages"][1]["attempts"], 1);
+    assert_eq!(record["messages"][1]["closures"], 1);
     let peer = read_state(&dir.state("h"));
-    assert_eq!(peer["insertions"].as_array().unwrap().len(), 2, "{peer}");
+    assert_eq!(peer["prompts"].as_array().unwrap().len(), 2);
+    assert_eq!(peer["insertions"].as_array().unwrap().len(), 2);
     assert_eq!(peer["sessions"], json!(["sess-1"]));
 }
 
@@ -5041,8 +4898,8 @@ fn known_async_promise_is_recovered_once_for_the_same_requester_work() {
 /// store while no owner runs): the next claim reconciles it `turn-ended`.
 /// (2) Its insertion was never acknowledged: it stays `delivery-unknown`
 /// across two further owners, with its one admission; the existing owed
-/// input resubmission of that same message (same key, at-most-once
-/// unproven) is not a second logical offer and settles nothing.
+/// input retains its original identity and is never resubmitted; a stable
+/// logical link cannot exclude another native effect.
 #[test]
 fn admitted_completion_is_reconciled_or_stays_unknown_never_readmitted() {
     // (1) ACK and tagged turn end durable, completion unresolved.
@@ -5122,6 +4979,9 @@ fn admitted_completion_is_reconciled_or_stays_unknown_never_readmitted() {
         value["event"] == "bash-async-completion-admitted" && value["work"] == x_work
     });
     assert_eq!(admitted["input"], 1);
+    let identity: (String, i64, i64) = db(&dir).query_row(
+        "SELECT m.key, m.admitted_generation, b.requester_work FROM message m JOIN bash_run b ON b.work=m.completion_work WHERE m.completion_work=?1",
+        [x_work], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
     wait_state(&dir.state("h"), |state| {
         state["prompts"]
             .as_array()
@@ -5138,10 +4998,9 @@ fn admitted_completion_is_reconciled_or_stays_unknown_never_readmitted() {
         assert_eq!(record["admission"]["admitted_generation"], 1);
         assert_eq!(record["admission"]["acknowledged"], false);
         assert_eq!(owner.event("h", "reattached")["pid"].as_u64(), Some(pid));
-        // The owed message itself is resubmitted with its key (existing path).
-        owner.until("resubmission attempt", |value| {
-            value["event"] == "session-resumed"
-        });
+        let held = owner.event("h", "recovered-conversation");
+        assert_eq!(held["state"], "unknown");
+        assert_eq!(held["reason"], "delivery-unresolved");
         std::thread::sleep(QUIET_WINDOW);
         let seen = if generation == 2 {
             owner.kill()
@@ -5163,13 +5022,19 @@ fn admitted_completion_is_reconciled_or_stays_unknown_never_readmitted() {
                 "{nothing}: {seen:#?}"
             );
         }
-        assert!(
-            seen.iter()
-                .all(|value| value["event"] != "recovered-conversation"),
-            "an owed input is not a settled survivor"
-        );
+        assert!(events(&seen, "h", "session-resumed").is_empty());
+        assert!(events(&seen, "h", "reopen-attempt").is_empty());
+        assert_eq!(prompts(&dir), 2, "completion must not be resubmitted");
     }
     let conn = db(&dir);
+    let after: (String, i64, i64) = conn.query_row(
+        "SELECT m.key, m.admitted_generation, b.requester_work FROM message m JOIN bash_run b ON b.work=m.completion_work WHERE m.completion_work=?1",
+        [x_work], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+    assert_eq!(
+        after, identity,
+        "original key, generation and exact requester survive"
+    );
+    assert_eq!(count(&conn, "SELECT count(*) FROM attempt WHERE idx=1"), 1);
     assert_eq!(
         count(
             &conn,
@@ -6590,6 +6455,70 @@ fn attached_missing_work_stays_owed_and_charged_until_namespace_end() {
         3
     );
     assert_eq!(count(&conn, "SELECT count(*) FROM incarnation"), 1);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM work WHERE id=102 AND outcome='code:0' AND observer='work-pid1-wait'"
+        ),
+        1,
+        "known wait/status is not refined to unknown by root end"
+    );
+}
+
+/// Settled-head Missing uses the same no-effect floor as owed-head Missing.
+/// The extra open work row models an omitted launch receipt, not a real fault.
+#[test]
+fn settled_head_missing_work_does_not_reopen_or_relaunch() {
+    let dir = Scratch::new("settled-missing");
+    let mut first = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            3,
+            json!([{
+                "id":"h", "argv":peer(&dir.state("h"), &["--live-reattach"]), "messages":["echo:settled"]
+            }]),
+        ),
+    );
+    first.event("h", "turn-end");
+    first.kill();
+    rusqlite::Connection::open(dir.store().join("intent.sqlite3"))
+        .unwrap()
+        .execute(
+            "INSERT INTO work(id,harness,incarnation,generation) VALUES(100,0,1,1)",
+            [],
+        )
+        .unwrap();
+    for _ in 0..2 {
+        let (terminal, _, seen) =
+            Run::start(&dir, &recover_for(&dir, "continue-attached")).terminal();
+        let missing = events(&seen, "h", "prior-end-unknown");
+        assert_eq!(missing.len(), 1);
+        assert_eq!(
+            missing[0]["meaning"],
+            "absent-from-attached-root-liveness-unknown"
+        );
+        assert!(events(&seen, "h", "reopen-attempt").is_empty());
+        assert!(events(&seen, "h", "launched").is_empty());
+        assert_eq!(
+            harness(&terminal, "h")["messages"][0]["state"],
+            "acknowledged"
+        );
+        assert_eq!(
+            count(
+                &db(&dir),
+                "SELECT count(*) FROM work WHERE id=100 AND outcome IS NULL"
+            ),
+            1
+        );
+        assert_eq!(
+            read_state(&dir.state("h"))["prompts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 }
 
 /// A real current-owner child work namespace ends without its harness wait

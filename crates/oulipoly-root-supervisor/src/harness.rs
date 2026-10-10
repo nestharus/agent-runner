@@ -415,7 +415,10 @@ impl Worker {
             .map(|durable| Tracked {
                 // A durable stop (`outage`, `attempts-exhausted`) keeps the
                 // message from being retried.
-                label: durable.stop,
+                label: durable.stop.or_else(|| {
+                    (durable.ack.is_none() && durable.unknown_attempts > 0)
+                        .then(|| "delivery-unresolved".to_owned())
+                }),
                 message: durable.message,
                 ack: durable.ack,
                 closures: durable.closures,
@@ -761,11 +764,33 @@ impl Worker {
         self.custody.lock().expect("custody lock").cancelled()
     }
 
-    /// Index of the first message still to be delivered.
+    /// No later input bypasses an earlier unacknowledged uncertain attempt.
     fn head(&self) -> Option<usize> {
+        if self
+            .tracked
+            .iter()
+            .any(|t| t.ack.is_none() && t.unknown_attempts > 0)
+        {
+            return None;
+        }
         self.tracked
             .iter()
-            .position(|tracked| tracked.ack.is_none() && tracked.label.is_none())
+            .position(|t| t.ack.is_none() && t.label.is_none())
+    }
+
+    /// Closure accounting is separate from retry authority. A held uncertain
+    /// message still counts a newly observed harness exit, but durable stops
+    /// and already charged exits are not charged again.
+    fn closure_head(&self) -> Option<usize> {
+        self.tracked
+            .iter()
+            .position(|t| t.ack.is_none())
+            .filter(|&index| {
+                matches!(
+                    self.tracked[index].label.as_deref(),
+                    None | Some("delivery-unresolved")
+                )
+            })
     }
 
     fn label_remaining(&mut self, label: &str) {
@@ -822,7 +847,9 @@ impl Worker {
                     }
                 }
                 Some(Prior::Exited { work, receipt }) => {
-                    let _ = self.observe_prior_exit(work, &receipt);
+                    if self.observe_prior_exit(work, &receipt) {
+                        let _ = self.after_drive(ConnEnd::Gone, "exit-observed-while-owner-absent");
+                    }
                     return;
                 }
                 Some(Prior::Unknown { work }) => {
@@ -942,7 +969,14 @@ impl Worker {
             Err((state, reason)) => {
                 self.unconversed(&facts, state, &reason);
                 self.report(json!({ "event": "holding-survivor", "work": live.work, "conversation": state }));
-                let _ = self.hold(live, turns.is_ok(), ConnEnd::Stop, "");
+                let end = if self.closure_head().is_some() {
+                    ConnEnd::Gone
+                } else {
+                    ConnEnd::Stop
+                };
+                let (end, observed) =
+                    self.hold(live, turns.is_ok(), end, "exit-observed-while-held");
+                let _ = self.after_drive(end, observed);
                 false
             }
         }
@@ -1323,7 +1357,7 @@ impl Worker {
             }
             ConnEnd::Gone => {}
         }
-        let Some(index) = self.head() else {
+        let Some(index) = self.closure_head() else {
             return false;
         };
         // The exact child exit has been observed: this is a closure.
@@ -1349,6 +1383,11 @@ impl Worker {
                 "closures": closures,
                 "attempts": self.tracked[index].attempts,
             }));
+            self.label_remaining("not-attempted");
+            return false;
+        }
+        if self.tracked[index].unknown_attempts > 0 {
+            self.tracked[index].label = Some("delivery-unresolved".to_owned());
             self.label_remaining("not-attempted");
             return false;
         }
@@ -1580,11 +1619,11 @@ impl Worker {
             ConnEnd::Gone if observed.send_fault.get() => {
                 // Not PeerGone: nothing has shown that the harness ended.
                 // It stays owed and in flight until its exit is observed.
-                self.report(json!({ "event": "send-fault", "index": self.head() }));
+                self.report(json!({ "event": "send-fault", "index": self.closure_head() }));
                 "exit-after-send-fault"
             }
             ConnEnd::Gone => {
-                self.report(json!({ "event": "read-fault", "index": self.head() }));
+                self.report(json!({ "event": "read-fault", "index": self.closure_head() }));
                 "exit-after-read-fault"
             }
             _ => "",
@@ -1878,8 +1917,12 @@ impl Worker {
             while let Some(index) = self.head() {
                 // The attempt is durable before it is sent, so no successor can
                 // miss an attempt that may have been inserted.
-                let Some(attempt) = self.durable(|store| store.begin_attempt(position, index))
+                let Some(reservation) = self.durable(|store| store.begin_attempt(position, index))
                 else {
+                    return ConnEnd::Stop;
+                };
+                let Some(attempt) = reservation else {
+                    self.label_remaining("delivery-unresolved");
                     return ConnEnd::Stop;
                 };
                 self.tracked[index].attempts += 1;
@@ -1975,11 +2018,13 @@ impl Worker {
                         ("no-ack:invalid-response", Some(ConnEnd::Stop))
                     }
                     DeliveryOutcome::NotNegotiated => {
+                        // Neutral client returns before constructing/calling session/prompt.
                         self.tracked[index].label = Some("not-negotiated".to_owned());
                         self.view(|view| view.open.retain(|input| input.index != index));
                         ("not-sent", Some(ConnEnd::Stop))
                     }
                     DeliveryOutcome::SessionMismatch => {
+                        // Local message/session binding check precedes the prompt call.
                         self.tracked[index].label = Some("session-mismatch".to_owned());
                         self.view(|view| view.open.retain(|input| input.index != index));
                         ("not-sent", Some(ConnEnd::Stop))
@@ -2880,7 +2925,7 @@ mod tests {
         };
         if acknowledged {
             let mut store = worker.store.lock().unwrap();
-            let attempt = store.begin_attempt(0, 0).unwrap();
+            let attempt = store.begin_attempt(0, 0).unwrap().unwrap();
             store.record_ack(0, 0, attempt, &ack).unwrap();
             worker.tracked[0].ack = Some(ack.clone());
         }
@@ -3231,7 +3276,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_completion_response_keeps_owed_account_until_durable_end() {
+    fn failed_completion_response_keeps_owed_account_without_retry() {
         let (worker, rx, _dir) = worker();
         let mut store = worker.store.lock().unwrap();
         let incarnation = store
@@ -3247,7 +3292,7 @@ mod tests {
         else {
             panic!("first admission")
         };
-        let attempt = store.begin_attempt(0, index).unwrap();
+        let attempt = store.begin_attempt(0, index).unwrap().unwrap();
         store
             .resolve_attempt(attempt, "no-ack:invalid-response")
             .unwrap();
@@ -3264,29 +3309,10 @@ mod tests {
         assert_eq!(summary["turn_ended"], 0);
         assert_eq!(summary["undelivered"], json!([]));
         let mut store = worker.store.lock().unwrap();
-        let later = store.begin_attempt(0, index).unwrap();
-        let ack = DurableAck {
-            label: "duplicate-unknown".into(),
-            basis: None,
-            recovered: false,
-            generation: store.generation(),
-            message_id: Some("m".into()),
-        };
-        store.record_ack(0, index, later, &ack).unwrap();
+        assert_eq!(store.begin_attempt(0, index).unwrap(), None);
         drop(store);
         assert!(!worker.settle_async(work, "turn-ended", None));
-        worker
-            .store
-            .lock()
-            .unwrap()
-            .record_turn_end(0, index)
-            .unwrap();
-        assert!(worker.settle_async(work, "turn-ended", None));
-        assert!(!worker.settle_async(work, "turn-ended", None));
-        let summary = bash::async_summary(&worker.views);
-        assert_eq!(summary["owed"], 0);
-        assert_eq!(summary["turn_ended"], 1);
-        assert_eq!(summary["undelivered"], json!([]));
+        assert_eq!(bash::async_summary(&worker.views)["owed"], 1);
         let changes: Vec<_> = rx
             .try_iter()
             .filter_map(|event| match event {
@@ -3296,7 +3322,49 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(changes, vec![json!("owed"), json!("turn-ended")]);
+        assert_eq!(changes, vec![json!("owed")]);
+    }
+
+    /// A stopped uncertain earlier input must not transfer its physical
+    /// closure to a later never-attempted input or authorize that later launch.
+    #[test]
+    fn unresolved_stopped_input_does_not_charge_or_relaunch_a_later_input() {
+        let (mut worker, rx, _dir) = worker();
+        let mut store = worker.store.lock().unwrap();
+        let attempt = store.begin_attempt(0, 0).unwrap().unwrap();
+        store
+            .resolve_attempt(attempt, "rejected-unresolved")
+            .unwrap();
+        let Admission::Admitted(_, message) = store
+            .admit_follow_up(0, 1, None, "later", true, None)
+            .unwrap()
+        else {
+            panic!("fixture admission");
+        };
+        drop(store);
+        worker.tracked[0].label = Some("rejected-unresolved".into());
+        worker.tracked[0].attempts = 1;
+        worker.tracked[0].unknown_attempts = 1;
+        worker.tracked.push(Tracked {
+            message,
+            label: None,
+            ack: None,
+            closures: 0,
+            attempts: 0,
+            prior_unknown: 0,
+            unknown_attempts: 0,
+            turn_ended: false,
+            follow_up: true,
+        });
+        assert!(worker.head().is_none());
+        assert!(worker.closure_head().is_none());
+        assert!(!worker.after_drive(ConnEnd::Gone, "fixture-wait"));
+        assert_eq!(worker.tracked[1].closures, 0);
+        assert_eq!(worker.tracked[1].attempts, 0);
+        assert!(
+            rx.try_iter()
+                .all(|event| !matches!(event, Event::Report(v) if v["event"] == "relaunch"))
+        );
     }
 
     /// CONFIGURED SEAM (A6): a harness launch whose spawn reply is lost or
@@ -3439,7 +3507,10 @@ mod tests {
     fn pending_attempt(worker: &mut Worker) -> i64 {
         // A real in-flight durable reservation, without spawning a harness.
         worker.launches = 0;
-        let attempt = worker.durable(|store| store.begin_attempt(0, 0)).unwrap();
+        let attempt = worker
+            .durable(|store| store.begin_attempt(0, 0))
+            .unwrap()
+            .unwrap();
         worker.tracked[0].attempts += 1;
         attempt
     }

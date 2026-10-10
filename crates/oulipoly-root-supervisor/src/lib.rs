@@ -146,9 +146,9 @@
 //! **Resident evidence.** Registered resident harnesses use the delivered
 //! SDK's prepared agreement, start/resume and turn helper. Their native
 //! session reference is deliberately Unbound to a canonical host session.
-//! If the owner dies after the wire error but before committing the durable
-//! rejection stop, successor recovery can resubmit the same owed key. This
-//! window establishes neither native at-most-once delivery nor retry authority.
+//! If the owner dies before recording a prompt outcome, its reservation is
+//! insertion-unknown. Successor recovery holds that input without resubmission,
+//! even with spare budget: no exact receiver-continuity receipt is established.
 //! An endpoint's INPUT_NOT_INSERTED code is an attributed declaration, not
 //! physical proof; all RPC rejections retain the input/close hold until cancel
 //! or peer exit, with no automatic retry after the stop commits.
@@ -220,7 +220,7 @@
 //!   caller's `ref` have committed to the store (`origin` `follow-up`). From
 //!   then on it is owed debt like an intent message: attempt, `ack`
 //!   (insertion readback), `agent-message` and `turn-end` name the same
-//!   `input`, and a later recovery resubmits it with its original key.
+//!   `input`. Recovery retains its original key, not permission to resend.
 //! * `close` refuses new input for the whole root (`close-requested`). An
 //!   admission whose check already passed can still commit and be reported
 //!   after this request; that input remains part of the admitted work. The
@@ -338,18 +338,20 @@
 //!
 //! * still exactly that process and admitting this owner: **attached**. Each
 //!   surviving harness is **reattached** (same process, its stdio from root
-//!   PID 1): the owner initializes again, resumes the recorded session and
-//!   resubmits what is owed with the original keys. Ends reported while no
+//!   PID 1): a possibly inserted input is held without reconnect or resubmission.
+//!   With no uncertain attempt, the owner may initialize/resume and deliver
+//!   genuinely unsent owed input within the configured budgets. Ends reported while
+//!   no
 //!   owner was attached are reported as such (`prior-exit`, with their
 //!   waiter) and count as closures like any observed exit. A report with
 //!   only the work PID 1's status, no harness wait, is `prior-end-unknown`
 //!   (`ended-with-work-namespace-status-unknown`): not a closure, and the
-//!   message is launched again within its attempt budget.
+//!   message is not retried unless every prior attempt excluded submission.
 //! * not running (gone, or its pid now names another process): **absent**,
 //!   recorded as exactly what was observed. Its harnesses ended with it,
 //!   status unknown unless it recorded a report (`prior-end-unknown`, not a
-//!   closure). The next launch starts a new incarnation under the same root
-//!   identity.
+//!   closure). Namespace end is not non-insertion: it grants no uncertain-input
+//!   retry. An independently authorized later launch starts a new incarnation.
 //! * possibly running but not attachable: **owned-unattached**. Nothing is
 //!   launched, killed or declared ended; the run reports `owned-unattached`
 //!   (exit 4) and owed messages stay in the store.
@@ -358,21 +360,17 @@
 //! transaction, labels every earlier-generation attempt that has no recorded
 //! outcome `unknown-prior-owner`: it may or may not have been sent or
 //! inserted. That is neither an acknowledgement nor a closure: the earlier
-//! owner's death is not an observed harness exit. It then resumes the
-//! recorded session and resubmits each owed message with its **original**
-//! key. A restored key is a supplied identity with unknown history, so an
-//! ACK after a restart is at best `duplicate-unknown`, with `recovered`
-//! when a dedup-contract receiver says it returned an earlier insertion.
-//! Durable storage does not make a restored key or session string a
-//! receiver-continuity proof.
+//! owner's death is not an observed harness exit. Every new reservation
+//! atomically requires all previous reservations for that input to be `not-sent`.
+//! A restored key/session, endpoint dedup declaration, ACK/tagged end, logical
+//! completion link or budget is not durable exact receiver continuity.
 //!
 //! One attempt-outcome classification backs completion non-delivery, restored
-//! and current turn accounts, close and reporting. Only `not-sent` establishes
-//! non-insertion without endpoint evidence; recorded insertion ACKs establish
-//! insertion. RPC rejection (`rejected-unresolved`), missing, invalid, closed
-//! and unfamiliar responses are unresolved. The legacy internal `rejected`
-//! classification is retained for already-conclusive fixture facts, never
-//! produced from current prompt RPC refusals.
+//! and current turn accounts, close and reporting. `not-sent` is produced only
+//! by the neutral client's local pre-call NotNegotiated/SessionMismatch branches,
+//! before constructing/calling session/prompt; it excludes that submission only.
+//! RPC rejection (including older internal `rejected` labels), missing, invalid,
+//! closed and unfamiliar responses are unresolved, not non-insertion evidence.
 //! A later refusal cannot erase any earlier unresolved attempt. An exact linked
 //! ACK and tagged end can settle the logical input while the earlier physical
 //! attempts remain in history. Neither that reconciliation nor resubmission
@@ -384,11 +382,20 @@
 //! reservation committed before a send: it may or may not have been sent,
 //! including when its owner died before recording an outcome.
 //! [`Intent::delivery_attempt_cap`] bounds attempts per message over every
-//! generation, so a loop of owner restarts with unresolved outcomes cannot
-//! retry forever; when it is used up the message stops as
+//! generation. It is an accounting/availability bound, never retry authority;
+//! unresolved attempts cannot be retried even below the cap. When used up it
+//! stops as
 //! `attempts-exhausted` with its unknown attempts still unknown, not as an
 //! outage, a closure or an acknowledgement. A surviving harness with
 //! nothing left to deliver is never dropped as gone; see Settled survivors.
+//!
+//! **Current Linux ACP v2 recovery scope (AGE-360).** For unqualified receivers,
+//! truthful refusal plus retained input/custody/loss accounts realizes conservative
+//! accounting, not executable continuation. Continuation for a possibly inserted
+//! input remains owed until positive non-insertion or exact receiver continuity
+//! excludes another native effect. No such continuity receipt is currently
+//! established. This source does not restore legacy guardians/mailboxes or promise
+//! installed recovery, a packaged `--recover` path, or provider fault qualification.
 //!
 //! # Settled survivors
 //!
@@ -459,9 +466,10 @@
 //! ACK without a
 //! tagged end stays unresolved. Later exact-link ACK and tagged end reconcile
 //! transport completion without another logical admission.
-//! The inherited owed-input path still reinitializes/resubmits without a live
-//! reattachment declaration; at-most-once is unproven there. This settled
-//! survivor contract must not be read as covering that path.
+//! An inherited input with unresolved insertion cannot use the owed-input path
+//! to reinitialize/resubmit. Settled-survivor resume for a distinct new input
+//! remains available under its declared contract; provider-internal replay and
+//! native lineage continuity are unqualified, not excluded by Runner records.
 //!
 //! Retained descriptors are custody, not a usable conversation, and a
 //! stored session string is scope, not continuity: neither alone opens one.
@@ -489,10 +497,12 @@
 //! * An owed message keeps its reason: `cancelled`, `outage`, `rejected-unresolved`,
 //!   `not-negotiated:*`, `session-*`, `invalid-response`, `launch-failed`,
 //!   `wait-unproven`, `authority-lost`, `store-failed`, `not-attempted`,
-//!   `attempts-exhausted`. Durable stops are `outage`, `attempts-exhausted`,
+//!   `attempts-exhausted`, `delivery-unresolved`. Durable stops are `outage`,
+//!   `attempts-exhausted`,
 //!   and a `rejected-unresolved` RPC attempt; the
-//!   others end this instance's attempts and a later recovery retries the
-//!   message. Rejection remains unacknowledged and is never replayed.
+//!   others end this instance's attempts. Recovery may retry only if every
+//!   prior reservation excluded submission. Rejection remains unacknowledged.
+//!   `delivery-unresolved` holds uncertain input while spare attempt budget is unused.
 //!   Terminal `owed` / `known_owed` and message state `owed` have explicit
 //!   `owed_scope: insertion-ack-absence`: they are not replay permission or
 //!   the async completion debt counter. `unresolved_attempts` retains all
@@ -506,8 +516,8 @@
 //!   once the harness's exit is observed. Silence is never a closure: a quiet
 //!   live harness stays owed and in flight until it answers, exits, or the
 //!   caller cancels. No timer ends or kills anything.
-//! * After a closure the harness is relaunched, the session resumed, and the
-//!   **same** message (same key) submitted again.
+//! * An observed closure is still charged. Relaunch/resubmission requires no
+//!   possibly inserted prior attempt; positive process end alone cannot supply it.
 //! * `idle` events are readiness since the session's first tracked attempt,
 //!   not completion of the latest message.
 //!
@@ -519,8 +529,8 @@
 //! * `closed`: the caller's `close` was followed through: every launched
 //!   or reattached harness's end was reported (those stopped for the close
 //!   by their work PID 1's kill, with `close` saying so), and any remaining
-//!   unacknowledged input is rejected with no earlier insertion-unresolved
-//!   attempt (exit 7). Physical reaping alone does not settle that uncertainty. The rejection
+//!   unacknowledged input has no insertion-unresolved attempt (exit 7). Physical
+//!   reaping alone does not settle that uncertainty. The rejection
 //!   and delivery debt remain in the report/store. It says how the run ended,
 //!   not that any input was
 //!   processed: a harness stopped for the close ended by a signal.
@@ -750,10 +760,11 @@ pub enum Recover {
     /// PID 1s, nothing is connected to, resubmitted or launched.
     Cancel,
     /// Continue the attached root's work: survivors are reattached and
-    /// what is owed is resubmitted with its original keys (an ACK is then
-    /// at best `duplicate-unknown`, not receiver continuity). A harness
-    /// that needs a relaunch is launched by the attached root PID 1, in its
-    /// original environment. A survivor with nothing owed is conversed with
+    /// possibly inserted inputs are held, never retried solely on spare budget.
+    /// Only never-attempted or positively not-sent inputs remain deliverable.
+    /// A harness whose relaunch is independently authorized is launched by the
+    /// attached root PID 1 in its original environment. A survivor with nothing
+    /// deliverable is conversed with
     /// again only as the crate's Settled survivors section allows.
     ContinueAttached,
 }
