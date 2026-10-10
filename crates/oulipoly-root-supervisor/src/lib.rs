@@ -1637,7 +1637,11 @@ where
     }
     report["async"] = bash::async_summary(&views);
     report["async"]["inherited"] = bash::inherited_summary(&store, None);
-    report["children"] = registry.summary();
+    report["children"] = if root_pid1["end_observed"] == true {
+        registry.summary_after_namespace_end()
+    } else {
+        registry.summary()
+    };
     report["root_pid1"] = root_pid1;
     emit_terminal(&mut out, &mut diagnostics, &report, code)
 }
@@ -1745,10 +1749,9 @@ fn recover_custody(
             } else if absent {
                 harness::Prior::Unknown { work }
             } else {
-                // The attached root PID 1, the only launcher, never had it:
-                // the launch was recorded but never requested.
-                let _ = store.resolve_work(work, "never-launched", Some("root-pid1-record"));
-                continue;
+                // PID 1 can lose its first report after clone. An attached
+                // list omission proves neither no-start nor physical end.
+                harness::Prior::Missing { work }
             };
             recovery.priors.insert(position, prior);
         }
@@ -1778,9 +1781,7 @@ fn recover_custody(
                 work: run.work,
             }
         } else {
-            // A missing first launch report can follow creation. Absence
-            // from attach is not a positive no-start reply for this intent.
-            bash::Prior::Unknown {
+            bash::Prior::Missing {
                 harness: run.harness,
                 work: run.work,
             }
@@ -1800,10 +1801,10 @@ fn recover_custody(
             .find(|receipt| receipt["work"] == name.as_str())
         {
             ChildFound::Exited(receipt.clone())
+        } else if absent {
+            ChildFound::RootEnded
         } else {
-            // Absent from an attached root's lists is not a positive
-            // no-start either (a first report can be lost after creation).
-            ChildFound::Unknown
+            ChildFound::Missing
         };
         recovery.children.push(ChildPrior {
             child: child.clone(),
@@ -1822,7 +1823,8 @@ struct ChildPrior {
 enum ChildFound {
     Live(custody::Adopted),
     Exited(Value),
-    Unknown,
+    RootEnded,
+    Missing,
 }
 
 /// A recovered child is never continued, reconnected or delivered to: its
@@ -1861,7 +1863,7 @@ fn recover_child<W: Write>(
                     None => (
                         "ended-with-work-namespace-status-unknown".to_owned(),
                         None,
-                        true,
+                        false,
                     ),
                 },
                 _ => ("end-unknown".to_owned(), None, true),
@@ -1872,16 +1874,23 @@ fn recover_child<W: Write>(
             None => (
                 "ended-with-work-namespace-status-unknown".to_owned(),
                 None,
-                true,
+                false,
             ),
         },
-        // Absent from the attached root's live and receipt lists: its end is
-        // unknown; no root-namespace end was observed.
-        ChildFound::Unknown => ("absent-from-root-lists-end-unknown".to_owned(), None, true),
+        ChildFound::RootEnded => (
+            "ended-with-root-namespace-status-unknown".to_owned(),
+            None,
+            false,
+        ),
+        ChildFound::Missing => (
+            "absent-from-attached-root-liveness-unknown".to_owned(),
+            None,
+            true,
+        ),
     };
     {
         let mut store = store.lock().expect("store lock");
-        if status != "end-unknown" {
+        if !unknown {
             let _ = store.resolve_work(child.work, &status, observer);
         }
         let _ = store.resolve_child(child.position, "lost-with-prior-owner");
@@ -1892,12 +1901,13 @@ fn recover_child<W: Write>(
         "outcome": "lost-with-prior-owner",
         "end": { "status": status, "observer": observer },
         "recovered": true,
+        "liveness": if unknown { "unknown" } else { "not-running" },
     });
     emit(
         out,
         &json!({ "event": "child-prior-end", "harness": child.id, "work": child.work, "status": status, "observer": observer }),
     );
-    registry.note_recovered(summary, unknown);
+    registry.note_recovered(child.position, summary, unknown);
 }
 
 /// Releases this owner's root PID 1 at the end of its run and reports how
@@ -1927,10 +1937,10 @@ fn end_custody(
             Some(status) => format!("{}:{status}", release.outcome),
             None => release.outcome.to_owned(),
         };
-        let _ = store
-            .lock()
-            .expect("store lock")
-            .end_incarnation(root.incarnation, &label);
+        let mut store = store.lock().expect("store lock");
+        if store.end_incarnation(root.incarnation, &label).is_ok() {
+            let _ = store.end_unresolved_work_namespaces(root.incarnation);
+        }
     }
     json!({
         "outcome": release.outcome,

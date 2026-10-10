@@ -391,6 +391,10 @@ pub(crate) enum Prior {
         harness: usize,
         work: i64,
     },
+    Missing {
+        harness: usize,
+        work: i64,
+    },
 }
 
 impl Ingress {
@@ -1080,8 +1084,9 @@ impl Ingress {
             );
         }
         self.custody.lock().expect("custody lock").release(token);
+        self.children.remove_run(work, physical != "unresolved");
         self.children
-            .remove_run(work, matches!(outcome, Outcome::Ended));
+            .finish_recovered_run(work, physical != "unresolved");
         let caller = match sink {
             _ if completion.is_some() => "detached-async",
             Some(sink) => {
@@ -1224,6 +1229,18 @@ impl Ingress {
         let mut gate = self.gate.0.lock().expect("bash gate");
         gate.open += 1;
         drop(gate);
+        let (position, work, possibly_running) = match &prior {
+            Prior::Live { harness, adopted } => (*harness, adopted.work, true),
+            Prior::Missing { harness, work } => (*harness, *work, true),
+            Prior::Exited { harness, work, .. } | Prior::Unknown { harness, work } => {
+                (*harness, *work, false)
+            }
+        };
+        // Publish before workers/admission: even an already-ended child
+        // harness can have an unresolved Bash namespace of its own.
+        if possibly_running {
+            self.children.add_recovered_run(position, work);
+        }
         let ingress = Arc::clone(self);
         thread::spawn(move || match prior {
             Prior::Live { harness, adopted } => {
@@ -1294,6 +1311,16 @@ impl Ingress {
                 } else {
                     Outcome::Unknown
                 });
+            }
+            Prior::Missing { harness, work } => {
+                ingress.report(json!({
+                    "event": "bash-prior-end", "work": work,
+                    "harness_position": harness, "status": Value::Null,
+                    "meaning": "absent-from-attached-root-liveness-unknown",
+                }));
+                // No output seal, end, completion settlement or replay: the
+                // work stays open and is charged again on every claim.
+                ingress.leave(Outcome::Unknown);
             }
             Prior::Unknown { harness, work } => {
                 ingress.seal_found_ended(work);
